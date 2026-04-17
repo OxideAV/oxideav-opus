@@ -23,20 +23,30 @@
 
 //! Opus audio codec (RFC 6716 bitstream, RFC 7845 in-Ogg mapping).
 //!
-//! What's landed:
+//! Decoder scope (see `decoder` module docs for the nitty-gritty):
 //!
 //! * `OpusHead` identification-packet parsing (RFC 7845 §5.1).
 //! * Full TOC byte + framing code 0/1/2/3 packet parser (RFC 6716 §3).
-//! * Decoder that produces correct silence output for DTX / silence
-//!   frames and for CELT frames whose silence flag is set.
-//! * Clean `Unsupported` rejection (no panics, no garbage) for SILK-only
-//!   and Hybrid frames, and for CELT frames that require the full
-//!   band-energy + PVQ + inverse MDCT stack (not yet landed).
+//! * CELT-only frames at any bandwidth (NB/WB/SWB/FB), mono + stereo,
+//!   2.5/5/10/20 ms — full §4.3 pipeline (range decode, coarse+fine+
+//!   final band energy, bit allocation, PVQ shape, anti-collapse,
+//!   IMDCT with overlap-add, comb post-filter).
+//! * SILK-only frames at NB/MB/WB, mono + stereo, 10/20/40/60 ms —
+//!   §4.2 pipeline (NLSF → LPC, LTP for voiced, excitation, synthesis,
+//!   stereo MS→LR unmix, 8/12/16 → 48 kHz upsample).
+//! * Silence / DTX frames (0 / 1-byte packets) produce correct-length
+//!   silence output.
 //!
-//! Scope that remains for follow-up agents: the CELT decoder stages
-//! (coarse+fine+final band energy, PVQ shape decode, anti-collapse,
-//! inverse MDCT with overlap-add window, post-filter); and the SILK
-//! decoder entirely. All of these are tracked in RFC 6716 §4.2 / §4.3.
+//! Decoder gaps that still return `Unsupported`:
+//!
+//! * Hybrid (SILK+CELT) frames — §4.2 + §4.3 need to share a packet.
+//! * SILK LBRR redundancy data — flags are parsed so the range coder
+//!   stays aligned, but the redundancy frames themselves are not yet
+//!   decoded; any packet that sets a LBRR flag is rejected rather than
+//!   silently dropping samples.
+//! * Channel mapping family 1/2 (Vorbis / ambisonic multistream).
+//!
+//! Encoder scope — see `encoder` module docs.
 
 pub mod decoder;
 pub mod encoder;
