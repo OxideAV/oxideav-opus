@@ -20,4 +20,4 @@ oxideav-celt = "0.0"
 
 [dev-dependencies]
 oxideav-ogg = "0.0"
-oxideav-container = "0.0"
+oxideav-container = "0.1"
