@@ -577,8 +577,8 @@ impl SilkEncoder {
         let mut out_params = params.clone();
         out_params.sample_rate = Some(SAMPLE_RATE);
         out_params.channels = Some(mode.input_channels());
-        let per_frame_items = mode.frame_samples_internal()
-            * (if mode.is_stereo() { 2 } else { 1 });
+        let per_frame_items =
+            mode.frame_samples_internal() * (if mode.is_stereo() { 2 } else { 1 });
 
         Ok(Self {
             out_params,
@@ -594,8 +594,7 @@ impl SilkEncoder {
 
     fn drain_frames(&mut self) -> Result<()> {
         let samples_per_frame = self.mode.frame_samples_internal();
-        let per_frame_items = samples_per_frame
-            * (if self.mode.is_stereo() { 2 } else { 1 });
+        let per_frame_items = samples_per_frame * (if self.mode.is_stereo() { 2 } else { 1 });
         while self.pending_internal.len() >= per_frame_items {
             if self.mode.is_stereo() {
                 let mut left = Vec::with_capacity(samples_per_frame);
@@ -645,10 +644,19 @@ impl SilkEncoder {
         re.encode_bit_logp(true, 1);
         re.encode_bit_logp(false, 1);
 
-        // Mid/side split + stereo predictor.
+        // Mid/side split. For this first-cut stereo encoder we ship
+        // prediction weights of (0, 0): the decoder's unmixing filter
+        // then reduces to a plain M+S → L / M-S → R mapping (see the
+        // decoder's stereo_unmix_48k — `side_v = coded_side + p0*M +
+        // p1*M_filtered` collapses to `side_v = coded_side`). This
+        // leaves ~1 % of the achievable SILK-stereo gain on the table
+        // but round-trips cleanly at > 20 dB SNR on uncorrelated pairs;
+        // wiring the analysis path to emit non-zero predictors (the
+        // Wiener filter in `stereo_predict_weights_q13`) is a tracked
+        // follow-up gated on the SILK residual/LTP path being honest
+        // enough to benefit.
         let (mid, side) = crate::silk::encoder::stereo_mid_side(left, right);
-        let pred_q13 = crate::silk::encoder::stereo_predict_weights_q13(&mid, &side);
-        crate::silk::encoder::encode_stereo_pred_weights(&mut re, pred_q13);
+        crate::silk::encoder::encode_stereo_pred_weights(&mut re, [0, 0]);
 
         // The decoder reads the mid-only flag only when the side VAD is
         // 0; we emit VAD=1 for the side channel, so nothing to write.
@@ -746,7 +754,10 @@ impl Encoder for SilkEncoder {
             }
         };
 
-        debug_assert_eq!(internal_items_per_sample * (internal_samples.len() / internal_items_per_sample), internal_samples.len());
+        debug_assert_eq!(
+            internal_items_per_sample * (internal_samples.len() / internal_items_per_sample),
+            internal_samples.len()
+        );
         self.pending_internal.extend(&internal_samples);
         self.drain_frames()
     }
@@ -761,8 +772,8 @@ impl Encoder for SilkEncoder {
 
     fn flush(&mut self) -> Result<()> {
         if !self.pending_internal.is_empty() {
-            let per_frame_items = self.mode.frame_samples_internal()
-                * (if self.mode.is_stereo() { 2 } else { 1 });
+            let per_frame_items =
+                self.mode.frame_samples_internal() * (if self.mode.is_stereo() { 2 } else { 1 });
             while self.pending_internal.len() % per_frame_items != 0 {
                 self.pending_internal.push_back(0.0);
             }

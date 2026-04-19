@@ -12,7 +12,9 @@ use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase,
 };
 use oxideav_opus::encoder::{
-    OpusEncoder, SilkEncoder, OPUS_FRAME_SAMPLES, SILK_FRAME_SAMPLES_48K, SILK_NB_RATE,
+    OpusEncoder, SilkEncoder, OPUS_FRAME_SAMPLES, SILK_FRAME_SAMPLES_48K,
+    SILK_MB_FRAME_SAMPLES_INTERNAL, SILK_MB_RATE, SILK_NB_FRAME_SAMPLES_INTERNAL, SILK_NB_RATE,
+    SILK_WB_FRAME_SAMPLES_INTERNAL, SILK_WB_RATE,
 };
 use oxideav_opus::toc::{OpusBandwidth, OpusMode, Toc};
 
@@ -673,4 +675,374 @@ fn silk_nb_mono_48k_input_roundtrips_cleanly() {
     let rms = mean_energy_i16(pcm).sqrt();
     println!("silk_nb_48k_input: rms={rms:.4e}");
     assert!(rms > 0.01, "decoded output too quiet — RMS={rms}");
+}
+
+// ----- SILK MB / WB / NB-stereo round-trips --------------------------
+
+/// Shared helper: encode a sine-like speech tone at the SILK internal
+/// rate through one of the new constructors, decode via our Opus
+/// decoder, and check the downsampled-back output's SNR.
+fn silk_mono_internal_rate_snr(
+    enc: &mut SilkEncoder,
+    internal_rate: u32,
+    internal_frame_samples: usize,
+    expected_config: u8,
+    expected_bw: OpusBandwidth,
+    n_frames: usize,
+    snr_bar: f64,
+) -> f64 {
+    // 300 Hz tone + slow amplitude envelope (speech-like).
+    let total = n_frames * internal_frame_samples;
+    let f_tone = 300.0f32;
+    let f_env = 5.0f32;
+    let signal_in: Vec<f32> = (0..total)
+        .map(|i| {
+            let t = i as f32 / internal_rate as f32;
+            let env = 0.5 + 0.5 * (2.0 * std::f32::consts::PI * f_env * t).sin();
+            (2.0 * std::f32::consts::PI * f_tone * t).sin() * 0.3 * env
+        })
+        .collect();
+
+    let mut packets: Vec<Packet> = Vec::new();
+    for chunk in signal_in.chunks(internal_frame_samples) {
+        if chunk.len() < internal_frame_samples {
+            break;
+        }
+        let mut bytes = Vec::with_capacity(chunk.len() * 2);
+        for &s in chunk {
+            let q = (s * 32768.0).clamp(-32768.0, 32767.0) as i16;
+            bytes.extend_from_slice(&q.to_le_bytes());
+        }
+        let frame = Frame::Audio(AudioFrame {
+            format: SampleFormat::S16,
+            channels: 1,
+            sample_rate: internal_rate,
+            samples: internal_frame_samples as u32,
+            pts: None,
+            time_base: TimeBase::new(1, internal_rate as i64),
+            data: vec![bytes],
+        });
+        enc.send_frame(&frame).expect("send");
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => packets.push(p),
+                Err(Error::NeedMore) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+    }
+    enc.flush().expect("flush");
+    while let Ok(p) = enc.receive_packet() {
+        packets.push(p);
+    }
+    assert!(!packets.is_empty(), "encoder emitted no packets");
+
+    for (i, pkt) in packets.iter().enumerate() {
+        assert!(pkt.data.len() >= 2, "packet {i} too short");
+        let toc = Toc::parse(pkt.data[0]);
+        assert_eq!(toc.mode, OpusMode::SilkOnly, "packet {i} SILK-only");
+        assert_eq!(toc.config, expected_config, "packet {i} config");
+        assert_eq!(toc.bandwidth, expected_bw, "packet {i} bandwidth");
+        assert_eq!(toc.frame_samples_48k, 960, "packet {i} 20 ms");
+        assert!(!toc.stereo, "packet {i} mono");
+        assert_eq!(toc.code, 0, "packet {i} framing code");
+    }
+
+    let decoded = decode_packets(&packets, 1);
+    let pcm = &decoded[0];
+    assert!(!pcm.is_empty());
+    assert!(pcm.iter().all(|s| (*s as f32).is_finite()));
+
+    // Downsample 48 kHz decoded PCM back to the internal rate by integer
+    // box-average, matching the encoder's pre-filter. ratio = 48/rate_khz.
+    let ratio = (48_000 / internal_rate) as usize;
+    let mut dec_internal = Vec::with_capacity(pcm.len() / ratio);
+    for chunk in pcm.chunks_exact(ratio) {
+        let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
+        dec_internal.push((sum / ratio as i32) as i16);
+    }
+
+    // Skip first 3 frames so the LPC state + upsampler FIR settle.
+    let skip = 3 * internal_frame_samples;
+    let n = signal_in.len().min(dec_internal.len()).saturating_sub(skip);
+    assert!(n > 100, "not enough samples for SNR comparison");
+    let (snr, lag) = snr_db_with_lag_search(
+        &signal_in[skip..skip + n],
+        &dec_internal[skip..skip + n],
+        80,
+    );
+    println!(
+        "silk {:?} mono: snr={snr:.2} dB (lag={lag} samples @ {internal_rate} Hz)",
+        expected_bw
+    );
+    assert!(
+        snr > snr_bar,
+        "SILK round-trip SNR {snr:.2} dB is below the {snr_bar} dB bar (lag={lag})"
+    );
+    snr
+}
+
+fn make_silk_mb_encoder() -> SilkEncoder {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(1);
+    p.sample_rate = Some(SILK_MB_RATE);
+    SilkEncoder::new_mb_mono_20ms(&p).expect("make SilkEncoder MB")
+}
+
+fn make_silk_wb_encoder() -> SilkEncoder {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(1);
+    p.sample_rate = Some(SILK_WB_RATE);
+    SilkEncoder::new_wb_mono_20ms(&p).expect("make SilkEncoder WB")
+}
+
+fn make_silk_nb_stereo_encoder() -> SilkEncoder {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(2);
+    p.sample_rate = Some(SILK_NB_RATE);
+    SilkEncoder::new_nb_stereo_20ms(&p).expect("make SilkEncoder NB stereo")
+}
+
+#[test]
+fn silk_mb_mono_20ms_roundtrip_snr_above_20db() {
+    let mut enc = make_silk_mb_encoder();
+    silk_mono_internal_rate_snr(
+        &mut enc,
+        SILK_MB_RATE,
+        SILK_MB_FRAME_SAMPLES_INTERNAL,
+        5,
+        OpusBandwidth::Mediumband,
+        25,
+        20.0,
+    );
+}
+
+#[test]
+fn silk_wb_mono_20ms_roundtrip_snr_above_20db() {
+    let mut enc = make_silk_wb_encoder();
+    silk_mono_internal_rate_snr(
+        &mut enc,
+        SILK_WB_RATE,
+        SILK_WB_FRAME_SAMPLES_INTERNAL,
+        9,
+        OpusBandwidth::Wideband,
+        25,
+        20.0,
+    );
+}
+
+/// NB stereo round-trip: encode a 300 Hz L tone + 300 Hz cosine R tone
+/// through the stereo SILK encoder, verify the TOC stereo bit is set,
+/// then decode and check both channels land at ≥ 20 dB SNR against
+/// their respective references (with a lag search for the SILK
+/// upsampler group delay).
+///
+/// Also asserts that L and R differ by a meaningful amount — if the
+/// encoder collapses to mid-only, the decoder splats the mid channel
+/// identically to both outputs and the test catches that.
+#[test]
+fn silk_nb_stereo_20ms_roundtrip_snr_and_channel_separation() {
+    let n_frames = 25;
+    let internal_rate = SILK_NB_RATE;
+    let internal_frame_samples = SILK_NB_FRAME_SAMPLES_INTERNAL;
+    let total = n_frames * internal_frame_samples;
+
+    // Left: 300 Hz sine, Right: 300 Hz cosine (90° phase) — same energy
+    // on both channels but non-zero side channel (S = (L-R)/2).
+    let f_tone = 300.0f32;
+    let tau = 2.0 * std::f32::consts::PI;
+    let l_in: Vec<f32> = (0..total)
+        .map(|i| (tau * f_tone * i as f32 / internal_rate as f32).sin() * 0.3)
+        .collect();
+    let r_in: Vec<f32> = (0..total)
+        .map(|i| (tau * f_tone * i as f32 / internal_rate as f32).cos() * 0.3)
+        .collect();
+
+    let mut enc = make_silk_nb_stereo_encoder();
+    let mut packets: Vec<Packet> = Vec::new();
+    for (lc, rc) in l_in
+        .chunks(internal_frame_samples)
+        .zip(r_in.chunks(internal_frame_samples))
+    {
+        if lc.len() < internal_frame_samples {
+            break;
+        }
+        let mut bytes = Vec::with_capacity(lc.len() * 4);
+        for i in 0..lc.len() {
+            let lq = (lc[i] * 32768.0).clamp(-32768.0, 32767.0) as i16;
+            let rq = (rc[i] * 32768.0).clamp(-32768.0, 32767.0) as i16;
+            bytes.extend_from_slice(&lq.to_le_bytes());
+            bytes.extend_from_slice(&rq.to_le_bytes());
+        }
+        let frame = Frame::Audio(AudioFrame {
+            format: SampleFormat::S16,
+            channels: 2,
+            sample_rate: internal_rate,
+            samples: internal_frame_samples as u32,
+            pts: None,
+            time_base: TimeBase::new(1, internal_rate as i64),
+            data: vec![bytes],
+        });
+        enc.send_frame(&frame).expect("send");
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => packets.push(p),
+                Err(Error::NeedMore) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+    }
+    enc.flush().expect("flush");
+    while let Ok(p) = enc.receive_packet() {
+        packets.push(p);
+    }
+    assert!(!packets.is_empty());
+
+    // Every packet must be SILK NB 20 ms stereo (config 1, stereo=1).
+    for (i, pkt) in packets.iter().enumerate() {
+        let toc = Toc::parse(pkt.data[0]);
+        assert_eq!(toc.mode, OpusMode::SilkOnly, "packet {i}");
+        assert_eq!(toc.config, 1, "packet {i} config");
+        assert_eq!(toc.bandwidth, OpusBandwidth::Narrowband, "packet {i} bw");
+        assert!(toc.stereo, "packet {i} stereo bit must be set");
+    }
+
+    // Decode.
+    let decoded = decode_packets(&packets, 2);
+    assert_eq!(decoded.len(), 2, "decoder must emit 2 channels");
+    let l_dec = &decoded[0];
+    let r_dec = &decoded[1];
+    assert!(!l_dec.is_empty() && !r_dec.is_empty());
+    assert!(l_dec.iter().all(|s| (*s as f32).is_finite()));
+    assert!(r_dec.iter().all(|s| (*s as f32).is_finite()));
+
+    // Downsample each channel back to 8 kHz.
+    let mut l_8k = Vec::with_capacity(l_dec.len() / 6);
+    let mut r_8k = Vec::with_capacity(r_dec.len() / 6);
+    for chunk in l_dec.chunks_exact(6) {
+        let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
+        l_8k.push((sum / 6) as i16);
+    }
+    for chunk in r_dec.chunks_exact(6) {
+        let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
+        r_8k.push((sum / 6) as i16);
+    }
+
+    // Skip the first 3 frames for state settling.
+    let skip = 3 * internal_frame_samples;
+    let n = l_in.len().min(l_8k.len()).saturating_sub(skip);
+    assert!(n > 100);
+    let (snr_l, lag_l) = snr_db_with_lag_search(&l_in[skip..skip + n], &l_8k[skip..skip + n], 60);
+    let (snr_r, lag_r) = snr_db_with_lag_search(&r_in[skip..skip + n], &r_8k[skip..skip + n], 60);
+    println!(
+        "silk_nb_stereo: snr_l={snr_l:.2} dB (lag={lag_l}), snr_r={snr_r:.2} dB (lag={lag_r})"
+    );
+    assert!(
+        snr_l > 20.0,
+        "stereo L-channel SNR {snr_l:.2} dB below 20 dB bar"
+    );
+    assert!(
+        snr_r > 20.0,
+        "stereo R-channel SNR {snr_r:.2} dB below 20 dB bar"
+    );
+
+    // Sanity: L and R must differ. Compute their RMS difference; for
+    // a genuine stereo decode it should be comparable to the signal
+    // RMS (two sinusoids 90° apart).
+    let n_cmp = l_8k.len().min(r_8k.len());
+    let skip2 = skip.min(n_cmp);
+    let mut diff = 0f64;
+    let mut e_l = 0f64;
+    for i in skip2..n_cmp {
+        let a = l_8k[i] as f64 / 32768.0;
+        let b = r_8k[i] as f64 / 32768.0;
+        diff += (a - b) * (a - b);
+        e_l += a * a;
+    }
+    let rms_diff = (diff / (n_cmp - skip2) as f64).sqrt();
+    let rms_l = (e_l / (n_cmp - skip2) as f64).sqrt();
+    println!("silk_nb_stereo: rms_diff={rms_diff:.4e}, rms_l={rms_l:.4e}");
+    // For an uncorrelated L/R pair, rms(L-R) ≈ sqrt(2) * rms(L). We
+    // accept >= 30% of that as "meaningfully different" — the stereo
+    // unmixing filter smears the side channel a bit.
+    let floor = 0.30 * rms_l * 2f64.sqrt();
+    assert!(
+        rms_diff > floor,
+        "L and R look identical (rms_diff={rms_diff:.4e}, floor={floor:.4e}) — stereo decoupling failed"
+    );
+}
+
+/// Silence in → silence out for MB / WB mono.
+#[test]
+fn silk_mb_mono_silence_stays_quiet() {
+    let mut enc = make_silk_mb_encoder();
+    let n_frames = 10;
+    let signal = vec![0.0f32; n_frames * SILK_MB_FRAME_SAMPLES_INTERNAL];
+    let mut packets = Vec::new();
+    for chunk in signal.chunks(SILK_MB_FRAME_SAMPLES_INTERNAL) {
+        let mut bytes = Vec::with_capacity(chunk.len() * 2);
+        for &s in chunk {
+            let q = (s * 32768.0).clamp(-32768.0, 32767.0) as i16;
+            bytes.extend_from_slice(&q.to_le_bytes());
+        }
+        let frame = Frame::Audio(AudioFrame {
+            format: SampleFormat::S16,
+            channels: 1,
+            sample_rate: SILK_MB_RATE,
+            samples: SILK_MB_FRAME_SAMPLES_INTERNAL as u32,
+            pts: None,
+            time_base: TimeBase::new(1, SILK_MB_RATE as i64),
+            data: vec![bytes],
+        });
+        enc.send_frame(&frame).unwrap();
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+    }
+    enc.flush().unwrap();
+    while let Ok(p) = enc.receive_packet() {
+        packets.push(p);
+    }
+    assert!(!packets.is_empty());
+    let decoded = decode_packets(&packets, 1);
+    let rms = mean_energy_i16(&decoded[0]).sqrt();
+    println!("silk_mb_silence: rms={rms:.4e}");
+    assert!(rms < 0.02, "silence round-trip RMS too high: {rms}");
+}
+
+#[test]
+fn silk_wb_mono_silence_stays_quiet() {
+    let mut enc = make_silk_wb_encoder();
+    let n_frames = 10;
+    let signal = vec![0.0f32; n_frames * SILK_WB_FRAME_SAMPLES_INTERNAL];
+    let mut packets = Vec::new();
+    for chunk in signal.chunks(SILK_WB_FRAME_SAMPLES_INTERNAL) {
+        let mut bytes = Vec::with_capacity(chunk.len() * 2);
+        for &s in chunk {
+            let q = (s * 32768.0).clamp(-32768.0, 32767.0) as i16;
+            bytes.extend_from_slice(&q.to_le_bytes());
+        }
+        let frame = Frame::Audio(AudioFrame {
+            format: SampleFormat::S16,
+            channels: 1,
+            sample_rate: SILK_WB_RATE,
+            samples: SILK_WB_FRAME_SAMPLES_INTERNAL as u32,
+            pts: None,
+            time_base: TimeBase::new(1, SILK_WB_RATE as i64),
+            data: vec![bytes],
+        });
+        enc.send_frame(&frame).unwrap();
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+    }
+    enc.flush().unwrap();
+    while let Ok(p) = enc.receive_packet() {
+        packets.push(p);
+    }
+    assert!(!packets.is_empty());
+    let decoded = decode_packets(&packets, 1);
+    let rms = mean_energy_i16(&decoded[0]).sqrt();
+    println!("silk_wb_silence: rms={rms:.4e}");
+    assert!(rms < 0.02, "silence round-trip RMS too high: {rms}");
 }

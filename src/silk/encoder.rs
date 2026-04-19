@@ -316,17 +316,26 @@ impl SilkFrameEncoder {
     }
 }
 
-/// Split an interleaved L/R stereo block into mid (M=(L+R)/2) and
-/// side (S=(L-R)/2) channels. Returns `(mid, side)`, each the same
-/// length as one input channel.
+/// Split an interleaved L/R stereo block into mid and side channels.
+///
+/// The decoder's `stereo_unmix_48k` reconstructs L / R as
+///   L = (mid + side) * 0.5
+///   R = (mid - side) * 0.5
+/// so to round-trip bit-for-bit we feed the encoder **twice** the raw
+/// M/S values, i.e. `M = L + R` and `S = L - R`. Passing the classical
+/// `(L+R)/2 / (L-R)/2` forms would lose 6 dB on each side of the
+/// reconstruction (the decoder's 0.5 scaling being a saturation
+/// headroom for the [-1, 1] S16 path — see the decoder comment).
+///
+/// Returns `(mid, side)`, each the same length as one input channel.
 pub fn stereo_mid_side(l: &[f32], r: &[f32]) -> (Vec<f32>, Vec<f32>) {
     debug_assert_eq!(l.len(), r.len());
     let n = l.len();
     let mut mid = Vec::with_capacity(n);
     let mut side = Vec::with_capacity(n);
     for i in 0..n {
-        mid.push((l[i] + r[i]) * 0.5);
-        side.push((l[i] - r[i]) * 0.5);
+        mid.push(l[i] + r[i]);
+        side.push(l[i] - r[i]);
     }
     (mid, side)
 }
@@ -589,12 +598,14 @@ mod tests {
 
     #[test]
     fn stereo_mid_side_reconstructs_lr() {
+        // mid/side are doubled compared to the classical (L+R)/2 form
+        // so the decoder's 0.5 unmix attenuation round-trips cleanly.
         let l = vec![0.1f32, 0.2, 0.3, 0.4];
         let r = vec![0.0f32, 0.1, 0.2, 0.3];
         let (m, s) = stereo_mid_side(&l, &r);
         for i in 0..l.len() {
-            let rec_l = m[i] + s[i];
-            let rec_r = m[i] - s[i];
+            let rec_l = (m[i] + s[i]) * 0.5;
+            let rec_r = (m[i] - s[i]) * 0.5;
             assert!((rec_l - l[i]).abs() < 1e-6);
             assert!((rec_r - r[i]).abs() < 1e-6);
         }
