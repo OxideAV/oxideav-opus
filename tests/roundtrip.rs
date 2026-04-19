@@ -235,7 +235,7 @@ fn ensure_voip_stereo() -> Option<&'static str> {
 fn open_ogg(path: &str) -> Box<dyn Demuxer> {
     let f = std::fs::File::open(path).expect("open ref");
     let rs: Box<dyn ReadSeek> = Box::new(f);
-    oxideav_ogg::demux::open(rs).expect("open ogg demuxer")
+    oxideav_ogg::demux::open(rs, &oxideav_core::NullCodecResolver).expect("open ogg demuxer")
 }
 
 /// Mode-detection check: CELT-only reference TOC reports CELT-only.
