@@ -8,33 +8,51 @@ version = "0.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6757cbf21db459bfda7ab0f034e417926c7847b27bfb8ef186672d7a055df686"
 dependencies = [
- "oxideav-codec",
- "oxideav-core",
+ "oxideav-codec 0.0.6",
+ "oxideav-core 0.0.8",
 ]
 
 [[package]]
 name = "oxideav-codec"
-version = "0.0.5"
+version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1074db2188b3b41befb69ab1eea2ebc53480d320513afdff615384345e0d2076"
+checksum = "196908ab5f2cd55f2e0014a5bb09abd56e7118218b0bd93265a26b81de4816a0"
 dependencies = [
- "oxideav-core",
+ "oxideav-core 0.0.8",
+]
+
+[[package]]
+name = "oxideav-codec"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed294d634aa58ca902f3d0fdbaf9ac16d62ed292709032f41cc42da95fe1f3a7"
+dependencies = [
+ "oxideav-core 0.1.1",
 ]
 
 [[package]]
 name = "oxideav-container"
-version = "0.0.4"
+version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9449043b8904a4856ebb25657b915ba85cd832d2903cacb9349564d04e6a82f8"
+checksum = "117a8109cf684621db8c47d0934f8d0173ca02b46c457b1d8ba883eb0b68bc92"
 dependencies = [
- "oxideav-core",
+ "oxideav-core 0.0.8",
 ]
 
 [[package]]
 name = "oxideav-core"
-version = "0.0.6"
+version = "0.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "558dd9aef4e71a01d521a205fb7a1e3c13289b3b0148fcf6aff2fc12e99e0fc1"
+checksum = "20080a5d6ee04ce3b3da4821d2bdc125cabe07f175b6939f3c9bebb62976620f"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "oxideav-core"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6442d1e45380a051858f066515c83d8a3e7c72a32c9744300f2ec519eae31419"
 dependencies = [
  "thiserror",
 ]
@@ -45,9 +63,9 @@ version = "0.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1f3f6ebe80cf107d4ed7d26c9d033bfd32bfb9bf9081a91783d030871dafc93"
 dependencies = [
- "oxideav-codec",
+ "oxideav-codec 0.0.6",
  "oxideav-container",
- "oxideav-core",
+ "oxideav-core 0.0.8",
 ]
 
 [[package]]
@@ -55,9 +73,9 @@ name = "oxideav-opus"
 version = "0.0.3"
 dependencies = [
  "oxideav-celt",
- "oxideav-codec",
+ "oxideav-codec 0.1.1",
  "oxideav-container",
- "oxideav-core",
+ "oxideav-core 0.1.1",
  "oxideav-ogg",
 ]
 
