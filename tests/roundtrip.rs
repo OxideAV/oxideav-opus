@@ -1,10 +1,5 @@
 //! Integration tests using ffmpeg-produced reference clips.
 //!
-//! Gated behind the `ogg-tests` feature because `oxideav-ogg` on
-//! crates.io currently lags the `oxideav-container 0.1` API. Enable
-//! with `cargo test --features ogg-tests` once running against
-//! a local path-dep or a fresh ogg release.
-//!
 //! These tests are skipped gracefully if `/usr/bin/ffmpeg` or the reference
 //! files are missing — consistent with other crates in the workspace.
 //!
@@ -17,8 +12,6 @@
 //!
 //! Full CELT audio decoding is not yet implemented; see
 //! `oxideav-opus/src/decoder.rs` for the current scope.
-
-#![cfg(feature = "ogg-tests")]
 
 use std::path::Path;
 use std::process::Command;

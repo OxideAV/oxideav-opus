@@ -16,18 +16,8 @@ categories = ["multimedia::encoding", "multimedia::audio"]
 [dependencies]
 oxideav-core = "0.1"
 oxideav-codec = "0.1"
-oxideav-celt = "0.0"
-# Optional — only needed by the ffmpeg-gated integration tests under
-# `--features ogg-tests`. Kept optional so routine `cargo test` on
-# crates.io doesn't try to resolve a sibling version that's currently
-# broken against the oxideav-container 0.1 API.
-oxideav-ogg = { version = "0.0", optional = true }
+oxideav-celt = "0.1"
 
 [dev-dependencies]
+oxideav-ogg = "0.1"
 oxideav-container = "0.1"
-
-[features]
-# Enables the tests/roundtrip.rs integration tests, which demux Opus
-# streams via oxideav-ogg. Off by default so stable crates.io CI
-# doesn't need a newer ogg release to build.
-ogg-tests = ["oxideav-ogg"]
