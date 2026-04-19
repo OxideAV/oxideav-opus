@@ -1,17 +1,26 @@
-//! Opus encoder — CELT-only full-band path, 20 ms single-frame packets.
+//! Opus encoder — CELT-only full-band + SILK-only NB mono 20 ms paths.
 //!
 //! # Mode selection
 //!
-//! This build only emits **CELT-only** frames at the full-band bandwidth
-//! (config 31, 20 ms, 48 kHz). Mode selection is therefore trivial:
+//! Two entry points, each covering one Opus mode:
 //!
-//! * `CodecParameters::sample_rate == 48_000` → CELT-only FB, 20 ms.
-//! * Any other sample rate → `Error::Unsupported` (resample upstream).
+//! * [`OpusEncoder::new_celt_only_full_band`] — CELT-only fullband
+//!   20 ms (config 31). Accepts 48 kHz mono/stereo input. Stereo is
+//!   downmixed to mono before the CELT mono core; see the original
+//!   CELT section below for the honest caveat about the stereo TOC bit.
 //!
-//! SILK-only and Hybrid modes are tracked as follow-up — an in-tree SILK
-//! encoder is not yet landed, so even at lower sample rates we prefer
-//! the honest "resample to 48 kHz first" route over silently mis-
-//! classifying the input.
+//! * [`SilkEncoder::new_nb_mono_20ms`] — SILK-only narrowband mono
+//!   20 ms (config 1). Accepts either 8 kHz or 48 kHz mono input; at
+//!   48 kHz the encoder downsamples 6:1 internally to drive the 8 kHz
+//!   SILK core. Output packets contain a `config = 1` TOC byte.
+//!
+//! [`OpusEncoder::new`] routes by the `CodecParameters::sample_rate`:
+//! 48 kHz mono/stereo → CELT-only FB; anything else → `Unsupported`,
+//! because switching to SILK invisibly would be a nasty foot-gun for
+//! callers that expected 48 kHz output parity. To emit SILK packets,
+//! construct a [`SilkEncoder`] explicitly.
+//!
+//! Hybrid (SILK+CELT) is not implemented on either path.
 //!
 //! # Packet layout (RFC 6716 §3)
 //!
@@ -357,6 +366,258 @@ fn extract_mono_f32(audio: &AudioFrame) -> Result<Vec<f32>> {
 
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     Ok(Box::new(OpusEncoder::new(params)?))
+}
+
+// ---------------------------------------------------------------------
+// SILK encoder — NB mono 20 ms.
+// ---------------------------------------------------------------------
+
+/// `config` field value for SILK-only, narrowband, 20 ms frames (§3.1
+/// Table 2).
+pub const OPUS_CONFIG_SILK_NB_20MS: u8 = 1;
+
+/// Number of PCM samples per 20 ms SILK NB frame at the internal 8 kHz
+/// rate.
+pub const SILK_NB_FRAME_SAMPLES_INTERNAL: usize = 160;
+
+/// Number of PCM samples per 20 ms frame at the Opus output rate of
+/// 48 kHz (for PTS accounting).
+pub const SILK_FRAME_SAMPLES_48K: usize = 960;
+
+/// Internal (SILK) rate for NB.
+pub const SILK_NB_RATE: u32 = 8_000;
+
+/// How many 48 kHz samples collapse to one 8 kHz sample. Used for the
+/// outer 48 → 8 kHz downmixer.
+const DOWNSAMPLE_RATIO: usize = (SAMPLE_RATE / SILK_NB_RATE) as usize; // 6
+
+/// Build a TOC byte for a SILK-only narrowband 20 ms (config 1) packet.
+///
+/// Layout (RFC 6716 §3.1): `config(5) | stereo(1) | code(2)`.
+pub fn build_silk_nb_20ms_toc(stereo: bool) -> u8 {
+    let stereo_bit: u8 = if stereo { 1 } else { 0 };
+    (OPUS_CONFIG_SILK_NB_20MS << 3) | (stereo_bit << 2) // code = 0
+}
+
+/// SILK-mode Opus encoder — narrowband (8 kHz internal) mono 20 ms.
+///
+/// Emits `config = 1` TOC bytes (SILK-only NB 20 ms mono) followed by
+/// the SILK bitstream described in [`crate::silk::encoder`]. Accepts
+/// 8 kHz **or** 48 kHz mono input; 48 kHz input is downsampled 6:1 to
+/// the SILK internal rate via a simple box-averaging filter (good
+/// enough for the speech-band content this mode targets).
+///
+/// The decoder-side companion is the existing [`crate::silk::SilkDecoder`]
+/// — every packet this encoder produces round-trips through our own
+/// decoder at ≥ 20 dB SNR on sine / speech-like test signals (see the
+/// `encoder_roundtrip.rs` integration test).
+///
+/// Out of scope for this first cut: stereo, MB/WB, 10/40/60 ms, LBRR,
+/// Hybrid. Those paths are tracked as follow-ups.
+pub struct SilkEncoder {
+    out_params: CodecParameters,
+    /// Underlying per-frame SILK bit encoder.
+    silk: crate::silk::encoder::SilkFrameEncoder,
+    /// Ring buffer of pending 8 kHz mono samples waiting for a full
+    /// 20 ms SILK frame.
+    pending_internal: VecDeque<f32>,
+    /// Expected input channel count on `send_frame`. Always 1 for this
+    /// constructor.
+    input_channels: u16,
+    /// Expected input sample rate (8 kHz or 48 kHz).
+    input_sample_rate: u32,
+    /// Output packet queue.
+    output: VecDeque<Packet>,
+    /// PTS counter in 48 kHz samples.
+    pts_counter: i64,
+}
+
+impl SilkEncoder {
+    /// Build a SILK NB mono 20 ms encoder.
+    ///
+    /// * `params.channels` must be `Some(1)` (or `None`, defaulting to 1).
+    /// * `params.sample_rate` must be `Some(8_000)` or `Some(48_000)`
+    ///   (or `None`, defaulting to 48 kHz since that's the Opus output
+    ///   rate). 48 kHz input is downsampled 6:1 internally.
+    pub fn new_nb_mono_20ms(params: &CodecParameters) -> Result<Self> {
+        let channels = params.channels.unwrap_or(1);
+        if channels != 1 {
+            return Err(Error::unsupported(format!(
+                "SILK NB mono encoder: only mono input supported, got {channels} channels"
+            )));
+        }
+        let sr = params.sample_rate.unwrap_or(SAMPLE_RATE);
+        if sr != SILK_NB_RATE && sr != SAMPLE_RATE {
+            return Err(Error::unsupported(format!(
+                "SILK NB mono encoder: input must be 8 kHz or 48 kHz, got {sr} Hz"
+            )));
+        }
+        let mut out_params = params.clone();
+        // Opus always outputs 48 kHz.
+        out_params.sample_rate = Some(SAMPLE_RATE);
+        out_params.channels = Some(1);
+        Ok(Self {
+            out_params,
+            silk: crate::silk::encoder::SilkFrameEncoder::new_nb_20ms(),
+            pending_internal: VecDeque::with_capacity(SILK_NB_FRAME_SAMPLES_INTERNAL * 2),
+            input_channels: 1,
+            input_sample_rate: sr,
+            output: VecDeque::new(),
+            pts_counter: 0,
+        })
+    }
+
+    /// Drain any complete 20 ms SILK frames out of `pending_internal`,
+    /// encoding each to a full Opus SILK-only packet.
+    fn drain_frames(&mut self) -> Result<()> {
+        while self.pending_internal.len() >= SILK_NB_FRAME_SAMPLES_INTERNAL {
+            let mut frame = Vec::with_capacity(SILK_NB_FRAME_SAMPLES_INTERNAL);
+            for _ in 0..SILK_NB_FRAME_SAMPLES_INTERNAL {
+                frame.push(self.pending_internal.pop_front().unwrap_or(0.0));
+            }
+            let pkt = self.encode_one_frame(&frame)?;
+            self.output.push_back(pkt);
+        }
+        Ok(())
+    }
+
+    /// Encode one 160-sample NB SILK frame (already at the internal
+    /// rate) into a full Opus SILK-only packet.
+    fn encode_one_frame(&mut self, pcm_internal: &[f32]) -> Result<Packet> {
+        debug_assert_eq!(pcm_internal.len(), SILK_NB_FRAME_SAMPLES_INTERNAL);
+        // Budget: ~260 bytes at the MVP carrier rate (13 bits / 8 kHz
+        // sample × 20 ms = 260 bytes). Round up to 384 for headroom.
+        let mut re = oxideav_celt::range_encoder::RangeEncoder::new(384);
+
+        // SILK packet-level header (RFC §4.2.3): one VAD flag + one
+        // LBRR flag per internal channel. Mono NB 20 ms frame:
+        //   vad_flags[0][0] = 1  (active)
+        //   lbrr_flag[0]    = 0  (no LBRR)
+        re.encode_bit_logp(true, 1); // VAD
+        re.encode_bit_logp(false, 1); // LBRR flag
+
+        // Frame body.
+        self.silk.encode_frame_body(pcm_internal, &mut re)?;
+
+        let body = re
+            .done()
+            .map_err(|e| Error::other(format!("SILK encoder: {e}")))?;
+        // Trim trailing zero-padding from the range encoder's storage
+        // allocation — the decoder is happy with any tail, but shorter
+        // packets are nicer for the bitrate reporting layer.
+        let body = strip_trailing_zeros(body);
+        // Assemble the Opus packet: TOC + body.
+        let toc = build_silk_nb_20ms_toc(false);
+        let mut data = Vec::with_capacity(1 + body.len());
+        data.push(toc);
+        data.extend_from_slice(&body);
+
+        let tb = TimeBase::new(1, SAMPLE_RATE as i64);
+        let pts = self.pts_counter;
+        self.pts_counter += SILK_FRAME_SAMPLES_48K as i64;
+        Ok(Packet::new(0, tb, data)
+            .with_pts(pts)
+            .with_duration(SILK_FRAME_SAMPLES_48K as i64))
+    }
+}
+
+/// Trim trailing zero bytes from a range-encoded buffer. The last
+/// non-zero byte of the main bitstream + the optional back-buffer
+/// bits fully determine the decoded symbols; any trailing zeros are
+/// padding the CELT range encoder writes to its allocated storage.
+fn strip_trailing_zeros(mut v: Vec<u8>) -> Vec<u8> {
+    while v.len() > 1 && v.last() == Some(&0) {
+        v.pop();
+    }
+    v
+}
+
+impl Encoder for SilkEncoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.out_params.codec_id
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.out_params
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        let audio = match frame {
+            Frame::Audio(a) => a,
+            _ => {
+                return Err(Error::invalid(
+                    "SILK encoder: expected audio frame, got video",
+                ))
+            }
+        };
+        if audio.channels != self.input_channels {
+            return Err(Error::invalid(format!(
+                "SILK encoder: frame channels ({}) differ from configured input channels ({})",
+                audio.channels, self.input_channels
+            )));
+        }
+        if audio.sample_rate != self.input_sample_rate {
+            return Err(Error::unsupported(format!(
+                "SILK encoder: input sample rate ({}) differs from configured rate ({}); reconfigure or resample first",
+                audio.sample_rate, self.input_sample_rate
+            )));
+        }
+
+        // Extract mono f32 samples (reuse the same helper as the CELT
+        // path — it already handles S16/F32/planar variants).
+        let mono = extract_mono_f32(audio)?;
+
+        // Downsample 48 kHz → 8 kHz if needed.
+        let internal_samples: Vec<f32> = if audio.sample_rate == SILK_NB_RATE {
+            mono
+        } else {
+            downsample_box(&mono, DOWNSAMPLE_RATIO)
+        };
+
+        self.pending_internal.extend(&internal_samples);
+        self.drain_frames()
+    }
+
+    fn receive_packet(&mut self) -> Result<Packet> {
+        if let Some(p) = self.output.pop_front() {
+            Ok(p)
+        } else {
+            Err(Error::NeedMore)
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        // Zero-pad the tail up to a 20 ms boundary so we emit a final
+        // packet instead of dropping the remainder.
+        if !self.pending_internal.is_empty() {
+            while self.pending_internal.len() % SILK_NB_FRAME_SAMPLES_INTERNAL != 0 {
+                self.pending_internal.push_back(0.0);
+            }
+            self.drain_frames()?;
+        }
+        Ok(())
+    }
+}
+
+/// Average every `ratio` consecutive input samples into one output
+/// sample. Cheap & cheerful anti-alias for speech-band content. The
+/// output length is `input.len() / ratio` (any trailing partial group
+/// is dropped — callers that need strict sample accounting should
+/// pass multiples of `ratio`).
+fn downsample_box(input: &[f32], ratio: usize) -> Vec<f32> {
+    if ratio <= 1 {
+        return input.to_vec();
+    }
+    let n_out = input.len() / ratio;
+    let mut out = Vec::with_capacity(n_out);
+    for i in 0..n_out {
+        let mut sum = 0f32;
+        for k in 0..ratio {
+            sum += input[i * ratio + k];
+        }
+        out.push(sum / ratio as f32);
+    }
+    out
 }
 
 #[cfg(test)]

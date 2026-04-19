@@ -54,11 +54,11 @@ pub fn synthesize(
     for sf in 0..n_subframes {
         let sf_start = sf * subframe_len;
         let sf_end = sf_start + subframe_len;
-        // Overall gain for this sub-frame (Q16 → f32). Scale down to
-        // avoid filter blow-up: the excitation here is already in Q0
-        // "raw" units from the MVP excitation generator, so we reduce
-        // the gain by an additional factor to keep output in [-1, 1].
-        let g = (gains_q16[sf].max(1) as f32 / 65536.0) * 1.0e-3;
+        // Overall gain for this sub-frame (Q16 → f32). The encoder
+        // emits `gains_q16 ≈ 65536 × per-subframe-residual-peak` so
+        // the synthesis output stays in [-1, 1] and round-trips the
+        // input at ~signed-8-bit excitation precision.
+        let g = gains_q16[sf].max(1) as f32 / 65536.0;
         let taps = &ltp_filter[sf];
         let lag = pitch_lags[sf];
 

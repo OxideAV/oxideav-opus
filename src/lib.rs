@@ -46,7 +46,12 @@
 //!   silently dropping samples.
 //! * Channel mapping family 1/2 (Vorbis / ambisonic multistream).
 //!
-//! Encoder scope — see `encoder` module docs.
+//! Encoder scope — see `encoder` module docs. Today the module exposes:
+//!
+//! * `OpusEncoder` — CELT-only Fullband mono/stereo 20 ms at 48 kHz.
+//! * `SilkEncoder` — SILK-only Narrowband mono 20 ms (config 1),
+//!   accepting 8 kHz or 48 kHz input. Round-trips through our own
+//!   decoder at ≥ 20 dB SNR on speech-like signals.
 
 pub mod decoder;
 pub mod encoder;

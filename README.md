@@ -1,8 +1,9 @@
 # oxideav-opus
 
 Pure-Rust **Opus** audio codec — RFC 6716 bitstream + RFC 7845 Ogg
-mapping. SILK and CELT decode (mono + stereo) plus a CELT-only
-full-band encoder. Zero C dependencies.
+mapping. SILK and CELT decode (mono + stereo) plus two encoders: a
+CELT-only full-band path and a SILK-only narrowband mono path. Zero C
+dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -38,17 +39,41 @@ oxideav-opus = "0.0"
 
 ### Encode
 
-- **CELT-only, Fullband, 20 ms, 48 kHz.** This is the only mode emitted.
-- Packet layout: TOC byte `config = 31` + CELT bitstream, framing code 0
-  (single frame per packet).
-- Mono input is encoded as-is.
-- Stereo input is **downmixed to mono** on the way in — the underlying
-  CELT encoder is mono-only today, so the TOC stereo bit is set to zero
-  and the per-channel detail is lost. The signal survives end-to-end
-  and the decoder splats it back across two channels when asked.
-- Input sample formats: `S16`, `S16P`, `F32`, `F32P`.
-- Input sample rate: **48 kHz only**. Any other rate returns
-  `Error::Unsupported` — resample upstream.
+Two explicit entry points, one per Opus mode:
+
+- **CELT-only, Fullband, 20 ms, 48 kHz** (`OpusEncoder::new` /
+  `OpusEncoder::new_celt_only_full_band`).
+  - Packet layout: TOC byte `config = 31` + CELT bitstream, framing code
+    0 (single frame per packet).
+  - Mono input is encoded as-is.
+  - Stereo input is **downmixed to mono** on the way in — the underlying
+    CELT encoder is mono-only today, so the TOC stereo bit is set to
+    zero and the per-channel detail is lost. The signal survives
+    end-to-end and the decoder splats it back across two channels when
+    asked.
+  - Input sample rate: **48 kHz only**. Any other rate returns
+    `Error::Unsupported` — resample upstream.
+
+- **SILK-only, Narrowband mono, 20 ms** (`SilkEncoder::new_nb_mono_20ms`).
+  - Packet layout: TOC byte `config = 1` + SILK bitstream, framing code
+    0 (single frame per packet).
+  - Accepts 8 kHz mono input natively, or 48 kHz mono input which is
+    downsampled 6:1 internally via a box-average anti-alias filter.
+  - Analysis-by-synthesis design: the encoder runs the same LPC filter
+    the decoder reconstructs from the NLSF stage-1 index, computes the
+    residual sample-by-sample against the decoder's reconstructed past,
+    and emits quantised residual magnitudes. Round-trips through our
+    own SILK decoder at **≥ 20 dB SNR** on speech-like signals (pinned
+    by the `silk_nb_mono_20ms_roundtrip_snr_above_20db` integration
+    test; typical measured value is ~24 dB).
+  - Bitstream layout follows RFC 6716 §4.2 header order (frame type →
+    gains → NLSF → LTP (skipped for unvoiced) → LCG seed → excitation);
+    the excitation *body* uses an MVP carrier format documented in
+    `src/silk/excitation.rs` (nibble-pair + sign per sample in place of
+    the RFC's shell-pulse split). Byte-exact parity with libopus'
+    `silk_enc` bit-stream is a tracked follow-up.
+
+- Input sample formats (both encoders): `S16`, `S16P`, `F32`, `F32P`.
 
 ### Not yet supported
 
@@ -58,7 +83,16 @@ oxideav-opus = "0.0"
   yet decoded. Packets that enable LBRR return `Error::Unsupported`.
 - **Channel mapping family 1 / 2** (Vorbis / ambisonic multistream,
   more than 2 channels).
-- **SILK or Hybrid encoding** — the encoder is CELT-only today.
+- **SILK encoding of MB / WB** — only NB (8 kHz internal rate) is wired
+  up on the encoder side today.
+- **SILK stereo encoding** — `SilkEncoder::new_nb_mono_20ms` is mono-only.
+- **SILK encoding of 10 / 40 / 60 ms frames** — only 20 ms frames are
+  emitted for now; the decoder handles all four sizes.
+- **Hybrid encoding** — still `Error::Unsupported` end-to-end.
+- **Voiced / LTP-path SILK encoding** — the encoder emits
+  `signal_type = unvoiced` on every frame so the LTP loop-back is not
+  exercised; this still round-trips speech-like tones at ≥ 20 dB SNR
+  but gives up the pitch-prediction gain that voiced LTP provides.
 - **CELT encoding of 2.5 / 5 / 10 ms frames**, 40 / 60 ms multi-frame
   packets, and framing codes 1 / 2 / 3 on the encoder side.
 - **Native CELT stereo encoding** (coupled L/R PVQ with intensity and
@@ -128,6 +162,36 @@ let frame = Frame::Audio(AudioFrame {
 enc.send_frame(&frame)?;
 let pkt = enc.receive_packet()?;
 // pkt.data[0] is the TOC byte: (31 << 3) | (stereo_bit << 2) | 0
+# Ok::<(), oxideav_core::Error>(())
+```
+
+### Encode (SILK-only, NB mono, 20 ms)
+
+```rust,no_run
+use oxideav_codec::Encoder;
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, SampleFormat, TimeBase};
+use oxideav_opus::encoder::{SilkEncoder, SILK_NB_RATE};
+
+let mut params = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+params.channels = Some(1);
+params.sample_rate = Some(SILK_NB_RATE); // 8 000 Hz
+let mut enc = SilkEncoder::new_nb_mono_20ms(&params)?;
+
+// One SILK NB frame at the internal rate = 160 samples = 20 ms.
+let pcm_s16 = vec![0u8; 160 * 2];
+let frame = Frame::Audio(AudioFrame {
+    format: SampleFormat::S16,
+    channels: 1,
+    sample_rate: SILK_NB_RATE,
+    samples: 160,
+    pts: None,
+    time_base: TimeBase::new(1, SILK_NB_RATE as i64),
+    data: vec![pcm_s16],
+});
+enc.send_frame(&frame)?;
+// One Opus packet per 20 ms of input.
+let pkt = enc.receive_packet()?;
+// pkt.data[0] is the TOC byte: (1 << 3) | 0 — SILK NB 20 ms mono.
 # Ok::<(), oxideav_core::Error>(())
 ```
 

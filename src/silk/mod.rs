@@ -39,6 +39,7 @@
 
 #![allow(clippy::many_single_char_names)]
 
+pub mod encoder;
 pub mod excitation;
 pub mod lsf;
 pub mod ltp;
@@ -363,6 +364,32 @@ impl SilkDecoder {
     }
 }
 
+/// Public thin wrapper around the crate-private `decode_frame_body`,
+/// intended for the encoder's internal-rate round-trip unit test. Not
+/// intended for general external use — the 20 ms body format assumed
+/// here is only stable because both encoder and decoder live in this
+/// crate.
+#[doc(hidden)]
+pub fn decode_frame_body_pub(
+    rc: &mut oxideav_celt::range_decoder::RangeDecoder<'_>,
+    vad_flag: bool,
+    bandwidth: OpusBandwidth,
+    lpc_order: usize,
+    subframe_len: usize,
+    n_subframes: usize,
+    state: &mut SilkChannelState,
+) -> Result<Vec<f32>> {
+    decode_frame_body(
+        rc,
+        vad_flag,
+        bandwidth,
+        lpc_order,
+        subframe_len,
+        n_subframes,
+        state,
+    )
+}
+
 /// Decode the body of one 20 ms (or 10 ms) SILK frame *after* the
 /// shared VAD/LBRR header has been consumed.
 ///
@@ -459,8 +486,12 @@ fn decode_frame_body(
         };
     }
 
-    // §4.2.7.7 LCG seed.
-    let seed = rc.decode_icdf(&tables::LCG_SEED_ICDF, 2) as u32;
+    // §4.2.7.7 LCG seed. RFC 6716 §4.2.7.7 codes the 2-bit seed using
+    // a uniform 4-symbol PDF on ft=256 (so ftb=8 with values [192, 128,
+    // 64, 0]); an earlier version of this decoder passed ftb=2 which
+    // caused the range coder to wrap and always return 0. Now we call
+    // with ftb=8 to match the table and keep encoder/decoder in sync.
+    let seed = rc.decode_icdf(&tables::LCG_SEED_ICDF, 8) as u32;
 
     // §4.2.7.8 Excitation.
     let excitation = excitation::decode_excitation(
@@ -621,7 +652,7 @@ fn f32_to_q15_clamp(x: f32) -> i16 {
 /// non-silent audio; bit-exactness here is NOT required for Opus
 /// compliance — libopus rounds to the nearest Q16 but the gain is
 /// further scaled by the LPC/LTP taps.
-fn gain_index_to_q16(idx: i32) -> i32 {
+pub(crate) fn gain_index_to_q16(idx: i32) -> i32 {
     let idx = idx.clamp(0, 63) as f32;
     let log2 = (0x1D1C71u32 as f32 / 65536.0) * idx + (2090.0 / 65536.0);
     let lin = 2f32.powf(log2);
@@ -629,7 +660,7 @@ fn gain_index_to_q16(idx: i32) -> i32 {
 }
 
 /// Inverse of `gain_index_to_q16`.
-fn gain_index_of_q16(gain: i32) -> i32 {
+pub(crate) fn gain_index_of_q16(gain: i32) -> i32 {
     let log2 = (gain.max(1) as f32 / 65536.0).log2();
     let idx = (log2 - 2090.0 / 65536.0) / (0x1D1C71u32 as f32 / 65536.0);
     idx.round() as i32

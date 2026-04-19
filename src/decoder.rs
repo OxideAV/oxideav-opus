@@ -256,7 +256,12 @@ fn decode_silk_frame(
     if dec.silk.is_none() || dec.silk.as_ref().map(|s| s.bandwidth) != Some(toc.bandwidth) {
         dec.silk = Some(SilkDecoder::new(toc.bandwidth));
     }
-    let silk = dec.silk.as_mut().unwrap();
+    let Some(silk) = dec.silk.as_mut() else {
+        // Unreachable: we just set `dec.silk` to `Some(_)`.
+        return Err(Error::other(
+            "opus decoder: SILK sub-decoder failed to initialise",
+        ));
+    };
 
     let mut rc = RangeDecoder::new(bytes);
     let pcm = silk.decode_frame_to_48k(&mut rc, toc)?;

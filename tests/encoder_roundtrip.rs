@@ -11,8 +11,10 @@ use oxideav_codec::Encoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase,
 };
-use oxideav_opus::encoder::{OpusEncoder, OPUS_FRAME_SAMPLES};
-use oxideav_opus::toc::{OpusMode, Toc};
+use oxideav_opus::encoder::{
+    OpusEncoder, SilkEncoder, OPUS_FRAME_SAMPLES, SILK_FRAME_SAMPLES_48K, SILK_NB_RATE,
+};
+use oxideav_opus::toc::{OpusBandwidth, OpusMode, Toc};
 
 const SR: u32 = 48_000;
 
@@ -431,4 +433,244 @@ fn celt_only_mono_sine_psnr_above_floor() {
         best_psnr > 8.0,
         "PSNR {best_psnr:.2} dB below achievable CELT-only floor of 8 dB (lag={best_lag})"
     );
+}
+
+// ----- SILK encoder → SILK decoder round-trip ----------------------
+
+/// Signal-to-noise ratio in dB between a reference f32 signal and a
+/// decoded i16 signal, both at 48 kHz. Applies a simple cross-
+/// correlation lag search inside `max_lag` samples to compensate for
+/// the SILK upsampler's group delay. Returns `(snr_db, best_lag)`.
+fn snr_db_with_lag_search(reference: &[f32], decoded: &[i16], max_lag: i32) -> (f64, i32) {
+    assert!(!reference.is_empty());
+    assert!(!decoded.is_empty());
+    let mut best_snr = f64::NEG_INFINITY;
+    let mut best_lag = 0i32;
+    for lag in -max_lag..=max_lag {
+        // Aligned window.
+        let (ref_start, dec_start) = if lag >= 0 {
+            (0usize, lag as usize)
+        } else {
+            ((-lag) as usize, 0usize)
+        };
+        let n = reference
+            .len()
+            .saturating_sub(ref_start)
+            .min(decoded.len().saturating_sub(dec_start));
+        if n < 800 {
+            continue;
+        }
+        let r = &reference[ref_start..ref_start + n];
+        let d = &decoded[dec_start..dec_start + n];
+        let mut sig = 0f64;
+        let mut err = 0f64;
+        for i in 0..n {
+            let rv = r[i] as f64;
+            let dv = d[i] as f64 / 32768.0;
+            sig += rv * rv;
+            let e = rv - dv;
+            err += e * e;
+        }
+        if sig == 0.0 {
+            continue;
+        }
+        let snr = 10.0 * (sig / err.max(1e-30)).log10();
+        if snr > best_snr {
+            best_snr = snr;
+            best_lag = lag;
+        }
+    }
+    (best_snr, best_lag)
+}
+
+fn make_silk_encoder_48k() -> SilkEncoder {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(1);
+    p.sample_rate = Some(SR);
+    SilkEncoder::new_nb_mono_20ms(&p).expect("make SilkEncoder 48k")
+}
+
+fn make_silk_encoder_8k() -> SilkEncoder {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(1);
+    p.sample_rate = Some(SILK_NB_RATE);
+    SilkEncoder::new_nb_mono_20ms(&p).expect("make SilkEncoder 8k")
+}
+
+/// Encode a tone through the SILK encoder, decode it with our Opus
+/// decoder, and measure the SNR between the input tone (after 48 →
+/// 8 kHz band-limiting) and the reconstructed output.
+#[test]
+fn silk_nb_mono_20ms_roundtrip_snr_above_20db() {
+    // 8 kHz input: 300 Hz tone + low-frequency speech-like envelope,
+    // 500 ms (25 × 20 ms frames). Amplitude 0.3 keeps us clear of
+    // the LPC saturation and the [-1, 1] clamp.
+    let n_frames = 25;
+    let sample_rate = SILK_NB_RATE;
+    let total = n_frames * (SILK_FRAME_SAMPLES_48K / 6); // 160 samples/frame @ 8k
+    let f_tone = 300.0f32;
+    let f_env = 5.0f32;
+    let signal_8k: Vec<f32> = (0..total)
+        .map(|i| {
+            let t = i as f32 / sample_rate as f32;
+            let env = 0.5 + 0.5 * (2.0 * std::f32::consts::PI * f_env * t).sin();
+            (2.0 * std::f32::consts::PI * f_tone * t).sin() * 0.3 * env
+        })
+        .collect();
+
+    let mut enc = make_silk_encoder_8k();
+    let mut packets: Vec<Packet> = Vec::new();
+    for chunk in signal_8k.chunks(160) {
+        if chunk.len() < 160 {
+            break;
+        }
+        let mut bytes = Vec::with_capacity(chunk.len() * 2);
+        for &s in chunk {
+            let q = (s * 32768.0).clamp(-32768.0, 32767.0) as i16;
+            bytes.extend_from_slice(&q.to_le_bytes());
+        }
+        let frame = Frame::Audio(AudioFrame {
+            format: SampleFormat::S16,
+            channels: 1,
+            sample_rate,
+            samples: 160,
+            pts: None,
+            time_base: TimeBase::new(1, sample_rate as i64),
+            data: vec![bytes],
+        });
+        enc.send_frame(&frame).expect("send");
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => packets.push(p),
+                Err(Error::NeedMore) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+    }
+    enc.flush().expect("flush");
+    while let Ok(p) = enc.receive_packet() {
+        packets.push(p);
+    }
+    assert!(!packets.is_empty(), "encoder emitted no packets");
+
+    // Every packet must be SILK NB 20 ms mono.
+    for (i, pkt) in packets.iter().enumerate() {
+        assert!(pkt.data.len() >= 2, "packet {i} too short");
+        let toc = Toc::parse(pkt.data[0]);
+        assert_eq!(toc.mode, OpusMode::SilkOnly, "packet {i} should be SILK");
+        assert_eq!(toc.bandwidth, OpusBandwidth::Narrowband, "packet {i} NB");
+        assert_eq!(toc.frame_samples_48k, 960, "packet {i} 20 ms");
+        assert!(!toc.stereo, "packet {i} mono");
+        assert_eq!(toc.code, 0, "packet {i} framing code");
+    }
+
+    // Decode.
+    let decoded = decode_packets(&packets, 1);
+    let pcm = &decoded[0];
+    assert!(!pcm.is_empty());
+    assert!(pcm.iter().all(|s| (*s as f32).is_finite()));
+
+    // Downsample the 48 kHz decoded PCM back to 8 kHz via a simple
+    // 6-tap box average, then compare against the original 8 kHz
+    // input with a small lag search to absorb the FIR group delay.
+    let mut dec_8k = Vec::with_capacity(pcm.len() / 6);
+    for chunk in pcm.chunks_exact(6) {
+        let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
+        dec_8k.push((sum / 6) as i16);
+    }
+    // Skip the first 3 frames so the LPC state and the upsampler FIR
+    // settle.
+    let skip = 3 * 160;
+    let n = signal_8k.len().min(dec_8k.len()).saturating_sub(skip);
+    assert!(n > 100, "not enough samples for SNR comparison");
+    let (snr, lag) =
+        snr_db_with_lag_search(&signal_8k[skip..skip + n], &dec_8k[skip..skip + n], 40);
+    println!("silk_nb_mono roundtrip: snr={snr:.2} dB (lag={lag} samples @ 8 kHz)");
+    assert!(
+        snr > 20.0,
+        "SILK round-trip SNR {snr:.2} dB is below the 20 dB bar (lag={lag})"
+    );
+}
+
+/// Silence in → silence out (at most a few LSB of carrier noise).
+#[test]
+fn silk_nb_mono_silence_roundtrip_stays_quiet() {
+    let mut enc = make_silk_encoder_8k();
+    let n_frames = 10;
+    let signal = vec![0.0f32; n_frames * 160];
+    let mut packets = Vec::new();
+    for chunk in signal.chunks(160) {
+        let mut bytes = Vec::with_capacity(chunk.len() * 2);
+        for &s in chunk {
+            let q = (s * 32768.0).clamp(-32768.0, 32767.0) as i16;
+            bytes.extend_from_slice(&q.to_le_bytes());
+        }
+        let frame = Frame::Audio(AudioFrame {
+            format: SampleFormat::S16,
+            channels: 1,
+            sample_rate: SILK_NB_RATE,
+            samples: 160,
+            pts: None,
+            time_base: TimeBase::new(1, SILK_NB_RATE as i64),
+            data: vec![bytes],
+        });
+        enc.send_frame(&frame).unwrap();
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+    }
+    enc.flush().unwrap();
+    while let Ok(p) = enc.receive_packet() {
+        packets.push(p);
+    }
+    assert!(!packets.is_empty());
+    let decoded = decode_packets(&packets, 1);
+    let rms = mean_energy_i16(&decoded[0]).sqrt();
+    println!("silk_nb_silence_roundtrip: rms={rms:.4e}");
+    assert!(rms < 0.02, "silence round-trip RMS too high: {rms}");
+}
+
+/// Accept 48 kHz input, downsample internally, round-trip.
+#[test]
+fn silk_nb_mono_48k_input_roundtrips_cleanly() {
+    let mut enc = make_silk_encoder_48k();
+    let freq = 300.0f32;
+    let n_frames = 10;
+    let total = n_frames * OPUS_FRAME_SAMPLES;
+    let signal: Vec<f32> = (0..total)
+        .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / SR as f32).sin() * 0.3)
+        .collect();
+
+    let mut packets = Vec::new();
+    for chunk in signal.chunks(OPUS_FRAME_SAMPLES) {
+        if chunk.len() < OPUS_FRAME_SAMPLES {
+            break;
+        }
+        let frame = make_s16_frame_mono(chunk);
+        enc.send_frame(&frame).unwrap();
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+    }
+    enc.flush().unwrap();
+    while let Ok(p) = enc.receive_packet() {
+        packets.push(p);
+    }
+    assert!(!packets.is_empty());
+
+    // Every packet is SILK-only config 1.
+    for pkt in &packets {
+        let toc = Toc::parse(pkt.data[0]);
+        assert_eq!(toc.mode, OpusMode::SilkOnly);
+        assert_eq!(toc.config, 1, "config should be SILK NB 20 ms");
+        assert_eq!(toc.frame_samples_48k, 960);
+    }
+
+    // Decode + basic sanity: non-silent, finite output.
+    let decoded = decode_packets(&packets, 1);
+    let pcm = &decoded[0];
+    assert!(pcm.iter().all(|s| (*s as f32).is_finite()));
+    let rms = mean_energy_i16(pcm).sqrt();
+    println!("silk_nb_48k_input: rms={rms:.4e}");
+    assert!(rms > 0.01, "decoded output too quiet — RMS={rms}");
 }
