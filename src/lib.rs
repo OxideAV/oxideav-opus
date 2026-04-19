@@ -54,25 +54,30 @@ pub mod header;
 pub mod silk;
 pub mod toc;
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
 
 pub const CODEC_ID_STR: &str = "opus";
 
 pub fn register(reg: &mut CodecRegistry) {
-    let cid = CodecId::new(CODEC_ID_STR);
     let caps = CodecCapabilities::audio("opus_sw")
         .with_lossy(true)
         .with_max_channels(2)
         .with_max_sample_rate(48_000);
-    reg.register_both(cid.clone(), caps, make_decoder, make_encoder);
-
     // AVI / WAVEFORMATEX tags — Opus in AVI is non-standard but a few
     // third-party muxers have stamped these wFormatTag values on Opus
-    // streams. Priority 10, no probe.
-    for tag in &[0x4F70u16, 0x704F, 0x7075] {
-        reg.claim_tag(cid.clone(), CodecTag::wave_format(*tag), 10, None);
-    }
+    // streams.
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_STR))
+            .capabilities(caps)
+            .decoder(make_decoder)
+            .encoder(make_encoder)
+            .tags([
+                CodecTag::wave_format(0x4F70),
+                CodecTag::wave_format(0x704F),
+                CodecTag::wave_format(0x7075),
+            ]),
+    );
 }
 
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
