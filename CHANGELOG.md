@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-opus/compare/v0.0.3...v0.0.4) - 2026-04-19
+
+### Other
+
+- restore integration tests + bump oxideav-ogg/celt deps to 0.1
+- gate ogg-dep integration tests behind `ogg-tests` feature
+- add SILK NB mono 20 ms encoder + fix LCG-seed ftb
+- bump oxideav-container dep to "0.1"
+- drop Cargo.lock — this crate is a library
+- bump oxideav-core / oxideav-codec dep examples to "0.1"
+- bump to oxideav-core 0.1.1 + codec 0.1.1
+- migrate register() to CodecInfo builder
+- bump oxideav-core + oxideav-codec deps to "0.1"
+- thread &dyn CodecResolver through open()
+- release v0.0.3
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-opus/releases/tag/v0.0.3) - 2026-04-19
 
 ### Other
