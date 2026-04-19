@@ -1,8 +1,7 @@
-//! Opus encoder — CELT-only full-band + SILK-only NB mono 20 ms paths.
+//! Opus encoder — CELT-only full-band + SILK-only NB/MB/WB (+NB stereo)
+//! 20 ms paths.
 //!
 //! # Mode selection
-//!
-//! Two entry points, each covering one Opus mode:
 //!
 //! * [`OpusEncoder::new_celt_only_full_band`] — CELT-only fullband
 //!   20 ms (config 31). Accepts 48 kHz mono/stereo input. Stereo is
@@ -10,9 +9,16 @@
 //!   CELT section below for the honest caveat about the stereo TOC bit.
 //!
 //! * [`SilkEncoder::new_nb_mono_20ms`] — SILK-only narrowband mono
-//!   20 ms (config 1). Accepts either 8 kHz or 48 kHz mono input; at
-//!   48 kHz the encoder downsamples 6:1 internally to drive the 8 kHz
-//!   SILK core. Output packets contain a `config = 1` TOC byte.
+//!   20 ms (config 1, 8 kHz internal). Accepts 8 kHz or 48 kHz mono
+//!   input; 48 kHz is downsampled 6:1 internally.
+//! * [`SilkEncoder::new_mb_mono_20ms`] — SILK-only mediumband mono
+//!   20 ms (config 5, 12 kHz internal). Accepts 12 kHz or 48 kHz input.
+//! * [`SilkEncoder::new_wb_mono_20ms`] — SILK-only wideband mono 20 ms
+//!   (config 9, 16 kHz internal). Accepts 16 kHz or 48 kHz input.
+//! * [`SilkEncoder::new_nb_stereo_20ms`] — SILK-only narrowband stereo
+//!   20 ms (config 1, stereo bit = 1). Accepts 8 kHz or 48 kHz stereo
+//!   input, emits a mid/side-coded stereo frame with the RFC §4.2.7.1
+//!   prediction header.
 //!
 //! [`OpusEncoder::new`] routes by the `CodecParameters::sample_rate`:
 //! 48 kHz mono/stereo → CELT-only FB; anything else → `Unsupported`,
@@ -369,16 +375,24 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 }
 
 // ---------------------------------------------------------------------
-// SILK encoder — NB mono 20 ms.
+// SILK encoder — NB / MB / WB mono + NB stereo, 20 ms.
 // ---------------------------------------------------------------------
 
 /// `config` field value for SILK-only, narrowband, 20 ms frames (§3.1
 /// Table 2).
 pub const OPUS_CONFIG_SILK_NB_20MS: u8 = 1;
+/// `config` field value for SILK-only, mediumband, 20 ms frames.
+pub const OPUS_CONFIG_SILK_MB_20MS: u8 = 5;
+/// `config` field value for SILK-only, wideband, 20 ms frames.
+pub const OPUS_CONFIG_SILK_WB_20MS: u8 = 9;
 
 /// Number of PCM samples per 20 ms SILK NB frame at the internal 8 kHz
 /// rate.
 pub const SILK_NB_FRAME_SAMPLES_INTERNAL: usize = 160;
+/// Samples per 20 ms SILK MB frame at the internal 12 kHz rate.
+pub const SILK_MB_FRAME_SAMPLES_INTERNAL: usize = 240;
+/// Samples per 20 ms SILK WB frame at the internal 16 kHz rate.
+pub const SILK_WB_FRAME_SAMPLES_INTERNAL: usize = 320;
 
 /// Number of PCM samples per 20 ms frame at the Opus output rate of
 /// 48 kHz (for PTS accounting).
@@ -386,10 +400,10 @@ pub const SILK_FRAME_SAMPLES_48K: usize = 960;
 
 /// Internal (SILK) rate for NB.
 pub const SILK_NB_RATE: u32 = 8_000;
-
-/// How many 48 kHz samples collapse to one 8 kHz sample. Used for the
-/// outer 48 → 8 kHz downmixer.
-const DOWNSAMPLE_RATIO: usize = (SAMPLE_RATE / SILK_NB_RATE) as usize; // 6
+/// Internal (SILK) rate for MB.
+pub const SILK_MB_RATE: u32 = 12_000;
+/// Internal (SILK) rate for WB.
+pub const SILK_WB_RATE: u32 = 16_000;
 
 /// Build a TOC byte for a SILK-only narrowband 20 ms (config 1) packet.
 ///
@@ -399,32 +413,108 @@ pub fn build_silk_nb_20ms_toc(stereo: bool) -> u8 {
     (OPUS_CONFIG_SILK_NB_20MS << 3) | (stereo_bit << 2) // code = 0
 }
 
-/// SILK-mode Opus encoder — narrowband (8 kHz internal) mono 20 ms.
+/// Build a TOC byte for a SILK-only mediumband 20 ms (config 5) packet.
+pub fn build_silk_mb_20ms_toc(stereo: bool) -> u8 {
+    let stereo_bit: u8 = if stereo { 1 } else { 0 };
+    (OPUS_CONFIG_SILK_MB_20MS << 3) | (stereo_bit << 2)
+}
+
+/// Build a TOC byte for a SILK-only wideband 20 ms (config 9) packet.
+pub fn build_silk_wb_20ms_toc(stereo: bool) -> u8 {
+    let stereo_bit: u8 = if stereo { 1 } else { 0 };
+    (OPUS_CONFIG_SILK_WB_20MS << 3) | (stereo_bit << 2)
+}
+
+/// Concrete SILK mode this `SilkEncoder` instance emits.
+#[derive(Copy, Clone, Debug)]
+enum SilkMode {
+    NbMono,
+    MbMono,
+    WbMono,
+    NbStereo,
+}
+
+impl SilkMode {
+    fn toc_byte(self) -> u8 {
+        match self {
+            SilkMode::NbMono => build_silk_nb_20ms_toc(false),
+            SilkMode::MbMono => build_silk_mb_20ms_toc(false),
+            SilkMode::WbMono => build_silk_wb_20ms_toc(false),
+            SilkMode::NbStereo => build_silk_nb_20ms_toc(true),
+        }
+    }
+    fn internal_rate(self) -> u32 {
+        match self {
+            SilkMode::NbMono | SilkMode::NbStereo => SILK_NB_RATE,
+            SilkMode::MbMono => SILK_MB_RATE,
+            SilkMode::WbMono => SILK_WB_RATE,
+        }
+    }
+    fn frame_samples_internal(self) -> usize {
+        match self {
+            SilkMode::NbMono | SilkMode::NbStereo => SILK_NB_FRAME_SAMPLES_INTERNAL,
+            SilkMode::MbMono => SILK_MB_FRAME_SAMPLES_INTERNAL,
+            SilkMode::WbMono => SILK_WB_FRAME_SAMPLES_INTERNAL,
+        }
+    }
+    fn input_channels(self) -> u16 {
+        match self {
+            SilkMode::NbStereo => 2,
+            _ => 1,
+        }
+    }
+    fn is_stereo(self) -> bool {
+        matches!(self, SilkMode::NbStereo)
+    }
+    /// Bytes of range-encoder storage to allocate per packet. Sized so
+    /// the MVP per-sample nibble carrier fits with headroom; stereo
+    /// doubles the mono budget.
+    fn buffer_bytes(self) -> u32 {
+        let samples = self.frame_samples_internal();
+        // ~17 bits per sample worst-case (nibble+nibble + sign), plus
+        // headers. Round up to a 64-byte multiple with 2× headroom.
+        let base = (samples * 17) / 8 + 128;
+        let doubled = if self.is_stereo() { base * 2 } else { base };
+        doubled.next_multiple_of(64).max(384) as u32
+    }
+    /// 48 kHz → internal-rate downsample ratio (integer).
+    fn downsample_ratio(self) -> usize {
+        (SAMPLE_RATE / self.internal_rate()) as usize
+    }
+}
+
+/// SILK-mode Opus encoder — NB/MB/WB mono + NB stereo, 20 ms frames.
 ///
-/// Emits `config = 1` TOC bytes (SILK-only NB 20 ms mono) followed by
-/// the SILK bitstream described in [`crate::silk::encoder`]. Accepts
-/// 8 kHz **or** 48 kHz mono input; 48 kHz input is downsampled 6:1 to
-/// the SILK internal rate via a simple box-averaging filter (good
-/// enough for the speech-band content this mode targets).
+/// Emits a TOC byte matching the configured mode followed by the SILK
+/// bitstream described in [`crate::silk::encoder`]. Accepts either the
+/// SILK internal rate (8 kHz / 12 kHz / 16 kHz for NB / MB / WB) or the
+/// 48 kHz Opus output rate; non-internal input is downsampled by a
+/// simple box-average pre-filter.
 ///
-/// The decoder-side companion is the existing [`crate::silk::SilkDecoder`]
-/// — every packet this encoder produces round-trips through our own
-/// decoder at ≥ 20 dB SNR on sine / speech-like test signals (see the
-/// `encoder_roundtrip.rs` integration test).
+/// Four explicit entry points, one per mode:
 ///
-/// Out of scope for this first cut: stereo, MB/WB, 10/40/60 ms, LBRR,
-/// Hybrid. Those paths are tracked as follow-ups.
+/// * [`SilkEncoder::new_nb_mono_20ms`] — NB mono (config 1).
+/// * [`SilkEncoder::new_mb_mono_20ms`] — MB mono (config 5).
+/// * [`SilkEncoder::new_wb_mono_20ms`] — WB mono (config 9).
+/// * [`SilkEncoder::new_nb_stereo_20ms`] — NB stereo (config 1 + TOC
+///   stereo bit). Runs a mid/side pair of [`SilkFrameEncoder`]s and
+///   emits the RFC §4.2.7.1 prediction header.
+///
+/// Round-trip SNR > 20 dB on speech-like input through the crate's own
+/// SILK decoder for every mode (see `encoder_roundtrip.rs`).
+///
+/// Out of scope for this pass: 10 / 40 / 60 ms frames, voiced/LTP path,
+/// LBRR, MB/WB stereo, Hybrid.
 pub struct SilkEncoder {
     out_params: CodecParameters,
-    /// Underlying per-frame SILK bit encoder.
-    silk: crate::silk::encoder::SilkFrameEncoder,
-    /// Ring buffer of pending 8 kHz mono samples waiting for a full
-    /// 20 ms SILK frame.
+    mode: SilkMode,
+    /// Per-frame SILK encoder for the mid (or mono) channel.
+    silk_mid: crate::silk::encoder::SilkFrameEncoder,
+    /// Side-channel encoder (stereo only).
+    silk_side: Option<crate::silk::encoder::SilkFrameEncoder>,
+    /// Pending internal-rate samples. For stereo, interleaved L/R.
     pending_internal: VecDeque<f32>,
-    /// Expected input channel count on `send_frame`. Always 1 for this
-    /// constructor.
-    input_channels: u16,
-    /// Expected input sample rate (8 kHz or 48 kHz).
+    /// Expected input sample rate (internal or 48 kHz).
     input_sample_rate: u32,
     /// Output packet queue.
     output: VecDeque<Packet>,
@@ -433,81 +523,153 @@ pub struct SilkEncoder {
 }
 
 impl SilkEncoder {
-    /// Build a SILK NB mono 20 ms encoder.
-    ///
-    /// * `params.channels` must be `Some(1)` (or `None`, defaulting to 1).
-    /// * `params.sample_rate` must be `Some(8_000)` or `Some(48_000)`
-    ///   (or `None`, defaulting to 48 kHz since that's the Opus output
-    ///   rate). 48 kHz input is downsampled 6:1 internally.
+    /// Build a SILK NB mono 20 ms encoder. Input: 8 kHz or 48 kHz mono.
     pub fn new_nb_mono_20ms(params: &CodecParameters) -> Result<Self> {
-        let channels = params.channels.unwrap_or(1);
-        if channels != 1 {
+        Self::new_mode(params, SilkMode::NbMono)
+    }
+
+    /// Build a SILK MB mono 20 ms encoder. Input: 12 kHz or 48 kHz mono.
+    pub fn new_mb_mono_20ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::MbMono)
+    }
+
+    /// Build a SILK WB mono 20 ms encoder. Input: 16 kHz or 48 kHz mono.
+    pub fn new_wb_mono_20ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::WbMono)
+    }
+
+    /// Build a SILK NB stereo 20 ms encoder. Input: 8 kHz or 48 kHz
+    /// stereo (interleaved L/R). Emits a mid/side-coded packet with the
+    /// stereo prediction header from RFC §4.2.7.1.
+    pub fn new_nb_stereo_20ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::NbStereo)
+    }
+
+    fn new_mode(params: &CodecParameters, mode: SilkMode) -> Result<Self> {
+        let channels = params.channels.unwrap_or(mode.input_channels());
+        if channels != mode.input_channels() {
             return Err(Error::unsupported(format!(
-                "SILK NB mono encoder: only mono input supported, got {channels} channels"
+                "SILK encoder: {:?} expects {}-channel input, got {channels} channels",
+                mode,
+                mode.input_channels()
             )));
         }
         let sr = params.sample_rate.unwrap_or(SAMPLE_RATE);
-        if sr != SILK_NB_RATE && sr != SAMPLE_RATE {
+        let internal = mode.internal_rate();
+        if sr != internal && sr != SAMPLE_RATE {
             return Err(Error::unsupported(format!(
-                "SILK NB mono encoder: input must be 8 kHz or 48 kHz, got {sr} Hz"
+                "SILK encoder: {mode:?} expects {internal} Hz or 48 kHz input, got {sr} Hz"
             )));
         }
+        let silk_mid = match mode {
+            SilkMode::NbMono | SilkMode::NbStereo => {
+                crate::silk::encoder::SilkFrameEncoder::new_nb_20ms()
+            }
+            SilkMode::MbMono => crate::silk::encoder::SilkFrameEncoder::new_mb_20ms(),
+            SilkMode::WbMono => crate::silk::encoder::SilkFrameEncoder::new_wb_20ms(),
+        };
+        let silk_side = if mode.is_stereo() {
+            Some(crate::silk::encoder::SilkFrameEncoder::new_nb_20ms())
+        } else {
+            None
+        };
+
         let mut out_params = params.clone();
-        // Opus always outputs 48 kHz.
         out_params.sample_rate = Some(SAMPLE_RATE);
-        out_params.channels = Some(1);
+        out_params.channels = Some(mode.input_channels());
+        let per_frame_items = mode.frame_samples_internal()
+            * (if mode.is_stereo() { 2 } else { 1 });
+
         Ok(Self {
             out_params,
-            silk: crate::silk::encoder::SilkFrameEncoder::new_nb_20ms(),
-            pending_internal: VecDeque::with_capacity(SILK_NB_FRAME_SAMPLES_INTERNAL * 2),
-            input_channels: 1,
+            mode,
+            silk_mid,
+            silk_side,
+            pending_internal: VecDeque::with_capacity(per_frame_items * 2),
             input_sample_rate: sr,
             output: VecDeque::new(),
             pts_counter: 0,
         })
     }
 
-    /// Drain any complete 20 ms SILK frames out of `pending_internal`,
-    /// encoding each to a full Opus SILK-only packet.
     fn drain_frames(&mut self) -> Result<()> {
-        while self.pending_internal.len() >= SILK_NB_FRAME_SAMPLES_INTERNAL {
-            let mut frame = Vec::with_capacity(SILK_NB_FRAME_SAMPLES_INTERNAL);
-            for _ in 0..SILK_NB_FRAME_SAMPLES_INTERNAL {
-                frame.push(self.pending_internal.pop_front().unwrap_or(0.0));
+        let samples_per_frame = self.mode.frame_samples_internal();
+        let per_frame_items = samples_per_frame
+            * (if self.mode.is_stereo() { 2 } else { 1 });
+        while self.pending_internal.len() >= per_frame_items {
+            if self.mode.is_stereo() {
+                let mut left = Vec::with_capacity(samples_per_frame);
+                let mut right = Vec::with_capacity(samples_per_frame);
+                for _ in 0..samples_per_frame {
+                    left.push(self.pending_internal.pop_front().unwrap_or(0.0));
+                    right.push(self.pending_internal.pop_front().unwrap_or(0.0));
+                }
+                let pkt = self.encode_one_stereo_frame(&left, &right)?;
+                self.output.push_back(pkt);
+            } else {
+                let mut frame = Vec::with_capacity(samples_per_frame);
+                for _ in 0..samples_per_frame {
+                    frame.push(self.pending_internal.pop_front().unwrap_or(0.0));
+                }
+                let pkt = self.encode_one_mono_frame(&frame)?;
+                self.output.push_back(pkt);
             }
-            let pkt = self.encode_one_frame(&frame)?;
-            self.output.push_back(pkt);
         }
         Ok(())
     }
 
-    /// Encode one 160-sample NB SILK frame (already at the internal
-    /// rate) into a full Opus SILK-only packet.
-    fn encode_one_frame(&mut self, pcm_internal: &[f32]) -> Result<Packet> {
-        debug_assert_eq!(pcm_internal.len(), SILK_NB_FRAME_SAMPLES_INTERNAL);
-        // Budget: ~260 bytes at the MVP carrier rate (13 bits / 8 kHz
-        // sample × 20 ms = 260 bytes). Round up to 384 for headroom.
-        let mut re = oxideav_celt::range_encoder::RangeEncoder::new(384);
+    fn encode_one_mono_frame(&mut self, pcm_internal: &[f32]) -> Result<Packet> {
+        debug_assert_eq!(pcm_internal.len(), self.mode.frame_samples_internal());
+        let mut re = oxideav_celt::range_encoder::RangeEncoder::new(self.mode.buffer_bytes());
 
-        // SILK packet-level header (RFC §4.2.3): one VAD flag + one
-        // LBRR flag per internal channel. Mono NB 20 ms frame:
-        //   vad_flags[0][0] = 1  (active)
-        //   lbrr_flag[0]    = 0  (no LBRR)
         re.encode_bit_logp(true, 1); // VAD
-        re.encode_bit_logp(false, 1); // LBRR flag
-
-        // Frame body.
-        self.silk.encode_frame_body(pcm_internal, &mut re)?;
+        re.encode_bit_logp(false, 1); // LBRR
+        self.silk_mid.encode_frame_body(pcm_internal, &mut re)?;
 
         let body = re
             .done()
             .map_err(|e| Error::other(format!("SILK encoder: {e}")))?;
-        // Trim trailing zero-padding from the range encoder's storage
-        // allocation — the decoder is happy with any tail, but shorter
-        // packets are nicer for the bitrate reporting layer.
         let body = strip_trailing_zeros(body);
-        // Assemble the Opus packet: TOC + body.
-        let toc = build_silk_nb_20ms_toc(false);
+        self.finish_packet(body)
+    }
+
+    fn encode_one_stereo_frame(&mut self, left: &[f32], right: &[f32]) -> Result<Packet> {
+        debug_assert_eq!(left.len(), right.len());
+        debug_assert_eq!(left.len(), self.mode.frame_samples_internal());
+        let mut re = oxideav_celt::range_encoder::RangeEncoder::new(self.mode.buffer_bytes());
+
+        // Shared VAD/LBRR header (RFC §4.2.3):
+        //   VAD[mid] = 1, LBRR[mid] = 0, VAD[side] = 1, LBRR[side] = 0.
+        re.encode_bit_logp(true, 1);
+        re.encode_bit_logp(false, 1);
+        re.encode_bit_logp(true, 1);
+        re.encode_bit_logp(false, 1);
+
+        // Mid/side split + stereo predictor.
+        let (mid, side) = crate::silk::encoder::stereo_mid_side(left, right);
+        let pred_q13 = crate::silk::encoder::stereo_predict_weights_q13(&mid, &side);
+        crate::silk::encoder::encode_stereo_pred_weights(&mut re, pred_q13);
+
+        // The decoder reads the mid-only flag only when the side VAD is
+        // 0; we emit VAD=1 for the side channel, so nothing to write.
+
+        // Mid + side bodies.
+        self.silk_mid.encode_frame_body(&mid, &mut re)?;
+        let side_enc = self
+            .silk_side
+            .as_mut()
+            .ok_or_else(|| Error::other("SILK stereo encoder: missing side-channel state"))?;
+        side_enc.encode_frame_body(&side, &mut re)?;
+
+        let body = re
+            .done()
+            .map_err(|e| Error::other(format!("SILK encoder: {e}")))?;
+        let body = strip_trailing_zeros(body);
+        self.finish_packet(body)
+    }
+
+    fn finish_packet(&mut self, body: Vec<u8>) -> Result<Packet> {
+        let toc = self.mode.toc_byte();
         let mut data = Vec::with_capacity(1 + body.len());
         data.push(toc);
         data.extend_from_slice(&body);
@@ -550,10 +712,11 @@ impl Encoder for SilkEncoder {
                 ))
             }
         };
-        if audio.channels != self.input_channels {
+        if audio.channels != self.mode.input_channels() {
             return Err(Error::invalid(format!(
                 "SILK encoder: frame channels ({}) differ from configured input channels ({})",
-                audio.channels, self.input_channels
+                audio.channels,
+                self.mode.input_channels()
             )));
         }
         if audio.sample_rate != self.input_sample_rate {
@@ -563,17 +726,27 @@ impl Encoder for SilkEncoder {
             )));
         }
 
-        // Extract mono f32 samples (reuse the same helper as the CELT
-        // path — it already handles S16/F32/planar variants).
-        let mono = extract_mono_f32(audio)?;
-
-        // Downsample 48 kHz → 8 kHz if needed.
-        let internal_samples: Vec<f32> = if audio.sample_rate == SILK_NB_RATE {
-            mono
+        // Extract f32 samples. Mono modes feed `extract_mono_f32`; the
+        // stereo mode keeps per-channel planes interleaved so the
+        // caller-side mid/side split stays bit-exact.
+        let internal_items_per_sample = if self.mode.is_stereo() { 2 } else { 1 };
+        let internal_samples: Vec<f32> = if self.mode.is_stereo() {
+            let stereo = extract_stereo_f32(audio)?;
+            if audio.sample_rate == self.mode.internal_rate() {
+                stereo
+            } else {
+                downsample_box_interleaved(&stereo, self.mode.downsample_ratio(), 2)
+            }
         } else {
-            downsample_box(&mono, DOWNSAMPLE_RATIO)
+            let mono = extract_mono_f32(audio)?;
+            if audio.sample_rate == self.mode.internal_rate() {
+                mono
+            } else {
+                downsample_box(&mono, self.mode.downsample_ratio())
+            }
         };
 
+        debug_assert_eq!(internal_items_per_sample * (internal_samples.len() / internal_items_per_sample), internal_samples.len());
         self.pending_internal.extend(&internal_samples);
         self.drain_frames()
     }
@@ -587,16 +760,137 @@ impl Encoder for SilkEncoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        // Zero-pad the tail up to a 20 ms boundary so we emit a final
-        // packet instead of dropping the remainder.
         if !self.pending_internal.is_empty() {
-            while self.pending_internal.len() % SILK_NB_FRAME_SAMPLES_INTERNAL != 0 {
+            let per_frame_items = self.mode.frame_samples_internal()
+                * (if self.mode.is_stereo() { 2 } else { 1 });
+            while self.pending_internal.len() % per_frame_items != 0 {
                 self.pending_internal.push_back(0.0);
             }
             self.drain_frames()?;
         }
         Ok(())
     }
+}
+
+/// Extract an interleaved L/R f32 buffer from an `AudioFrame`. Supports
+/// the same sample formats as [`extract_mono_f32`] but returns
+/// `samples * 2` floats, preserving per-channel detail.
+fn extract_stereo_f32(audio: &AudioFrame) -> Result<Vec<f32>> {
+    let n = audio.samples as usize;
+    let ch = audio.channels as usize;
+    if ch != 2 {
+        return Err(Error::invalid(format!(
+            "SILK stereo encoder: expected 2-channel input, got {ch}"
+        )));
+    }
+    let mut out = vec![0f32; n * 2];
+    match audio.format {
+        SampleFormat::S16 => {
+            let bytes = &audio.data[0];
+            let needed = n * 2 * 2;
+            if bytes.len() < needed {
+                return Err(Error::invalid(
+                    "SILK stereo encoder: S16 input shorter than declared sample count",
+                ));
+            }
+            for i in 0..n {
+                for c in 0..2 {
+                    let off = (i * 2 + c) * 2;
+                    let s = i16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                    out[i * 2 + c] = s as f32 / 32768.0;
+                }
+            }
+        }
+        SampleFormat::S16P => {
+            if audio.data.len() < 2 {
+                return Err(Error::invalid("SILK stereo encoder: S16P missing planes"));
+            }
+            for i in 0..n {
+                for c in 0..2 {
+                    let plane = &audio.data[c];
+                    if plane.len() < n * 2 {
+                        return Err(Error::invalid(
+                            "SILK stereo encoder: S16P plane shorter than declared sample count",
+                        ));
+                    }
+                    let off = i * 2;
+                    let s = i16::from_le_bytes([plane[off], plane[off + 1]]);
+                    out[i * 2 + c] = s as f32 / 32768.0;
+                }
+            }
+        }
+        SampleFormat::F32 => {
+            let bytes = &audio.data[0];
+            let needed = n * 2 * 4;
+            if bytes.len() < needed {
+                return Err(Error::invalid(
+                    "SILK stereo encoder: F32 input shorter than declared sample count",
+                ));
+            }
+            for i in 0..n {
+                for c in 0..2 {
+                    let off = (i * 2 + c) * 4;
+                    out[i * 2 + c] = f32::from_le_bytes([
+                        bytes[off],
+                        bytes[off + 1],
+                        bytes[off + 2],
+                        bytes[off + 3],
+                    ]);
+                }
+            }
+        }
+        SampleFormat::F32P => {
+            if audio.data.len() < 2 {
+                return Err(Error::invalid("SILK stereo encoder: F32P missing planes"));
+            }
+            for i in 0..n {
+                for c in 0..2 {
+                    let plane = &audio.data[c];
+                    if plane.len() < n * 4 {
+                        return Err(Error::invalid(
+                            "SILK stereo encoder: F32P plane shorter than declared sample count",
+                        ));
+                    }
+                    let off = i * 4;
+                    out[i * 2 + c] = f32::from_le_bytes([
+                        plane[off],
+                        plane[off + 1],
+                        plane[off + 2],
+                        plane[off + 3],
+                    ]);
+                }
+            }
+        }
+        other => {
+            return Err(Error::unsupported(format!(
+                "SILK stereo encoder: sample format {other:?} not supported (use S16 / S16P / F32 / F32P)"
+            )));
+        }
+    }
+    Ok(out)
+}
+
+/// Interleaved (stride-aware) box-average downsampler. `stride` is the
+/// number of interleaved channels (1 = mono, 2 = stereo). Identical
+/// ratio averaging as [`downsample_box`], but keeps per-channel samples
+/// aligned through the decimation.
+fn downsample_box_interleaved(input: &[f32], ratio: usize, stride: usize) -> Vec<f32> {
+    if ratio <= 1 {
+        return input.to_vec();
+    }
+    debug_assert_eq!(input.len() % stride, 0);
+    let n_out_frames = (input.len() / stride) / ratio;
+    let mut out = vec![0f32; n_out_frames * stride];
+    for i in 0..n_out_frames {
+        for c in 0..stride {
+            let mut sum = 0f32;
+            for k in 0..ratio {
+                sum += input[(i * ratio + k) * stride + c];
+            }
+            out[i * stride + c] = sum / ratio as f32;
+        }
+    }
+    out
 }
 
 /// Average every `ratio` consecutive input samples into one output
