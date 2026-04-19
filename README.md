@@ -1,9 +1,9 @@
 # oxideav-opus
 
 Pure-Rust **Opus** audio codec — RFC 6716 bitstream + RFC 7845 Ogg
-mapping. SILK and CELT decode (mono + stereo) plus two encoders: a
-CELT-only full-band path and a SILK-only narrowband mono path. Zero C
-dependencies.
+mapping. SILK and CELT decode (mono + stereo) plus encoders for a
+CELT-only full-band path and SILK-only narrowband/mediumband/wideband
+mono + NB stereo. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -54,18 +54,34 @@ Two explicit entry points, one per Opus mode:
   - Input sample rate: **48 kHz only**. Any other rate returns
     `Error::Unsupported` — resample upstream.
 
-- **SILK-only, Narrowband mono, 20 ms** (`SilkEncoder::new_nb_mono_20ms`).
-  - Packet layout: TOC byte `config = 1` + SILK bitstream, framing code
-    0 (single frame per packet).
-  - Accepts 8 kHz mono input natively, or 48 kHz mono input which is
-    downsampled 6:1 internally via a box-average anti-alias filter.
-  - Analysis-by-synthesis design: the encoder runs the same LPC filter
-    the decoder reconstructs from the NLSF stage-1 index, computes the
-    residual sample-by-sample against the decoder's reconstructed past,
-    and emits quantised residual magnitudes. Round-trips through our
-    own SILK decoder at **≥ 20 dB SNR** on speech-like signals (pinned
-    by the `silk_nb_mono_20ms_roundtrip_snr_above_20db` integration
-    test; typical measured value is ~24 dB).
+- **SILK-only mono** at every SILK bandwidth and, additionally,
+  **SILK-only NB stereo** — all 20 ms frames:
+  - `SilkEncoder::new_nb_mono_20ms` — NB (8 kHz internal, config 1).
+  - `SilkEncoder::new_mb_mono_20ms` — MB (12 kHz internal, config 5).
+  - `SilkEncoder::new_wb_mono_20ms` — WB (16 kHz internal, config 9).
+  - `SilkEncoder::new_nb_stereo_20ms` — NB stereo (config 1, TOC stereo
+    bit = 1). Feeds a mid/side pair into two SILK frame encoders and
+    emits the RFC §4.2.7.1 prediction header (weights are shipped as 0
+    for this first pass — enough for a clean round-trip, see follow-up
+    list below).
+  - Each mono constructor accepts either the SILK internal rate (8 / 12
+    / 16 kHz respectively) or 48 kHz; 48 kHz input is downsampled by a
+    simple box-average pre-filter. The stereo constructor accepts 8 kHz
+    or 48 kHz stereo.
+  - Packet layout: TOC byte (config 1 / 5 / 9) + SILK bitstream, framing
+    code 0 (single frame per packet).
+  - Analysis-by-synthesis design: each per-bandwidth SilkFrameEncoder
+    runs the same LPC filter the decoder reconstructs from the NLSF
+    stage-1 index (shared BandwidthParams descriptor: NB/MB use LPC
+    order 10, WB uses LPC order 16), computes the residual sample-by-
+    sample against the decoder's reconstructed past, and emits
+    quantised residual magnitudes. Round-trip SNR through our own
+    decoder clears 20 dB on speech-like tones — typical measured values
+    (see `encoder_roundtrip.rs`):
+    - NB mono: ~24 dB
+    - MB mono: ~25 dB
+    - WB mono: ~29 dB
+    - NB stereo: ~30 dB (L) / ~27 dB (R)
   - Bitstream layout follows RFC 6716 §4.2 header order (frame type →
     gains → NLSF → LTP (skipped for unvoiced) → LCG seed → excitation);
     the excitation *body* uses an MVP carrier format documented in
@@ -73,7 +89,7 @@ Two explicit entry points, one per Opus mode:
     the RFC's shell-pulse split). Byte-exact parity with libopus'
     `silk_enc` bit-stream is a tracked follow-up.
 
-- Input sample formats (both encoders): `S16`, `S16P`, `F32`, `F32P`.
+- Input sample formats (all encoders): `S16`, `S16P`, `F32`, `F32P`.
 
 ### Not yet supported
 
@@ -83,9 +99,15 @@ Two explicit entry points, one per Opus mode:
   yet decoded. Packets that enable LBRR return `Error::Unsupported`.
 - **Channel mapping family 1 / 2** (Vorbis / ambisonic multistream,
   more than 2 channels).
-- **SILK encoding of MB / WB** — only NB (8 kHz internal rate) is wired
-  up on the encoder side today.
-- **SILK stereo encoding** — `SilkEncoder::new_nb_mono_20ms` is mono-only.
+- **SILK encoding of MB / WB stereo** — NB stereo is wired up (see
+  `SilkEncoder::new_nb_stereo_20ms`); MB and WB stereo are mechanically
+  identical follow-ups.
+- **SILK stereo predictor** — the NB stereo encoder currently emits
+  prediction weights of (0, 0). Wiring the full Wiener-filter analysis
+  path in `silk::encoder::stereo_predict_weights_q13` is a follow-up
+  (the function is already in place; the remaining work is subtracting
+  the predicted side from the coded side before it reaches the
+  SilkFrameEncoder).
 - **SILK encoding of 10 / 40 / 60 ms frames** — only 20 ms frames are
   emitted for now; the decoder handles all four sizes.
 - **Hybrid encoding** — still `Error::Unsupported` end-to-end.
@@ -166,6 +188,11 @@ let pkt = enc.receive_packet()?;
 ```
 
 ### Encode (SILK-only, NB mono, 20 ms)
+
+Analogous constructors exist for MB mono (`new_mb_mono_20ms`, 12 kHz
+internal), WB mono (`new_wb_mono_20ms`, 16 kHz internal) and NB stereo
+(`new_nb_stereo_20ms`, 8 kHz internal, 2-channel input).
+
 
 ```rust,no_run
 use oxideav_codec::Encoder;
