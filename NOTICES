@@ -1,0 +1,80 @@
+oxideav-opus third-party notices
+================================
+
+This crate is distributed under the MIT license (see LICENSE) and
+additionally incorporates material from the following upstream
+projects. Their copyright notices and license terms are reproduced
+below and apply to the incorporated material.
+
+
+libopus (Xiph.Org Foundation / Skype)
+-------------------------------------
+
+The SILK stereo prediction / quantisation tables in
+`src/silk/tables.rs` (`STEREO_PRED_JOINT_ICDF`,
+`STEREO_UNIFORM3_ICDF`, `STEREO_UNIFORM5_ICDF`,
+`STEREO_ONLY_CODE_MID_ICDF`, `STEREO_PRED_QUANT_Q13`) are transcribed
+verbatim from the libopus reference implementation, file
+`silk/tables_other.c`. They are required for bit-exact decoder
+output compatibility with the reference.
+
+Other files in the SILK decoder (`src/silk/mod.rs`, `src/silk/lsf.rs`,
+`src/decoder.rs`) reference libopus function names (e.g.
+`silk_Decode`, `silk_stereo_MS_to_LR`, `silk_stereo_decode_pred`,
+`tf_decode`) and layout in comments for cross-reference with the
+reference implementation. These files are independent Rust
+re-implementations of the algorithms described in the Opus
+specification (RFC 6716), not ports of libopus source code, but are
+listed here for completeness.
+
+Algorithmic re-implementations of the Opus RFC 6716 specification
+throughout this crate are independent Rust code and do not reproduce
+libopus source. The attribution above applies only to the verbatim
+tables identified above.
+
+libopus is distributed under the following terms:
+
+    Copyright 2001-2023 Xiph.Org, Skype Limited, Octasic,
+                        Jean-Marc Valin, Timothy B. Terriberry,
+                        CSIRO, Gregory Maxwell, Mark Borgerding,
+                        Erik de Castro Lopo, Mozilla, Amazon
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
+
+    - Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+
+    - Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+
+    - Neither the name of Internet Society, IETF or IETF Trust, nor the
+    names of specific contributors, may be used to endorse or promote
+    products derived from this software without specific prior written
+    permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+    A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
+    OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+    EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+    PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+    Opus is subject to the royalty-free patent licenses which are
+    specified at:
+
+    Xiph.Org Foundation:
+    https://datatracker.ietf.org/ipr/1524/
+
+    Microsoft Corporation:
+    https://datatracker.ietf.org/ipr/1914/
+
+    Broadcom Corporation:
+    https://datatracker.ietf.org/ipr/1526/
