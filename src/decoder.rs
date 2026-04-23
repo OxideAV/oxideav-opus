@@ -45,23 +45,41 @@ use crate::toc::{OpusMode, Toc};
 pub const OPUS_RATE_HZ: u32 = 48_000;
 
 /// Build an Opus decoder from the codec parameters.
+///
+/// If `params.extradata` is a valid `OpusHead` with channel mapping
+/// family 1 or 2 and `output_channel_count > 2`, a
+/// [`MultistreamOpusDecoder`] is returned that demuxes each packet
+/// into N sub-stream packets (per RFC 7845 §5.1.1) and mixes the
+/// coupled/uncoupled streams into the final output according to the
+/// channel mapping table.
+///
+/// Otherwise the single-stream path is used. `params.channels` may be
+/// 1 or 2; anything else is rejected.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let channels = params.channels.unwrap_or(1).max(1);
+
+    // Detect multistream via the OpusHead extradata.
+    if !params.extradata.is_empty() {
+        if let Ok(head) = crate::header::parse_opus_head(&params.extradata) {
+            if head.channel_mapping_family == 1 || head.channel_mapping_family == 2 {
+                return MultistreamOpusDecoder::new(params, &head)
+                    .map(|d| Box::new(d) as Box<dyn Decoder>);
+            }
+            if head.channel_mapping_family != 0 {
+                return Err(Error::unsupported(format!(
+                    "Opus channel mapping family {} not supported",
+                    head.channel_mapping_family
+                )));
+            }
+        }
+    }
+
     if channels > 2 {
         return Err(Error::unsupported(
-            "Opus multi-stream (channel mapping family 1/2) not yet supported",
+            "Opus channel count > 2 requires a channel-mapped OpusHead (family 1 or 2) in extradata",
         ));
     }
-    Ok(Box::new(OpusDecoder {
-        codec_id: params.codec_id.clone(),
-        channels,
-        time_base: TimeBase::new(1, OPUS_RATE_HZ as i64),
-        pending: None,
-        eof: false,
-        emit_pts: 0,
-        state: CeltState::new(channels as usize),
-        silk: None,
-    }))
+    Ok(Box::new(OpusDecoder::new(params, channels)))
 }
 
 /// Persistent CELT decoder state (carried across frames).
@@ -123,6 +141,62 @@ struct OpusDecoder {
     /// SILK sub-decoder, instantiated lazily when the first SILK-only
     /// packet arrives.
     silk: Option<SilkDecoder>,
+}
+
+impl OpusDecoder {
+    fn new(params: &CodecParameters, channels: u16) -> Self {
+        Self {
+            codec_id: params.codec_id.clone(),
+            channels,
+            time_base: TimeBase::new(1, OPUS_RATE_HZ as i64),
+            pending: None,
+            eof: false,
+            emit_pts: 0,
+            state: CeltState::new(channels as usize),
+            silk: None,
+        }
+    }
+
+    /// Decode an already-parsed Opus packet to per-channel f32 PCM.
+    ///
+    /// Used by `MultistreamOpusDecoder` which parses the outer framing
+    /// itself (to support self-delimited sub-stream packets) and then
+    /// hands the parsed frames to this method.
+    ///
+    /// Every returned channel is exactly
+    /// `toc.frame_samples_48k * frames.len()` long — zero-padded if
+    /// the underlying decode path emitted fewer samples (CELT's
+    /// internal grid is M*100 rather than M*120; the existing
+    /// single-stream decode_packet relies on `get(i).unwrap_or(0.0)`
+    /// to zero-fill, but multistream needs the explicit padding so
+    /// every sub-stream has the same sample count).
+    fn decode_parsed_to_pcm(
+        &mut self,
+        parsed: &crate::toc::OpusPacket<'_>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let toc_ch = parsed.toc.channels();
+        let out_channels = self.channels.max(toc_ch);
+        let per_frame = parsed.toc.frame_samples_48k as usize;
+        let total_samples = per_frame * parsed.frames.len();
+
+        let mut per_ch: Vec<Vec<f32>> = (0..out_channels)
+            .map(|_| Vec::with_capacity(total_samples))
+            .collect();
+        for frame_bytes in parsed.frames.iter() {
+            let mut ch_buf = decode_frame(self, &parsed.toc, frame_bytes, out_channels as usize)?;
+            for (dst, src) in per_ch.iter_mut().zip(ch_buf.drain(..)) {
+                let start = dst.len();
+                dst.extend_from_slice(&src);
+                // Pad to `per_frame` samples if the decoder returned
+                // fewer (current CELT pipeline emits M*100 = 800 at
+                // LM=3 when the spec mandates M*120 = 960).
+                if dst.len() < start + per_frame {
+                    dst.resize(start + per_frame, 0.0);
+                }
+            }
+        }
+        Ok(per_ch)
+    }
 }
 
 impl Decoder for OpusDecoder {
@@ -218,6 +292,235 @@ fn decode_packet(dec: &mut OpusDecoder, packet: &Packet) -> Result<Frame> {
         time_base: dec.time_base,
         data: vec![interleaved],
     }))
+}
+
+/// Multistream Opus decoder per RFC 7845 §5.1 (channel mapping family
+/// 1 for Vorbis surround, family 2 for ambisonics).
+///
+/// Holds N sub-decoders (one per Opus stream in the packet). The first
+/// M streams are stereo ("coupled"), the rest are mono ("uncoupled").
+/// Each input packet is split into N sub-packets using the same length
+/// coding as RFC 6716 §3.2.5 (all but the last stream has a 1 or 2
+/// byte length prefix), and each sub-packet is decoded by its
+/// corresponding sub-decoder. The decoded per-stream channels are then
+/// gathered into the final output via the channel mapping table.
+pub struct MultistreamOpusDecoder {
+    codec_id: CodecId,
+    /// Output channel count (C).
+    channels: u16,
+    /// Stream count (N).
+    stream_count: u8,
+    /// Coupled stream count (M). First M streams are stereo.
+    coupled_stream_count: u8,
+    /// Channel mapping table: `channel_mapping[c]` = source stream
+    /// channel index for output channel c. Coupled streams occupy two
+    /// consecutive indices per stream, followed by one index per
+    /// uncoupled stream. Index 255 = silent (per RFC 7845).
+    channel_mapping: Vec<u8>,
+    time_base: TimeBase,
+    pending: Option<Packet>,
+    eof: bool,
+    emit_pts: i64,
+    /// Sub-decoders. First `coupled_stream_count` are stereo, the rest
+    /// are mono.
+    streams: Vec<OpusDecoder>,
+}
+
+impl MultistreamOpusDecoder {
+    /// Construct from already-parsed OpusHead.
+    fn new(params: &CodecParameters, head: &crate::header::OpusHead) -> Result<Self> {
+        // Mapping table layout per RFC 7845 §5.1.1 for family 1/2:
+        //   byte 0: stream count (N)
+        //   byte 1: coupled stream count (M)
+        //   bytes 2..2+C: channel_mapping (one byte per output channel)
+        if head.mapping_table.len() < 2 {
+            return Err(Error::invalid(
+                "Opus multistream OpusHead: mapping table too short",
+            ));
+        }
+        let stream_count = head.mapping_table[0];
+        let coupled_stream_count = head.mapping_table[1];
+        if stream_count == 0 {
+            return Err(Error::invalid(
+                "Opus multistream: stream count must be > 0",
+            ));
+        }
+        if coupled_stream_count > stream_count {
+            return Err(Error::invalid(
+                "Opus multistream: coupled > stream count",
+            ));
+        }
+        let c = head.output_channel_count as usize;
+        if head.mapping_table.len() < 2 + c {
+            return Err(Error::invalid(
+                "Opus multistream: channel mapping truncated",
+            ));
+        }
+        // Validate mapping indices: max valid index is
+        //   2 * coupled + (stream - coupled) - 1 = stream + coupled - 1.
+        // 255 is allowed and means "silent channel".
+        let max_idx = stream_count + coupled_stream_count;
+        for &m in &head.mapping_table[2..2 + c] {
+            if m != 255 && m >= max_idx {
+                return Err(Error::invalid(format!(
+                    "Opus multistream: channel mapping index {} out of range (max {})",
+                    m,
+                    max_idx - 1
+                )));
+            }
+        }
+
+        // Family 2 (ambisonics) forbids coupled streams — every stream
+        // is a discrete ambisonic channel.
+        if head.channel_mapping_family == 2 && coupled_stream_count != 0 {
+            return Err(Error::invalid(
+                "Opus family 2 (ambisonics): coupled streams must be 0",
+            ));
+        }
+
+        let mut streams = Vec::with_capacity(stream_count as usize);
+        for i in 0..stream_count {
+            let ch: u16 = if i < coupled_stream_count { 2 } else { 1 };
+            streams.push(OpusDecoder::new(params, ch));
+        }
+
+        Ok(Self {
+            codec_id: params.codec_id.clone(),
+            channels: head.output_channel_count as u16,
+            stream_count,
+            coupled_stream_count,
+            channel_mapping: head.mapping_table[2..2 + c].to_vec(),
+            time_base: TimeBase::new(1, OPUS_RATE_HZ as i64),
+            pending: None,
+            eof: false,
+            emit_pts: 0,
+            streams,
+        })
+    }
+
+    /// Split a multistream packet into N parsed sub-stream packets.
+    ///
+    /// Per RFC 7845 §5.1.1 and libopus's `opus_multistream_decode`:
+    /// the first N-1 sub-streams use **self-delimited framing**
+    /// (RFC 6716 Appendix B); the last sub-stream uses regular
+    /// framing and takes the remaining bytes.
+    fn split_packet<'a>(&self, data: &'a [u8]) -> Result<Vec<crate::toc::OpusPacket<'a>>> {
+        let n = self.stream_count as usize;
+        let mut out: Vec<crate::toc::OpusPacket<'a>> = Vec::with_capacity(n);
+        let mut cursor = 0usize;
+        for _ in 0..n.saturating_sub(1) {
+            let (pkt, consumed) =
+                crate::toc::parse_self_delimited_packet(&data[cursor..])?;
+            out.push(pkt);
+            cursor += consumed;
+        }
+        // Last sub-stream: regular framing.
+        let pkt = crate::toc::parse_packet(&data[cursor..])?;
+        out.push(pkt);
+        Ok(out)
+    }
+}
+
+impl Decoder for MultistreamOpusDecoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        if self.pending.is_some() {
+            return Err(Error::other(
+                "Opus multistream: receive_frame must be called before sending another packet",
+            ));
+        }
+        self.pending = Some(packet.clone());
+        Ok(())
+    }
+
+    fn receive_frame(&mut self) -> Result<Frame> {
+        let Some(pkt) = self.pending.take() else {
+            return if self.eof {
+                Err(Error::Eof)
+            } else {
+                Err(Error::NeedMore)
+            };
+        };
+        let sub_packets = self.split_packet(&pkt.data)?;
+        debug_assert_eq!(sub_packets.len(), self.stream_count as usize);
+
+        // Decode each sub-stream into per-channel buffers. Collect the
+        // channels into one flat vector in the order:
+        //   [stream0_L, stream0_R, stream1_L, stream1_R, ..., streamM-1_L, streamM-1_R,
+        //    streamM, streamM+1, ..., streamN-1]
+        // i.e. the same indexing the channel mapping table uses.
+        let mut stream_channels: Vec<Vec<f32>> = Vec::new();
+        let mut per_frame_samples = 0usize;
+        for (i, sub) in sub_packets.iter().enumerate() {
+            let pcm = self.streams[i].decode_parsed_to_pcm(sub)?;
+            if per_frame_samples == 0 && !pcm.is_empty() {
+                per_frame_samples = pcm[0].len();
+            } else if !pcm.is_empty() && pcm[0].len() != per_frame_samples {
+                return Err(Error::invalid(format!(
+                    "Opus multistream: stream {} sample count {} != expected {}",
+                    i,
+                    pcm[0].len(),
+                    per_frame_samples,
+                )));
+            }
+            for ch in pcm.into_iter() {
+                stream_channels.push(ch);
+            }
+        }
+
+        // Map to output channels.
+        let out_channels = self.channels as usize;
+        let mut interleaved =
+            Vec::with_capacity(per_frame_samples * out_channels * 2);
+        for i in 0..per_frame_samples {
+            for c in 0..out_channels {
+                let idx = self.channel_mapping[c];
+                let s = if idx == 255 {
+                    0.0f32
+                } else if (idx as usize) < stream_channels.len() {
+                    stream_channels[idx as usize]
+                        .get(i)
+                        .copied()
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let clamped = (s * 32768.0).clamp(-32768.0, 32767.0) as i16;
+                interleaved.extend_from_slice(&clamped.to_le_bytes());
+            }
+        }
+
+        let pts = pkt.pts.unwrap_or(self.emit_pts);
+        self.emit_pts = pts + per_frame_samples as i64;
+
+        Ok(Frame::Audio(AudioFrame {
+            format: SampleFormat::S16,
+            channels: self.channels,
+            sample_rate: OPUS_RATE_HZ,
+            samples: per_frame_samples as u32,
+            pts: Some(pts),
+            time_base: self.time_base,
+            data: vec![interleaved],
+        }))
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.eof = true;
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        for s in self.streams.iter_mut() {
+            s.reset()?;
+        }
+        self.pending = None;
+        self.eof = false;
+        self.emit_pts = 0;
+        Ok(())
+    }
 }
 
 fn decode_frame(
@@ -983,13 +1286,40 @@ mod tests {
     }
 
     #[test]
-    fn make_decoder_rejects_multistream() {
+    fn make_decoder_rejects_multichannel_without_extradata() {
+        // No extradata = no OpusHead = no multistream mapping. A
+        // channel count > 2 is only valid with a channel-mapped
+        // OpusHead (family 1 or 2) in extradata.
         let mut p = CodecParameters::audio(CodecId::new("opus"));
         p.channels = Some(6);
         match make_decoder(&p) {
             Err(Error::Unsupported(_)) => {}
             _ => panic!("expected Unsupported"),
         }
+    }
+
+    #[test]
+    fn make_decoder_accepts_family1_surround_5_1() {
+        // Build a minimal OpusHead for 5.1 surround (Vorbis channel
+        // order): 6 output channels, stream_count=4, coupled=2,
+        // mapping [0,4,1,2,3,5] (FL FR FC LFE BL BR in libopus order).
+        let mut head = Vec::new();
+        head.extend_from_slice(b"OpusHead");
+        head.push(1); // version
+        head.push(6); // channels
+        head.extend_from_slice(&0u16.to_le_bytes()); // pre_skip
+        head.extend_from_slice(&48_000u32.to_le_bytes());
+        head.extend_from_slice(&0i16.to_le_bytes()); // gain
+        head.push(1); // family 1
+        head.push(4); // stream count
+        head.push(2); // coupled
+        head.extend_from_slice(&[0, 4, 1, 2, 3, 5]);
+
+        let mut p = CodecParameters::audio(CodecId::new("opus"));
+        p.channels = Some(6);
+        p.extradata = head;
+        let d = make_decoder(&p).expect("5.1 multistream should be accepted");
+        assert_eq!(d.codec_id().as_str(), "opus");
     }
 
     #[test]

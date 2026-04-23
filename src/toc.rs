@@ -239,6 +239,183 @@ pub fn parse_packet(data: &[u8]) -> Result<OpusPacket<'_>> {
     }
 }
 
+/// Parse a self-delimited Opus packet per RFC 6716 Appendix B.
+///
+/// Self-delimited framing is used for the first N-1 sub-streams of a
+/// multistream packet (RFC 7845 §5.1.1): the packet carries its own
+/// length information so the parser can tell where this sub-stream
+/// ends and the next one begins without external framing.
+///
+/// The rules vary by code (from Appendix B):
+///
+/// * **Code 0** — 1 frame. Add a 1-or-2-byte length giving the frame
+///   size.
+/// * **Code 1** — 2 equal frames. Add a length giving the size of
+///   *each* frame.
+/// * **Code 2** — 2 unequal frames. Already has length for the first
+///   frame. Add a length for the second frame.
+/// * **Code 3 CBR** — N CBR frames. Add a length giving the size of
+///   each frame.
+/// * **Code 3 VBR** — N VBR frames. Already has N-1 lengths. Add a
+///   length for the Nth frame.
+///
+/// Returns `(OpusPacket, bytes_consumed)` — the caller advances its
+/// input cursor by `bytes_consumed` before parsing the next sub-stream.
+pub fn parse_self_delimited_packet(data: &[u8]) -> Result<(OpusPacket<'_>, usize)> {
+    if data.is_empty() {
+        return Err(Error::invalid("self-delimited Opus packet empty"));
+    }
+    let toc = Toc::parse(data[0]);
+    let mut cursor = 1usize;
+
+    match toc.code {
+        0 => {
+            let (n, used) = read_length(&data[cursor..])?;
+            cursor += used;
+            if cursor + n > data.len() {
+                return Err(Error::invalid(
+                    "self-delimited code-0: frame exceeds buffer",
+                ));
+            }
+            let frames = vec![&data[cursor..cursor + n]];
+            cursor += n;
+            Ok((
+                OpusPacket {
+                    toc,
+                    frames,
+                    padding: &[],
+                },
+                cursor,
+            ))
+        }
+        1 => {
+            let (n, used) = read_length(&data[cursor..])?;
+            cursor += used;
+            if cursor + 2 * n > data.len() {
+                return Err(Error::invalid(
+                    "self-delimited code-1: 2 frames exceed buffer",
+                ));
+            }
+            let f1 = &data[cursor..cursor + n];
+            let f2 = &data[cursor + n..cursor + 2 * n];
+            cursor += 2 * n;
+            Ok((
+                OpusPacket {
+                    toc,
+                    frames: vec![f1, f2],
+                    padding: &[],
+                },
+                cursor,
+            ))
+        }
+        2 => {
+            let (n1, u1) = read_length(&data[cursor..])?;
+            cursor += u1;
+            let (n2, u2) = read_length(&data[cursor..])?;
+            cursor += u2;
+            if cursor + n1 + n2 > data.len() {
+                return Err(Error::invalid(
+                    "self-delimited code-2: frames exceed buffer",
+                ));
+            }
+            let f1 = &data[cursor..cursor + n1];
+            let f2 = &data[cursor + n1..cursor + n1 + n2];
+            cursor += n1 + n2;
+            Ok((
+                OpusPacket {
+                    toc,
+                    frames: vec![f1, f2],
+                    padding: &[],
+                },
+                cursor,
+            ))
+        }
+        3 => {
+            // Same frame-count / padding structure as the regular
+            // parser, but with an extra explicit length for the last
+            // frame.
+            let body = &data[cursor..];
+            if body.is_empty() {
+                return Err(Error::invalid(
+                    "self-delimited code-3: missing frame-count byte",
+                ));
+            }
+            let fc = body[0];
+            let vbr = fc & 0x80 != 0;
+            let has_padding = fc & 0x40 != 0;
+            let n_frames = (fc & 0x3F) as usize;
+            if n_frames == 0 {
+                return Err(Error::invalid("self-delimited code-3: 0 frames"));
+            }
+            let mut body_cur = 1usize;
+
+            let mut pad_bytes = 0usize;
+            if has_padding {
+                loop {
+                    if body_cur >= body.len() {
+                        return Err(Error::invalid(
+                            "self-delimited code-3: padding length truncated",
+                        ));
+                    }
+                    let p = body[body_cur];
+                    body_cur += 1;
+                    if p == 255 {
+                        pad_bytes += 254;
+                    } else {
+                        pad_bytes += p as usize;
+                        break;
+                    }
+                }
+            }
+
+            let mut frame_sizes: Vec<usize> = Vec::with_capacity(n_frames);
+            if vbr {
+                // N-1 lengths for frames 0..N-2, plus 1 explicit
+                // length for the Nth frame (self-delimited extension).
+                for _ in 0..n_frames {
+                    let (len, used) = read_length(&body[body_cur..])?;
+                    frame_sizes.push(len);
+                    body_cur += used;
+                }
+            } else {
+                // CBR: 1 explicit length giving the size of each
+                // (equal-sized) frame.
+                let (len, used) = read_length(&body[body_cur..])?;
+                body_cur += used;
+                for _ in 0..n_frames {
+                    frame_sizes.push(len);
+                }
+            }
+
+            let total_frame_bytes: usize = frame_sizes.iter().sum();
+            if body_cur + total_frame_bytes + pad_bytes > body.len() {
+                return Err(Error::invalid(
+                    "self-delimited code-3: frame data exceeds buffer",
+                ));
+            }
+
+            let data_start_in_body = body_cur;
+            let mut frames: Vec<&[u8]> = Vec::with_capacity(n_frames);
+            let mut pos = data_start_in_body;
+            for &sz in &frame_sizes {
+                frames.push(&body[pos..pos + sz]);
+                pos += sz;
+            }
+            let padding_start = pos;
+            let consumed = cursor + padding_start + pad_bytes;
+            Ok((
+                OpusPacket {
+                    toc,
+                    frames,
+                    padding: &body[padding_start..padding_start + pad_bytes],
+                },
+                consumed,
+            ))
+        }
+        _ => unreachable!(),
+    }
+}
+
 /// Code-3 packet parsing per RFC 6716 §3.2.5.
 fn parse_code3<'a>(toc: Toc, body: &'a [u8]) -> Result<OpusPacket<'a>> {
     if body.is_empty() {
@@ -477,5 +654,90 @@ mod tests {
     #[test]
     fn parse_empty_packet_errors() {
         assert!(parse_packet(&[]).is_err());
+    }
+
+    /// RFC 6716 Appendix B / RFC 7845 §5.1.1 self-delimited framing:
+    /// a code-0 packet in self-delimited form has a 1-byte length
+    /// prepended to the single frame.
+    #[test]
+    fn parse_self_delimited_code0() {
+        // TOC=code-0 (config=31 stereo=0), length=3, frame bytes 0xAA 0xBB 0xCC,
+        // then trailing bytes that belong to the *next* sub-stream.
+        let mut p = vec![31u8 << 3, 3, 0xAA, 0xBB, 0xCC];
+        p.extend_from_slice(&[0xFF, 0xFF]);
+        let (pkt, consumed) = parse_self_delimited_packet(&p).unwrap();
+        assert_eq!(pkt.frames.len(), 1);
+        assert_eq!(pkt.frames[0], &[0xAA, 0xBB, 0xCC]);
+        // TOC + length(1) + frame(3) = 5 bytes consumed; 2 bytes
+        // remain for the next sub-stream.
+        assert_eq!(consumed, 5);
+    }
+
+    /// Self-delimited code-1: two equal frames, 1 length = per-frame size.
+    #[test]
+    fn parse_self_delimited_code1() {
+        let mut p = vec![(31u8 << 3) | 1, 2, 0x10, 0x20, 0x30, 0x40];
+        p.extend_from_slice(&[0x99]);
+        let (pkt, consumed) = parse_self_delimited_packet(&p).unwrap();
+        assert_eq!(pkt.frames.len(), 2);
+        assert_eq!(pkt.frames[0], &[0x10, 0x20]);
+        assert_eq!(pkt.frames[1], &[0x30, 0x40]);
+        assert_eq!(consumed, 6); // TOC + len + 2*2
+    }
+
+    /// Self-delimited code-2: two possibly-different frames, both
+    /// lengths explicitly coded.
+    #[test]
+    fn parse_self_delimited_code2() {
+        let mut p = vec![(31u8 << 3) | 2, 1, 3, 0xAA, 0xBB, 0xBB, 0xBB];
+        p.extend_from_slice(&[0x00, 0x00]);
+        let (pkt, consumed) = parse_self_delimited_packet(&p).unwrap();
+        assert_eq!(pkt.frames.len(), 2);
+        assert_eq!(pkt.frames[0], &[0xAA]);
+        assert_eq!(pkt.frames[1], &[0xBB, 0xBB, 0xBB]);
+        // TOC + 2 length bytes + 1 + 3 = 7.
+        assert_eq!(consumed, 7);
+    }
+
+    /// Self-delimited code-3 CBR: 1 explicit length = per-frame size.
+    #[test]
+    fn parse_self_delimited_code3_cbr() {
+        // TOC=code-3 | CELT 2.5ms NB, fc=3 (3 frames, no VBR, no pad),
+        // length=2, then 3*2=6 bytes of frame data.
+        let mut p = vec![(16u8 << 3) | 3, 3, 2, 1, 2, 3, 4, 5, 6];
+        p.push(0xEE);
+        let (pkt, consumed) = parse_self_delimited_packet(&p).unwrap();
+        assert_eq!(pkt.frames.len(), 3);
+        assert_eq!(pkt.frames[0], &[1, 2]);
+        assert_eq!(pkt.frames[1], &[3, 4]);
+        assert_eq!(pkt.frames[2], &[5, 6]);
+        assert_eq!(consumed, 9); // TOC + fc + len + 6
+    }
+
+    /// Self-delimited code-3 VBR: N explicit lengths (N-1 for interior
+    /// frames + 1 for the final frame).
+    #[test]
+    fn parse_self_delimited_code3_vbr() {
+        // fc = 0x83 = VBR + 3 frames. lens = 1, 2, 3. frames = A, BC, DEF.
+        let p = vec![
+            (16u8 << 3) | 3,
+            0x83,
+            1,
+            2,
+            3,
+            0xA,
+            0xB,
+            0xC,
+            0xD,
+            0xE,
+            0xF,
+        ];
+        let (pkt, consumed) = parse_self_delimited_packet(&p).unwrap();
+        assert_eq!(pkt.frames.len(), 3);
+        assert_eq!(pkt.frames[0], &[0xA]);
+        assert_eq!(pkt.frames[1], &[0xB, 0xC]);
+        assert_eq!(pkt.frames[2], &[0xD, 0xE, 0xF]);
+        // TOC + fc + 3 len bytes + 1 + 2 + 3 = 11.
+        assert_eq!(consumed, 11);
     }
 }

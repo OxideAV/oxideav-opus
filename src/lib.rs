@@ -94,5 +94,8 @@ fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     encoder::make_encoder(params)
 }
 
+pub use decoder::MultistreamOpusDecoder;
 pub use header::{parse_opus_head, OpusHead};
-pub use toc::{parse_packet, OpusBandwidth, OpusMode, OpusPacket, Toc};
+pub use toc::{
+    parse_packet, parse_self_delimited_packet, OpusBandwidth, OpusMode, OpusPacket, Toc,
+};

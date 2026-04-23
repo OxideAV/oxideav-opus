@@ -232,6 +232,36 @@ fn ensure_voip_stereo() -> Option<&'static str> {
     }
 }
 
+/// 5.1 surround Opus reference (channel mapping family 1, Vorbis
+/// channel order). ffmpeg's libopus muxer produces a family-1
+/// OpusHead with 4 streams (2 coupled + 2 uncoupled) for 5.1.
+fn ensure_multistream_5_1() -> Option<&'static str> {
+    let path = "/tmp/ref-opus-5.1.opus";
+    if ensure_ref(
+        path,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=f=440:d=1:sample_rate=48000",
+            "-ac",
+            "6",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "192k",
+            "-application",
+            "audio",
+            "-mapping_family",
+            "1",
+        ],
+    ) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 /// Hybrid (SILK+CELT) reference. libopus picks the Hybrid mode for
 /// speech input at mid-bitrate (around 20-40 kbps) with non-NB/MB
 /// content, specifically when the cutoff pushes the frame up into
@@ -1031,6 +1061,62 @@ fn hybrid_decodes_to_audio() {
         "expected ≥1 Hybrid packet to decode, got {hybrid_decoded}"
     );
     let _ = (decoded, total_energy);
+}
+
+/// Multistream (family 1 / Vorbis 5.1 surround) decodes to 6-channel
+/// output. Pin the contract that every packet produces an AudioFrame
+/// with `channels == 6` and the expected sample count. Decode must
+/// not panic or silently produce the wrong sample count. Unsupported
+/// errors are only tolerated for LBRR-flagged frames (same policy as
+/// single-stream tests).
+#[test]
+fn multistream_5_1_decodes_to_six_channels() {
+    let Some(path) = ensure_multistream_5_1() else {
+        eprintln!("skip: ffmpeg / reference unavailable");
+        return;
+    };
+    let mut dmx = open_ogg(path);
+    let params = dmx.streams()[0].params.clone();
+    assert_eq!(
+        params.channels,
+        Some(6),
+        "reference clip should advertise 6 channels"
+    );
+    assert!(
+        !params.extradata.is_empty(),
+        "5.1 Opus must carry an OpusHead (family 1) in extradata"
+    );
+    let mut dec = oxideav_opus::decoder::make_decoder(&params).expect("make multistream decoder");
+
+    let mut decoded = 0usize;
+    for _ in 0..30 {
+        let pkt = match dmx.next_packet() {
+            Ok(p) => p,
+            Err(Error::Eof) => break,
+            Err(e) => panic!("demux: {}", e),
+        };
+        dec.send_packet(&pkt).expect("send");
+        match dec.receive_frame() {
+            Ok(Frame::Audio(a)) => {
+                assert_eq!(a.sample_rate, 48_000);
+                assert_eq!(a.channels, 6, "5.1 output must have 6 channels");
+                // 6 channels × samples × 2 bytes per S16 sample.
+                assert_eq!(a.data[0].len(), a.samples as usize * 6 * 2);
+                decoded += 1;
+            }
+            Ok(_) => panic!("expected audio"),
+            Err(Error::Unsupported(msg)) => {
+                if !msg.to_lowercase().contains("lbrr") {
+                    panic!("unexpected Unsupported on multistream: {}", msg);
+                }
+            }
+            Err(e) => panic!("decode error: {:?}", e),
+        }
+    }
+    assert!(
+        decoded >= 5,
+        "expected ≥5 multistream decodes, got {decoded}"
+    );
 }
 
 /// Single-frequency Goertzel magnitude. Used by the audio acceptance test.
