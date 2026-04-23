@@ -2,8 +2,8 @@
 
 Pure-Rust **Opus** audio codec — RFC 6716 bitstream + RFC 7845 Ogg
 mapping. SILK and CELT decode (mono + stereo) plus encoders for a
-CELT-only full-band path and SILK-only narrowband/mediumband/wideband
-mono + NB stereo. Zero C dependencies.
+CELT-only full-band path and the full SILK-only config matrix
+(NB / MB / WB, mono + stereo, 10 / 20 / 40 / 60 ms). Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -54,22 +54,31 @@ Two explicit entry points, one per Opus mode:
   - Input sample rate: **48 kHz only**. Any other rate returns
     `Error::Unsupported` — resample upstream.
 
-- **SILK-only mono** at every SILK bandwidth and, additionally,
-  **SILK-only NB stereo** — all 20 ms frames:
-  - `SilkEncoder::new_nb_mono_20ms` — NB (8 kHz internal, config 1).
-  - `SilkEncoder::new_mb_mono_20ms` — MB (12 kHz internal, config 5).
-  - `SilkEncoder::new_wb_mono_20ms` — WB (16 kHz internal, config 9).
-  - `SilkEncoder::new_nb_stereo_20ms` — NB stereo (config 1, TOC stereo
-    bit = 1). Feeds a mid/side pair into two SILK frame encoders and
-    emits the RFC §4.2.7.1 prediction header (weights are shipped as 0
-    for this first pass — enough for a clean round-trip, see follow-up
-    list below).
-  - Each mono constructor accepts either the SILK internal rate (8 / 12
-    / 16 kHz respectively) or 48 kHz; 48 kHz input is downsampled by a
-    simple box-average pre-filter. The stereo constructor accepts 8 kHz
-    or 48 kHz stereo.
-  - Packet layout: TOC byte (config 1 / 5 / 9) + SILK bitstream, framing
-    code 0 (single frame per packet).
+- **SILK-only**, full config matrix (configs 0..=11), mono and stereo,
+  10 / 20 / 40 / 60 ms frames — 24 named constructors, one per
+  (bandwidth, channels, duration) tuple:
+  - 20 ms mono: `SilkEncoder::new_nb_mono_20ms` (config 1),
+    `new_mb_mono_20ms` (config 5), `new_wb_mono_20ms` (config 9).
+  - 20 ms stereo: `new_nb_stereo_20ms` / `new_mb_stereo_20ms` /
+    `new_wb_stereo_20ms` (configs 1 / 5 / 9 + stereo bit).
+  - 10 ms mono + stereo: configs 0 / 4 / 8. Each embedded SILK frame
+    has 2 sub-frames instead of 4.
+  - 40 ms mono + stereo: configs 2 / 6 / 10. Packet carries 2 back-to-
+    back 20 ms SILK frame bodies per RFC §4.2.4 (still framing code 0).
+  - 60 ms mono + stereo: configs 3 / 7 / 11. 3 back-to-back bodies.
+
+  Each constructor accepts either the SILK internal rate (8 / 12 /
+  16 kHz for NB / MB / WB) or 48 kHz; 48 kHz input is downsampled by a
+  simple box-average pre-filter.
+
+  Stereo paths feed a mid/side pair into two SILK frame encoders and
+  emit the RFC §4.2.7.1 prediction header per embedded 20 ms SILK
+  frame (weights are shipped as 0 for this pass — enough for a clean
+  round-trip, see follow-up list below).
+
+  Packet layout: TOC byte + SILK bitstream. Always framing code 0;
+  40 / 60 ms packets use the RFC §4.2.4 multi-SILK-frame-per-Opus-frame
+  mechanism rather than framing codes 1/2/3.
   - Analysis-by-synthesis design: each per-bandwidth SilkFrameEncoder
     runs the same LPC filter the decoder reconstructs from the NLSF
     stage-1 index (shared BandwidthParams descriptor: NB/MB use LPC
@@ -99,17 +108,12 @@ Two explicit entry points, one per Opus mode:
   yet decoded. Packets that enable LBRR return `Error::Unsupported`.
 - **Channel mapping family 1 / 2** (Vorbis / ambisonic multistream,
   more than 2 channels).
-- **SILK encoding of MB / WB stereo** — NB stereo is wired up (see
-  `SilkEncoder::new_nb_stereo_20ms`); MB and WB stereo are mechanically
-  identical follow-ups.
-- **SILK stereo predictor** — the NB stereo encoder currently emits
+- **SILK stereo predictor** — the stereo encoder currently emits
   prediction weights of (0, 0). Wiring the full Wiener-filter analysis
   path in `silk::encoder::stereo_predict_weights_q13` is a follow-up
   (the function is already in place; the remaining work is subtracting
   the predicted side from the coded side before it reaches the
   SilkFrameEncoder).
-- **SILK encoding of 10 / 40 / 60 ms frames** — only 20 ms frames are
-  emitted for now; the decoder handles all four sizes.
 - **Hybrid encoding** — still `Error::Unsupported` end-to-end.
 - **Voiced / LTP-path SILK encoding** — the encoder emits
   `signal_type = unvoiced` on every frame so the LTP loop-back is not

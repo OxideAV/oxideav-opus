@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT AND BSD-3-Clause"
 repository = "https://github.com/OxideAV/oxideav-opus"
 authors = ["Mark Karpeles"]
-description = "Opus audio codec for oxideav — SILK + CELT decode (mono/stereo), CELT-only full-band encode, SILK NB mono 20 ms encode"
+description = "Opus audio codec for oxideav — SILK + CELT decode (mono/stereo), CELT-only full-band encode, SILK-only encode (NB/MB/WB, mono+stereo, 10/20/40/60 ms)"
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-opus"
