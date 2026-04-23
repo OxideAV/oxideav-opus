@@ -66,6 +66,8 @@ use oxideav_core::Result;
 
 use crate::silk::excitation::MAG_NIBBLE_ICDF;
 use crate::silk::lsf;
+use crate::silk::ltp;
+use crate::silk::pitch_analysis::{analyze_pitch, PitchEstimate};
 use crate::silk::tables;
 use crate::toc::OpusBandwidth;
 
@@ -79,6 +81,21 @@ const NLSF_STAGE1_IDX: usize = 0;
 /// Smallest value yields `gain_q16 ≈ 1.09 × 65536` — big enough to
 /// keep the residual magnitudes well within the 9-bit carrier.
 const GAIN_INDEX_UNVOICED: i32 = 0;
+
+/// Gain index for voiced frames. Same as unvoiced in the MVP: the
+/// actual excitation amplitude is still derived closed-loop from the
+/// quantised residual.
+const GAIN_INDEX_VOICED: i32 = 0;
+
+/// LTP scaling factor (Q14) used by the voiced encoder path. Value
+/// 15565 is the "strong-periodicity" level (RFC 6716 §4.2.7.6.3 Table
+/// 43 idx 0) — reasonable default for open-loop voiced selection.
+const LTP_SCALE_Q14_VOICED: i32 = 15565;
+
+/// LTP periodicity class (0/1/2) used by the voiced path. Class 2 is
+/// the largest codebook (32 entries, finest tap resolution) which
+/// helps when the open-loop pitch analyser is confident.
+const LTP_PERIODICITY_VOICED: usize = 2;
 
 /// Ratio used when quantising the residual to signed 8 bits. We pick
 /// a conservative factor so peaks don't clip to ±255 — the decoder's
@@ -134,6 +151,13 @@ pub struct SilkFrameEncoder {
     /// Last `lpc_order` samples of the previous frame's *synthesized*
     /// output. Seeded with zeros.
     prev_synth: Vec<f32>,
+    /// Previous frame's primary pitch lag (at the internal rate). Used
+    /// by the next frame's delta pitch coding. Zero forces absolute.
+    prev_pitch_lag: i32,
+    /// LTP history: past synthesized output, long enough to cover the
+    /// maximum pitch lag (288 samples @ WB) plus the 5-tap filter. We
+    /// size it at 480 to match the decoder's `SilkChannelState`.
+    ltp_history: Vec<f32>,
 }
 
 impl SilkFrameEncoder {
@@ -163,6 +187,8 @@ impl SilkFrameEncoder {
             params,
             n_subframes,
             prev_synth: vec![0.0; order],
+            prev_pitch_lag: 0,
+            ltp_history: vec![0.0; 480],
         }
     }
 
@@ -226,6 +252,8 @@ impl SilkFrameEncoder {
     /// the side channel transitions from mid-only to coded.
     pub fn reset(&mut self) {
         self.prev_synth = vec![0.0; self.params.lpc_order];
+        self.prev_pitch_lag = 0;
+        self.ltp_history = vec![0.0; 480];
     }
 
     /// Encode one 20 ms SILK-only body (the bit-stream after the
@@ -233,7 +261,27 @@ impl SilkFrameEncoder {
     ///
     /// * `pcm_internal` — `frame_len()` samples at the internal rate.
     /// * `enc` — in-flight range encoder.
+    ///
+    /// Uses open-loop pitch analysis to decide voiced vs unvoiced. When
+    /// the analyser reports a confident pitch, emits `signal_type = 2`
+    /// with quantised pitch lag + LTP filter taps and subtracts the
+    /// predicted excitation before shell-coding the residual (RFC
+    /// §4.2.7.6). Otherwise falls back to the original unvoiced path.
     pub fn encode_frame_body(
+        &mut self,
+        pcm_internal: &[f32],
+        enc: &mut RangeEncoder,
+    ) -> Result<()> {
+        let pitch = analyze_pitch(pcm_internal, self.params.bandwidth);
+        if pitch.voiced {
+            self.encode_frame_body_voiced(pcm_internal, enc, pitch)
+        } else {
+            self.encode_frame_body_unvoiced(pcm_internal, enc)
+        }
+    }
+
+    /// Unvoiced / inactive path: the original MVP encoder.
+    fn encode_frame_body_unvoiced(
         &mut self,
         pcm_internal: &[f32],
         enc: &mut RangeEncoder,
@@ -243,28 +291,22 @@ impl SilkFrameEncoder {
         let frame_len = self.frame_len();
         let subframe_len = self.params.subframe_len;
 
-        // §4.2.7.3 frame type — unvoiced/active (sym=2) so the decoder
-        // takes the UNVOICED gain MSB + skips the LTP path.
-        let frame_type_sym: usize = 2;
-        enc.encode_icdf(frame_type_sym, &tables::FRAME_TYPE_ACTIVE_ICDF, 8);
-        let signal_type: u8 = 1; // unvoiced
+        // §4.2.7.3 frame type — unvoiced/active (sym=2).
+        enc.encode_icdf(2, &tables::FRAME_TYPE_ACTIVE_ICDF, 8);
+        let signal_type: u8 = 1;
 
-        // §4.2.7.5 NLSF — build the same NLSF the decoder will from
-        // `NLSF_STAGE1_IDX` and zero stage-2 residuals.
+        // §4.2.7.5 NLSF.
         let residuals = vec![0i32; order];
         let nlsf_q15 = synthesize_nlsf_like_decoder(NLSF_STAGE1_IDX, false, order, &residuals);
         let nlsf_q15 = lsf::stabilize(&nlsf_q15, order);
         let lpc = lsf::nlsf_to_lpc(&nlsf_q15, self.params.bandwidth);
 
-        // §4.2.7.4 sub-frame gains — pick a constant gain index.
         let gain_index: i32 = GAIN_INDEX_UNVOICED;
         let gain_q16 = super::gain_index_to_q16(gain_index);
         let g = gain_q16.max(1) as f32 / 65536.0;
         let scale = 128.0 / g;
 
-        // Closed-loop analysis-by-synthesis (same formulation as the NB
-        // path, unchanged by bandwidth).
-        let synth_hist = self.prev_synth.clone(); // length = order
+        let synth_hist = self.prev_synth.clone();
         let mut out = vec![0f32; frame_len];
         let mut signed_mags = vec![0i32; frame_len];
         for n in 0..frame_len {
@@ -288,7 +330,7 @@ impl SilkFrameEncoder {
             out[n] = (e_quant + pred).clamp(-1.0, 1.0);
         }
 
-        // Emit the gain-index bitstream: MSB(3) + LSB(3) + 3 deltas.
+        // Gain index bitstream.
         let msb = ((gain_index >> 3) & 0x7) as usize;
         let lsb = (gain_index & 0x7) as usize;
         let msb_icdf = match signal_type {
@@ -302,10 +344,7 @@ impl SilkFrameEncoder {
             enc.encode_icdf(4, &tables::GAIN_DELTA_ICDF, 8);
         }
 
-        // NLSF bitstream: stage-1 (32-sym ICDF) + `order` residuals
-        // (11-sym each + sign) + interp coef (4-sym). The stage-1 ICDF
-        // is bandwidth-dependent: NB/MB share the "NB" codebook, WB
-        // has its own.
+        // NLSF bitstream.
         let stage1_icdf: &[u8] = match self.params.bandwidth {
             OpusBandwidth::Wideband => &tables::NLSF_WB_STAGE1_UNVOICED_ICDF,
             _ => &tables::NLSF_NB_STAGE1_UNVOICED_ICDF,
@@ -315,25 +354,21 @@ impl SilkFrameEncoder {
         for &r in &residuals {
             let mag = (r + 4).clamp(0, 10) as usize;
             enc.encode_icdf(mag, uniform_11, 8);
-            // (Future: sign bit when mag != 4 && residual != 0.)
         }
-        // Interp coef — "no interp" = 3 (ICDF is {192, 128, 64, 0}).
         enc.encode_icdf(3, &[192, 128, 64, 0], 8);
 
-        // §4.2.7.6 LTP — unvoiced, so decoder skips all LTP bits.
+        // §4.2.7.6 LTP — unvoiced, decoder skips LTP bits.
 
-        // §4.2.7.7 LCG seed — always 0.
+        // §4.2.7.7 LCG seed.
         enc.encode_icdf(0, &tables::LCG_SEED_ICDF, 8);
 
         // §4.2.7.8 Excitation (MVP carrier).
-        let rate_icdf: &[u8] = &tables::RATE_LEVEL_INACTIVE_ICDF;
-        enc.encode_icdf(0, rate_icdf, 8);
+        enc.encode_icdf(0, &tables::RATE_LEVEL_INACTIVE_ICDF, 8);
         let n_shells = frame_len.div_ceil(16);
-        let pulse_icdf = &tables::PULSE_COUNT_ICDF[0];
         for _ in 0..n_shells {
-            enc.encode_icdf(0, pulse_icdf, 8);
+            enc.encode_icdf(0, &tables::PULSE_COUNT_ICDF[0], 8);
         }
-        let _ = subframe_len; // currently only used for debug_assert
+        let _ = subframe_len;
         for &signed in &signed_mags {
             let mag_i = signed.unsigned_abs() as i32;
             let neg = signed < 0;
@@ -346,15 +381,209 @@ impl SilkFrameEncoder {
             }
         }
 
-        // Update `prev_synth` with the last `order` samples of the
-        // decoder's reconstructed output (kept in sync by the closed-
-        // loop quantisation above).
+        // Advance state.
         let start = out.len().saturating_sub(order);
         self.prev_synth.clear();
         self.prev_synth.extend_from_slice(&out[start..]);
+        // Shift LTP history forward with the newly-synthesized output.
+        shift_ltp_history(&mut self.ltp_history, &out);
+        self.prev_pitch_lag = 0;
 
         Ok(())
     }
+
+    /// Voiced / LTP path. Emits `signal_type = 2`, a primary pitch lag
+    /// (absolute or delta against `self.prev_pitch_lag`), a 5-tap LTP
+    /// filter index per sub-frame, and the LTP-subtracted residual via
+    /// the same MVP carrier used by the unvoiced path.
+    ///
+    /// Closed-loop inside each sample:
+    /// 1. LPC prediction from `out[..n]` + prev_synth history.
+    /// 2. LTP prediction from `out[..n-lag]` / ltp_history — weighted
+    ///    by the quantised tap vector.
+    /// 3. Residual = pcm - lpc_pred - ltp_pred; quantised to signed
+    ///    magnitude through the same 8-bit nibble carrier.
+    /// 4. `out[n] = residual_quantised + lpc_pred + ltp_pred` — the
+    ///    decoder will reconstruct this same value.
+    fn encode_frame_body_voiced(
+        &mut self,
+        pcm_internal: &[f32],
+        enc: &mut RangeEncoder,
+        pitch: PitchEstimate,
+    ) -> Result<()> {
+        debug_assert_eq!(pcm_internal.len(), self.frame_len());
+        let order = self.params.lpc_order;
+        let frame_len = self.frame_len();
+        let subframe_len = self.params.subframe_len;
+
+        // §4.2.7.3 frame type — voiced/active (sym=4: signal_type=2,
+        // quant_offset=0).
+        enc.encode_icdf(4, &tables::FRAME_TYPE_ACTIVE_ICDF, 8);
+        let signal_type: u8 = 2;
+
+        // NLSF — voiced variant of the fixed template.
+        let residuals = vec![0i32; order];
+        let nlsf_q15 = synthesize_nlsf_like_decoder(NLSF_STAGE1_IDX, true, order, &residuals);
+        let nlsf_q15 = lsf::stabilize(&nlsf_q15, order);
+        let lpc = lsf::nlsf_to_lpc(&nlsf_q15, self.params.bandwidth);
+
+        // Gain — same constant gain index as unvoiced path.
+        let gain_index: i32 = GAIN_INDEX_VOICED;
+        let gain_q16 = super::gain_index_to_q16(gain_index);
+        let g = gain_q16.max(1) as f32 / 65536.0;
+        let scale = 128.0 / g;
+
+        // Pick the LTP filter index + taps up front. Use the same
+        // taps for every sub-frame (MVP — the spec allows per-sub-frame
+        // filter indices but the analyser is frame-level).
+        let periodicity = LTP_PERIODICITY_VOICED;
+        let ltp_filter_idx = ltp::pick_ltp_filter_index(pitch.correlation, periodicity);
+        let ltp_taps = ltp::ltp_filter_from_index(ltp_filter_idx, periodicity);
+
+        // Per-subframe pitch lags — use the primary lag everywhere (the
+        // decoder's `expand_pitch_contour` does the same).
+        let primary_lag = pitch.lag_internal;
+        let pitch_lags = vec![primary_lag; self.n_subframes];
+
+        // LTP scaling (Q14 → f32).
+        let ltp_scale_q14 = LTP_SCALE_Q14_VOICED;
+        let ltp_scale = ltp_scale_q14 as f32 / 16384.0;
+        // Match the decoder's `synth::synthesize` 0.25 attenuation on
+        // the LTP contribution (decoder: `e += ltp_sum * ltp_scale *
+        // 0.25`). We apply the exact same factor here so the closed-
+        // loop residual we quantise cancels on the decoder side.
+        let ltp_attn = 0.25_f32;
+
+        // Shell-quantise with LTP subtraction.
+        let synth_hist = self.prev_synth.clone();
+        let ltp_hist_len = self.ltp_history.len();
+        let mut out = vec![0f32; frame_len];
+        let mut signed_mags = vec![0i32; frame_len];
+
+        for n in 0..frame_len {
+            // LPC prediction (same as unvoiced).
+            let mut lpc_pred = 0f32;
+            for k in 1..=order {
+                let idx = n as i32 - k as i32;
+                let past = if idx >= 0 {
+                    out[idx as usize]
+                } else {
+                    synth_hist[(synth_hist.len() as i32 + idx) as usize]
+                };
+                lpc_pred += lpc[k - 1] * past;
+            }
+
+            // LTP prediction: sum of 5 taps at n-lag+{−2,−1,0,+1,+2}.
+            // Exactly mirrors `synth::synthesize` for voiced frames.
+            let mut ltp_sum = 0f32;
+            for k in 0..5 {
+                let lag_k = primary_lag + (k as i32 - 2);
+                let idx = n as i32 - lag_k;
+                let past = if idx >= 0 {
+                    out[idx as usize]
+                } else {
+                    let hi = (ltp_hist_len as i32 + idx) as usize;
+                    self.ltp_history.get(hi).copied().unwrap_or(0.0)
+                };
+                ltp_sum += ltp_taps[k] * past;
+            }
+            let ltp_pred = ltp_sum * ltp_scale * ltp_attn;
+
+            // Residual we want the decoder to reconstruct.
+            let e_desired = pcm_internal[n] - lpc_pred - ltp_pred;
+            let signed_mag_f = (e_desired * scale).round();
+            let mag_i = signed_mag_f.abs().clamp(0.0, CARRIER_FULL_SCALE) as i32;
+            let neg = signed_mag_f < 0.0;
+            let signed = if neg { -mag_i } else { mag_i };
+            signed_mags[n] = signed;
+            let e_quant = (signed as f32 / 128.0) * g;
+            // Closed-loop synthesis equals what the decoder produces.
+            out[n] = (e_quant + lpc_pred + ltp_pred).clamp(-1.0, 1.0);
+        }
+
+        // Gain index bitstream (signal_type=2 → voiced MSB ICDF).
+        let msb = ((gain_index >> 3) & 0x7) as usize;
+        let lsb = (gain_index & 0x7) as usize;
+        enc.encode_icdf(msb, &tables::GAIN_MSB_VOICED_ICDF, 8);
+        enc.encode_icdf(lsb, &tables::GAIN_LSB_ICDF, 8);
+        for _ in 1..self.n_subframes {
+            enc.encode_icdf(4, &tables::GAIN_DELTA_ICDF, 8);
+        }
+
+        // NLSF bitstream — use the voiced stage-1 ICDF.
+        let stage1_icdf: &[u8] = match self.params.bandwidth {
+            OpusBandwidth::Wideband => &tables::NLSF_WB_STAGE1_VOICED_ICDF,
+            _ => &tables::NLSF_NB_STAGE1_VOICED_ICDF,
+        };
+        enc.encode_icdf(NLSF_STAGE1_IDX, stage1_icdf, 8);
+        let uniform_11 = &tables::NLSF_RESIDUAL_UNIFORM_11_ICDF;
+        for &r in &residuals {
+            let mag = (r + 4).clamp(0, 10) as usize;
+            enc.encode_icdf(mag, uniform_11, 8);
+        }
+        enc.encode_icdf(3, &[192, 128, 64, 0], 8);
+
+        // §4.2.7.6 LTP bitstream.
+        ltp::encode_primary_pitch_lag(enc, self.params.bandwidth, primary_lag, self.prev_pitch_lag);
+        ltp::encode_pitch_contour(enc, self.params.bandwidth);
+        ltp::encode_ltp_periodicity(enc, periodicity);
+        for _ in 0..self.n_subframes {
+            ltp::encode_ltp_filter_index(enc, periodicity, ltp_filter_idx);
+        }
+        ltp::encode_ltp_scaling(enc, ltp_scale_q14);
+
+        // §4.2.7.7 LCG seed.
+        enc.encode_icdf(0, &tables::LCG_SEED_ICDF, 8);
+
+        // §4.2.7.8 Excitation (MVP carrier, voiced rate-level ICDF).
+        enc.encode_icdf(0, &tables::RATE_LEVEL_VOICED_ICDF, 8);
+        let n_shells = frame_len.div_ceil(16);
+        for _ in 0..n_shells {
+            enc.encode_icdf(0, &tables::PULSE_COUNT_ICDF[0], 8);
+        }
+        let _ = subframe_len;
+        let _ = pitch_lags; // currently passed via primary_lag directly
+        for &signed in &signed_mags {
+            let mag_i = signed.unsigned_abs() as i32;
+            let neg = signed < 0;
+            let hi = ((mag_i >> 4) & 0xf) as usize;
+            let lo = (mag_i & 0xf) as usize;
+            enc.encode_icdf(hi, &MAG_NIBBLE_ICDF, 8);
+            enc.encode_icdf(lo, &MAG_NIBBLE_ICDF, 8);
+            if mag_i != 0 {
+                enc.encode_bit_logp(neg, 1);
+            }
+        }
+
+        // Advance state.
+        let start = out.len().saturating_sub(order);
+        self.prev_synth.clear();
+        self.prev_synth.extend_from_slice(&out[start..]);
+        shift_ltp_history(&mut self.ltp_history, &out);
+        self.prev_pitch_lag = primary_lag;
+
+        Ok(())
+    }
+}
+
+/// Shift `history` by the length of `new_samples`, appending the new
+/// samples on the right. Matches `synth::synthesize`'s LTP history
+/// update — critical for encoder/decoder lock-step.
+fn shift_ltp_history(history: &mut Vec<f32>, new_samples: &[f32]) {
+    let hist_len = history.len();
+    let keep = hist_len.saturating_sub(new_samples.len());
+    let mut new_hist = Vec::with_capacity(hist_len);
+    new_hist.extend_from_slice(&history[hist_len - keep..]);
+    new_hist.extend_from_slice(new_samples);
+    if new_hist.len() > hist_len {
+        let drop = new_hist.len() - hist_len;
+        new_hist.drain(0..drop);
+    } else if new_hist.len() < hist_len {
+        let mut pad = vec![0f32; hist_len - new_hist.len()];
+        pad.extend(new_hist);
+        new_hist = pad;
+    }
+    *history = new_hist;
 }
 
 /// Split an interleaved L/R stereo block into mid and side channels.

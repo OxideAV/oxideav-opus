@@ -174,14 +174,18 @@ pub fn analyze_pitch(pcm_internal: &[f32], bw: OpusBandwidth) -> PitchEstimate {
         }
     }
 
-    // Octave-error guard: if the winning lag is high and there's a
-    // sub-harmonic (half-lag) with "good enough" correlation, prefer
-    // the fundamental. We look for any local peak at `best_lag_ds / k`
-    // for k ∈ {2, 3} that reaches >= 0.85 × best_corr.
-    for k in 2..=3 {
+    // Octave-error guard: if the winning lag has a sub-multiple with
+    // "good enough" correlation, prefer the fundamental. We scan ALL
+    // sub-multiples (/2, /3, ...) down to min_lag_ds and pick the
+    // smallest one that still scores ≥ 0.85 × best_corr — this is what
+    // keeps the analyser on the fundamental for pure tones + envelope-
+    // modulated harmonics.
+    let best_corr_at_discovery = best_corr;
+    let mut k = 2i32;
+    loop {
         let cand = best_lag_ds / k;
         if cand < min_lag_ds {
-            continue;
+            break;
         }
         // Find local max in a small window around `cand` (±1).
         let lo = (cand - 1).max(min_lag_ds);
@@ -195,9 +199,13 @@ pub fn analyze_pitch(pcm_internal: &[f32], bw: OpusBandwidth) -> PitchEstimate {
                 cand_best_lag = l;
             }
         }
-        if cand_best_corr >= 0.85 * best_corr {
+        if cand_best_corr >= 0.85 * best_corr_at_discovery {
             best_lag_ds = cand_best_lag;
             best_corr = cand_best_corr;
+        }
+        k += 1;
+        if k > 12 {
+            break;
         }
     }
 

@@ -19,9 +19,11 @@
 /// PDF ≈ {26, 230}/256 → ICDF {230, 0}.
 pub const FRAME_TYPE_INACTIVE_ICDF: [u8; 2] = [230, 0];
 
-/// Frame type when VAD_flag = 1 (active). 4 symbols.
-/// PDF ≈ {24, 74, 148, 10}/256 → ICDF {232, 158, 10, 0}.
-pub const FRAME_TYPE_ACTIVE_ICDF: [u8; 4] = [232, 158, 10, 0];
+/// Frame type when VAD_flag = 1 (active). 6 symbols per RFC Table 7
+/// mapping (decoder: 0/1 inactive, 2/3 unvoiced, 4/5 voiced).
+///
+/// PDF ≈ {16, 16, 80, 80, 32, 32}/256 → ICDF {240, 224, 144, 64, 32, 0}.
+pub const FRAME_TYPE_ACTIVE_ICDF: [u8; 6] = [240, 224, 144, 64, 32, 0];
 
 // -------------------------------------------------------------------
 // §4.2.7.4 Sub-frame gains.
