@@ -479,8 +479,9 @@ impl SilkMode {
     }
     /// RFC 6716 Table 2 `config` field for this mode.
     fn config(self) -> u8 {
-        // NB = 0..=3, MB = 4..=7, WB = 8..=11. Within each block
-        // the order is 10/20/40/60 ms.
+        // Each bandwidth occupies a block of 4 configs: NB=0..=3,
+        // MB=4..=7, WB=8..=11. Within each block the order is
+        // 10/20/40/60 ms.
         let base = match self.bw {
             SilkBw::Nb => 0u8,
             SilkBw::Mb => 4,

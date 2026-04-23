@@ -45,6 +45,7 @@ pub mod lsf;
 pub mod ltp;
 pub mod pitch_analysis;
 pub mod range_dec;
+pub mod shell;
 pub mod synth;
 pub mod tables;
 
