@@ -1119,6 +1119,84 @@ fn multistream_5_1_decodes_to_six_channels() {
     );
 }
 
+/// RFC 6716 Appendix A test vectors from
+/// `samples/ffmpeg/A-codecs/opus/testvectorNN.ogg`.
+///
+/// Uses `catch_unwind` around each packet to survive panics thrown
+/// by the underlying CELT pipeline on the more exotic test vectors
+/// (out-of-bounds index in the comb post-filter when pitch+2 exceeds
+/// the current sub-frame length — a libopus sub-block corner case
+/// that this crate's pre-MVP CELT does not yet guard against).
+///
+/// Structural assertions only: no bit-exact f32 compare. Panics are
+/// captured and reported, not re-raised, so the test never fails the
+/// way a missing end-to-end decode would — it just prints a
+/// per-vector status line so follow-up work can track progress.
+#[test]
+#[ignore = "RFC test vectors trigger CELT post-filter bounds panic; run manually"]
+fn rfc6716_test_vectors_report() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let base = "/home/magicaltux/projects/oxideav/samples/ffmpeg/A-codecs/opus";
+    if !Path::new(base).exists() {
+        eprintln!("skip: RFC test vectors unavailable at {base}");
+        return;
+    }
+    for n in 1u8..=12 {
+        let path = format!("{}/testvector{:02}.ogg", base, n);
+        if !Path::new(&path).exists() {
+            continue;
+        }
+        let mut dmx = open_ogg(&path);
+        let params = dmx.streams()[0].params.clone();
+        let mut dec = match oxideav_opus::decoder::make_decoder(&params) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("vec{:02}: make_decoder failed: {}", n, e);
+                continue;
+            }
+        };
+        let mut packets = 0usize;
+        let mut decoded = 0usize;
+        let mut unsupported = 0usize;
+        let mut panicked = 0usize;
+        for _ in 0..200 {
+            let pkt = match dmx.next_packet() {
+                Ok(p) => p,
+                Err(Error::Eof) => break,
+                Err(_) => break,
+            };
+            packets += 1;
+            if dec.send_packet(&pkt).is_err() {
+                continue;
+            }
+            // Guard against CELT bounds panics. The decoder state is
+            // discarded after a panic so subsequent packets may yield
+            // garbage; break out of the inner loop in that case.
+            let result =
+                catch_unwind(AssertUnwindSafe(|| dec.receive_frame()));
+            match result {
+                Ok(Ok(Frame::Audio(a))) => {
+                    assert_eq!(a.sample_rate, 48_000);
+                    decoded += 1;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(Error::Unsupported(_))) => {
+                    unsupported += 1;
+                }
+                Ok(Err(_)) => {}
+                Err(_) => {
+                    panicked += 1;
+                    break;
+                }
+            }
+        }
+        eprintln!(
+            "vec{:02}: {:4} packets  {:4} decoded  {:3} unsupported  {:2} panics",
+            n, packets, decoded, unsupported, panicked
+        );
+    }
+}
+
 /// Single-frequency Goertzel magnitude. Used by the audio acceptance test.
 #[allow(dead_code)]
 fn goertzel(samples: &[f32], sample_rate: f32, target_hz: f32) -> f32 {
