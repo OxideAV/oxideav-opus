@@ -232,6 +232,42 @@ fn ensure_voip_stereo() -> Option<&'static str> {
     }
 }
 
+/// Hybrid (SILK+CELT) reference. libopus picks the Hybrid mode for
+/// speech input at mid-bitrate (around 20-40 kbps) with non-NB/MB
+/// content, specifically when the cutoff pushes the frame up into
+/// SWB/FB while the encoder still prefers SILK for the low band.
+///
+/// `-cutoff 16000` forces a hybrid range of the bit-allocation
+/// trade-off: SILK at 16 kHz internal → up to 8 kHz, CELT from 8 kHz
+/// up to the cutoff. At 32 kbps libopus will almost always pick
+/// Hybrid (config 12 or 14).
+fn ensure_hybrid_mono() -> Option<&'static str> {
+    let path = "/tmp/ref-opus-hybrid-mono.opus";
+    if ensure_ref(
+        path,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=f=440:d=1:sample_rate=48000",
+            "-ac",
+            "1",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "32k",
+            "-application",
+            "voip",
+            "-cutoff",
+            "16000",
+        ],
+    ) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 fn open_ogg(path: &str) -> Box<dyn Demuxer> {
     let f = std::fs::File::open(path).expect("open ref");
     let rs: Box<dyn ReadSeek> = Box::new(f);
@@ -908,6 +944,93 @@ fn celt_stereo_pipeline_runs_end_to_end() {
         saw_stereo_audio,
         "expected at least one stereo CELT packet to produce audio"
     );
+}
+
+/// Hybrid (SILK low-band + CELT high-band) frames decode to audio.
+/// The encoder at 32 kbps VOIP with a 16 kHz cutoff usually picks the
+/// Hybrid SWB config (12/13). Pin the contract that every packet
+/// either produces an AudioFrame at the expected sample count, or
+/// returns an Unsupported for something we haven't implemented yet.
+/// Never panic. Never silently emit garbage length.
+#[test]
+fn hybrid_decodes_to_audio() {
+    let Some(path) = ensure_hybrid_mono() else {
+        eprintln!("skip: ffmpeg / reference unavailable");
+        return;
+    };
+    let mut dmx = open_ogg(path);
+
+    // Verify at least some packets are Hybrid config 12-15.
+    let mut saw_hybrid = false;
+    for _ in 0..20 {
+        match dmx.next_packet() {
+            Ok(pkt) => {
+                let toc = Toc::parse(pkt.data[0]);
+                if toc.mode == OpusMode::Hybrid {
+                    saw_hybrid = true;
+                    break;
+                }
+            }
+            Err(Error::Eof) => break,
+            Err(e) => panic!("demux error: {}", e),
+        }
+    }
+    if !saw_hybrid {
+        eprintln!("skip: reference clip has no Hybrid packets");
+        return;
+    }
+
+    // Re-open and decode.
+    let mut dmx = open_ogg(path);
+    let params = dmx.streams()[0].params.clone();
+    let mut dec = oxideav_opus::decoder::make_decoder(&params).expect("make decoder");
+
+    let mut decoded = 0usize;
+    let mut hybrid_decoded = 0usize;
+    let mut total_energy = 0f64;
+    for _ in 0..50 {
+        let pkt = match dmx.next_packet() {
+            Ok(p) => p,
+            Err(Error::Eof) => break,
+            Err(e) => panic!("demux: {}", e),
+        };
+        let toc = Toc::parse(pkt.data[0]);
+        let is_hybrid = toc.mode == OpusMode::Hybrid;
+        dec.send_packet(&pkt).expect("send");
+        match dec.receive_frame() {
+            Ok(Frame::Audio(a)) => {
+                assert_eq!(a.sample_rate, 48_000);
+                assert_eq!(
+                    a.samples, toc.frame_samples_48k,
+                    "sample count must match TOC"
+                );
+                assert_eq!(a.channels, 1);
+                for chunk in a.data[0].chunks_exact(2) {
+                    let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+                    let f = s as f32 / 32768.0;
+                    total_energy += (f as f64) * (f as f64);
+                }
+                decoded += 1;
+                if is_hybrid {
+                    hybrid_decoded += 1;
+                }
+            }
+            Ok(_) => panic!("expected audio"),
+            Err(Error::Unsupported(msg)) => {
+                // Tolerate LBRR-tagged, but hybrid should not return
+                // Unsupported anymore.
+                if is_hybrid && !msg.to_lowercase().contains("lbrr") {
+                    panic!("hybrid packet should decode, got Unsupported: {}", msg);
+                }
+            }
+            Err(e) => panic!("decode error: {:?}", e),
+        }
+    }
+    assert!(
+        hybrid_decoded >= 1,
+        "expected ≥1 Hybrid packet to decode, got {hybrid_decoded}"
+    );
+    let _ = (decoded, total_energy);
 }
 
 /// Single-frequency Goertzel magnitude. Used by the audio acceptance test.

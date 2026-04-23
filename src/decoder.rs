@@ -233,10 +233,117 @@ fn decode_frame(
     match toc.mode {
         OpusMode::CeltOnly => decode_celt_frame(dec, toc, bytes, channels, n_samples),
         OpusMode::SilkOnly => decode_silk_frame(dec, toc, bytes, channels, n_samples),
-        OpusMode::Hybrid => Err(Error::unsupported(
-            "Opus Hybrid frames not yet: needs SILK+CELT with bit-exact CELT",
-        )),
+        OpusMode::Hybrid => decode_hybrid_frame(dec, toc, bytes, channels, n_samples),
     }
+}
+
+/// Decode a Hybrid Opus frame (RFC 6716 §4.4).
+///
+/// Hybrid frames pack a SILK-WB body (covering the 0..8 kHz low band)
+/// and a CELT high-band portion (starting at band 17, covering
+/// 8..12 kHz or 8..20 kHz depending on SWB vs FB) into a single range
+/// coded bitstream. The SILK part decodes first; the CELT part
+/// re-uses the same `RangeDecoder` resumed where SILK left off.
+///
+/// Output is the sum of the SILK-WB-upsampled-to-48-kHz low-band and
+/// the CELT-48-kHz high-band, with a short cross-fade at the seam to
+/// prevent phase-discontinuity crackle. Supports mono and stereo at
+/// 10 ms / 20 ms.
+fn decode_hybrid_frame(
+    dec: &mut OpusDecoder,
+    toc: &Toc,
+    bytes: &[u8],
+    channels: usize,
+    n_samples: usize,
+) -> Result<Vec<Vec<f32>>> {
+    // Only SWB (12) / FB (14) hybrid @ 10 ms and SWB (13) / FB (15) @ 20 ms
+    // are defined in the TOC table. Both route to SILK-WB internally.
+    let silk_bw = crate::toc::OpusBandwidth::Wideband;
+    // Ensure the SILK sub-decoder is configured for WB.
+    if dec.silk.is_none() || dec.silk.as_ref().map(|s| s.bandwidth) != Some(silk_bw) {
+        dec.silk = Some(SilkDecoder::new(silk_bw));
+    }
+
+    // Hybrid SILK operates as a WB frame (16 kHz internal). The frame
+    // length mirrors `toc.frame_samples_48k` — 480 = 10 ms, 960 = 20 ms
+    // at 48 kHz, equivalent to 160 / 320 samples at 16 kHz.
+    //
+    // We construct a SILK-only view of the TOC so the existing SILK
+    // decoder path runs unchanged. The shared range coder is passed in
+    // via `decode_frame_to_48k`, which consumes exactly the SILK
+    // portion of the bitstream and stops cleanly at the boundary.
+    let silk_toc = crate::toc::Toc {
+        config: toc.config,
+        mode: crate::toc::OpusMode::SilkOnly,
+        bandwidth: silk_bw,
+        frame_samples_48k: toc.frame_samples_48k,
+        stereo: toc.stereo,
+        code: toc.code,
+    };
+
+    let mut rc = RangeDecoder::new(bytes);
+    let silk_pcm_48k = {
+        let silk = dec.silk.as_mut().ok_or_else(|| {
+            Error::other("opus hybrid: SILK sub-decoder failed to initialise")
+        })?;
+        silk.decode_frame_to_48k(&mut rc, &silk_toc)?
+    };
+
+    // Split SILK output into per-channel buffers matching `channels`.
+    let silk_per_ch: Vec<Vec<f32>> = if toc.stereo {
+        debug_assert_eq!(silk_pcm_48k.len(), n_samples * 2);
+        let mut l = Vec::with_capacity(n_samples);
+        let mut r = Vec::with_capacity(n_samples);
+        for c in silk_pcm_48k.chunks_exact(2) {
+            l.push(c[0]);
+            r.push(c[1]);
+        }
+        if channels == 2 {
+            vec![l, r]
+        } else {
+            // Downmix (rare but guard): average L+R.
+            let mono: Vec<f32> =
+                l.iter().zip(r.iter()).map(|(a, b)| 0.5 * (a + b)).collect();
+            vec![mono]
+        }
+    } else {
+        let mut v = vec![silk_pcm_48k];
+        while v.len() < channels {
+            v.push(v[0].clone());
+        }
+        v
+    };
+
+    // CELT high-band: use the same range coder. start_band=17 for both
+    // SWB and FB hybrid. end_band comes from the bandwidth.
+    let celt_start = 17usize;
+    let celt_pcm = decode_celt_body(dec, toc, &mut rc, channels, n_samples, celt_start)?;
+
+    // Mix SILK-low + CELT-high into the output. Both are already at
+    // 48 kHz. The CELT output at bands below `celt_start` is zero (the
+    // bit allocator skipped those bands), so a straight pointwise sum
+    // is correct. We apply a very short cross-fade at the frame seam
+    // boundaries to smooth any residual phase mismatch at the SILK /
+    // CELT transition.
+    let fade = 8usize.min(n_samples);
+    let mut out: Vec<Vec<f32>> = (0..channels).map(|_| vec![0f32; n_samples]).collect();
+    for c in 0..channels {
+        let silk_c = silk_per_ch.get(c).cloned().unwrap_or_else(|| vec![0.0; n_samples]);
+        let celt_c = celt_pcm.get(c).cloned().unwrap_or_else(|| vec![0.0; n_samples]);
+        for i in 0..n_samples {
+            let s = silk_c.get(i).copied().unwrap_or(0.0);
+            let e = celt_c.get(i).copied().unwrap_or(0.0);
+            // Simple linear fade-in over the first `fade` samples to
+            // hide any seam discontinuity in the SILK upsample.
+            let w = if i < fade {
+                (i + 1) as f32 / (fade + 1) as f32
+            } else {
+                1.0
+            };
+            out[c][i] = (s + e * w).clamp(-1.0, 1.0);
+        }
+    }
+    Ok(out)
 }
 
 /// Decode a SILK-only frame using the crate-local `silk` module and
@@ -311,11 +418,27 @@ fn decode_celt_frame(
     channels: usize,
     n_samples: usize,
 ) -> Result<Vec<Vec<f32>>> {
-    let state = &mut dec.state;
     let mut rc = RangeDecoder::new(bytes);
+    decode_celt_body(dec, toc, &mut rc, channels, n_samples, 0)
+}
+
+/// CELT decode body shared by CELT-only and Hybrid frames.
+///
+/// * `rc` — range decoder already positioned at the CELT portion of the
+///   frame. For CELT-only this is the frame start; for Hybrid this is
+///   *after* the SILK body has been consumed from the same bitstream.
+/// * `start_band` — 0 for CELT-only, 17 for Hybrid.
+fn decode_celt_body(
+    dec: &mut OpusDecoder,
+    toc: &Toc,
+    mut rc: &mut RangeDecoder<'_>,
+    channels: usize,
+    n_samples: usize,
+    start_band: usize,
+) -> Result<Vec<Vec<f32>>> {
+    let state = &mut dec.state;
     let lm = lm_for_frame_samples(toc.frame_samples_48k) as i32;
     let end_band = end_band_for_bandwidth_celt(toc.bandwidth.cutoff_hz());
-    let start_band = 0usize;
     let total_bits_raw = (rc.storage() * 8) as i32;
 
     // Silence flag (decoded inside header).
@@ -402,7 +525,7 @@ fn decode_celt_frame(
     };
 
     // Bits available for PVQ.
-    let mut bits = ((bytes.len() as i32) * 8 << BITRES) - rc.tell_frac() as i32 - 1;
+    let mut bits = ((rc.storage() as i32) * 8 << BITRES) - rc.tell_frac() as i32 - 1;
     let anti_collapse_rsv = if header.transient && lm >= 2 && bits >= ((lm + 2) << BITRES) {
         1 << BITRES
     } else {
@@ -452,7 +575,7 @@ fn decode_celt_frame(
         Vec::new()
     };
     let mut collapse_masks = vec![0u8; NB_EBANDS * channels];
-    let total_pvq_bits = (bytes.len() as i32) * (8 << BITRES) - anti_collapse_rsv;
+    let total_pvq_bits = (rc.storage() as i32) * (8 << BITRES) - anti_collapse_rsv;
     let y_opt = if channels == 2 {
         Some(y_buf.as_mut_slice())
     } else {
@@ -491,7 +614,7 @@ fn decode_celt_frame(
     };
 
     // Final fine-energy pass.
-    let bits_left = (bytes.len() as i32) * 8 - rc.tell();
+    let bits_left = (rc.storage() as i32) * 8 - rc.tell();
     unquant_energy_finalise(
         &mut rc,
         &mut state.old_band_e,
@@ -632,11 +755,13 @@ fn decode_celt_frame(
     }
 
     for c in 0..channels {
-        let mut filtered = vec![0f32; n];
+        // comb_filter is in-place on `y` (see oxideav_celt::post_filter).
+        // Start by copying the IMDCT output into `filtered`, then run
+        // the filter against the previous frame's history.
+        let mut filtered = pcm_per_ch[c].clone();
         let history = state.history[c].clone();
         comb_filter(
-            &mut filtered,
-            &pcm_per_ch[c],
+            &mut filtered[..120],
             &history,
             state.pf_period_old,
             state.pf_period,
@@ -649,14 +774,13 @@ fn decode_celt_frame(
             overlap,
         );
         if lm > 0 {
-            let mut tail = vec![0f32; n - 120];
-            // Build a synthetic history that is the just-filtered first 120 samples
-            // appended to the original history (so comb_filter can read negative offsets).
+            // The tail (post-shortMdctSize) uses the *current* frame's
+            // filter throughout, with the already-filtered 120 samples
+            // as history.
             let mut synth_hist = history.clone();
             synth_hist.extend_from_slice(&filtered[..120]);
             comb_filter(
-                &mut tail,
-                &pcm_per_ch[c][120..],
+                &mut filtered[120..],
                 &synth_hist,
                 state.pf_period,
                 postfilter_pitch,
@@ -668,7 +792,6 @@ fn decode_celt_frame(
                 window120(),
                 overlap,
             );
-            filtered[120..].copy_from_slice(&tail);
         }
         // Update history for next frame: last samples of filtered output.
         let take = HISTORY_SIZE.min(filtered.len());
