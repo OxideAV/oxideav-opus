@@ -1063,12 +1063,19 @@ fn decode_celt_body(
         // the filter against the previous frame's history.
         let mut filtered = pcm_per_ch[c].clone();
         let history = state.history[c].clone();
+        // libopus splits the frame at the short-MDCT boundary (120
+        // samples): the first 120 samples use the crossfade between the
+        // previous-frame and current-frame filters; the tail uses the
+        // current filter only. At LM=0 (2.5 ms CELT frame) the whole
+        // frame is shorter than the short-MDCT size, so we run a single
+        // call on the `n` available samples.
+        let head = n.min(120);
         comb_filter(
-            &mut filtered[..120],
+            &mut filtered[..head],
             &history,
             state.pf_period_old,
             state.pf_period,
-            120, // shortMdctSize
+            head, // shortMdctSize (or full frame if smaller)
             state.pf_gain_old,
             state.pf_gain,
             state.pf_tapset_old,
@@ -1081,13 +1088,13 @@ fn decode_celt_body(
             // filter throughout, with the already-filtered 120 samples
             // as history.
             let mut synth_hist = history.clone();
-            synth_hist.extend_from_slice(&filtered[..120]);
+            synth_hist.extend_from_slice(&filtered[..head]);
             comb_filter(
-                &mut filtered[120..],
+                &mut filtered[head..],
                 &synth_hist,
                 state.pf_period,
                 postfilter_pitch,
-                n - 120,
+                n - head,
                 state.pf_gain,
                 postfilter_gain,
                 state.pf_tapset,

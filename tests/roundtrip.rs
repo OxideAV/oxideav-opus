@@ -1122,18 +1122,20 @@ fn multistream_5_1_decodes_to_six_channels() {
 /// RFC 6716 Appendix A test vectors from
 /// `samples/ffmpeg/A-codecs/opus/testvectorNN.ogg`.
 ///
-/// Uses `catch_unwind` around each packet to survive panics thrown
-/// by the underlying CELT pipeline on the more exotic test vectors
-/// (out-of-bounds index in the comb post-filter when pitch+2 exceeds
-/// the current sub-frame length — a libopus sub-block corner case
-/// that this crate's pre-MVP CELT does not yet guard against).
+/// Uses `catch_unwind` around each packet as a belt-and-braces guard
+/// against latent bounds panics in the decoder — the suite now
+/// decodes every packet across all 12 reference vectors (vec08/09/10
+/// previously panicked in the comb post-filter on sub-frames shorter
+/// than the 120-sample crossfade window; see the CELT clamp in
+/// `oxideav-celt/src/post_filter.rs` and the Opus short-MDCT-size
+/// guard here in `decode_celt_body`).
 ///
-/// Structural assertions only: no bit-exact f32 compare. Panics are
-/// captured and reported, not re-raised, so the test never fails the
-/// way a missing end-to-end decode would — it just prints a
-/// per-vector status line so follow-up work can track progress.
+/// Structural assertions only: no bit-exact f32 compare. Panics, if
+/// any new ones surface, are captured and reported rather than
+/// re-raised, so the test emits a per-vector status line that CI /
+/// reviewers can eyeball.
 #[test]
-#[ignore = "RFC test vectors trigger CELT post-filter bounds panic; run manually"]
+#[ignore = "RFC test vectors: run manually via --include-ignored (prints per-vector stats)"]
 fn rfc6716_test_vectors_report() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     let base = "/home/magicaltux/projects/oxideav/samples/ffmpeg/A-codecs/opus";
