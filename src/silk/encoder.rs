@@ -1,10 +1,11 @@
-//! SILK encoder — NB / MB / WB mono 20 ms (+ building block for stereo).
+//! SILK encoder — NB / MB / WB mono + stereo, 10 / 20 ms frames
+//! (+ building block for 40 / 60 ms multi-frame packets).
 //!
 //! Companion to [`crate::silk::SilkDecoder`]. Scope:
 //!
-//! * **Narrowband** (8 kHz internal rate) mono 20 ms frames.
-//! * **Mediumband** (12 kHz internal rate) mono 20 ms frames.
-//! * **Wideband** (16 kHz internal rate) mono 20 ms frames.
+//! * **Narrowband** (8 kHz internal rate) mono / stereo, 10 or 20 ms.
+//! * **Mediumband** (12 kHz internal rate) mono / stereo, 10 or 20 ms.
+//! * **Wideband** (16 kHz internal rate) mono / stereo, 10 or 20 ms.
 //! * Analysis-by-synthesis around the MVP carrier format documented
 //!   in [`super::excitation`]: LPC analysis → residual → magnitude +
 //!   sign per sample.
@@ -17,6 +18,13 @@
 //! parameterised on a [`BandwidthParams`] descriptor; only the internal
 //! sampling rate constants, LPC order, sub-frame length and (for NLSF)
 //! stage-1 codebook differ.
+//!
+//! 10 ms and 20 ms share the same per-frame body layout; the only
+//! difference is the number of sub-frames (2 for 10 ms, 4 for 20 ms).
+//! Longer 40 / 60 ms packets are composed at the top level
+//! ([`crate::encoder::SilkEncoder`]) by running 2 or 3 back-to-back
+//! 20 ms `SilkFrameEncoder` bodies inside a single Opus frame, per
+//! RFC 6716 §4.2.4.
 //!
 //! # Bitstream order (same as decoder's [`super::decode_frame_body`])
 //!
@@ -129,13 +137,31 @@ pub struct SilkFrameEncoder {
 }
 
 impl SilkFrameEncoder {
-    /// Build a frame encoder for the requested bandwidth. All three
-    /// bandwidths use 4 sub-frames (20 ms frames).
+    /// Build a frame encoder for the requested bandwidth, defaulting to
+    /// 20 ms (4 sub-frames). For 10 ms use
+    /// [`SilkFrameEncoder::new_with_subframes`].
     pub fn new(params: BandwidthParams) -> Self {
+        Self::new_with_subframes(params, 4)
+    }
+
+    /// Build a frame encoder with an explicit sub-frame count.
+    ///
+    /// * `n_subframes == 4` — 20 ms frame (NB: 160 / MB: 240 / WB: 320
+    ///   samples at the internal rate).
+    /// * `n_subframes == 2` — 10 ms frame (half the length).
+    ///
+    /// Panics for any other value — the RFC only defines 10 ms and
+    /// 20 ms base SILK frames. 40 ms / 60 ms Opus packets are built by
+    /// concatenating 2 / 3 back-to-back 20 ms bodies (see RFC §4.2.4).
+    pub fn new_with_subframes(params: BandwidthParams, n_subframes: usize) -> Self {
+        assert!(
+            n_subframes == 2 || n_subframes == 4,
+            "SILK frame encoder only supports 2 (10 ms) or 4 (20 ms) sub-frames, got {n_subframes}"
+        );
         let order = params.lpc_order;
         Self {
             params,
-            n_subframes: 4,
+            n_subframes,
             prev_synth: vec![0.0; order],
         }
     }
@@ -153,6 +179,21 @@ impl SilkFrameEncoder {
     /// Convenience: WB (16 kHz) mono 20 ms encoder.
     pub fn new_wb_20ms() -> Self {
         Self::new(BandwidthParams::wb())
+    }
+
+    /// Convenience: NB (8 kHz) mono 10 ms encoder (2 sub-frames).
+    pub fn new_nb_10ms() -> Self {
+        Self::new_with_subframes(BandwidthParams::nb(), 2)
+    }
+
+    /// Convenience: MB (12 kHz) mono 10 ms encoder (2 sub-frames).
+    pub fn new_mb_10ms() -> Self {
+        Self::new_with_subframes(BandwidthParams::mb(), 2)
+    }
+
+    /// Convenience: WB (16 kHz) mono 10 ms encoder (2 sub-frames).
+    pub fn new_wb_10ms() -> Self {
+        Self::new_with_subframes(BandwidthParams::wb(), 2)
     }
 
     /// Frame length in internal-rate samples:
@@ -572,6 +613,76 @@ mod tests {
     #[test]
     fn encode_decode_nb_one_frame_internal_rate_snr() {
         run_internal_rate_roundtrip(BandwidthParams::nb(), 8_000, 25.0);
+    }
+
+    /// 10 ms round-trip (2-subframe) for all three bandwidths. The
+    /// bar is softer than the 20 ms case — with only 2 sub-frames the
+    /// LPC history starts from zero for each frame, which hurts the
+    /// first-frame prediction; we still want >20 dB.
+    #[test]
+    fn encode_decode_nb_10ms_internal_rate_snr() {
+        run_internal_rate_roundtrip_10ms(BandwidthParams::nb(), 8_000, 20.0);
+    }
+
+    #[test]
+    fn encode_decode_mb_10ms_internal_rate_snr() {
+        run_internal_rate_roundtrip_10ms(BandwidthParams::mb(), 12_000, 20.0);
+    }
+
+    #[test]
+    fn encode_decode_wb_10ms_internal_rate_snr() {
+        run_internal_rate_roundtrip_10ms(BandwidthParams::wb(), 16_000, 20.0);
+    }
+
+    fn run_internal_rate_roundtrip_10ms(params: BandwidthParams, rate: u32, snr_bar: f64) {
+        use oxideav_celt::range_decoder::RangeDecoder;
+
+        let mut enc = SilkFrameEncoder::new_with_subframes(params, 2);
+        let frame_len = enc.frame_len();
+        let freq = 300.0f32;
+        let pcm: Vec<f32> = (0..frame_len)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / rate as f32).sin() * 0.3)
+            .collect();
+
+        let mut re = RangeEncoder::new(1024);
+        re.encode_bit_logp(true, 1);
+        re.encode_bit_logp(false, 1);
+        enc.encode_frame_body(&pcm, &mut re).expect("encode");
+        let buf = re.done().expect("done");
+
+        let mut dec_state = crate::silk::SilkChannelState::new();
+        let mut rc = RangeDecoder::new(&buf);
+        let _vad = rc.decode_bit_logp(1);
+        let _lbrr = rc.decode_bit_logp(1);
+        let decoded = crate::silk::decode_frame_body_pub(
+            &mut rc,
+            true,
+            params.bandwidth,
+            params.lpc_order,
+            params.subframe_len,
+            2,
+            &mut dec_state,
+        )
+        .expect("decode");
+        assert_eq!(decoded.len(), frame_len);
+        let sig: f64 = pcm.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+        let err: f64 = pcm
+            .iter()
+            .zip(decoded.iter())
+            .map(|(a, b)| {
+                let e = (*a - *b) as f64;
+                e * e
+            })
+            .sum();
+        let snr = 10.0 * (sig / err.max(1e-30)).log10();
+        println!(
+            "{:?} 10 ms internal-rate SNR: {snr:.2} dB (bar {snr_bar})",
+            params.bandwidth
+        );
+        assert!(
+            snr > snr_bar,
+            "10 ms internal-rate SNR {snr:.2} dB below {snr_bar} dB bar"
+        );
     }
 
     #[test]
