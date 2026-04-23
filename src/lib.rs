@@ -37,14 +37,15 @@
 //! * Silence / DTX frames (0 / 1-byte packets) produce correct-length
 //!   silence output.
 //!
-//! Decoder gaps that still return `Unsupported`:
+//! Additional decoder modes:
 //!
-//! * Hybrid (SILK+CELT) frames — §4.2 + §4.3 need to share a packet.
-//! * SILK LBRR redundancy data — flags are parsed so the range coder
-//!   stays aligned, but the redundancy frames themselves are not yet
-//!   decoded; any packet that sets a LBRR flag is rejected rather than
-//!   silently dropping samples.
-//! * Channel mapping family 1/2 (Vorbis / ambisonic multistream).
+//! * Hybrid (SILK+CELT) frames (§4.4) — SILK WB body + CELT high band
+//!   with a start_band offset (17 for FB, 14 for SWB), summed.
+//! * SILK LBRR redundancy — flags are parsed and the redundancy
+//!   bodies decode-and-discard via a scratch SILK state so the range
+//!   coder stays aligned; loss-free output is unaffected.
+//! * Channel mapping family 1 (Vorbis surround) and family 2
+//!   (ambisonics) via the `MultistreamDecoder`.
 //!
 //! Encoder scope — see `encoder` module docs. Today the module exposes:
 //!

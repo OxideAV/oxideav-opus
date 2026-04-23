@@ -12,10 +12,13 @@
 //!    denormalise, IMDCT (sub-block + window + overlap-add), comb post
 //!    filter. Output is 48 kHz S16 PCM.
 //! 5. **SILK-only frames (§4.2)** — NB/MB/WB mono + stereo at 10/20/40/60 ms
-//!    via the `silk` module. LBRR redundancy data is parsed but not yet
-//!    decoded — packets with LBRR flags set return Unsupported. See
-//!    `silk/mod.rs` for details.
-//! 6. **Hybrid / multistream** — clean `Unsupported` errors.
+//!    via the `silk` module. LBRR redundancy data is decoded-and-discarded
+//!    via a scratch SILK channel state so the range coder stays aligned;
+//!    the loss-free output is unaffected.
+//! 6. **Hybrid (§4.4)** — SILK-WB low band + CELT high band with
+//!    start_band offset, run through the same pipelines and summed.
+//! 7. **Multistream (RFC 7845 §5.1.1)** — channel mapping family 1
+//!    (Vorbis surround) and family 2 (ambisonics).
 
 use oxideav_celt::bands::{anti_collapse, denormalise_bands, quant_all_bands};
 use oxideav_celt::header::decode_header;
@@ -240,9 +243,8 @@ fn decode_frame(
 /// upsample to 48 kHz.
 ///
 /// Supported: mono and stereo NB/MB/WB at 10/20/40/60 ms. LBRR
-/// redundancy data is not yet honoured — packets with LBRR flags set
-/// return `Unsupported` (the most recent reference clips from ffmpeg
-/// at VOIP bitrates don't enable LBRR).
+/// redundancy data is parsed and decoded to a scratch state so the
+/// range coder stays aligned; the primary output is unaffected.
 fn decode_silk_frame(
     dec: &mut OpusDecoder,
     toc: &Toc,

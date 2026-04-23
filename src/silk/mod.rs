@@ -250,14 +250,41 @@ impl SilkDecoder {
             }
         }
 
-        // Any LBRR data? We don't decode it yet. Return Unsupported so
-        // the range coder doesn't desync.
-        for n in 0..n_internal_channels {
+        // RFC 6716 §4.2.4: LBRR frame bodies come *before* the regular
+        // frames, ordered by frame index then channel. Each LBRR body
+        // has the same structure as a regular SILK frame body (stereo
+        // header is NOT re-emitted for LBRR — only stage-1/2 NLSF + LTP
+        // + excitation). We decode-and-discard using scratch channel
+        // states so the main decoder's LPC/LTP history isn't corrupted.
+        //
+        // This is the "robust" behaviour: LBRR is an out-of-band
+        // redundancy copy used for packet-loss concealment. In the
+        // loss-free path we just need to consume the bits so the range
+        // coder stays aligned with the regular frame bodies that follow.
+        let any_lbrr = (0..n_internal_channels)
+            .any(|n| (0..n_frames_per_packet).any(|i| lbrr_flags[n][i]));
+        if any_lbrr {
+            let mut lbrr_mid_state = SilkChannelState::new();
+            let mut lbrr_side_state = SilkChannelState::new();
             for i in 0..n_frames_per_packet {
-                if lbrr_flags[n][i] {
-                    return Err(Error::unsupported(
-                        "SILK: LBRR redundancy frames not yet implemented",
-                    ));
+                for n in 0..n_internal_channels {
+                    if !lbrr_flags[n][i] {
+                        continue;
+                    }
+                    let state_ref = if n == 0 {
+                        &mut lbrr_mid_state
+                    } else {
+                        &mut lbrr_side_state
+                    };
+                    let _ = decode_frame_body(
+                        rc,
+                        vad_flags[n][i],
+                        self.bandwidth,
+                        self.lpc_order,
+                        self.subframe_len,
+                        n_subframes_per_frame,
+                        state_ref,
+                    )?;
                 }
             }
         }
