@@ -1,5 +1,5 @@
-//! Opus encoder — CELT-only full-band + SILK-only NB/MB/WB (+NB stereo)
-//! 20 ms paths.
+//! Opus encoder — CELT-only full-band + the full SILK-only config
+//! matrix (configs 0..=11), mono and stereo, 10 / 20 / 40 / 60 ms.
 //!
 //! # Mode selection
 //!
@@ -8,17 +8,19 @@
 //!   downmixed to mono before the CELT mono core; see the original
 //!   CELT section below for the honest caveat about the stereo TOC bit.
 //!
-//! * [`SilkEncoder::new_nb_mono_20ms`] — SILK-only narrowband mono
-//!   20 ms (config 1, 8 kHz internal). Accepts 8 kHz or 48 kHz mono
-//!   input; 48 kHz is downsampled 6:1 internally.
-//! * [`SilkEncoder::new_mb_mono_20ms`] — SILK-only mediumband mono
-//!   20 ms (config 5, 12 kHz internal). Accepts 12 kHz or 48 kHz input.
-//! * [`SilkEncoder::new_wb_mono_20ms`] — SILK-only wideband mono 20 ms
-//!   (config 9, 16 kHz internal). Accepts 16 kHz or 48 kHz input.
-//! * [`SilkEncoder::new_nb_stereo_20ms`] — SILK-only narrowband stereo
-//!   20 ms (config 1, stereo bit = 1). Accepts 8 kHz or 48 kHz stereo
-//!   input, emits a mid/side-coded stereo frame with the RFC §4.2.7.1
-//!   prediction header.
+//! * [`SilkEncoder`] exposes one named constructor per (bandwidth,
+//!   channels, duration) tuple:
+//!   - bandwidth ∈ {NB, MB, WB} (8 / 12 / 16 kHz internal rates),
+//!   - channels ∈ {mono, stereo},
+//!   - duration ∈ {10, 20, 40, 60} ms.
+//!
+//!   That gives 24 constructors, covering all 12 SILK-only `config`
+//!   values × stereo bit. Each accepts either the SILK internal rate
+//!   or 48 kHz; the latter is downsampled by a box-average pre-filter.
+//!   40 / 60 ms packets carry 2 / 3 back-to-back 20 ms SILK frame
+//!   bodies per RFC 6716 §4.2.4, so they produce a single Opus packet
+//!   with framing code 0 (not code-1/2/3 — the SILK frames share one
+//!   TOC byte and one range-coder bitstream).
 //!
 //! [`OpusEncoder::new`] routes by the `CodecParameters::sample_rate`:
 //! 48 kHz mono/stereo → CELT-only FB; anything else → `Unsupported`,
@@ -52,9 +54,11 @@
 //!
 //! # Unsupported
 //!
-//! * Framing codes 1/2/3 (multi-frame packets) — not emitted.
-//! * 2.5 / 5 / 10 / 40 / 60 ms frame sizes.
-//! * SILK-only / Hybrid modes.
+//! * Framing codes 1/2/3 (multi-frame packets) — not emitted. 40 / 60
+//!   ms SILK packets *are* emitted via RFC §4.2.4's multiple-SILK-
+//!   frames-per-Opus-frame mechanism (still code = 0).
+//! * CELT 2.5 / 5 / 10 ms frame sizes.
+//! * Hybrid (SILK+CELT) mode.
 //! * More than 2 channels.
 
 use std::collections::VecDeque;
@@ -425,50 +429,137 @@ pub fn build_silk_wb_20ms_toc(stereo: bool) -> u8 {
     (OPUS_CONFIG_SILK_WB_20MS << 3) | (stereo_bit << 2)
 }
 
+/// Opus audio bandwidth for a SILK-only mode.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SilkBw {
+    Nb,
+    Mb,
+    Wb,
+}
+
+impl SilkBw {
+    fn internal_rate(self) -> u32 {
+        match self {
+            SilkBw::Nb => SILK_NB_RATE,
+            SilkBw::Mb => SILK_MB_RATE,
+            SilkBw::Wb => SILK_WB_RATE,
+        }
+    }
+    /// Samples per 20 ms SILK frame at the internal rate.
+    fn frame_samples_20ms(self) -> usize {
+        match self {
+            SilkBw::Nb => SILK_NB_FRAME_SAMPLES_INTERNAL,
+            SilkBw::Mb => SILK_MB_FRAME_SAMPLES_INTERNAL,
+            SilkBw::Wb => SILK_WB_FRAME_SAMPLES_INTERNAL,
+        }
+    }
+}
+
 /// Concrete SILK mode this `SilkEncoder` instance emits.
+///
+/// A SILK mode is the tuple of (bandwidth, channels, duration). Together
+/// they fix the TOC `config` field (0..=11) plus the stereo bit. The
+/// decoder's frame-size mapping is in RFC 6716 Table 2.
 #[derive(Copy, Clone, Debug)]
-enum SilkMode {
-    NbMono,
-    MbMono,
-    WbMono,
-    NbStereo,
+struct SilkMode {
+    bw: SilkBw,
+    stereo: bool,
+    /// Opus frame duration in milliseconds: 10, 20, 40, or 60.
+    duration_ms: u32,
 }
 
 impl SilkMode {
-    fn toc_byte(self) -> u8 {
-        match self {
-            SilkMode::NbMono => build_silk_nb_20ms_toc(false),
-            SilkMode::MbMono => build_silk_mb_20ms_toc(false),
-            SilkMode::WbMono => build_silk_wb_20ms_toc(false),
-            SilkMode::NbStereo => build_silk_nb_20ms_toc(true),
+    fn new(bw: SilkBw, stereo: bool, duration_ms: u32) -> Self {
+        debug_assert!(matches!(duration_ms, 10 | 20 | 40 | 60));
+        Self {
+            bw,
+            stereo,
+            duration_ms,
         }
+    }
+    /// RFC 6716 Table 2 `config` field for this mode.
+    fn config(self) -> u8 {
+        // NB = 0..=3, MB = 4..=7, WB = 8..=11. Within each block
+        // the order is 10/20/40/60 ms.
+        let base = match self.bw {
+            SilkBw::Nb => 0u8,
+            SilkBw::Mb => 4,
+            SilkBw::Wb => 8,
+        };
+        let offset = match self.duration_ms {
+            10 => 0,
+            20 => 1,
+            40 => 2,
+            60 => 3,
+            _ => unreachable!(),
+        };
+        base + offset
+    }
+    fn toc_byte(self) -> u8 {
+        let stereo_bit: u8 = if self.stereo { 1 } else { 0 };
+        (self.config() << 3) | (stereo_bit << 2)
     }
     fn internal_rate(self) -> u32 {
-        match self {
-            SilkMode::NbMono | SilkMode::NbStereo => SILK_NB_RATE,
-            SilkMode::MbMono => SILK_MB_RATE,
-            SilkMode::WbMono => SILK_WB_RATE,
+        self.bw.internal_rate()
+    }
+    /// Number of 20 ms SILK frames packed into this Opus frame per
+    /// RFC §4.2.4. 10 ms = 1 (half-length), 20 ms = 1, 40 ms = 2,
+    /// 60 ms = 3.
+    fn silk_frames_per_packet(self) -> usize {
+        match self.duration_ms {
+            10 | 20 => 1,
+            40 => 2,
+            60 => 3,
+            _ => unreachable!(),
         }
     }
+    /// Number of sub-frames in each embedded SILK frame (2 for 10 ms,
+    /// 4 for 20/40/60 ms).
+    fn subframes_per_silk_frame(self) -> usize {
+        if self.duration_ms == 10 {
+            2
+        } else {
+            4
+        }
+    }
+    /// Total internal-rate samples carried by this Opus frame.
     fn frame_samples_internal(self) -> usize {
-        match self {
-            SilkMode::NbMono | SilkMode::NbStereo => SILK_NB_FRAME_SAMPLES_INTERNAL,
-            SilkMode::MbMono => SILK_MB_FRAME_SAMPLES_INTERNAL,
-            SilkMode::WbMono => SILK_WB_FRAME_SAMPLES_INTERNAL,
+        let per_silk = match self.duration_ms {
+            10 => self.bw.frame_samples_20ms() / 2,
+            _ => self.bw.frame_samples_20ms(),
+        };
+        per_silk * self.silk_frames_per_packet()
+    }
+    /// Samples per *embedded* SILK frame at the internal rate (one of
+    /// the 1/2/3 blocks that make up a 10/20/40/60 ms Opus frame).
+    fn samples_per_silk_frame(self) -> usize {
+        self.frame_samples_internal() / self.silk_frames_per_packet()
+    }
+    /// PCM samples per Opus frame at the 48 kHz output rate (for PTS
+    /// accounting).
+    fn frame_samples_48k(self) -> usize {
+        match self.duration_ms {
+            10 => 480,
+            20 => 960,
+            40 => 1920,
+            60 => 2880,
+            _ => unreachable!(),
         }
     }
     fn input_channels(self) -> u16 {
-        match self {
-            SilkMode::NbStereo => 2,
-            _ => 1,
+        if self.stereo {
+            2
+        } else {
+            1
         }
     }
     fn is_stereo(self) -> bool {
-        matches!(self, SilkMode::NbStereo)
+        self.stereo
     }
     /// Bytes of range-encoder storage to allocate per packet. Sized so
     /// the MVP per-sample nibble carrier fits with headroom; stereo
-    /// doubles the mono budget.
+    /// doubles the mono budget. 40 / 60 ms packets carry 2 / 3 back-to-
+    /// back SILK frame bodies, so the budget scales linearly.
     fn buffer_bytes(self) -> u32 {
         let samples = self.frame_samples_internal();
         // ~17 bits per sample worst-case (nibble+nibble + sign), plus
@@ -483,7 +574,8 @@ impl SilkMode {
     }
 }
 
-/// SILK-mode Opus encoder — NB/MB/WB mono + NB stereo, 20 ms frames.
+/// SILK-mode Opus encoder — covers the full SILK-only config matrix
+/// (configs 0..=11), mono and stereo, 10 / 20 / 40 / 60 ms frames.
 ///
 /// Emits a TOC byte matching the configured mode followed by the SILK
 /// bitstream described in [`crate::silk::encoder`]. Accepts either the
@@ -491,20 +583,29 @@ impl SilkMode {
 /// 48 kHz Opus output rate; non-internal input is downsampled by a
 /// simple box-average pre-filter.
 ///
-/// Four explicit entry points, one per mode:
+/// Named entry points (one per (bandwidth, channels, duration) tuple):
 ///
-/// * [`SilkEncoder::new_nb_mono_20ms`] — NB mono (config 1).
-/// * [`SilkEncoder::new_mb_mono_20ms`] — MB mono (config 5).
-/// * [`SilkEncoder::new_wb_mono_20ms`] — WB mono (config 9).
-/// * [`SilkEncoder::new_nb_stereo_20ms`] — NB stereo (config 1 + TOC
-///   stereo bit). Runs a mid/side pair of [`SilkFrameEncoder`]s and
-///   emits the RFC §4.2.7.1 prediction header.
+/// * 20 ms mono: [`SilkEncoder::new_nb_mono_20ms`], `new_mb_mono_20ms`,
+///   `new_wb_mono_20ms` (configs 1, 5, 9).
+/// * 20 ms stereo: [`SilkEncoder::new_nb_stereo_20ms`],
+///   `new_mb_stereo_20ms`, `new_wb_stereo_20ms` (configs 1/5/9 + stereo
+///   bit). Runs a mid/side pair of [`SilkFrameEncoder`]s and emits the
+///   RFC §4.2.7.1 prediction header.
+/// * 10 ms mono + stereo: configs 0, 4, 8 (half the sub-frame count
+///   per embedded SILK frame).
+/// * 40 ms mono + stereo: configs 2, 6, 10 — packet carries 2 back-to-
+///   back 20 ms SILK frame bodies per RFC §4.2.4.
+/// * 60 ms mono + stereo: configs 3, 7, 11 — 3 back-to-back 20 ms SILK
+///   frame bodies.
 ///
 /// Round-trip SNR > 20 dB on speech-like input through the crate's own
-/// SILK decoder for every mode (see `encoder_roundtrip.rs`).
+/// SILK decoder for every 20 ms mode (see `encoder_roundtrip.rs`).
+/// 10 ms frames lose a bit of first-frame SNR because the LPC history
+/// starts cold; 40/60 ms frames match the 20 ms bar because each
+/// embedded SILK frame carries its own LPC history.
 ///
-/// Out of scope for this pass: 10 / 40 / 60 ms frames, voiced/LTP path,
-/// LBRR, MB/WB stereo, Hybrid.
+/// Out of scope for this pass: voiced/LTP path, LBRR (redundancy),
+/// Hybrid.
 pub struct SilkEncoder {
     out_params: CodecParameters,
     mode: SilkMode,
@@ -523,26 +624,147 @@ pub struct SilkEncoder {
 }
 
 impl SilkEncoder {
+    // ---- 20 ms mono + stereo, all 3 bandwidths ---------------------
+
     /// Build a SILK NB mono 20 ms encoder. Input: 8 kHz or 48 kHz mono.
     pub fn new_nb_mono_20ms(params: &CodecParameters) -> Result<Self> {
-        Self::new_mode(params, SilkMode::NbMono)
+        Self::new_mode(params, SilkMode::new(SilkBw::Nb, false, 20))
     }
 
     /// Build a SILK MB mono 20 ms encoder. Input: 12 kHz or 48 kHz mono.
     pub fn new_mb_mono_20ms(params: &CodecParameters) -> Result<Self> {
-        Self::new_mode(params, SilkMode::MbMono)
+        Self::new_mode(params, SilkMode::new(SilkBw::Mb, false, 20))
     }
 
     /// Build a SILK WB mono 20 ms encoder. Input: 16 kHz or 48 kHz mono.
     pub fn new_wb_mono_20ms(params: &CodecParameters) -> Result<Self> {
-        Self::new_mode(params, SilkMode::WbMono)
+        Self::new_mode(params, SilkMode::new(SilkBw::Wb, false, 20))
     }
 
     /// Build a SILK NB stereo 20 ms encoder. Input: 8 kHz or 48 kHz
     /// stereo (interleaved L/R). Emits a mid/side-coded packet with the
     /// stereo prediction header from RFC §4.2.7.1.
     pub fn new_nb_stereo_20ms(params: &CodecParameters) -> Result<Self> {
-        Self::new_mode(params, SilkMode::NbStereo)
+        Self::new_mode(params, SilkMode::new(SilkBw::Nb, true, 20))
+    }
+
+    /// MB stereo 20 ms (config 5 + stereo bit).
+    pub fn new_mb_stereo_20ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Mb, true, 20))
+    }
+
+    /// WB stereo 20 ms (config 9 + stereo bit).
+    pub fn new_wb_stereo_20ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Wb, true, 20))
+    }
+
+    // ---- 10 ms mono + stereo, all 3 bandwidths ---------------------
+
+    /// NB mono 10 ms (config 0). Input: 8 kHz or 48 kHz mono.
+    pub fn new_nb_mono_10ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Nb, false, 10))
+    }
+
+    /// MB mono 10 ms (config 4). Input: 12 kHz or 48 kHz mono.
+    pub fn new_mb_mono_10ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Mb, false, 10))
+    }
+
+    /// WB mono 10 ms (config 8). Input: 16 kHz or 48 kHz mono.
+    pub fn new_wb_mono_10ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Wb, false, 10))
+    }
+
+    /// NB stereo 10 ms (config 0 + stereo bit).
+    pub fn new_nb_stereo_10ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Nb, true, 10))
+    }
+
+    /// MB stereo 10 ms (config 4 + stereo bit).
+    pub fn new_mb_stereo_10ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Mb, true, 10))
+    }
+
+    /// WB stereo 10 ms (config 8 + stereo bit).
+    pub fn new_wb_stereo_10ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Wb, true, 10))
+    }
+
+    // ---- 40 ms mono + stereo, all 3 bandwidths ---------------------
+    //
+    // 40 ms Opus frames contain 2 back-to-back 20 ms SILK frames per
+    // RFC §4.2.4. The header VAD/LBRR flags span both SILK frames.
+
+    /// NB mono 40 ms (config 2).
+    pub fn new_nb_mono_40ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Nb, false, 40))
+    }
+
+    /// MB mono 40 ms (config 6).
+    pub fn new_mb_mono_40ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Mb, false, 40))
+    }
+
+    /// WB mono 40 ms (config 10).
+    pub fn new_wb_mono_40ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Wb, false, 40))
+    }
+
+    /// NB stereo 40 ms.
+    pub fn new_nb_stereo_40ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Nb, true, 40))
+    }
+
+    /// MB stereo 40 ms.
+    pub fn new_mb_stereo_40ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Mb, true, 40))
+    }
+
+    /// WB stereo 40 ms.
+    pub fn new_wb_stereo_40ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Wb, true, 40))
+    }
+
+    // ---- 60 ms mono + stereo, all 3 bandwidths ---------------------
+
+    /// NB mono 60 ms (config 3).
+    pub fn new_nb_mono_60ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Nb, false, 60))
+    }
+
+    /// MB mono 60 ms (config 7).
+    pub fn new_mb_mono_60ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Mb, false, 60))
+    }
+
+    /// WB mono 60 ms (config 11).
+    pub fn new_wb_mono_60ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Wb, false, 60))
+    }
+
+    /// NB stereo 60 ms.
+    pub fn new_nb_stereo_60ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Nb, true, 60))
+    }
+
+    /// MB stereo 60 ms.
+    pub fn new_mb_stereo_60ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Mb, true, 60))
+    }
+
+    /// WB stereo 60 ms.
+    pub fn new_wb_stereo_60ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(params, SilkMode::new(SilkBw::Wb, true, 60))
+    }
+
+    fn build_frame_encoder(mode: SilkMode) -> crate::silk::encoder::SilkFrameEncoder {
+        let bw_params = match mode.bw {
+            SilkBw::Nb => crate::silk::encoder::BandwidthParams::nb(),
+            SilkBw::Mb => crate::silk::encoder::BandwidthParams::mb(),
+            SilkBw::Wb => crate::silk::encoder::BandwidthParams::wb(),
+        };
+        let subframes = mode.subframes_per_silk_frame();
+        crate::silk::encoder::SilkFrameEncoder::new_with_subframes(bw_params, subframes)
     }
 
     fn new_mode(params: &CodecParameters, mode: SilkMode) -> Result<Self> {
@@ -561,15 +783,9 @@ impl SilkEncoder {
                 "SILK encoder: {mode:?} expects {internal} Hz or 48 kHz input, got {sr} Hz"
             )));
         }
-        let silk_mid = match mode {
-            SilkMode::NbMono | SilkMode::NbStereo => {
-                crate::silk::encoder::SilkFrameEncoder::new_nb_20ms()
-            }
-            SilkMode::MbMono => crate::silk::encoder::SilkFrameEncoder::new_mb_20ms(),
-            SilkMode::WbMono => crate::silk::encoder::SilkFrameEncoder::new_wb_20ms(),
-        };
+        let silk_mid = Self::build_frame_encoder(mode);
         let silk_side = if mode.is_stereo() {
-            Some(crate::silk::encoder::SilkFrameEncoder::new_nb_20ms())
+            Some(Self::build_frame_encoder(mode))
         } else {
             None
         };
@@ -617,13 +833,48 @@ impl SilkEncoder {
         Ok(())
     }
 
+    /// Emit the shared VAD + LBRR header at the top of an Opus frame
+    /// per RFC §4.2.3 / §4.2.4. Layout (from libopus `silk_Decode`):
+    ///
+    /// ```text
+    ///   for each internal channel n:
+    ///     for each packet frame i:
+    ///       vad_flags[n][i] = ec_dec_bit_logp(1)
+    ///     lbrr_flag[n]      = ec_dec_bit_logp(1)
+    /// ```
+    ///
+    /// We always emit `vad = 1` (active frame) and `lbrr = 0` (no
+    /// redundancy). For stereo the mid channel's bits come first,
+    /// then the side channel's. For multi-frame packets (40 / 60 ms)
+    /// the VAD bits for all internal frames are emitted before the
+    /// LBRR flag (one LBRR flag per channel, regardless of frame
+    /// count).
+    fn emit_shared_header(&self, enc: &mut oxideav_celt::range_encoder::RangeEncoder) {
+        let n_silk_frames = self.mode.silk_frames_per_packet();
+        let n_channels = if self.mode.is_stereo() { 2 } else { 1 };
+        for _ch in 0..n_channels {
+            for _i in 0..n_silk_frames {
+                enc.encode_bit_logp(true, 1); // VAD = 1
+            }
+            enc.encode_bit_logp(false, 1); // LBRR = 0
+        }
+    }
+
     fn encode_one_mono_frame(&mut self, pcm_internal: &[f32]) -> Result<Packet> {
         debug_assert_eq!(pcm_internal.len(), self.mode.frame_samples_internal());
         let mut re = oxideav_celt::range_encoder::RangeEncoder::new(self.mode.buffer_bytes());
 
-        re.encode_bit_logp(true, 1); // VAD
-        re.encode_bit_logp(false, 1); // LBRR
-        self.silk_mid.encode_frame_body(pcm_internal, &mut re)?;
+        self.emit_shared_header(&mut re);
+
+        // Emit 1 / 2 / 3 back-to-back SILK frame bodies. For 10 and
+        // 20 ms Opus frames this is just one body.
+        let per_silk = self.mode.samples_per_silk_frame();
+        let n = self.mode.silk_frames_per_packet();
+        for i in 0..n {
+            let start = i * per_silk;
+            self.silk_mid
+                .encode_frame_body(&pcm_internal[start..start + per_silk], &mut re)?;
+        }
 
         let body = re
             .done()
@@ -637,37 +888,33 @@ impl SilkEncoder {
         debug_assert_eq!(left.len(), self.mode.frame_samples_internal());
         let mut re = oxideav_celt::range_encoder::RangeEncoder::new(self.mode.buffer_bytes());
 
-        // Shared VAD/LBRR header (RFC §4.2.3):
-        //   VAD[mid] = 1, LBRR[mid] = 0, VAD[side] = 1, LBRR[side] = 0.
-        re.encode_bit_logp(true, 1);
-        re.encode_bit_logp(false, 1);
-        re.encode_bit_logp(true, 1);
-        re.encode_bit_logp(false, 1);
+        self.emit_shared_header(&mut re);
 
-        // Mid/side split. For this first-cut stereo encoder we ship
-        // prediction weights of (0, 0): the decoder's unmixing filter
-        // then reduces to a plain M+S → L / M-S → R mapping (see the
-        // decoder's stereo_unmix_48k — `side_v = coded_side + p0*M +
-        // p1*M_filtered` collapses to `side_v = coded_side`). This
-        // leaves ~1 % of the achievable SILK-stereo gain on the table
-        // but round-trips cleanly at > 20 dB SNR on uncorrelated pairs;
-        // wiring the analysis path to emit non-zero predictors (the
-        // Wiener filter in `stereo_predict_weights_q13`) is a tracked
-        // follow-up gated on the SILK residual/LTP path being honest
-        // enough to benefit.
-        let (mid, side) = crate::silk::encoder::stereo_mid_side(left, right);
-        crate::silk::encoder::encode_stereo_pred_weights(&mut re, [0, 0]);
+        // For stereo, the mid/side split is done *per 20 ms SILK sub-
+        // frame* because the decoder emits one stereo prediction header
+        // + one mid body + one side body per sub-frame (RFC §4.2.4).
+        let per_silk = self.mode.samples_per_silk_frame();
+        let n = self.mode.silk_frames_per_packet();
+        for i in 0..n {
+            let start = i * per_silk;
+            let lc = &left[start..start + per_silk];
+            let rc = &right[start..start + per_silk];
 
-        // The decoder reads the mid-only flag only when the side VAD is
-        // 0; we emit VAD=1 for the side channel, so nothing to write.
+            // Stereo prediction weights (0, 0) for the MVP — see the
+            // comment in the 20 ms path.
+            let (mid, side) = crate::silk::encoder::stereo_mid_side(lc, rc);
+            crate::silk::encoder::encode_stereo_pred_weights(&mut re, [0, 0]);
 
-        // Mid + side bodies.
-        self.silk_mid.encode_frame_body(&mid, &mut re)?;
-        let side_enc = self
-            .silk_side
-            .as_mut()
-            .ok_or_else(|| Error::other("SILK stereo encoder: missing side-channel state"))?;
-        side_enc.encode_frame_body(&side, &mut re)?;
+            // Mid then side body. The decoder reads the mid-only flag
+            // only when the side VAD is 0; we emit VAD=1 for the side
+            // channel (see `emit_shared_header`), so no extra bit.
+            self.silk_mid.encode_frame_body(&mid, &mut re)?;
+            let side_enc = self
+                .silk_side
+                .as_mut()
+                .ok_or_else(|| Error::other("SILK stereo encoder: missing side state"))?;
+            side_enc.encode_frame_body(&side, &mut re)?;
+        }
 
         let body = re
             .done()
@@ -684,10 +931,11 @@ impl SilkEncoder {
 
         let tb = TimeBase::new(1, SAMPLE_RATE as i64);
         let pts = self.pts_counter;
-        self.pts_counter += SILK_FRAME_SAMPLES_48K as i64;
+        let samples_48k = self.mode.frame_samples_48k() as i64;
+        self.pts_counter += samples_48k;
         Ok(Packet::new(0, tb, data)
             .with_pts(pts)
-            .with_duration(SILK_FRAME_SAMPLES_48K as i64))
+            .with_duration(samples_48k))
     }
 }
 
