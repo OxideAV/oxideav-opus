@@ -1,8 +1,8 @@
 # oxideav-opus
 
 Pure-Rust **Opus** audio codec — RFC 6716 bitstream + RFC 7845 Ogg
-mapping. SILK and CELT decode (mono + stereo) plus encoders for a
-CELT-only full-band path and the full SILK-only config matrix
+mapping. SILK + CELT + Hybrid decode (mono + stereo) plus encoders
+for a CELT-only full-band path and the full SILK-only config matrix
 (NB / MB / WB, mono + stereo, 10 / 20 / 40 / 60 ms). Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
@@ -26,9 +26,14 @@ oxideav-opus = "0.0"
 - CELT frame sizes: 2.5 / 5 / 10 / 20 ms (config 16–31).
 - **SILK-only frames** at NB / MB / WB (8 / 12 / 16 kHz internal rate).
 - SILK frame sizes: 10 / 20 / 40 / 60 ms (config 0–11).
-- **Stereo**: both CELT and SILK stereo paths — SILK includes the
+- **Hybrid frames (SILK + CELT, RFC 6716 §4.4)** — SILK-WB covers the
+  0..8 kHz low band; CELT starts at band 17 (the 8 kHz edge) and fills
+  8..12 kHz (SWB) or 8..20 kHz (FB) on the same range-coded bitstream.
+  All four configs (12 = SWB 10 ms, 13 = SWB 20 ms, 14 = FB 10 ms,
+  15 = FB 20 ms) decode mono and stereo.
+- **Stereo**: CELT, SILK, and Hybrid stereo paths — SILK includes the
   mid/side unmixing filter with prediction-weight interpolation.
-- **Mono**: both CELT and SILK mono paths.
+- **Mono**: CELT, SILK, and Hybrid mono paths.
 - Framing codes 0, 1, 2, 3 — single-frame, paired-equal, paired-variable,
   and VBR/CBR multi-frame packets (RFC 6716 §3.2).
 - Silence / DTX packets (0 / 1-byte frames) emit correctly-sized silence.
@@ -102,7 +107,6 @@ Two explicit entry points, one per Opus mode:
 
 ### Not yet supported
 
-- **Hybrid (SILK + CELT) frames** — bailed out with `Error::Unsupported`.
 - **SILK LBRR redundancy frames** — the LBRR flags are parsed (so the
   range coder stays aligned) but the redundancy payload itself is not
   yet decoded. Packets that enable LBRR return `Error::Unsupported`.

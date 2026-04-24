@@ -540,18 +540,27 @@ fn decode_frame(
     }
 }
 
-/// Decode a Hybrid Opus frame (RFC 6716 §4.4).
+/// Decode a Hybrid Opus frame (RFC 6716 §4.4 / §4.3 start_band=17).
 ///
-/// Hybrid frames pack a SILK-WB body (covering the 0..8 kHz low band)
-/// and a CELT high-band portion (starting at band 17, covering
-/// 8..12 kHz or 8..20 kHz depending on SWB vs FB) into a single range
-/// coded bitstream. The SILK part decodes first; the CELT part
-/// re-uses the same `RangeDecoder` resumed where SILK left off.
+/// Hybrid frames (TOC config 12..=15) pack a SILK-WB body (covering
+/// the 0..8 kHz low band) and a CELT high-band portion (starting at
+/// band 17, i.e. the 8 kHz edge, covering 8..12 kHz for SWB or
+/// 8..20 kHz for FB) into a single range-coded bitstream. The SILK
+/// part decodes first; the CELT part re-uses the **same**
+/// `RangeDecoder` resumed where SILK left off — that's what makes this
+/// a single-packet hybrid rather than two independent bitstreams.
 ///
-/// Output is the sum of the SILK-WB-upsampled-to-48-kHz low-band and
-/// the CELT-48-kHz high-band, with a short cross-fade at the seam to
-/// prevent phase-discontinuity crackle. Supports mono and stereo at
-/// 10 ms / 20 ms.
+/// Internally SILK always runs at 16 kHz (WB), regardless of whether
+/// the TOC bandwidth is SWB (config 12/13) or FB (14/15); the bins
+/// between 8 kHz and the TOC bandwidth cutoff are filled in by the
+/// CELT high-band, which runs at 48 kHz. The final output is the
+/// pointwise sum of the two layers at 48 kHz: SILK's anti-aliasing
+/// filter zeroes out content above 8 kHz, and the CELT bit allocator
+/// skips bands below `start_band=17` (also zero), so the sum is
+/// band-complementary and mixes cleanly without a fade.
+///
+/// Supports mono and stereo at 10 ms / 20 ms (the only configurations
+/// RFC 6716 Table 2 defines for hybrid).
 fn decode_hybrid_frame(
     dec: &mut OpusDecoder,
     toc: &Toc,
@@ -623,27 +632,33 @@ fn decode_hybrid_frame(
     let celt_pcm = decode_celt_body(dec, toc, &mut rc, channels, n_samples, celt_start)?;
 
     // Mix SILK-low + CELT-high into the output. Both are already at
-    // 48 kHz. The CELT output at bands below `celt_start` is zero (the
-    // bit allocator skipped those bands), so a straight pointwise sum
-    // is correct. We apply a very short cross-fade at the frame seam
-    // boundaries to smooth any residual phase mismatch at the SILK /
-    // CELT transition.
-    let fade = 8usize.min(n_samples);
+    // 48 kHz. The CELT MDCT output at bands below `celt_start` is
+    // zero (the bit allocator skipped those bands), and the SILK
+    // upsampler's anti-aliasing filter removes content above ~8 kHz
+    // from the SILK-WB output, so the two contributions are
+    // band-complementary and a straight pointwise sum is correct.
+    //
+    // No per-frame fade is applied: CELT already handles continuity
+    // between adjacent frames via its own IMDCT overlap-add (a
+    // per-frame linear ramp at the start of every frame would
+    // introduce a periodic 20 ms amplitude discontinuity in the CELT
+    // high band, which was previously costing audible dB in the
+    // hybrid round-trip vs ffmpeg). The final S16 conversion
+    // downstream clamps to the codec-output range.
     let mut out: Vec<Vec<f32>> = (0..channels).map(|_| vec![0f32; n_samples]).collect();
     for c in 0..channels {
-        let silk_c = silk_per_ch.get(c).cloned().unwrap_or_else(|| vec![0.0; n_samples]);
-        let celt_c = celt_pcm.get(c).cloned().unwrap_or_else(|| vec![0.0; n_samples]);
+        let silk_c = silk_per_ch
+            .get(c)
+            .cloned()
+            .unwrap_or_else(|| vec![0.0; n_samples]);
+        let celt_c = celt_pcm
+            .get(c)
+            .cloned()
+            .unwrap_or_else(|| vec![0.0; n_samples]);
         for i in 0..n_samples {
             let s = silk_c.get(i).copied().unwrap_or(0.0);
             let e = celt_c.get(i).copied().unwrap_or(0.0);
-            // Simple linear fade-in over the first `fade` samples to
-            // hide any seam discontinuity in the SILK upsample.
-            let w = if i < fade {
-                (i + 1) as f32 / (fade + 1) as f32
-            } else {
-                1.0
-            };
-            out[c][i] = (s + e * w).clamp(-1.0, 1.0);
+            out[c][i] = s + e;
         }
     }
     Ok(out)
