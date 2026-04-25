@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-opus/compare/v0.0.4...v0.0.5) - 2026-04-25
+
+### Other
+
+- bump oxideav-celt to 0.2
+- drop oxideav-codec/oxideav-container shims, import from oxideav-core
+- promote hybrid decode from hidden to first-class + interop tests
+- implement real RFC 4.2.7.8 shell-pulse coder
+- add SILK encoder voiced-path round-trip tests
+- wire SILK encoder voiced/LTP path end-to-end
+- add SILK encoder pitch lag + LTP filter encode helpers
+- add SILK encoder pitch analysis (autocorrelation)
+- README + Cargo description for full SILK encode matrix
+- full SILK-only config matrix (0-11) encoder
+- clamp CELT post-filter head to `n.min(120)` for short frames
+- add SILK 10 ms NB/MB/WB mono frame encoder
+- add RFC 6716 Appendix A test-vector smoke test (ignored)
+- multistream decoder (channel mapping family 1 + 2)
+- decode Hybrid (SILK+CELT) frames per RFC 6716 §4.4
+- decode-and-discard SILK LBRR bodies to keep range coder aligned
+- add BSD-3-Clause attribution for libopus-derived code
+- document SILK MB/WB/stereo encoder modes in README
+- round-trip tests + stereo M/S scaling fix for SILK MB/WB/stereo
+- add SILK MB/WB mono + NB stereo encoder modes
+- factor SILK frame encoder into BandwidthParams descriptor (NB/MB/WB)
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-opus/compare/v0.0.3...v0.0.4) - 2026-04-19
 
 ### Other
