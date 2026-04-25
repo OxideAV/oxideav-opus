@@ -1110,6 +1110,7 @@ fn make_tone_at_rate(rate: u32, total_samples: usize) -> Vec<f32> {
 /// combinations. Encodes a 300 Hz tone + 5 Hz envelope, decodes, then
 /// downsamples the 48 kHz decoded PCM back to the internal rate by box
 /// average and measures SNR with a lag search.
+#[allow(clippy::too_many_arguments)]
 fn silk_mono_any_duration_snr(
     enc: SilkEncoder,
     internal_rate: u32,
