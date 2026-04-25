@@ -263,8 +263,8 @@ impl SilkDecoder {
         // redundancy copy used for packet-loss concealment. In the
         // loss-free path we just need to consume the bits so the range
         // coder stays aligned with the regular frame bodies that follow.
-        let any_lbrr = (0..n_internal_channels)
-            .any(|n| (0..n_frames_per_packet).any(|i| lbrr_flags[n][i]));
+        let any_lbrr =
+            (0..n_internal_channels).any(|n| (0..n_frames_per_packet).any(|i| lbrr_flags[n][i]));
         if any_lbrr {
             let mut lbrr_mid_state = SilkChannelState::new();
             let mut lbrr_side_state = SilkChannelState::new();

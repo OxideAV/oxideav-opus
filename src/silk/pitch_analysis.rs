@@ -265,7 +265,11 @@ mod tests {
         // 200 Hz @ 8 kHz → period = 40 samples.
         let pcm = synth_sine(200.0, 8_000, 160, 0.3);
         let p = analyze_pitch(&pcm, OpusBandwidth::Narrowband);
-        assert!(p.voiced, "200 Hz sine should be voiced (corr={})", p.correlation);
+        assert!(
+            p.voiced,
+            "200 Hz sine should be voiced (corr={})",
+            p.correlation
+        );
         // Allow ±1 sample quantisation error.
         assert!(
             (p.lag_internal - 40).abs() <= 2,
@@ -280,7 +284,11 @@ mod tests {
         // 150 Hz harmonic mix @ 16 kHz → period ≈ 107 samples.
         let pcm = synth_harmonic(150.0, 16_000, 320, 0.3);
         let p = analyze_pitch(&pcm, OpusBandwidth::Wideband);
-        assert!(p.voiced, "harmonic @ 150 Hz should be voiced (corr={})", p.correlation);
+        assert!(
+            p.voiced,
+            "harmonic @ 150 Hz should be voiced (corr={})",
+            p.correlation
+        );
         // Lag = 16000 / 150 ≈ 106.67 internal samples.
         assert!(
             (p.lag_internal - 107).abs() <= 4,
@@ -300,7 +308,11 @@ mod tests {
             })
             .collect();
         let p = analyze_pitch(&pcm, OpusBandwidth::Wideband);
-        assert!(!p.voiced, "white noise should be unvoiced (corr={})", p.correlation);
+        assert!(
+            !p.voiced,
+            "white noise should be unvoiced (corr={})",
+            p.correlation
+        );
     }
 
     #[test]

@@ -719,19 +719,7 @@ mod tests {
     #[test]
     fn parse_self_delimited_code3_vbr() {
         // fc = 0x83 = VBR + 3 frames. lens = 1, 2, 3. frames = A, BC, DEF.
-        let p = vec![
-            (16u8 << 3) | 3,
-            0x83,
-            1,
-            2,
-            3,
-            0xA,
-            0xB,
-            0xC,
-            0xD,
-            0xE,
-            0xF,
-        ];
+        let p = vec![(16u8 << 3) | 3, 0x83, 1, 2, 3, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF];
         let (pkt, consumed) = parse_self_delimited_packet(&p).unwrap();
         assert_eq!(pkt.frames.len(), 3);
         assert_eq!(pkt.frames[0], &[0xA]);

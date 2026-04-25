@@ -231,10 +231,7 @@ mod tests {
             let abs_flag = dec.decode_bit_logp(1);
             assert!(abs_flag, "expected abs flag for prev_lag=0");
             let got = decode_absolute_pitch_lag(&mut dec, OpusBandwidth::Narrowband).unwrap();
-            assert_eq!(
-                got, lag,
-                "NB lag {lag} did not round-trip (got {got})"
-            );
+            assert_eq!(got, lag, "NB lag {lag} did not round-trip (got {got})");
         }
     }
 

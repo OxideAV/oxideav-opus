@@ -7,7 +7,7 @@
 //! and IMDCT are not bit-exact with libopus yet), so the acceptance
 //! bar is **decoded energy relative to input**, not a tight PSNR.
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase,
 };
@@ -1406,9 +1406,7 @@ fn run_stereo_smoke_test(
     assert_eq!(decoded.len(), 2);
     let e_l = mean_energy_i16(&decoded[0]);
     let e_r = mean_energy_i16(&decoded[1]);
-    println!(
-        "silk {expected_bw:?} stereo 20 ms: e_l={e_l:.4e}, e_r={e_r:.4e}"
-    );
+    println!("silk {expected_bw:?} stereo 20 ms: e_l={e_l:.4e}, e_r={e_r:.4e}");
     assert!(e_l > 1e-4, "stereo L too quiet");
     assert!(e_r > 1e-4, "stereo R too quiet");
 }

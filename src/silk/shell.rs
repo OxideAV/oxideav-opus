@@ -50,27 +50,49 @@ pub const RATE_LEVEL_VOICED_ICDF: [u8; 9] = [223, 193, 157, 140, 106, 57, 39, 18
 /// Pulse count ICDFs for rate levels 0..=10. 18 symbols each, ftb=8.
 pub const PULSE_COUNT_ICDF: [[u8; 18]; 11] = [
     // level 0: {131,74,25,8,3,3,1,1,1,1,1,1,1,1,1,1,1,1}
-    [125, 51, 26, 18, 15, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+    [
+        125, 51, 26, 18, 15, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+    ],
     // level 1: {58,93,60,23,7,3,1,1,1,1,1,1,1,1,1,1,1,1}
-    [198, 105, 45, 22, 15, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+    [
+        198, 105, 45, 22, 15, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+    ],
     // level 2: {43,51,46,33,24,16,11,8,6,3,3,3,2,1,1,2,1,2}
-    [213, 162, 116, 83, 59, 43, 32, 24, 18, 15, 12, 9, 7, 6, 5, 3, 2, 0],
+    [
+        213, 162, 116, 83, 59, 43, 32, 24, 18, 15, 12, 9, 7, 6, 5, 3, 2, 0,
+    ],
     // level 3: {17,52,71,57,31,12,5,1,1,1,1,1,1,1,1,1,1,1}
-    [239, 187, 116, 59, 28, 16, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+    [
+        239, 187, 116, 59, 28, 16, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+    ],
     // level 4: {6,21,41,53,49,35,21,11,6,3,2,2,1,1,1,1,1,1}
-    [250, 229, 188, 135, 86, 51, 30, 19, 13, 10, 8, 6, 5, 4, 3, 2, 1, 0],
+    [
+        250, 229, 188, 135, 86, 51, 30, 19, 13, 10, 8, 6, 5, 4, 3, 2, 1, 0,
+    ],
     // level 5: {7,14,22,28,29,28,25,20,17,13,11,9,7,5,4,4,3,10}
-    [249, 235, 213, 185, 156, 128, 103, 83, 66, 53, 42, 33, 26, 21, 17, 13, 10, 0],
+    [
+        249, 235, 213, 185, 156, 128, 103, 83, 66, 53, 42, 33, 26, 21, 17, 13, 10, 0,
+    ],
     // level 6: {2,5,14,29,42,46,41,31,19,11,6,3,2,1,1,1,1,1}
-    [254, 249, 235, 206, 164, 118, 77, 46, 27, 16, 10, 7, 5, 4, 3, 2, 1, 0],
+    [
+        254, 249, 235, 206, 164, 118, 77, 46, 27, 16, 10, 7, 5, 4, 3, 2, 1, 0,
+    ],
     // level 7: {1,2,4,10,19,29,35,37,34,28,20,14,8,5,4,2,2,2}
-    [255, 253, 249, 239, 220, 191, 156, 119, 85, 57, 37, 23, 15, 10, 6, 4, 2, 0],
+    [
+        255, 253, 249, 239, 220, 191, 156, 119, 85, 57, 37, 23, 15, 10, 6, 4, 2, 0,
+    ],
     // level 8: {1,2,2,5,9,14,20,24,27,28,26,23,20,15,11,8,6,15}
-    [255, 253, 251, 246, 237, 223, 203, 179, 152, 124, 98, 75, 55, 40, 29, 21, 15, 0],
+    [
+        255, 253, 251, 246, 237, 223, 203, 179, 152, 124, 98, 75, 55, 40, 29, 21, 15, 0,
+    ],
     // level 9: {1,1,1,6,27,58,56,39,25,14,10,6,3,3,2,1,1,2}
-    [255, 254, 253, 247, 220, 162, 106, 67, 42, 28, 18, 12, 9, 6, 4, 3, 2, 0],
+    [
+        255, 254, 253, 247, 220, 162, 106, 67, 42, 28, 18, 12, 9, 6, 4, 3, 2, 0,
+    ],
     // level 10: {2,1,6,27,58,56,39,25,14,10,6,3,3,2,1,1,2,0}
-    [254, 253, 247, 220, 162, 106, 67, 42, 28, 18, 12, 9, 6, 4, 3, 2, 0, 0],
+    [
+        254, 253, 247, 220, 162, 106, 67, 42, 28, 18, 12, 9, 6, 4, 3, 2, 0, 0,
+    ],
 ];
 
 // -------------------------------------------------------------------
@@ -304,12 +326,7 @@ fn encode_shell_block_locations(enc: &mut RangeEncoder, pulses: &[u32; 16]) {
 
 /// Encode the pulse count for a shell block, emitting 17-escapes so
 /// the decoder picks up `lsb_count` extra LSBs for every coefficient.
-fn encode_pulse_count(
-    enc: &mut RangeEncoder,
-    rate_level: usize,
-    pulse_count: u32,
-    lsb_count: u32,
-) {
+fn encode_pulse_count(enc: &mut RangeEncoder, rate_level: usize, pulse_count: u32, lsb_count: u32) {
     debug_assert!(pulse_count <= 16);
     debug_assert!(lsb_count <= 10);
     // RFC §4.2.7.8.2: first read uses `rate_level`. Each emitted 17
@@ -337,10 +354,7 @@ pub fn quantize_to_shell(signed_mags: &[i32]) -> Vec<i32> {
         // Pick min lsb such that sum(|m| >> lsb) ≤ 16, or cap at 10.
         let mut lsb = 0u32;
         loop {
-            let sum: u64 = slice
-                .iter()
-                .map(|m| (m.unsigned_abs() as u64) >> lsb)
-                .sum();
+            let sum: u64 = slice.iter().map(|m| (m.unsigned_abs() as u64) >> lsb).sum();
             if sum <= 16 || lsb >= 10 {
                 break;
             }
@@ -432,10 +446,7 @@ pub fn encode_excitation(
         // Find the minimum lsb_count such that sum(|m| >> lsb_count) <= 16.
         let mut lsb = 0u32;
         loop {
-            let sum: u64 = slice
-                .iter()
-                .map(|m| (m.unsigned_abs() as u64) >> lsb)
-                .sum();
+            let sum: u64 = slice.iter().map(|m| (m.unsigned_abs() as u64) >> lsb).sum();
             if sum <= 16 || lsb >= 10 {
                 break;
             }
@@ -446,11 +457,7 @@ pub fn encode_excitation(
         let mut total_pulses = 0u32;
         for i in 0..16 {
             let abs = slice[i].unsigned_abs();
-            let p = if shift == 0 {
-                abs
-            } else {
-                abs >> shift
-            };
+            let p = if shift == 0 { abs } else { abs >> shift };
             let mask = if shift == 0 { 0 } else { (1u32 << shift) - 1 };
             let bits = abs & mask;
             pulses_per_sample[base + i] = p.min(16);
@@ -471,9 +478,7 @@ pub fn encode_excitation(
             // Sort indices by descending pulses_per_sample[base+i], reduce
             // largest until sum ≤ 16.
             let mut order: Vec<usize> = (0..16).collect();
-            order.sort_by(|&a, &b| {
-                pulses_per_sample[base + b].cmp(&pulses_per_sample[base + a])
-            });
+            order.sort_by(|&a, &b| pulses_per_sample[base + b].cmp(&pulses_per_sample[base + a]));
             let mut excess = total_pulses - 16;
             for &i in &order {
                 if excess == 0 {
@@ -777,7 +782,9 @@ mod tests {
     #[test]
     fn roundtrip_high_magnitude_block_uses_lsbs() {
         // Magnitudes up to 120 (CARRIER_FULL_SCALE) force multiple LSBs.
-        let sm: Vec<i32> = (0..16).map(|i| if i % 2 == 0 { 100 } else { -80 }).collect();
+        let sm: Vec<i32> = (0..16)
+            .map(|i| if i % 2 == 0 { 100 } else { -80 })
+            .collect();
         let mut enc = RangeEncoder::new(256);
         encode_excitation(&mut enc, &sm, 1, 0);
         let buf = enc.done().unwrap();
@@ -886,4 +893,3 @@ mod tests {
         eprintln!("shell_bits={shell_bits} mvp_bits={mvp_bits}");
     }
 }
-

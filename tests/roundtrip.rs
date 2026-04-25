@@ -16,7 +16,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use oxideav_container::{Demuxer, ReadSeek};
+use oxideav_core::{Demuxer, ReadSeek};
 use oxideav_core::{Error, Frame};
 use oxideav_opus::toc::{parse_packet, OpusMode, Toc};
 
@@ -1186,8 +1186,7 @@ fn rfc6716_test_vectors_report() {
             // Guard against CELT bounds panics. The decoder state is
             // discarded after a panic so subsequent packets may yield
             // garbage; break out of the inner loop in that case.
-            let result =
-                catch_unwind(AssertUnwindSafe(|| dec.receive_frame()));
+            let result = catch_unwind(AssertUnwindSafe(|| dec.receive_frame()));
             match result {
                 Ok(Ok(Frame::Audio(a))) => {
                     assert_eq!(a.sample_rate, 48_000);
@@ -1722,10 +1721,7 @@ fn hybrid_decoder_carries_both_bands() {
     // The CELT-only reconstruction at 32 kbps is coarse but
     // non-zero; the bar is deliberately loose (the CELT shape decode
     // is not bit-exact yet).
-    assert!(
-        e_high >= 0.0,
-        "negative high-band energy (numerical bug)"
-    );
+    assert!(e_high >= 0.0, "negative high-band energy (numerical bug)");
 }
 
 /// Single-frequency Goertzel magnitude. Used by the audio acceptance test.

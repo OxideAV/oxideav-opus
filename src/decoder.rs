@@ -33,7 +33,7 @@ use oxideav_celt::tables::{
     end_band_for_bandwidth_celt, init_caps, lm_for_frame_samples, EBAND_5MS, NB_EBANDS,
     SPREAD_ICDF, SPREAD_NORMAL, TF_SELECT_TABLE, TRIM_ICDF,
 };
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
@@ -341,14 +341,10 @@ impl MultistreamOpusDecoder {
         let stream_count = head.mapping_table[0];
         let coupled_stream_count = head.mapping_table[1];
         if stream_count == 0 {
-            return Err(Error::invalid(
-                "Opus multistream: stream count must be > 0",
-            ));
+            return Err(Error::invalid("Opus multistream: stream count must be > 0"));
         }
         if coupled_stream_count > stream_count {
-            return Err(Error::invalid(
-                "Opus multistream: coupled > stream count",
-            ));
+            return Err(Error::invalid("Opus multistream: coupled > stream count"));
         }
         let c = head.output_channel_count as usize;
         if head.mapping_table.len() < 2 + c {
@@ -409,8 +405,7 @@ impl MultistreamOpusDecoder {
         let mut out: Vec<crate::toc::OpusPacket<'a>> = Vec::with_capacity(n);
         let mut cursor = 0usize;
         for _ in 0..n.saturating_sub(1) {
-            let (pkt, consumed) =
-                crate::toc::parse_self_delimited_packet(&data[cursor..])?;
+            let (pkt, consumed) = crate::toc::parse_self_delimited_packet(&data[cursor..])?;
             out.push(pkt);
             cursor += consumed;
         }
@@ -473,18 +468,14 @@ impl Decoder for MultistreamOpusDecoder {
 
         // Map to output channels.
         let out_channels = self.channels as usize;
-        let mut interleaved =
-            Vec::with_capacity(per_frame_samples * out_channels * 2);
+        let mut interleaved = Vec::with_capacity(per_frame_samples * out_channels * 2);
         for i in 0..per_frame_samples {
             for c in 0..out_channels {
                 let idx = self.channel_mapping[c];
                 let s = if idx == 255 {
                     0.0f32
                 } else if (idx as usize) < stream_channels.len() {
-                    stream_channels[idx as usize]
-                        .get(i)
-                        .copied()
-                        .unwrap_or(0.0)
+                    stream_channels[idx as usize].get(i).copied().unwrap_or(0.0)
                 } else {
                     0.0
                 };
@@ -595,9 +586,10 @@ fn decode_hybrid_frame(
 
     let mut rc = RangeDecoder::new(bytes);
     let silk_pcm_48k = {
-        let silk = dec.silk.as_mut().ok_or_else(|| {
-            Error::other("opus hybrid: SILK sub-decoder failed to initialise")
-        })?;
+        let silk = dec
+            .silk
+            .as_mut()
+            .ok_or_else(|| Error::other("opus hybrid: SILK sub-decoder failed to initialise"))?;
         silk.decode_frame_to_48k(&mut rc, &silk_toc)?
     };
 
@@ -614,8 +606,7 @@ fn decode_hybrid_frame(
             vec![l, r]
         } else {
             // Downmix (rare but guard): average L+R.
-            let mono: Vec<f32> =
-                l.iter().zip(r.iter()).map(|(a, b)| 0.5 * (a + b)).collect();
+            let mono: Vec<f32> = l.iter().zip(r.iter()).map(|(a, b)| 0.5 * (a + b)).collect();
             vec![mono]
         }
     } else {
