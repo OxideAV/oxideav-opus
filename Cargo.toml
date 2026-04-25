@@ -15,7 +15,7 @@ categories = ["multimedia::encoding", "multimedia::audio"]
 
 [dependencies]
 oxideav-core = "0.1"
-oxideav-celt = "0.2"
+oxideav-celt = "0.1"
 
 [dev-dependencies]
 oxideav-ogg = "0.1"
