@@ -9,7 +9,7 @@
 
 use oxideav_core::Encoder;
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase,
+    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet,
 };
 use oxideav_opus::encoder::{
     OpusEncoder, SilkEncoder, OPUS_FRAME_SAMPLES, SILK_FRAME_SAMPLES_48K,
@@ -27,12 +27,8 @@ fn make_s16_frame_mono(samples_f32: &[f32]) -> Frame {
         bytes.extend_from_slice(&q.to_le_bytes());
     }
     Frame::Audio(AudioFrame {
-        format: SampleFormat::S16,
-        channels: 1,
-        sample_rate: SR,
         samples: samples_f32.len() as u32,
         pts: None,
-        time_base: TimeBase::new(1, SR as i64),
         data: vec![bytes],
     })
 }
@@ -47,12 +43,8 @@ fn make_s16_frame_stereo(l: &[f32], r: &[f32]) -> Frame {
         bytes.extend_from_slice(&rq.to_le_bytes());
     }
     Frame::Audio(AudioFrame {
-        format: SampleFormat::S16,
-        channels: 2,
-        sample_rate: SR,
         samples: l.len() as u32,
         pts: None,
-        time_base: TimeBase::new(1, SR as i64),
         data: vec![bytes],
     })
 }
@@ -82,11 +74,9 @@ fn decode_packets(packets: &[Packet], channels: u16) -> Vec<Vec<i16>> {
         dec.send_packet(pkt).expect("send_packet");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.sample_rate, SR);
-                assert_eq!(a.channels, channels);
                 let bytes = &a.data[0];
                 let n = a.samples as usize;
-                let ch = a.channels as usize;
+                let ch = channels as usize;
                 // Interleaved S16 LE.
                 for i in 0..n {
                     for (c, ac) in acc.iter_mut().enumerate().take(ch) {
@@ -532,12 +522,8 @@ fn silk_nb_mono_20ms_roundtrip_snr_above_20db() {
             bytes.extend_from_slice(&q.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate,
             samples: 160,
             pts: None,
-            time_base: TimeBase::new(1, sample_rate as i64),
             data: vec![bytes],
         });
         enc.send_frame(&frame).expect("send");
@@ -608,12 +594,8 @@ fn silk_nb_mono_silence_roundtrip_stays_quiet() {
             bytes.extend_from_slice(&q.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: SILK_NB_RATE,
             samples: 160,
             pts: None,
-            time_base: TimeBase::new(1, SILK_NB_RATE as i64),
             data: vec![bytes],
         });
         enc.send_frame(&frame).unwrap();
@@ -714,12 +696,8 @@ fn silk_mono_internal_rate_snr(
             bytes.extend_from_slice(&q.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: internal_rate,
             samples: internal_frame_samples as u32,
             pts: None,
-            time_base: TimeBase::new(1, internal_rate as i64),
             data: vec![bytes],
         });
         enc.send_frame(&frame).expect("send");
@@ -875,12 +853,8 @@ fn silk_nb_stereo_20ms_roundtrip_snr_and_channel_separation() {
             bytes.extend_from_slice(&rq.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 2,
-            sample_rate: internal_rate,
             samples: internal_frame_samples as u32,
             pts: None,
-            time_base: TimeBase::new(1, internal_rate as i64),
             data: vec![bytes],
         });
         enc.send_frame(&frame).expect("send");
@@ -986,12 +960,8 @@ fn silk_mb_mono_silence_stays_quiet() {
             bytes.extend_from_slice(&q.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: SILK_MB_RATE,
             samples: SILK_MB_FRAME_SAMPLES_INTERNAL as u32,
             pts: None,
-            time_base: TimeBase::new(1, SILK_MB_RATE as i64),
             data: vec![bytes],
         });
         enc.send_frame(&frame).unwrap();
@@ -1023,12 +993,8 @@ fn silk_wb_mono_silence_stays_quiet() {
             bytes.extend_from_slice(&q.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: SILK_WB_RATE,
             samples: SILK_WB_FRAME_SAMPLES_INTERNAL as u32,
             pts: None,
-            time_base: TimeBase::new(1, SILK_WB_RATE as i64),
             data: vec![bytes],
         });
         enc.send_frame(&frame).unwrap();
@@ -1055,7 +1021,7 @@ fn silk_wb_mono_silence_stays_quiet() {
 fn encode_mono_run(
     mut enc: SilkEncoder,
     signal: &[f32],
-    internal_rate: u32,
+    _internal_rate: u32,
     samples_per_input_frame: usize,
 ) -> Vec<Packet> {
     let mut packets: Vec<Packet> = Vec::new();
@@ -1069,12 +1035,8 @@ fn encode_mono_run(
             bytes.extend_from_slice(&q.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: internal_rate,
             samples: samples_per_input_frame as u32,
             pts: None,
-            time_base: TimeBase::new(1, internal_rate as i64),
             data: vec![bytes],
         });
         enc.send_frame(&frame).expect("send");
@@ -1374,12 +1336,8 @@ fn run_stereo_smoke_test(
             bytes.extend_from_slice(&rq.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 2,
-            sample_rate: internal_rate,
             samples: samples_per_frame as u32,
             pts: None,
-            time_base: TimeBase::new(1, internal_rate as i64),
             data: vec![bytes],
         });
         enc.send_frame(&frame).expect("send");

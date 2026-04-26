@@ -90,6 +90,10 @@ pub struct OpusEncoder {
     /// Channel count on the *input* frames (1 or 2). Stereo inputs are
     /// downmixed to mono before hitting the CELT encoder.
     input_channels: u16,
+    /// Sample format of the input frames (S16 / S16P / F32 / F32P). Frames
+    /// no longer carry this themselves — the encoder caches it from the
+    /// stream's `CodecParameters` at construction time.
+    input_sample_format: SampleFormat,
     /// The underlying mono CELT encoder.
     celt: CeltEncoder,
     /// Output packet queue (one Opus packet per 20 ms of input).
@@ -125,6 +129,10 @@ impl OpusEncoder {
         let mut celt_params = params.clone();
         celt_params.channels = Some(1);
         celt_params.sample_rate = Some(SAMPLE_RATE);
+        // CELT consumes the mono F32 buffer we emit from extract_mono_f32.
+        // Pin the sample format here so the inner encoder doesn't fall
+        // back on the caller's input format (which may be S16 or planar).
+        celt_params.sample_format = Some(SampleFormat::F32);
         // CeltEncoder expects its own codec id; clone the whole parameter
         // block and override the id so the inner encoder doesn't reject
         // us for a mismatch.
@@ -139,9 +147,12 @@ impl OpusEncoder {
         out_params.sample_rate = Some(SAMPLE_RATE);
         out_params.channels = Some(channels);
 
+        let input_sample_format = params.sample_format.unwrap_or(SampleFormat::S16);
+
         Ok(Self {
             out_params,
             input_channels: channels,
+            input_sample_format,
             celt,
             output: VecDeque::new(),
             pts_counter: 0,
@@ -210,22 +221,12 @@ impl Encoder for OpusEncoder {
                 ))
             }
         };
-        if audio.sample_rate != SAMPLE_RATE {
-            return Err(Error::unsupported(format!(
-                "opus encoder: input must be 48 kHz (got {}); resample before encoding",
-                audio.sample_rate
-            )));
-        }
-        if audio.channels != self.input_channels {
-            return Err(Error::invalid(format!(
-                "opus encoder: frame channels ({}) differ from configured input channels ({})",
-                audio.channels, self.input_channels
-            )));
-        }
 
         // Flatten the input into a mono f32 buffer regardless of whether
-        // the container was mono (passthrough) or stereo (downmix).
-        let mono = extract_mono_f32(audio)?;
+        // the container was mono (passthrough) or stereo (downmix). The
+        // input shape (channels + sample format) comes from the encoder's
+        // stream params, since the slim AudioFrame no longer carries it.
+        let mono = extract_mono_f32(audio, self.input_channels, self.input_sample_format)?;
 
         // Feed the CELT encoder as a single mono F32 frame.
         let mut bytes = Vec::with_capacity(mono.len() * 4);
@@ -233,12 +234,8 @@ impl Encoder for OpusEncoder {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
         let celt_frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::F32,
-            channels: 1,
-            sample_rate: SAMPLE_RATE,
             samples: mono.len() as u32,
             pts: audio.pts,
-            time_base: TimeBase::new(1, SAMPLE_RATE as i64),
             data: vec![bytes],
         });
         self.celt.send_frame(&celt_frame)?;
@@ -263,14 +260,17 @@ impl Encoder for OpusEncoder {
 /// Decode the `AudioFrame`'s sample bytes into a mono f32 buffer, applying
 /// a stereo → mono downmix (simple mean) when needed. Supports S16 and
 /// F32 (interleaved or planar).
-fn extract_mono_f32(audio: &AudioFrame) -> Result<Vec<f32>> {
+///
+/// `channels` and `format` are sourced from the encoder's stream params,
+/// since the slim `AudioFrame` no longer carries them per-frame.
+fn extract_mono_f32(audio: &AudioFrame, channels: u16, format: SampleFormat) -> Result<Vec<f32>> {
     let n = audio.samples as usize;
-    let ch = audio.channels as usize;
+    let ch = channels as usize;
     if ch == 0 {
         return Err(Error::invalid("opus encoder: 0-channel audio frame"));
     }
     let mut out = vec![0f32; n];
-    match audio.format {
+    match format {
         SampleFormat::S16 => {
             // Interleaved S16.
             let bytes = &audio.data[0];
@@ -618,6 +618,9 @@ pub struct SilkEncoder {
     pending_internal: VecDeque<f32>,
     /// Expected input sample rate (internal or 48 kHz).
     input_sample_rate: u32,
+    /// Sample format of the input frames; cached from stream params since
+    /// the slim `AudioFrame` no longer carries it.
+    input_sample_format: SampleFormat,
     /// Output packet queue.
     output: VecDeque<Packet>,
     /// PTS counter in 48 kHz samples.
@@ -797,6 +800,8 @@ impl SilkEncoder {
         let per_frame_items =
             mode.frame_samples_internal() * (if mode.is_stereo() { 2 } else { 1 });
 
+        let input_sample_format = params.sample_format.unwrap_or(SampleFormat::S16);
+
         Ok(Self {
             out_params,
             mode,
@@ -804,6 +809,7 @@ impl SilkEncoder {
             silk_side,
             pending_internal: VecDeque::with_capacity(per_frame_items * 2),
             input_sample_rate: sr,
+            input_sample_format,
             output: VecDeque::new(),
             pts_counter: 0,
         })
@@ -969,34 +975,27 @@ impl Encoder for SilkEncoder {
                 ))
             }
         };
-        if audio.channels != self.mode.input_channels() {
-            return Err(Error::invalid(format!(
-                "SILK encoder: frame channels ({}) differ from configured input channels ({})",
-                audio.channels,
-                self.mode.input_channels()
-            )));
-        }
-        if audio.sample_rate != self.input_sample_rate {
-            return Err(Error::unsupported(format!(
-                "SILK encoder: input sample rate ({}) differs from configured rate ({}); reconfigure or resample first",
-                audio.sample_rate, self.input_sample_rate
-            )));
-        }
 
         // Extract f32 samples. Mono modes feed `extract_mono_f32`; the
         // stereo mode keeps per-channel planes interleaved so the
-        // caller-side mid/side split stays bit-exact.
+        // caller-side mid/side split stays bit-exact. Channel count and
+        // sample format come from the encoder's stream params, since the
+        // slim `AudioFrame` no longer carries them per-frame.
         let internal_items_per_sample = if self.mode.is_stereo() { 2 } else { 1 };
         let internal_samples: Vec<f32> = if self.mode.is_stereo() {
-            let stereo = extract_stereo_f32(audio)?;
-            if audio.sample_rate == self.mode.internal_rate() {
+            let stereo = extract_stereo_f32(audio, self.input_sample_format)?;
+            if self.input_sample_rate == self.mode.internal_rate() {
                 stereo
             } else {
                 downsample_box_interleaved(&stereo, self.mode.downsample_ratio(), 2)
             }
         } else {
-            let mono = extract_mono_f32(audio)?;
-            if audio.sample_rate == self.mode.internal_rate() {
+            let mono = extract_mono_f32(
+                audio,
+                self.mode.input_channels(),
+                self.input_sample_format,
+            )?;
+            if self.input_sample_rate == self.mode.internal_rate() {
                 mono
             } else {
                 downsample_box(&mono, self.mode.downsample_ratio())
@@ -1035,16 +1034,14 @@ impl Encoder for SilkEncoder {
 /// Extract an interleaved L/R f32 buffer from an `AudioFrame`. Supports
 /// the same sample formats as [`extract_mono_f32`] but returns
 /// `samples * 2` floats, preserving per-channel detail.
-fn extract_stereo_f32(audio: &AudioFrame) -> Result<Vec<f32>> {
+///
+/// `format` comes from the encoder's stream params, since the slim
+/// `AudioFrame` no longer carries it per-frame. Stereo channel count is
+/// implied by the SILK stereo mode that calls this helper.
+fn extract_stereo_f32(audio: &AudioFrame, format: SampleFormat) -> Result<Vec<f32>> {
     let n = audio.samples as usize;
-    let ch = audio.channels as usize;
-    if ch != 2 {
-        return Err(Error::invalid(format!(
-            "SILK stereo encoder: expected 2-channel input, got {ch}"
-        )));
-    }
     let mut out = vec![0f32; n * 2];
-    match audio.format {
+    match format {
         SampleFormat::S16 => {
             let bytes = &audio.data[0];
             let needed = n * 2 * 2;
@@ -1247,12 +1244,8 @@ mod tests {
         // Feed one frame of silence.
         let bytes = vec![0u8; OPUS_FRAME_SAMPLES * 2];
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: SAMPLE_RATE,
             samples: OPUS_FRAME_SAMPLES as u32,
             pts: None,
-            time_base: TimeBase::new(1, SAMPLE_RATE as i64),
             data: vec![bytes],
         });
         enc.send_frame(&frame).unwrap();

@@ -35,7 +35,7 @@ use oxideav_celt::tables::{
 };
 use oxideav_core::Decoder;
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
+    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase,
 };
 
 use crate::silk::SilkDecoder;
@@ -284,12 +284,8 @@ fn decode_packet(dec: &mut OpusDecoder, packet: &Packet) -> Result<Frame> {
     dec.emit_pts = pts + total_samples as i64;
 
     Ok(Frame::Audio(AudioFrame {
-        format: SampleFormat::S16,
-        channels: out_channels,
-        sample_rate: OPUS_RATE_HZ,
         samples: total_samples as u32,
         pts: Some(pts),
-        time_base: dec.time_base,
         data: vec![interleaved],
     }))
 }
@@ -488,12 +484,8 @@ impl Decoder for MultistreamOpusDecoder {
         self.emit_pts = pts + per_frame_samples as i64;
 
         Ok(Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: self.channels,
-            sample_rate: OPUS_RATE_HZ,
             samples: per_frame_samples as u32,
             pts: Some(pts),
-            time_base: self.time_base,
             data: vec![interleaved],
         }))
     }
@@ -1346,9 +1338,6 @@ mod tests {
         match f {
             Frame::Audio(a) => {
                 assert_eq!(a.samples, 960);
-                assert_eq!(a.channels, 2);
-                assert_eq!(a.sample_rate, 48_000);
-                assert_eq!(a.format, SampleFormat::S16);
                 let s16_bytes = &a.data[0];
                 assert!(s16_bytes.chunks(2).all(|c| c[0] == 0 && c[1] == 0));
             }

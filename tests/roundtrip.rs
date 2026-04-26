@@ -410,9 +410,7 @@ fn silk_nb_voip_decodes_to_audio() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.sample_rate, 48_000);
                 assert_eq!(a.samples, 960);
-                assert_eq!(a.channels, 1);
                 let bytes = &a.data[0];
                 assert_eq!(bytes.len(), 960 * 2);
                 for chunk in bytes.chunks_exact(2) {
@@ -488,7 +486,6 @@ fn celt_pipeline_runs_end_to_end() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.sample_rate, 48_000);
                 assert_eq!(a.samples, 960);
                 saw_audio = true;
             }
@@ -613,13 +610,11 @@ fn silk_nb_voip_10ms_decodes() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.sample_rate, 48_000);
                 assert_eq!(
                     a.samples, 480,
                     "10 ms @ 48 kHz should be 480 samples; got {}",
                     a.samples
                 );
-                assert_eq!(a.channels, 1);
                 for chunk in a.data[0].chunks_exact(2) {
                     let s = i16::from_le_bytes([chunk[0], chunk[1]]);
                     let f = s as f32 / 32768.0;
@@ -687,13 +682,11 @@ fn silk_60ms_nb_decodes() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.sample_rate, 48_000);
                 assert_eq!(
                     a.samples, expected_samples,
                     "40/60 ms SILK packet must produce {} samples; got {}",
                     expected_samples, a.samples
                 );
-                assert_eq!(a.channels, 1);
                 for chunk in a.data[0].chunks_exact(2) {
                     let s = i16::from_le_bytes([chunk[0], chunk[1]]);
                     let f = s as f32 / 32768.0;
@@ -760,8 +753,6 @@ fn silk_stereo_decodes_20ms_nb() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.sample_rate, 48_000);
-                assert_eq!(a.channels, 2, "TOC is stereo — output must be stereo");
                 // Stereo SILK @ 20 ms = 960 samples × 2 channels × 2 bytes.
                 assert_eq!(a.data[0].len(), a.samples as usize * 2 * 2);
                 let samples = &a.data[0];
@@ -909,13 +900,11 @@ fn celt_mono_10ms_pipeline_runs_end_to_end() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.sample_rate, 48_000);
                 assert_eq!(
                     a.samples, 480,
                     "10 ms CELT @ 48 kHz should be 480 samples; got {}",
                     a.samples
                 );
-                assert_eq!(a.channels, 1);
                 saw_audio = true;
             }
             Ok(Frame::Video(_)) => panic!("video from audio decoder"),
@@ -962,9 +951,7 @@ fn celt_stereo_pipeline_runs_end_to_end() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.sample_rate, 48_000);
                 assert_eq!(a.samples, 960);
-                assert_eq!(a.channels, 2, "TOC is stereo — output must be stereo");
                 // 2 channels × 960 samples × 2 bytes per S16 sample.
                 assert_eq!(a.data[0].len(), 960 * 2 * 2);
                 saw_stereo_audio = true;
@@ -1041,12 +1028,10 @@ fn hybrid_decodes_to_audio() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.sample_rate, 48_000);
                 assert_eq!(
                     a.samples, toc.frame_samples_48k,
                     "sample count must match TOC"
                 );
-                assert_eq!(a.channels, 1);
                 for chunk in a.data[0].chunks_exact(2) {
                     let s = i16::from_le_bytes([chunk[0], chunk[1]]);
                     let f = s as f32 / 32768.0;
@@ -1110,8 +1095,6 @@ fn multistream_5_1_decodes_to_six_channels() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.sample_rate, 48_000);
-                assert_eq!(a.channels, 6, "5.1 output must have 6 channels");
                 // 6 channels × samples × 2 bytes per S16 sample.
                 assert_eq!(a.data[0].len(), a.samples as usize * 6 * 2);
                 decoded += 1;
@@ -1188,8 +1171,7 @@ fn rfc6716_test_vectors_report() {
             // garbage; break out of the inner loop in that case.
             let result = catch_unwind(AssertUnwindSafe(|| dec.receive_frame()));
             match result {
-                Ok(Ok(Frame::Audio(a))) => {
-                    assert_eq!(a.sample_rate, 48_000);
+                Ok(Ok(Frame::Audio(_))) => {
                     decoded += 1;
                 }
                 Ok(Ok(_)) => {}
@@ -1376,7 +1358,6 @@ fn hybrid_fb_stereo_24k_matches_ffmpeg_within_sanity() {
     // Decode with our crate.
     let mut dmx = open_ogg(opus_path);
     let params = dmx.streams()[0].params.clone();
-    assert_eq!(params.channels, Some(2));
     let mut dec = oxideav_opus::decoder::make_decoder(&params).expect("make decoder");
 
     let mut ours: Vec<f32> = Vec::with_capacity(96_000);
@@ -1389,7 +1370,6 @@ fn hybrid_fb_stereo_24k_matches_ffmpeg_within_sanity() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.channels, 2);
                 for chunk in a.data[0].chunks_exact(2) {
                     let s = i16::from_le_bytes([chunk[0], chunk[1]]);
                     ours.push(s as f32 / 32768.0);
@@ -1557,8 +1537,6 @@ fn hybrid_config_matrix_mono_and_stereo() {
             dec.send_packet(&pkt).expect("send");
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    assert_eq!(a.sample_rate, 48_000);
-                    assert_eq!(a.channels as u32, ch);
                     if is_matching_hybrid {
                         assert_eq!(
                             a.samples, expected_samples,
@@ -1674,7 +1652,8 @@ fn hybrid_decoder_carries_both_bands() {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
                 // Take channel 0 only (downmix view).
-                let ch = a.channels as usize;
+                // S16 interleaved: bytes = samples * channels * 2.
+                let ch = a.data[0].len() / (a.samples as usize * 2);
                 for (i, chunk) in a.data[0].chunks_exact(2).enumerate() {
                     if i % ch != 0 {
                         continue;
