@@ -95,7 +95,9 @@ Two explicit entry points, one per Opus mode:
     - NB mono: ~24 dB
     - MB mono: ~25 dB
     - WB mono: ~29 dB
-    - NB stereo: ~30 dB (L) / ~27 dB (R)
+    - NB stereo: ~31 dB (L) / ~27 dB (R) at all of 10 / 20 / 40 / 60 ms
+    - MB stereo: ~36 dB (L) / ~31 dB (R) at 20 ms
+    - WB stereo: ~43 dB (L) / ~33 dB (R) at 20 ms
   - Bitstream layout follows RFC 6716 §4.2 header order (frame type →
     gains → NLSF → LTP (skipped for unvoiced) → LCG seed → excitation);
     the excitation *body* uses an MVP carrier format documented in

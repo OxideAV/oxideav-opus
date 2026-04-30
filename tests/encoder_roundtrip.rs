@@ -1298,32 +1298,48 @@ fn silk_wb_mono_60ms_roundtrip() {
     );
 }
 
-// ----- MB / WB stereo 20 ms tests (configs 5, 9 + stereo bit) ------
+// ----- Stereo SILK SNR + channel-separation tests ------------------
 //
-// Light-weight "energy + stereo decoupling" check; the detailed SNR
-// numbers live in `silk_nb_stereo_20ms_roundtrip_snr_and_channel_separation`.
+// Generic helper: encode an L/R sine pair (90° apart) at the SILK
+// internal rate, decode through the crate's Opus decoder, downsample
+// each channel back to the internal rate, and assert
+//
+//   - per-channel SNR clears `min_snr_db`,
+//   - rms(L - R) is at least 30% of sqrt(2)·rms(L)  (i.e. the side
+//     channel did not collapse to mid-only).
+//
+// Drives MB / WB stereo at 20 ms (configs 5, 9) and NB stereo at the
+// 10/40/60 ms frame sizes (configs 0, 2, 3 + stereo bit).
 
-fn run_stereo_smoke_test(
+#[allow(clippy::too_many_arguments)]
+fn run_stereo_snr_test(
     mut enc: SilkEncoder,
     internal_rate: u32,
-    samples_per_frame: usize,
+    samples_per_input_frame: usize,
+    samples_per_silk_frame: usize,
+    n_input_frames: usize,
     expected_config: u8,
     expected_bw: OpusBandwidth,
+    min_snr_db: f64,
 ) {
-    let n_frames = 10;
-    let total = n_frames * samples_per_frame;
+    // 300 Hz sine on L, 300 Hz cosine on R — equal energy, non-zero
+    // side channel. Padded with a brief envelope to avoid clipping.
+    let total = n_input_frames * samples_per_input_frame;
     let tau = 2.0 * std::f32::consts::PI;
     let f_tone = 300.0f32;
-    let l: Vec<f32> = (0..total)
+    let l_in: Vec<f32> = (0..total)
         .map(|i| (tau * f_tone * i as f32 / internal_rate as f32).sin() * 0.3)
         .collect();
-    let r: Vec<f32> = (0..total)
+    let r_in: Vec<f32> = (0..total)
         .map(|i| (tau * f_tone * i as f32 / internal_rate as f32).cos() * 0.3)
         .collect();
 
     let mut packets: Vec<Packet> = Vec::new();
-    for (lc, rc) in l.chunks(samples_per_frame).zip(r.chunks(samples_per_frame)) {
-        if lc.len() < samples_per_frame {
+    for (lc, rc) in l_in
+        .chunks(samples_per_input_frame)
+        .zip(r_in.chunks(samples_per_input_frame))
+    {
+        if lc.len() < samples_per_input_frame {
             break;
         }
         let mut bytes = Vec::with_capacity(lc.len() * 4);
@@ -1334,7 +1350,7 @@ fn run_stereo_smoke_test(
             bytes.extend_from_slice(&rq.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            samples: samples_per_frame as u32,
+            samples: samples_per_input_frame as u32,
             pts: None,
             data: vec![bytes],
         });
@@ -1352,48 +1368,178 @@ fn run_stereo_smoke_test(
         packets.push(p);
     }
     assert!(!packets.is_empty());
+
     for (i, pkt) in packets.iter().enumerate() {
         let toc = Toc::parse(pkt.data[0]);
         assert_eq!(toc.mode, OpusMode::SilkOnly, "packet {i}");
-        assert_eq!(toc.config, expected_config, "packet {i}");
-        assert_eq!(toc.bandwidth, expected_bw, "packet {i}");
-        assert!(toc.stereo, "packet {i}");
+        assert_eq!(toc.config, expected_config, "packet {i} config");
+        assert_eq!(toc.bandwidth, expected_bw, "packet {i} bw");
+        assert!(toc.stereo, "packet {i} stereo bit must be set");
     }
+
+    // Decode at 48 kHz, then downsample each channel back to the SILK
+    // internal rate by box-averaging.
     let decoded = decode_packets(&packets, 2);
     assert_eq!(decoded.len(), 2);
-    let e_l = mean_energy_i16(&decoded[0]);
-    let e_r = mean_energy_i16(&decoded[1]);
-    println!("silk {expected_bw:?} stereo 20 ms: e_l={e_l:.4e}, e_r={e_r:.4e}");
-    assert!(e_l > 1e-4, "stereo L too quiet");
-    assert!(e_r > 1e-4, "stereo R too quiet");
-}
+    let l_dec = &decoded[0];
+    let r_dec = &decoded[1];
+    assert!(!l_dec.is_empty() && !r_dec.is_empty());
+    assert!(l_dec.iter().all(|s| (*s as f32).is_finite()));
+    assert!(r_dec.iter().all(|s| (*s as f32).is_finite()));
 
-#[test]
-fn silk_mb_stereo_20ms_produces_audio() {
-    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
-    p.channels = Some(2);
-    p.sample_rate = Some(SILK_MB_RATE);
-    let enc = SilkEncoder::new_mb_stereo_20ms(&p).expect("make MB stereo 20 ms");
-    run_stereo_smoke_test(
-        enc,
-        SILK_MB_RATE,
-        SILK_MB_FRAME_SAMPLES_INTERNAL,
-        5,
-        OpusBandwidth::Mediumband,
+    let down: usize = (SR / internal_rate) as usize;
+    assert!(down >= 2);
+    let mut l_int = Vec::with_capacity(l_dec.len() / down);
+    let mut r_int = Vec::with_capacity(r_dec.len() / down);
+    for chunk in l_dec.chunks_exact(down) {
+        let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
+        l_int.push((sum / down as i32) as i16);
+    }
+    for chunk in r_dec.chunks_exact(down) {
+        let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
+        r_int.push((sum / down as i32) as i16);
+    }
+
+    // Skip first 3 SILK sub-frames so the LPC + stereo-unmix state has
+    // settled. The lag window matches the NB-stereo test (60 samples
+    // at 8 kHz ≈ 7.5 ms); we scale it linearly with the internal rate.
+    let skip = 3 * samples_per_silk_frame;
+    let n = l_in.len().min(l_int.len()).saturating_sub(skip);
+    assert!(n > 100);
+    let max_lag = (60u32 * internal_rate / 8_000) as i32;
+    let (snr_l, lag_l) =
+        snr_db_with_lag_search(&l_in[skip..skip + n], &l_int[skip..skip + n], max_lag);
+    let (snr_r, lag_r) =
+        snr_db_with_lag_search(&r_in[skip..skip + n], &r_int[skip..skip + n], max_lag);
+    println!(
+        "silk {expected_bw:?} stereo cfg={expected_config}: snr_l={snr_l:.2} dB (lag={lag_l}), snr_r={snr_r:.2} dB (lag={lag_r})"
+    );
+    assert!(
+        snr_l > min_snr_db,
+        "stereo L SNR {snr_l:.2} dB below {min_snr_db:.2} dB bar"
+    );
+    assert!(
+        snr_r > min_snr_db,
+        "stereo R SNR {snr_r:.2} dB below {min_snr_db:.2} dB bar"
+    );
+
+    // Channel-separation sanity: rms(L - R) must be a meaningful
+    // fraction of sqrt(2) · rms(L) — otherwise the stereo encoder
+    // collapsed to mid-only and the decoder splatted mid identically
+    // to both outputs.
+    let n_cmp = l_int.len().min(r_int.len());
+    let skip2 = skip.min(n_cmp);
+    let mut diff = 0f64;
+    let mut e_l = 0f64;
+    for i in skip2..n_cmp {
+        let a = l_int[i] as f64 / 32768.0;
+        let b = r_int[i] as f64 / 32768.0;
+        diff += (a - b) * (a - b);
+        e_l += a * a;
+    }
+    let rms_diff = (diff / (n_cmp - skip2) as f64).sqrt();
+    let rms_l = (e_l / (n_cmp - skip2) as f64).sqrt();
+    println!("silk {expected_bw:?} stereo cfg={expected_config}: rms_diff={rms_diff:.4e}, rms_l={rms_l:.4e}");
+    let floor = 0.30 * rms_l * 2f64.sqrt();
+    assert!(
+        rms_diff > floor,
+        "L and R look identical (rms_diff={rms_diff:.4e}, floor={floor:.4e}) — stereo decoupling failed"
     );
 }
 
 #[test]
-fn silk_wb_stereo_20ms_produces_audio() {
+fn silk_mb_stereo_20ms_roundtrip_snr_and_channel_separation() {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(2);
+    p.sample_rate = Some(SILK_MB_RATE);
+    let enc = SilkEncoder::new_mb_stereo_20ms(&p).expect("make MB stereo 20 ms");
+    run_stereo_snr_test(
+        enc,
+        SILK_MB_RATE,
+        SILK_MB_FRAME_SAMPLES_INTERNAL,
+        SILK_MB_FRAME_SAMPLES_INTERNAL,
+        25,
+        5,
+        OpusBandwidth::Mediumband,
+        20.0,
+    );
+}
+
+#[test]
+fn silk_wb_stereo_20ms_roundtrip_snr_and_channel_separation() {
     let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
     p.channels = Some(2);
     p.sample_rate = Some(SILK_WB_RATE);
     let enc = SilkEncoder::new_wb_stereo_20ms(&p).expect("make WB stereo 20 ms");
-    run_stereo_smoke_test(
+    run_stereo_snr_test(
         enc,
         SILK_WB_RATE,
         SILK_WB_FRAME_SAMPLES_INTERNAL,
+        SILK_WB_FRAME_SAMPLES_INTERNAL,
+        25,
         9,
         OpusBandwidth::Wideband,
+        20.0,
+    );
+}
+
+// ----- NB stereo at 10 / 40 / 60 ms (configs 0 / 2 / 3 + stereo) ----
+//
+// Same SNR + channel-separation contract as the MB / WB 20 ms tests
+// above. 10 ms loses a bit of LPC history per frame; 40 / 60 ms
+// packets carry 2 / 3 back-to-back 20 ms SILK frame bodies.
+
+#[test]
+fn silk_nb_stereo_10ms_roundtrip_snr_and_channel_separation() {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(2);
+    p.sample_rate = Some(SILK_NB_RATE);
+    let enc = SilkEncoder::new_nb_stereo_10ms(&p).expect("make NB stereo 10 ms");
+    let half = SILK_NB_FRAME_SAMPLES_INTERNAL / 2; // 80 samples @ 8 kHz
+    run_stereo_snr_test(
+        enc,
+        SILK_NB_RATE,
+        half,
+        half,
+        50,
+        0,
+        OpusBandwidth::Narrowband,
+        15.0, // 10 ms loses some first-frame SNR; matches mono 10 ms bar
+    );
+}
+
+#[test]
+fn silk_nb_stereo_40ms_roundtrip_snr_and_channel_separation() {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(2);
+    p.sample_rate = Some(SILK_NB_RATE);
+    let enc = SilkEncoder::new_nb_stereo_40ms(&p).expect("make NB stereo 40 ms");
+    run_stereo_snr_test(
+        enc,
+        SILK_NB_RATE,
+        SILK_NB_FRAME_SAMPLES_INTERNAL * 2,
+        SILK_NB_FRAME_SAMPLES_INTERNAL,
+        15,
+        2,
+        OpusBandwidth::Narrowband,
+        20.0,
+    );
+}
+
+#[test]
+fn silk_nb_stereo_60ms_roundtrip_snr_and_channel_separation() {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(2);
+    p.sample_rate = Some(SILK_NB_RATE);
+    let enc = SilkEncoder::new_nb_stereo_60ms(&p).expect("make NB stereo 60 ms");
+    run_stereo_snr_test(
+        enc,
+        SILK_NB_RATE,
+        SILK_NB_FRAME_SAMPLES_INTERNAL * 3,
+        SILK_NB_FRAME_SAMPLES_INTERNAL,
+        12,
+        3,
+        OpusBandwidth::Narrowband,
+        20.0,
     );
 }

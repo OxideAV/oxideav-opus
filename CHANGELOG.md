@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests
+
+- Promote MB / WB stereo SILK 20 ms tests from "energy + smoke" to full
+  SNR + channel-separation. Both clear the 20 dB bar on a 300 Hz
+  L-sin / R-cos tone pair (MB ~36 / 31 dB, WB ~43 / 33 dB).
+- Add NB stereo round-trip SNR + channel-separation tests at 10 / 40 /
+  60 ms (configs 0 / 2 / 3 + stereo bit), filling out the duration
+  matrix to match the existing 20 ms NB stereo coverage.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-opus/compare/v0.0.5...v0.0.6) - 2026-04-25
 
 ### Other
