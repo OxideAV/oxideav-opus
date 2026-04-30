@@ -8,9 +8,7 @@
 //! bar is **decoded energy relative to input**, not a tight PSNR.
 
 use oxideav_core::Encoder;
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet,
-};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet};
 use oxideav_opus::encoder::{
     OpusEncoder, SilkEncoder, OPUS_FRAME_SAMPLES, SILK_FRAME_SAMPLES_48K,
     SILK_MB_FRAME_SAMPLES_INTERNAL, SILK_MB_RATE, SILK_NB_FRAME_SAMPLES_INTERNAL, SILK_NB_RATE,

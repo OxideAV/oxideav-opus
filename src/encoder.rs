@@ -990,11 +990,8 @@ impl Encoder for SilkEncoder {
                 downsample_box_interleaved(&stereo, self.mode.downsample_ratio(), 2)
             }
         } else {
-            let mono = extract_mono_f32(
-                audio,
-                self.mode.input_channels(),
-                self.input_sample_format,
-            )?;
+            let mono =
+                extract_mono_f32(audio, self.mode.input_channels(), self.input_sample_format)?;
             if self.input_sample_rate == self.mode.internal_rate() {
                 mono
             } else {

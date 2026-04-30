@@ -34,9 +34,7 @@ use oxideav_celt::tables::{
     SPREAD_ICDF, SPREAD_NORMAL, TF_SELECT_TABLE, TRIM_ICDF,
 };
 use oxideav_core::Decoder;
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase,
-};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase};
 
 use crate::silk::SilkDecoder;
 use crate::toc::{OpusMode, Toc};
