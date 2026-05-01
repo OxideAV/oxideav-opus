@@ -2,8 +2,9 @@
 
 Pure-Rust **Opus** audio codec — RFC 6716 bitstream + RFC 7845 Ogg
 mapping. SILK + CELT + Hybrid decode (mono + stereo) plus encoders
-for a CELT-only full-band path and the full SILK-only config matrix
-(NB / MB / WB, mono + stereo, 10 / 20 / 40 / 60 ms). Zero C dependencies.
+for a CELT-only full-band path, the full SILK-only config matrix
+(NB / MB / WB, mono + stereo, 10 / 20 / 40 / 60 ms), and Hybrid mono
+20 ms (SWB / FB). Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -76,6 +77,28 @@ Two explicit entry points, one per Opus mode:
   16 kHz for NB / MB / WB) or 48 kHz; 48 kHz input is downsampled by a
   simple box-average pre-filter.
 
+- **Hybrid (SILK + CELT) mono, 20 ms** at SWB and FB
+  (`HybridEncoder::new_swb_mono_20ms` / `new_fb_mono_20ms`) — TOC
+  configs 13 (SWB) and 15 (FB). Per RFC 6716 §4.4 the SILK part runs
+  WB (16 kHz internal, covering 0..8 kHz) regardless of TOC bandwidth;
+  the CELT part starts at band 17 (the 8 kHz edge) and covers 8..12 kHz
+  (SWB) or 8..20 kHz (FB) on the **same** range-coded bitstream — the
+  CELT body is appended to the in-flight `RangeEncoder` after the SILK
+  body so the whole packet is one shared arithmetic stream, exactly
+  what the decoder expects.
+
+  Input: 48 kHz mono only. Stereo and 10 ms hybrid (configs 12 / 14)
+  are tracked follow-ups — the underlying CELT mono encoder still
+  needs the LM=2 path before 10 ms hybrid can land.
+
+  Round-trip through our own decoder on a 300 Hz low-band tone:
+  - SWB 20 ms hybrid: ~24 dB low-band SNR
+  - FB 20 ms hybrid: ~24 dB low-band SNR
+
+  The high band is exercised by a swept-sine test (`hybrid_*_sweep_*`)
+  that confirms both the < 4 kHz (SILK) and > 8 kHz (CELT) regions
+  carry recovered energy after a round-trip.
+
   Stereo paths feed a mid/side pair into two SILK frame encoders and
   emit the RFC §4.2.7.1 prediction header per embedded 20 ms SILK
   frame (weights are shipped as 0 for this pass — enough for a clean
@@ -120,7 +143,10 @@ Two explicit entry points, one per Opus mode:
   (the function is already in place; the remaining work is subtracting
   the predicted side from the coded side before it reaches the
   SilkFrameEncoder).
-- **Hybrid encoding** — still `Error::Unsupported` end-to-end.
+- **Hybrid stereo encoding and 10 ms hybrid** (configs 12 / 14) —
+  the mono 20 ms `HybridEncoder` is wired (configs 13 / 15); stereo
+  needs the SILK stereo prediction header on top of the existing
+  mono path, and 10 ms hybrid needs the LM=2 CELT encoder path.
 - **Voiced / LTP-path SILK encoding** — the encoder emits
   `signal_type = unvoiced` on every frame so the LTP loop-back is not
   exercised; this still round-trips speech-like tones at ≥ 20 dB SNR

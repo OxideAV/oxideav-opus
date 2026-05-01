@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Hybrid (SILK + CELT) mono 20 ms encoder for SWB (config 13) and FB
+  (config 15) per RFC 6716 §4.4. Runs SILK-WB on the 0..8 kHz low band
+  and CELT (`start_band = 17`) on the 8..12 kHz / 8..20 kHz high band,
+  sharing a single range-coded bitstream — the CELT body is appended
+  to the in-flight `RangeEncoder` after the SILK body, mirroring the
+  decoder's `decode_hybrid_frame` which uses the same arithmetic
+  stream end-to-end. New named constructors: `HybridEncoder::new_swb_
+  mono_20ms` and `new_fb_mono_20ms`. Mono 48 kHz input only; stereo +
+  10 ms hybrid are tracked follow-ups.
+- New CELT-encoder helper `CeltEncoder::encode_hybrid_body_mono(pcm,
+  enc, start_band, end_band, budget_bytes)` — encodes a CELT body
+  into a caller-supplied `RangeEncoder` with the given band range,
+  threading all the §4.3 stages (coarse + fine energy, tf_decode,
+  spread, dynalloc, allocator, PVQ, fine-finalise) through the
+  `start_band..end_band` window. Mirrors `decode_celt_body` on the
+  encoder side. Mono only for now.
+
 ### Tests
 
 - Promote MB / WB stereo SILK 20 ms tests from "energy + smoke" to full
@@ -15,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add NB stereo round-trip SNR + channel-separation tests at 10 / 40 /
   60 ms (configs 0 / 2 / 3 + stereo bit), filling out the duration
   matrix to match the existing 20 ms NB stereo coverage.
+- Add hybrid_roundtrip integration tests covering Hybrid SWB + FB
+  20 ms TOC sanity, low-band tone SNR (~24 dB), swept-sine
+  band-energy survival in both the < 4 kHz and > 8 kHz regions, and
+  silence-stays-quiet bounds.
 
 ## [0.0.6](https://github.com/OxideAV/oxideav-opus/compare/v0.0.5...v0.0.6) - 2026-04-25
 

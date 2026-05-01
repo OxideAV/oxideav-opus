@@ -53,6 +53,9 @@
 //! * `SilkEncoder` — SILK-only Narrowband mono 20 ms (config 1),
 //!   accepting 8 kHz or 48 kHz input. Round-trips through our own
 //!   decoder at ≥ 20 dB SNR on speech-like signals.
+//! * `HybridEncoder` — SILK-WB low band + CELT high band, mono
+//!   20 ms, SWB (config 13) or FB (config 15). Single shared range-
+//!   coded bitstream per RFC 6716 §4.4.
 
 pub mod decoder;
 pub mod encoder;
