@@ -1543,3 +1543,122 @@ fn silk_nb_stereo_60ms_roundtrip_snr_and_channel_separation() {
         20.0,
     );
 }
+
+// ----- MB stereo at 10 / 40 / 60 ms (configs 4 / 6 / 7 + stereo) ----
+//
+// Same SNR + channel-separation contract as the NB stereo tests above,
+// scaled to the MB internal rate (12 kHz) and frame layout. 10 ms loses
+// some first-frame SNR (one-shot LPC history); 40 / 60 ms packets carry
+// 2 / 3 back-to-back 20 ms SILK frame bodies per RFC §4.2.4.
+
+#[test]
+fn silk_mb_stereo_10ms_roundtrip_snr_and_channel_separation() {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(2);
+    p.sample_rate = Some(SILK_MB_RATE);
+    let enc = SilkEncoder::new_mb_stereo_10ms(&p).expect("make MB stereo 10 ms");
+    let half = SILK_MB_FRAME_SAMPLES_INTERNAL / 2; // 120 samples @ 12 kHz
+    run_stereo_snr_test(
+        enc,
+        SILK_MB_RATE,
+        half,
+        half,
+        50,
+        4,
+        OpusBandwidth::Mediumband,
+        15.0,
+    );
+}
+
+#[test]
+fn silk_mb_stereo_40ms_roundtrip_snr_and_channel_separation() {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(2);
+    p.sample_rate = Some(SILK_MB_RATE);
+    let enc = SilkEncoder::new_mb_stereo_40ms(&p).expect("make MB stereo 40 ms");
+    run_stereo_snr_test(
+        enc,
+        SILK_MB_RATE,
+        SILK_MB_FRAME_SAMPLES_INTERNAL * 2,
+        SILK_MB_FRAME_SAMPLES_INTERNAL,
+        15,
+        6,
+        OpusBandwidth::Mediumband,
+        20.0,
+    );
+}
+
+#[test]
+fn silk_mb_stereo_60ms_roundtrip_snr_and_channel_separation() {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(2);
+    p.sample_rate = Some(SILK_MB_RATE);
+    let enc = SilkEncoder::new_mb_stereo_60ms(&p).expect("make MB stereo 60 ms");
+    run_stereo_snr_test(
+        enc,
+        SILK_MB_RATE,
+        SILK_MB_FRAME_SAMPLES_INTERNAL * 3,
+        SILK_MB_FRAME_SAMPLES_INTERNAL,
+        12,
+        7,
+        OpusBandwidth::Mediumband,
+        20.0,
+    );
+}
+
+// ----- WB stereo at 10 / 40 / 60 ms (configs 8 / 10 / 11 + stereo) ----
+
+#[test]
+fn silk_wb_stereo_10ms_roundtrip_snr_and_channel_separation() {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(2);
+    p.sample_rate = Some(SILK_WB_RATE);
+    let enc = SilkEncoder::new_wb_stereo_10ms(&p).expect("make WB stereo 10 ms");
+    let half = SILK_WB_FRAME_SAMPLES_INTERNAL / 2; // 160 samples @ 16 kHz
+    run_stereo_snr_test(
+        enc,
+        SILK_WB_RATE,
+        half,
+        half,
+        50,
+        8,
+        OpusBandwidth::Wideband,
+        15.0,
+    );
+}
+
+#[test]
+fn silk_wb_stereo_40ms_roundtrip_snr_and_channel_separation() {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(2);
+    p.sample_rate = Some(SILK_WB_RATE);
+    let enc = SilkEncoder::new_wb_stereo_40ms(&p).expect("make WB stereo 40 ms");
+    run_stereo_snr_test(
+        enc,
+        SILK_WB_RATE,
+        SILK_WB_FRAME_SAMPLES_INTERNAL * 2,
+        SILK_WB_FRAME_SAMPLES_INTERNAL,
+        15,
+        10,
+        OpusBandwidth::Wideband,
+        20.0,
+    );
+}
+
+#[test]
+fn silk_wb_stereo_60ms_roundtrip_snr_and_channel_separation() {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(2);
+    p.sample_rate = Some(SILK_WB_RATE);
+    let enc = SilkEncoder::new_wb_stereo_60ms(&p).expect("make WB stereo 60 ms");
+    run_stereo_snr_test(
+        enc,
+        SILK_WB_RATE,
+        SILK_WB_FRAME_SAMPLES_INTERNAL * 3,
+        SILK_WB_FRAME_SAMPLES_INTERNAL,
+        12,
+        11,
+        OpusBandwidth::Wideband,
+        20.0,
+    );
+}
