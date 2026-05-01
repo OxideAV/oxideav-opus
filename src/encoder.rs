@@ -1172,8 +1172,12 @@ fn downsample_box(input: &[f32], ratio: usize) -> Vec<f32> {
 // Hybrid encoder — SILK-WB low band + CELT high band, mono 20 ms.
 // ---------------------------------------------------------------------
 
+/// `config` field value for Hybrid SWB 10 ms (RFC 6716 Table 2).
+pub const OPUS_CONFIG_HYBRID_SWB_10MS: u8 = 12;
 /// `config` field value for Hybrid SWB 20 ms (RFC 6716 Table 2).
 pub const OPUS_CONFIG_HYBRID_SWB_20MS: u8 = 13;
+/// `config` field value for Hybrid FB 10 ms.
+pub const OPUS_CONFIG_HYBRID_FB_10MS: u8 = 14;
 /// `config` field value for Hybrid FB 20 ms.
 pub const OPUS_CONFIG_HYBRID_FB_20MS: u8 = 15;
 
@@ -1205,12 +1209,24 @@ impl HybridBandwidth {
             HybridBandwidth::Fb => OPUS_CONFIG_HYBRID_FB_20MS,
         }
     }
+
+    /// TOC `config` field value for 10 ms hybrid (RFC 6716 Table 2).
+    pub fn config_10ms(self) -> u8 {
+        match self {
+            HybridBandwidth::Swb => OPUS_CONFIG_HYBRID_SWB_10MS,
+            HybridBandwidth::Fb => OPUS_CONFIG_HYBRID_FB_10MS,
+        }
+    }
 }
 
 /// CELT `start_band` for every Hybrid configuration (RFC 6716 §4.4).
 /// SILK covers up to 8 kHz, which is exactly the band-17 boundary in
 /// the CELT band table (`EBAND_5MS[17] = 40` ↔ `40 * 200 Hz/bin = 8 kHz`).
 pub const HYBRID_CELT_START_BAND: usize = 17;
+
+/// 48 kHz samples in a 10 ms Hybrid frame (configs 12 / 14). 480 = half
+/// the 20 ms count.
+pub const HYBRID_FRAME_SAMPLES_48K_10MS: usize = 480;
 
 /// Total bytes the Hybrid encoder allocates for a 20 ms packet (TOC +
 /// SILK + CELT). The SILK MVP carrier produces a thicker body than a
@@ -1231,10 +1247,26 @@ const HYBRID_PACKET_BYTES_FB_20MS: usize = 1275;
 const HYBRID_PACKET_BYTES_SWB_20MS_STEREO: usize = 1275;
 const HYBRID_PACKET_BYTES_FB_20MS_STEREO: usize = 1275;
 
+/// 10 ms Hybrid budgets — the SILK 10 ms WB body is roughly half the
+/// 20 ms size (2 sub-frames vs 4) but the per-frame range-coder
+/// overhead doesn't shrink linearly, so we allocate ~80 % of the 20 ms
+/// size rather than exactly half. Both stereo budgets stay clamped to
+/// the RFC 6716 §3.2.1 1275-byte hard cap.
+const HYBRID_PACKET_BYTES_SWB_10MS: usize = 800;
+const HYBRID_PACKET_BYTES_FB_10MS: usize = 1024;
+const HYBRID_PACKET_BYTES_SWB_10MS_STEREO: usize = 1275;
+const HYBRID_PACKET_BYTES_FB_10MS_STEREO: usize = 1275;
+
 /// Build a TOC byte for a Hybrid 20 ms packet.
 pub fn build_hybrid_20ms_toc(bw: HybridBandwidth, stereo: bool) -> u8 {
     let stereo_bit: u8 = if stereo { 1 } else { 0 };
     (bw.config_20ms() << 3) | (stereo_bit << 2) // code = 0
+}
+
+/// Build a TOC byte for a Hybrid 10 ms packet.
+pub fn build_hybrid_10ms_toc(bw: HybridBandwidth, stereo: bool) -> u8 {
+    let stereo_bit: u8 = if stereo { 1 } else { 0 };
+    (bw.config_10ms() << 3) | (stereo_bit << 2) // code = 0
 }
 
 /// Hybrid (SILK + CELT) Opus encoder for 20 ms frames at SWB or FB —
@@ -1254,21 +1286,30 @@ pub fn build_hybrid_20ms_toc(bw: HybridBandwidth, stereo: bool) -> u8 {
 /// CELT high-band runs on the original 48 kHz. Output: one Opus packet
 /// per 20 ms frame with TOC config 13 (SWB) or 15 (FB).
 ///
-/// 10 ms hybrid (configs 12, 14) is a tracked follow-up — the CELT
-/// encoder still needs the LM=2 path before it can emit short hybrid
-/// CELT bodies.
+/// 10 ms Hybrid (configs 12 / 14) routes through the same `HybridEncoder`
+/// type; pick the duration via [`HybridEncoder::new_swb_mono_10ms`] /
+/// `new_fb_mono_10ms` / `new_swb_stereo_10ms` / `new_fb_stereo_10ms`.
+/// The 10 ms path uses the CELT LM=2 short-block (480-sample) frame and
+/// the SILK 2-sub-frame WB body; otherwise the layout matches the
+/// 20 ms variant.
 pub struct HybridEncoder {
     out_params: CodecParameters,
     bw: HybridBandwidth,
     /// True for stereo packets (TOC stereo bit = 1).
     stereo: bool,
-    /// SILK frame encoder for the mid (or mono) channel — WB 20 ms,
-    /// 4 sub-frames.
+    /// Frame duration in 48 kHz samples — 480 for 10 ms (configs 12 /
+    /// 14), 960 for 20 ms (configs 13 / 15). Drives both the SILK-side
+    /// frame length and the CELT MDCT LM.
+    frame_samples_48k: usize,
+    /// SILK frame encoder for the mid (or mono) channel — WB 4 sub-frames
+    /// for 20 ms, WB 2 sub-frames for 10 ms.
     silk_mid: crate::silk::encoder::SilkFrameEncoder,
     /// SILK frame encoder for the side channel (stereo only).
     silk_side: Option<crate::silk::encoder::SilkFrameEncoder>,
     /// CELT encoder used for the high-band only — mono (1 ch) or
-    /// dual-stereo (2 ch) at 48 kHz.
+    /// dual-stereo (2 ch) at 48 kHz. Built with
+    /// `new_with_frame_samples(_, 960)` for 20 ms and
+    /// `new_with_frame_samples(_, 480)` for 10 ms.
     celt: oxideav_celt::encoder::CeltEncoder,
     /// 48 kHz pending PCM samples — interleaved L,R for stereo, plain
     /// mono otherwise.
@@ -1283,27 +1324,80 @@ pub struct HybridEncoder {
 impl HybridEncoder {
     /// Build a Hybrid SWB 20 ms mono encoder (TOC config 13).
     pub fn new_swb_mono_20ms(params: &CodecParameters) -> Result<Self> {
-        Self::new_mode(params, HybridBandwidth::Swb, false)
+        Self::new_mode(params, HybridBandwidth::Swb, false, SILK_FRAME_SAMPLES_48K)
     }
 
     /// Build a Hybrid FB 20 ms mono encoder (TOC config 15).
     pub fn new_fb_mono_20ms(params: &CodecParameters) -> Result<Self> {
-        Self::new_mode(params, HybridBandwidth::Fb, false)
+        Self::new_mode(params, HybridBandwidth::Fb, false, SILK_FRAME_SAMPLES_48K)
     }
 
     /// Build a Hybrid SWB 20 ms stereo encoder (TOC config 13 + stereo
     /// bit). Input: 48 kHz interleaved L/R.
     pub fn new_swb_stereo_20ms(params: &CodecParameters) -> Result<Self> {
-        Self::new_mode(params, HybridBandwidth::Swb, true)
+        Self::new_mode(params, HybridBandwidth::Swb, true, SILK_FRAME_SAMPLES_48K)
     }
 
     /// Build a Hybrid FB 20 ms stereo encoder (TOC config 15 + stereo
     /// bit). Input: 48 kHz interleaved L/R.
     pub fn new_fb_stereo_20ms(params: &CodecParameters) -> Result<Self> {
-        Self::new_mode(params, HybridBandwidth::Fb, true)
+        Self::new_mode(params, HybridBandwidth::Fb, true, SILK_FRAME_SAMPLES_48K)
     }
 
-    fn new_mode(params: &CodecParameters, bw: HybridBandwidth, stereo: bool) -> Result<Self> {
+    /// Build a Hybrid SWB 10 ms mono encoder (TOC config 12). The SILK
+    /// low band runs as a 2-sub-frame WB body; the CELT high band uses
+    /// the LM=2 (480-sample / 10 ms) MDCT.
+    pub fn new_swb_mono_10ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(
+            params,
+            HybridBandwidth::Swb,
+            false,
+            HYBRID_FRAME_SAMPLES_48K_10MS,
+        )
+    }
+
+    /// Build a Hybrid FB 10 ms mono encoder (TOC config 14).
+    pub fn new_fb_mono_10ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(
+            params,
+            HybridBandwidth::Fb,
+            false,
+            HYBRID_FRAME_SAMPLES_48K_10MS,
+        )
+    }
+
+    /// Build a Hybrid SWB 10 ms stereo encoder (TOC config 12 + stereo
+    /// bit). Input: 48 kHz interleaved L/R.
+    pub fn new_swb_stereo_10ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(
+            params,
+            HybridBandwidth::Swb,
+            true,
+            HYBRID_FRAME_SAMPLES_48K_10MS,
+        )
+    }
+
+    /// Build a Hybrid FB 10 ms stereo encoder (TOC config 14 + stereo
+    /// bit). Input: 48 kHz interleaved L/R.
+    pub fn new_fb_stereo_10ms(params: &CodecParameters) -> Result<Self> {
+        Self::new_mode(
+            params,
+            HybridBandwidth::Fb,
+            true,
+            HYBRID_FRAME_SAMPLES_48K_10MS,
+        )
+    }
+
+    fn new_mode(
+        params: &CodecParameters,
+        bw: HybridBandwidth,
+        stereo: bool,
+        frame_samples_48k: usize,
+    ) -> Result<Self> {
+        debug_assert!(matches!(
+            frame_samples_48k,
+            HYBRID_FRAME_SAMPLES_48K_10MS | SILK_FRAME_SAMPLES_48K
+        ));
         let want_channels: u16 = if stereo { 2 } else { 1 };
         let channels = params.channels.unwrap_or(want_channels);
         if channels != want_channels {
@@ -1319,24 +1413,40 @@ impl HybridEncoder {
             )));
         }
 
-        // SILK runs as WB 20 ms (4 sub-frames, LPC order 16).
-        let silk_mid = crate::silk::encoder::SilkFrameEncoder::new_wb_20ms();
-        let silk_side = if stereo {
-            Some(crate::silk::encoder::SilkFrameEncoder::new_wb_20ms())
+        // SILK runs as WB; 4 sub-frames for 20 ms, 2 sub-frames for 10 ms.
+        let (silk_mid, silk_side) = if frame_samples_48k == SILK_FRAME_SAMPLES_48K {
+            let m = crate::silk::encoder::SilkFrameEncoder::new_wb_20ms();
+            let s = if stereo {
+                Some(crate::silk::encoder::SilkFrameEncoder::new_wb_20ms())
+            } else {
+                None
+            };
+            (m, s)
         } else {
-            None
+            let m = crate::silk::encoder::SilkFrameEncoder::new_wb_10ms();
+            let s = if stereo {
+                Some(crate::silk::encoder::SilkFrameEncoder::new_wb_10ms())
+            } else {
+                None
+            };
+            (m, s)
         };
 
         // CELT runs at FB 48 kHz; channels matches the Hybrid input.
         // Mono uses encode_hybrid_body_mono; stereo uses
         // encode_hybrid_body_stereo. Both reuse the encoder's per-channel
-        // MDCT, pre-emphasis, and band-energy state.
+        // MDCT, pre-emphasis, and band-energy state. The CELT LM is
+        // picked from `frame_samples_48k`: 960 → LM=3 (20 ms), 480 →
+        // LM=2 (10 ms).
         let mut celt_params = params.clone();
         celt_params.channels = Some(channels);
         celt_params.sample_rate = Some(SAMPLE_RATE);
         celt_params.sample_format = Some(SampleFormat::F32);
         celt_params.codec_id = CodecId::new(oxideav_celt::CODEC_ID_STR);
-        let celt = oxideav_celt::encoder::CeltEncoder::new(&celt_params)?;
+        let celt = oxideav_celt::encoder::CeltEncoder::new_with_frame_samples(
+            &celt_params,
+            frame_samples_48k,
+        )?;
 
         let mut out_params = params.clone();
         out_params.sample_rate = Some(SAMPLE_RATE);
@@ -1348,6 +1458,7 @@ impl HybridEncoder {
             out_params,
             bw,
             stereo,
+            frame_samples_48k,
             silk_mid,
             silk_side,
             celt,
@@ -1358,24 +1469,23 @@ impl HybridEncoder {
         })
     }
 
-    /// Encode one 20 ms Hybrid mono frame.
+    /// Encode one Hybrid mono frame (10 ms or 20 ms, picked from
+    /// `self.frame_samples_48k`).
     ///
-    /// `pcm_48k_mono` must be exactly 960 samples. Order:
+    /// `pcm_48k_mono` must be exactly `self.frame_samples_48k` samples
+    /// (480 for 10 ms / 960 for 20 ms). Order:
     /// 1. Build the shared range encoder.
     /// 2. Emit the shared SILK VAD/LBRR header (1 VAD bit + 1 LBRR bit
     ///    for the single internal channel).
-    /// 3. Downsample to 16 kHz and encode the SILK WB body into the
-    ///    same encoder.
+    /// 3. Downsample to 16 kHz and encode the SILK WB body (160 or
+    ///    320 samples internal) into the same encoder.
     /// 4. Encode the CELT high-band body (start_band=17) into the same
     ///    encoder, with the appropriate end_band for SWB / FB.
     /// 5. Finalise (`done()`) and prepend the TOC byte.
     fn encode_one_frame(&mut self, pcm_48k_mono: &[f32]) -> Result<Packet> {
-        debug_assert_eq!(pcm_48k_mono.len(), SILK_FRAME_SAMPLES_48K);
+        debug_assert_eq!(pcm_48k_mono.len(), self.frame_samples_48k);
 
-        let bytes = match self.bw {
-            HybridBandwidth::Swb => HYBRID_PACKET_BYTES_SWB_20MS,
-            HybridBandwidth::Fb => HYBRID_PACKET_BYTES_FB_20MS,
-        };
+        let bytes = self.packet_bytes_mono();
         let mut re = oxideav_celt::range_encoder::RangeEncoder::new(bytes as u32);
 
         // SILK shared header: one channel → one VAD bit (active) + one
@@ -1384,10 +1494,10 @@ impl HybridEncoder {
         re.encode_bit_logp(true, 1); // VAD
         re.encode_bit_logp(false, 1); // LBRR
 
-        // SILK body — downsample 48 kHz → 16 kHz (ratio 3) and encode
-        // as a single 320-sample WB frame.
+        // SILK body — downsample 48 kHz → 16 kHz (ratio 3). 320 samples
+        // for 20 ms WB, 160 samples for 10 ms WB.
         let silk_internal = downsample_box(pcm_48k_mono, 3);
-        debug_assert_eq!(silk_internal.len(), SILK_WB_FRAME_SAMPLES_INTERNAL);
+        debug_assert_eq!(silk_internal.len(), self.silk_mid.frame_len());
         self.silk_mid.encode_frame_body(&silk_internal, &mut re)?;
 
         // CELT high-band body — same range encoder, start at band 17.
@@ -1404,8 +1514,9 @@ impl HybridEncoder {
         self.finalize_packet(re, false)
     }
 
-    /// Encode one 20 ms Hybrid stereo frame. `pcm_48k_lr` must be exactly
-    /// `2 * SILK_FRAME_SAMPLES_48K = 1920` interleaved L/R samples.
+    /// Encode one Hybrid stereo frame (10 ms or 20 ms). `pcm_48k_lr`
+    /// must be exactly `2 * self.frame_samples_48k` interleaved L/R
+    /// samples (960 for 10 ms, 1920 for 20 ms).
     ///
     /// Layout matches what the hybrid stereo decoder expects:
     /// 1. Shared SILK VAD + LBRR header for **two** internal channels
@@ -1416,14 +1527,13 @@ impl HybridEncoder {
     ///    the same range encoder.
     /// 4. CELT high-band body via `encode_hybrid_body_stereo`
     ///    (`start_band = 17`, `channels = 2`, dual-stereo coupling).
-    /// 5. Finalise and prepend the TOC byte (config 13 / 15 + stereo bit).
+    /// 5. Finalise and prepend the TOC byte (config 12/13/14/15 +
+    ///    stereo bit).
     fn encode_one_frame_stereo(&mut self, pcm_48k_lr: &[f32]) -> Result<Packet> {
-        debug_assert_eq!(pcm_48k_lr.len(), 2 * SILK_FRAME_SAMPLES_48K);
+        let frame_n = self.frame_samples_48k;
+        debug_assert_eq!(pcm_48k_lr.len(), 2 * frame_n);
 
-        let bytes = match self.bw {
-            HybridBandwidth::Swb => HYBRID_PACKET_BYTES_SWB_20MS_STEREO,
-            HybridBandwidth::Fb => HYBRID_PACKET_BYTES_FB_20MS_STEREO,
-        };
+        let bytes = self.packet_bytes_stereo();
         let mut re = oxideav_celt::range_encoder::RangeEncoder::new(bytes as u32);
 
         // SILK shared header — two internal channels: VAD+LBRR per channel.
@@ -1436,18 +1546,19 @@ impl HybridEncoder {
         re.encode_bit_logp(false, 1); // side LBRR
 
         // De-interleave to L / R.
-        let mut left = Vec::with_capacity(SILK_FRAME_SAMPLES_48K);
-        let mut right = Vec::with_capacity(SILK_FRAME_SAMPLES_48K);
-        for i in 0..SILK_FRAME_SAMPLES_48K {
+        let mut left = Vec::with_capacity(frame_n);
+        let mut right = Vec::with_capacity(frame_n);
+        for i in 0..frame_n {
             left.push(pcm_48k_lr[2 * i]);
             right.push(pcm_48k_lr[2 * i + 1]);
         }
 
-        // Downsample 48 kHz → 16 kHz, then mid/side split.
+        // Downsample 48 kHz → 16 kHz, then mid/side split. 320 samples
+        // for 20 ms WB, 160 samples for 10 ms WB.
         let l_internal = downsample_box(&left, 3);
         let r_internal = downsample_box(&right, 3);
-        debug_assert_eq!(l_internal.len(), SILK_WB_FRAME_SAMPLES_INTERNAL);
-        debug_assert_eq!(r_internal.len(), SILK_WB_FRAME_SAMPLES_INTERNAL);
+        debug_assert_eq!(l_internal.len(), self.silk_mid.frame_len());
+        debug_assert_eq!(r_internal.len(), self.silk_mid.frame_len());
         let (mid, side) = crate::silk::encoder::stereo_mid_side(&l_internal, &r_internal);
 
         // SILK stereo prediction header: emit (0, 0) for the MVP — the
@@ -1477,6 +1588,36 @@ impl HybridEncoder {
         self.finalize_packet(re, true)
     }
 
+    /// Total packet byte budget for the mono path — picks the per-mode
+    /// constant based on `self.frame_samples_48k` and `self.bw`. RFC 6716
+    /// §3.2.1 caps every per-frame value at 1275 bytes.
+    fn packet_bytes_mono(&self) -> usize {
+        match (self.frame_samples_48k, self.bw) {
+            (SILK_FRAME_SAMPLES_48K, HybridBandwidth::Swb) => HYBRID_PACKET_BYTES_SWB_20MS,
+            (SILK_FRAME_SAMPLES_48K, HybridBandwidth::Fb) => HYBRID_PACKET_BYTES_FB_20MS,
+            (HYBRID_FRAME_SAMPLES_48K_10MS, HybridBandwidth::Swb) => HYBRID_PACKET_BYTES_SWB_10MS,
+            (HYBRID_FRAME_SAMPLES_48K_10MS, HybridBandwidth::Fb) => HYBRID_PACKET_BYTES_FB_10MS,
+            _ => unreachable!("Hybrid encoder: unsupported frame_samples_48k"),
+        }
+    }
+
+    /// Total packet byte budget for the stereo path. All variants are
+    /// capped at the RFC 6716 §3.2.1 1275-byte limit since SILK MVP
+    /// stereo at this rate dominates the budget on either duration.
+    fn packet_bytes_stereo(&self) -> usize {
+        match (self.frame_samples_48k, self.bw) {
+            (SILK_FRAME_SAMPLES_48K, HybridBandwidth::Swb) => HYBRID_PACKET_BYTES_SWB_20MS_STEREO,
+            (SILK_FRAME_SAMPLES_48K, HybridBandwidth::Fb) => HYBRID_PACKET_BYTES_FB_20MS_STEREO,
+            (HYBRID_FRAME_SAMPLES_48K_10MS, HybridBandwidth::Swb) => {
+                HYBRID_PACKET_BYTES_SWB_10MS_STEREO
+            }
+            (HYBRID_FRAME_SAMPLES_48K_10MS, HybridBandwidth::Fb) => {
+                HYBRID_PACKET_BYTES_FB_10MS_STEREO
+            }
+            _ => unreachable!("Hybrid encoder: unsupported frame_samples_48k"),
+        }
+    }
+
     /// Compute the bytes available to CELT after the SILK body has been
     /// emitted into `re`. Floored at 16 bytes so the CELT bit allocator
     /// always has a sensible budget.
@@ -1496,24 +1637,28 @@ impl HybridEncoder {
             .map_err(|e| Error::other(format!("Hybrid encoder: {e}")))?;
         let body = strip_trailing_zeros(body);
 
-        let toc = build_hybrid_20ms_toc(self.bw, stereo);
+        let toc = if self.frame_samples_48k == SILK_FRAME_SAMPLES_48K {
+            build_hybrid_20ms_toc(self.bw, stereo)
+        } else {
+            build_hybrid_10ms_toc(self.bw, stereo)
+        };
         let mut data = Vec::with_capacity(1 + body.len());
         data.push(toc);
         data.extend_from_slice(&body);
 
         let tb = TimeBase::new(1, SAMPLE_RATE as i64);
         let pts = self.pts_counter;
-        self.pts_counter += SILK_FRAME_SAMPLES_48K as i64;
+        self.pts_counter += self.frame_samples_48k as i64;
         Ok(Packet::new(0, tb, data)
             .with_pts(pts)
-            .with_duration(SILK_FRAME_SAMPLES_48K as i64))
+            .with_duration(self.frame_samples_48k as i64))
     }
 
     fn drain_frames(&mut self) -> Result<()> {
         let per_frame = if self.stereo {
-            SILK_FRAME_SAMPLES_48K * 2
+            self.frame_samples_48k * 2
         } else {
-            SILK_FRAME_SAMPLES_48K
+            self.frame_samples_48k
         };
         while self.pending_48k.len() >= per_frame {
             let mut frame = Vec::with_capacity(per_frame);
@@ -1569,9 +1714,9 @@ impl Encoder for HybridEncoder {
 
     fn flush(&mut self) -> Result<()> {
         let per_frame = if self.stereo {
-            SILK_FRAME_SAMPLES_48K * 2
+            self.frame_samples_48k * 2
         } else {
-            SILK_FRAME_SAMPLES_48K
+            self.frame_samples_48k
         };
         if !self.pending_48k.is_empty() {
             while self.pending_48k.len() % per_frame != 0 {

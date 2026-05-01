@@ -28,6 +28,7 @@ use oxideav_opus::toc::{OpusBandwidth, OpusMode, Toc};
 
 const SR: u32 = 48_000;
 const FRAME_SAMPLES_20MS: usize = 960;
+const FRAME_SAMPLES_10MS: usize = 480;
 
 fn make_s16_frame_mono(samples_f32: &[f32]) -> Frame {
     let mut bytes = Vec::with_capacity(samples_f32.len() * 2);
@@ -76,6 +77,79 @@ fn make_hybrid_stereo_encoder(bw: HybridBandwidth) -> HybridEncoder {
         HybridBandwidth::Swb => HybridEncoder::new_swb_stereo_20ms(&p).expect("SWB stereo encoder"),
         HybridBandwidth::Fb => HybridEncoder::new_fb_stereo_20ms(&p).expect("FB stereo encoder"),
     }
+}
+
+fn make_hybrid_encoder_10ms(bw: HybridBandwidth) -> HybridEncoder {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(1);
+    p.sample_rate = Some(SR);
+    match bw {
+        HybridBandwidth::Swb => HybridEncoder::new_swb_mono_10ms(&p).expect("SWB 10ms encoder"),
+        HybridBandwidth::Fb => HybridEncoder::new_fb_mono_10ms(&p).expect("FB 10ms encoder"),
+    }
+}
+
+fn make_hybrid_stereo_encoder_10ms(bw: HybridBandwidth) -> HybridEncoder {
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(2);
+    p.sample_rate = Some(SR);
+    match bw {
+        HybridBandwidth::Swb => {
+            HybridEncoder::new_swb_stereo_10ms(&p).expect("SWB stereo 10ms encoder")
+        }
+        HybridBandwidth::Fb => {
+            HybridEncoder::new_fb_stereo_10ms(&p).expect("FB stereo 10ms encoder")
+        }
+    }
+}
+
+fn drive_encoder_10ms(enc: &mut HybridEncoder, signal: &[f32]) -> Vec<Packet> {
+    let mut packets = Vec::new();
+    for chunk in signal.chunks(FRAME_SAMPLES_10MS) {
+        if chunk.len() < FRAME_SAMPLES_10MS {
+            break;
+        }
+        let frame = make_s16_frame_mono(chunk);
+        enc.send_frame(&frame).expect("send_frame");
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => packets.push(p),
+                Err(Error::NeedMore) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+    }
+    enc.flush().expect("flush");
+    while let Ok(p) = enc.receive_packet() {
+        packets.push(p);
+    }
+    packets
+}
+
+fn drive_encoder_stereo_10ms(enc: &mut HybridEncoder, l: &[f32], r: &[f32]) -> Vec<Packet> {
+    assert_eq!(l.len(), r.len());
+    let mut packets = Vec::new();
+    let chunks_l = l.chunks(FRAME_SAMPLES_10MS);
+    let chunks_r = r.chunks(FRAME_SAMPLES_10MS);
+    for (lc, rc) in chunks_l.zip(chunks_r) {
+        if lc.len() < FRAME_SAMPLES_10MS {
+            break;
+        }
+        let frame = make_s16_frame_stereo(lc, rc);
+        enc.send_frame(&frame).expect("send_frame");
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => packets.push(p),
+                Err(Error::NeedMore) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+    }
+    enc.flush().expect("flush");
+    while let Ok(p) = enc.receive_packet() {
+        packets.push(p);
+    }
+    packets
 }
 
 fn drive_encoder_stereo(enc: &mut HybridEncoder, l: &[f32], r: &[f32]) -> Vec<Packet> {
@@ -1000,6 +1074,372 @@ fn hybrid_fb_stereo_cross_decodes_through_libopus() {
     let r_l = rms_i16(&pcm_l);
     let r_r = rms_i16(&pcm_r);
     println!("hybrid_fb_stereo cross-decode through libopus: rms_L={r_l:.4e}, rms_R={r_r:.4e}");
+    assert!(
+        r_l > 0.01 && r_r > 0.01,
+        "libopus decode RMS too low (L={r_l}, R={r_r})"
+    );
+}
+
+// -------------------------------------------------------------------
+// 10 ms Hybrid (configs 12 / 14) — mono and stereo.
+// -------------------------------------------------------------------
+
+#[test]
+fn hybrid_swb_10ms_toc_is_config_12() {
+    let mut enc = make_hybrid_encoder_10ms(HybridBandwidth::Swb);
+    let signal: Vec<f32> = (0..FRAME_SAMPLES_10MS)
+        .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SR as f32).sin() * 0.3)
+        .collect();
+    let packets = drive_encoder_10ms(&mut enc, &signal);
+    assert!(!packets.is_empty(), "encoder produced no packets");
+    let toc = Toc::parse(packets[0].data[0]);
+    assert_eq!(toc.config, 12, "SWB 10 ms hybrid TOC config");
+    assert_eq!(toc.mode, OpusMode::Hybrid);
+    assert_eq!(toc.bandwidth, OpusBandwidth::SuperWideband);
+    assert_eq!(toc.frame_samples_48k, 480);
+    assert!(!toc.stereo, "mono encoder must emit stereo bit = 0");
+    assert_eq!(toc.code, 0);
+}
+
+#[test]
+fn hybrid_fb_10ms_toc_is_config_14() {
+    let mut enc = make_hybrid_encoder_10ms(HybridBandwidth::Fb);
+    let signal: Vec<f32> = (0..FRAME_SAMPLES_10MS)
+        .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SR as f32).sin() * 0.3)
+        .collect();
+    let packets = drive_encoder_10ms(&mut enc, &signal);
+    assert!(!packets.is_empty());
+    let toc = Toc::parse(packets[0].data[0]);
+    assert_eq!(toc.config, 14, "FB 10 ms hybrid TOC config");
+    assert_eq!(toc.mode, OpusMode::Hybrid);
+    assert_eq!(toc.bandwidth, OpusBandwidth::Fullband);
+    assert_eq!(toc.frame_samples_48k, 480);
+}
+
+#[test]
+fn hybrid_swb_10ms_stereo_toc_is_config_12_with_stereo_bit() {
+    let mut enc = make_hybrid_stereo_encoder_10ms(HybridBandwidth::Swb);
+    let l: Vec<f32> = (0..FRAME_SAMPLES_10MS)
+        .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SR as f32).sin() * 0.3)
+        .collect();
+    let r: Vec<f32> = (0..FRAME_SAMPLES_10MS)
+        .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SR as f32).cos() * 0.3)
+        .collect();
+    let packets = drive_encoder_stereo_10ms(&mut enc, &l, &r);
+    assert!(!packets.is_empty());
+    let toc = Toc::parse(packets[0].data[0]);
+    assert_eq!(toc.config, 12);
+    assert_eq!(toc.mode, OpusMode::Hybrid);
+    assert_eq!(toc.bandwidth, OpusBandwidth::SuperWideband);
+    assert_eq!(toc.frame_samples_48k, 480);
+    assert!(toc.stereo);
+}
+
+#[test]
+fn hybrid_fb_10ms_stereo_toc_is_config_14_with_stereo_bit() {
+    let mut enc = make_hybrid_stereo_encoder_10ms(HybridBandwidth::Fb);
+    let l: Vec<f32> = (0..FRAME_SAMPLES_10MS)
+        .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SR as f32).sin() * 0.3)
+        .collect();
+    let r: Vec<f32> = (0..FRAME_SAMPLES_10MS)
+        .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SR as f32).cos() * 0.3)
+        .collect();
+    let packets = drive_encoder_stereo_10ms(&mut enc, &l, &r);
+    assert!(!packets.is_empty());
+    let toc = Toc::parse(packets[0].data[0]);
+    assert_eq!(toc.config, 14);
+    assert_eq!(toc.mode, OpusMode::Hybrid);
+    assert_eq!(toc.bandwidth, OpusBandwidth::Fullband);
+    assert!(toc.stereo);
+}
+
+#[test]
+fn hybrid_swb_10ms_sweep_has_both_band_energy() {
+    // 50 frames * 10 ms = 500 ms, matching the 20 ms sweep test.
+    let n_frames = 50;
+    let total = n_frames * FRAME_SAMPLES_10MS;
+    let f0 = 500.0f32;
+    let f1 = 11_000.0f32;
+    let signal: Vec<f32> = (0..total)
+        .map(|i| {
+            let t = i as f32 / SR as f32;
+            let f = f0 + (f1 - f0) * (i as f32 / total as f32);
+            (2.0 * std::f32::consts::PI * f * t).sin() * 0.3
+        })
+        .collect();
+
+    let mut enc = make_hybrid_encoder_10ms(HybridBandwidth::Swb);
+    let packets = drive_encoder_10ms(&mut enc, &signal);
+    assert!(!packets.is_empty());
+    for pkt in &packets {
+        let toc = Toc::parse(pkt.data[0]);
+        assert_eq!(toc.config, 12);
+        assert_eq!(toc.mode, OpusMode::Hybrid);
+    }
+
+    let pcm = decode_packets(&packets);
+    assert!(!pcm.is_empty());
+    // Skip 2 frames (≈ 20 ms) to let SILK + CELT settle.
+    let skip = (FRAME_SAMPLES_10MS * 2).min(pcm.len());
+    let lp = lowpass(&pcm[skip..], 4_000.0, SR);
+    let hp = highpass(&pcm[skip..], 8_000.0, SR);
+    let lp_rms = rms_f32(&lp);
+    let hp_rms = rms_f32(&hp);
+    let in_rms = rms_f32(&signal[skip..]);
+    println!(
+        "hybrid_swb_10ms_sweep: in_rms={in_rms:.4e}, lp_rms={lp_rms:.4e}, hp_rms={hp_rms:.4e}"
+    );
+    assert!(
+        lp_rms > 0.05 * in_rms,
+        "low band too quiet: {lp_rms} vs {in_rms}"
+    );
+    assert!(
+        hp_rms > 0.05 * in_rms,
+        "high band too quiet: {hp_rms} vs {in_rms}"
+    );
+}
+
+#[test]
+fn hybrid_fb_10ms_sweep_has_both_band_energy() {
+    let n_frames = 50;
+    let total = n_frames * FRAME_SAMPLES_10MS;
+    let f0 = 500.0f32;
+    let f1 = 18_000.0f32;
+    let signal: Vec<f32> = (0..total)
+        .map(|i| {
+            let t = i as f32 / SR as f32;
+            let f = f0 + (f1 - f0) * (i as f32 / total as f32);
+            (2.0 * std::f32::consts::PI * f * t).sin() * 0.3
+        })
+        .collect();
+
+    let mut enc = make_hybrid_encoder_10ms(HybridBandwidth::Fb);
+    let packets = drive_encoder_10ms(&mut enc, &signal);
+    assert!(!packets.is_empty());
+
+    let pcm = decode_packets(&packets);
+    assert!(!pcm.is_empty());
+    let skip = (FRAME_SAMPLES_10MS * 2).min(pcm.len());
+    let lp = lowpass(&pcm[skip..], 4_000.0, SR);
+    let hp = highpass(&pcm[skip..], 8_000.0, SR);
+    let lp_rms = rms_f32(&lp);
+    let hp_rms = rms_f32(&hp);
+    let in_rms = rms_f32(&signal[skip..]);
+    println!("hybrid_fb_10ms_sweep: in_rms={in_rms:.4e}, lp_rms={lp_rms:.4e}, hp_rms={hp_rms:.4e}");
+    assert!(
+        lp_rms > 0.05 * in_rms,
+        "low band too quiet: {lp_rms} vs {in_rms}"
+    );
+    assert!(
+        hp_rms > 0.05 * in_rms,
+        "high band too quiet: {hp_rms} vs {in_rms}"
+    );
+}
+
+#[test]
+fn hybrid_swb_10ms_silence_stays_quiet() {
+    let n_frames = 10;
+    let total = n_frames * FRAME_SAMPLES_10MS;
+    let signal = vec![0.0f32; total];
+    let mut enc = make_hybrid_encoder_10ms(HybridBandwidth::Swb);
+    let packets = drive_encoder_10ms(&mut enc, &signal);
+    assert!(!packets.is_empty());
+
+    let pcm = decode_packets(&packets);
+    let r = rms_i16(&pcm);
+    println!("hybrid_swb_10ms_silence: rms={r:.4e}");
+    assert!(r < 0.25, "silence in → output too loud: {r}");
+    assert!(pcm.iter().all(|s| (*s as f32).is_finite()));
+}
+
+#[test]
+fn hybrid_swb_10ms_stereo_sweep_has_both_band_energy_per_channel() {
+    let n_frames = 50;
+    let total = n_frames * FRAME_SAMPLES_10MS;
+    let l: Vec<f32> = (0..total)
+        .map(|i| {
+            let t = i as f32 / SR as f32;
+            let f = 500.0 + (11_000.0 - 500.0) * (i as f32 / total as f32);
+            (2.0 * std::f32::consts::PI * f * t).sin() * 0.3
+        })
+        .collect();
+    let r: Vec<f32> = (0..total)
+        .map(|i| {
+            let t = i as f32 / SR as f32;
+            let f = 600.0 + (11_500.0 - 600.0) * (i as f32 / total as f32);
+            (2.0 * std::f32::consts::PI * f * t).cos() * 0.3
+        })
+        .collect();
+
+    let mut enc = make_hybrid_stereo_encoder_10ms(HybridBandwidth::Swb);
+    let packets = drive_encoder_stereo_10ms(&mut enc, &l, &r);
+    assert!(!packets.is_empty());
+    for pkt in &packets {
+        let toc = Toc::parse(pkt.data[0]);
+        assert_eq!(toc.config, 12);
+        assert!(toc.stereo);
+    }
+    let (l_dec, r_dec) = decode_packets_stereo(&packets);
+    assert!(!l_dec.is_empty() && !r_dec.is_empty());
+    let skip = (FRAME_SAMPLES_10MS * 2).min(l_dec.len());
+
+    for (label, dec, src) in [("L", &l_dec, &l), ("R", &r_dec, &r)] {
+        let lp = lowpass(&dec[skip..], 4_000.0, SR);
+        let hp = highpass(&dec[skip..], 8_000.0, SR);
+        let lp_rms = rms_f32(&lp);
+        let hp_rms = rms_f32(&hp);
+        let in_rms = rms_f32(&src[skip..]);
+        println!(
+            "hybrid_swb_10ms_stereo_sweep[{label}]: in_rms={in_rms:.4e}, lp_rms={lp_rms:.4e}, hp_rms={hp_rms:.4e}"
+        );
+        assert!(
+            lp_rms > 0.05 * in_rms,
+            "{label} low band too quiet: {lp_rms} vs {in_rms}"
+        );
+        assert!(
+            hp_rms > 0.05 * in_rms,
+            "{label} high band too quiet: {hp_rms} vs {in_rms}"
+        );
+    }
+}
+
+// ----- libopus / ffmpeg cross-decode validation for 10 ms Hybrid -----
+
+#[test]
+fn hybrid_swb_mono_10ms_cross_decodes_through_libopus() {
+    if !ffmpeg_available() {
+        eprintln!("skip: ffmpeg not on PATH");
+        return;
+    }
+    let n_frames = 50;
+    let total = n_frames * FRAME_SAMPLES_10MS;
+    let signal: Vec<f32> = (0..total)
+        .map(|i| (2.0 * std::f32::consts::PI * 500.0 * i as f32 / SR as f32).sin() * 0.3)
+        .collect();
+    let mut enc = make_hybrid_encoder_10ms(HybridBandwidth::Swb);
+    let packets = drive_encoder_10ms(&mut enc, &signal);
+    assert!(!packets.is_empty());
+
+    let path = "/tmp/oxideav-opus-hybrid-swb-mono-10ms.opus";
+    write_ogg_opus_file(&packets, 1, path);
+
+    let pcm = ffmpeg_decode_to_s16(path, 1).expect("ffmpeg ran");
+    assert!(!pcm.is_empty(), "libopus decoded to empty PCM");
+    let r = rms_i16(&pcm);
+    println!(
+        "hybrid_swb_mono_10ms cross-decode through libopus: rms={r:.4e}, samples={}",
+        pcm.len()
+    );
+    assert!(r > 0.01, "libopus decode RMS too low: {r}");
+    assert!(pcm.iter().all(|s| (*s as f32).is_finite()));
+}
+
+#[test]
+fn hybrid_fb_mono_10ms_cross_decodes_through_libopus() {
+    if !ffmpeg_available() {
+        eprintln!("skip: ffmpeg not on PATH");
+        return;
+    }
+    let n_frames = 50;
+    let total = n_frames * FRAME_SAMPLES_10MS;
+    let signal: Vec<f32> = (0..total)
+        .map(|i| (2.0 * std::f32::consts::PI * 600.0 * i as f32 / SR as f32).sin() * 0.3)
+        .collect();
+    let mut enc = make_hybrid_encoder_10ms(HybridBandwidth::Fb);
+    let packets = drive_encoder_10ms(&mut enc, &signal);
+    assert!(!packets.is_empty());
+
+    let path = "/tmp/oxideav-opus-hybrid-fb-mono-10ms.opus";
+    write_ogg_opus_file(&packets, 1, path);
+
+    let pcm = ffmpeg_decode_to_s16(path, 1).expect("ffmpeg ran");
+    assert!(!pcm.is_empty(), "libopus decoded to empty PCM");
+    let r = rms_i16(&pcm);
+    println!(
+        "hybrid_fb_mono_10ms cross-decode through libopus: rms={r:.4e}, samples={}",
+        pcm.len()
+    );
+    assert!(r > 0.01, "libopus decode RMS too low: {r}");
+    assert!(pcm.iter().all(|s| (*s as f32).is_finite()));
+}
+
+#[test]
+fn hybrid_swb_stereo_10ms_cross_decodes_through_libopus() {
+    if !ffmpeg_available() {
+        eprintln!("skip: ffmpeg not on PATH");
+        return;
+    }
+    let n_frames = 50;
+    let total = n_frames * FRAME_SAMPLES_10MS;
+    let l: Vec<f32> = (0..total)
+        .map(|i| (2.0 * std::f32::consts::PI * 500.0 * i as f32 / SR as f32).sin() * 0.3)
+        .collect();
+    let r: Vec<f32> = (0..total)
+        .map(|i| (2.0 * std::f32::consts::PI * 700.0 * i as f32 / SR as f32).cos() * 0.3)
+        .collect();
+    let mut enc = make_hybrid_stereo_encoder_10ms(HybridBandwidth::Swb);
+    let packets = drive_encoder_stereo_10ms(&mut enc, &l, &r);
+    assert!(!packets.is_empty());
+
+    let path = "/tmp/oxideav-opus-hybrid-swb-stereo-10ms.opus";
+    write_ogg_opus_file(&packets, 2, path);
+
+    let pcm = ffmpeg_decode_to_s16(path, 2).expect("ffmpeg ran");
+    assert!(!pcm.is_empty(), "libopus decoded to empty PCM");
+
+    let mut pcm_l = Vec::with_capacity(pcm.len() / 2);
+    let mut pcm_r = Vec::with_capacity(pcm.len() / 2);
+    for chunk in pcm.chunks_exact(2) {
+        pcm_l.push(chunk[0]);
+        pcm_r.push(chunk[1]);
+    }
+    let r_l = rms_i16(&pcm_l);
+    let r_r = rms_i16(&pcm_r);
+    println!(
+        "hybrid_swb_stereo_10ms cross-decode through libopus: rms_L={r_l:.4e}, rms_R={r_r:.4e}, samples_per_ch={}",
+        pcm_l.len()
+    );
+    assert!(
+        r_l > 0.01 && r_r > 0.01,
+        "libopus decode RMS too low (L={r_l}, R={r_r})"
+    );
+}
+
+#[test]
+fn hybrid_fb_stereo_10ms_cross_decodes_through_libopus() {
+    if !ffmpeg_available() {
+        eprintln!("skip: ffmpeg not on PATH");
+        return;
+    }
+    let n_frames = 50;
+    let total = n_frames * FRAME_SAMPLES_10MS;
+    let l: Vec<f32> = (0..total)
+        .map(|i| (2.0 * std::f32::consts::PI * 600.0 * i as f32 / SR as f32).sin() * 0.3)
+        .collect();
+    let r: Vec<f32> = (0..total)
+        .map(|i| (2.0 * std::f32::consts::PI * 800.0 * i as f32 / SR as f32).cos() * 0.3)
+        .collect();
+    let mut enc = make_hybrid_stereo_encoder_10ms(HybridBandwidth::Fb);
+    let packets = drive_encoder_stereo_10ms(&mut enc, &l, &r);
+    assert!(!packets.is_empty());
+
+    let path = "/tmp/oxideav-opus-hybrid-fb-stereo-10ms.opus";
+    write_ogg_opus_file(&packets, 2, path);
+
+    let pcm = ffmpeg_decode_to_s16(path, 2).expect("ffmpeg ran");
+    assert!(!pcm.is_empty(), "libopus decoded to empty PCM");
+
+    let mut pcm_l = Vec::with_capacity(pcm.len() / 2);
+    let mut pcm_r = Vec::with_capacity(pcm.len() / 2);
+    for chunk in pcm.chunks_exact(2) {
+        pcm_l.push(chunk[0]);
+        pcm_r.push(chunk[1]);
+    }
+    let r_l = rms_i16(&pcm_l);
+    let r_r = rms_i16(&pcm_r);
+    println!(
+        "hybrid_fb_stereo_10ms cross-decode through libopus: rms_L={r_l:.4e}, rms_R={r_r:.4e}"
+    );
     assert!(
         r_l > 0.01 && r_r > 0.01,
         "libopus decode RMS too low (L={r_l}, R={r_r})"

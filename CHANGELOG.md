@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Hybrid (SILK + CELT) **10 ms** mono and stereo encoders for SWB
+  (config 12) and FB (config 14) per RFC 6716 §4.4. New named
+  constructors `HybridEncoder::new_swb_mono_10ms`,
+  `new_fb_mono_10ms`, `new_swb_stereo_10ms`, `new_fb_stereo_10ms`
+  mirror the existing 20 ms variants but pick the SILK 2-sub-frame
+  WB body (160 internal samples) and the CELT LM=2 (480-sample / 10 ms)
+  short-block path via the new
+  `oxideav_celt::encoder::CeltEncoder::new_with_frame_samples(_, 480)`
+  constructor. The shared range-coded layout, SILK VAD/LBRR header,
+  stereo prediction header, and CELT
+  `start_band = 17` plumbing are unchanged from the 20 ms variant —
+  10 ms is otherwise the same hybrid body, just at half the duration.
+  RFC 6716 §3.2.1 1275-byte per-frame cap still applies.
 - Hybrid (SILK + CELT) mono 20 ms encoder for SWB (config 13) and FB
   (config 15) per RFC 6716 §4.4. Runs SILK-WB on the 0..8 kHz low band
   and CELT (`start_band = 17`) on the 8..12 kHz / 8..20 kHz high band,
@@ -16,8 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the in-flight `RangeEncoder` after the SILK body, mirroring the
   decoder's `decode_hybrid_frame` which uses the same arithmetic
   stream end-to-end. New named constructors: `HybridEncoder::new_swb_
-  mono_20ms` and `new_fb_mono_20ms`. Mono 48 kHz input only; stereo +
-  10 ms hybrid are tracked follow-ups.
+  mono_20ms` and `new_fb_mono_20ms`.
 - New CELT-encoder helper `CeltEncoder::encode_hybrid_body_mono(pcm,
   enc, start_band, end_band, budget_bytes)` — encodes a CELT body
   into a caller-supplied `RangeEncoder` with the given band range,
@@ -38,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   20 ms TOC sanity, low-band tone SNR (~24 dB), swept-sine
   band-energy survival in both the < 4 kHz and > 8 kHz regions, and
   silence-stays-quiet bounds.
+- Extend hybrid_roundtrip with **10 ms** Hybrid coverage (configs
+  12 / 14 SWB / FB, mono + stereo): TOC config sanity, swept-sine
+  band-energy survival in both < 4 kHz and > 8 kHz regions, silence
+  bounds, and libopus + ffmpeg cross-decode checks for every
+  10 ms variant. 32 hybrid_roundtrip tests total (was 20).
 
 ## [0.0.6](https://github.com/OxideAV/oxideav-opus/compare/v0.0.5...v0.0.6) - 2026-04-25
 

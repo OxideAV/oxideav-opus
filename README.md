@@ -77,16 +77,22 @@ Two explicit entry points, one per Opus mode:
   16 kHz for NB / MB / WB) or 48 kHz; 48 kHz input is downsampled by a
   simple box-average pre-filter.
 
-- **Hybrid (SILK + CELT) 20 ms** at SWB and FB, mono and stereo
-  (`HybridEncoder::new_swb_mono_20ms` / `new_fb_mono_20ms` /
-  `new_swb_stereo_20ms` / `new_fb_stereo_20ms`) — TOC configs 13 (SWB)
-  and 15 (FB). Per RFC 6716 §4.4 the SILK part runs WB (16 kHz
-  internal, covering 0..8 kHz) regardless of TOC bandwidth; the CELT
-  part starts at band 17 (the 8 kHz edge) and covers 8..12 kHz (SWB)
-  or 8..20 kHz (FB) on the **same** range-coded bitstream — the CELT
-  body is appended to the in-flight `RangeEncoder` after the SILK body
-  so the whole packet is one shared arithmetic stream, exactly what
-  the decoder expects.
+- **Hybrid (SILK + CELT) 20 ms and 10 ms** at SWB and FB, mono and
+  stereo (`HybridEncoder::new_{swb,fb}_{mono,stereo}_{10,20}ms`) —
+  TOC configs 12 / 13 (SWB 10 / 20 ms) and 14 / 15 (FB 10 / 20 ms).
+  Per RFC 6716 §4.4 the SILK part runs WB (16 kHz internal, covering
+  0..8 kHz) regardless of TOC bandwidth; the CELT part starts at band
+  17 (the 8 kHz edge) and covers 8..12 kHz (SWB) or 8..20 kHz (FB)
+  on the **same** range-coded bitstream — the CELT body is appended
+  to the in-flight `RangeEncoder` after the SILK body so the whole
+  packet is one shared arithmetic stream, exactly what the decoder
+  expects.
+
+  At 20 ms the SILK frame encoder uses 4 sub-frames and the CELT
+  high-band runs at LM=3 (960-sample MDCT). At 10 ms the SILK frame
+  encoder uses 2 sub-frames and the CELT high-band runs at LM=2
+  (480-sample MDCT) via
+  `oxideav_celt::CeltEncoder::new_with_frame_samples(_, 480)`.
 
   Stereo Hybrid runs a mid/side pair of WB SILK frame encoders for the
   low band (with the RFC §4.2.7.1 prediction header — weights shipped
@@ -95,17 +101,15 @@ Two explicit entry points, one per Opus mode:
   capped at the RFC 6716 §3.2.1 1275-byte per-frame limit so libopus /
   ffmpeg accept them.
 
-  Input: 48 kHz mono or stereo. 10 ms hybrid (configs 12 / 14) is a
-  tracked follow-up — the underlying CELT encoder still needs the
-  LM=2 path before 10 ms hybrid can land.
+  Input: 48 kHz mono or stereo.
 
   Round-trip through our own decoder on a 300 Hz low-band tone:
   - SWB 20 ms hybrid mono: ~24 dB low-band SNR
   - FB 20 ms hybrid mono: ~24 dB low-band SNR
   - SWB 20 ms hybrid stereo (300 Hz L / 400 Hz R): ~23 dB L / ~23 dB R
 
-  Cross-decode through libopus / ffmpeg: SWB mono, SWB stereo, and FB
-  stereo packets all decode without error to non-trivial PCM.
+  Cross-decode through libopus / ffmpeg: SWB / FB mono and stereo at
+  both 10 ms and 20 ms decode without error to non-trivial PCM.
 
   The high band is exercised by swept-sine tests (`hybrid_*_sweep_*`)
   that confirm both the < 4 kHz (SILK) and > 8 kHz (CELT) regions
