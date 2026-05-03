@@ -150,11 +150,7 @@ fn decode_fixture_pcm(case: &CorpusCase) -> Option<DecodedPcm> {
     let file = match fs::File::open(&opus_path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!(
-                "skip {}: missing {} ({e})",
-                case.name,
-                opus_path.display()
-            );
+            eprintln!("skip {}: missing {} ({e})", case.name, opus_path.display());
             return None;
         }
     };
