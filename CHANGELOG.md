@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-opus/compare/v0.0.6...v0.0.7) - 2026-05-03
+
+### Other
+
+- revert celt 0.2 → 0.1
+- bump oxideav-celt 0.1 -> 0.2 for new AudioFrame layout
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- Hybrid 10 ms (configs 12 + 14) mono and stereo
+- Hybrid stereo 20 ms (configs 13 + 15) and broadened SILK MB/WB stereo
+- add Hybrid (SILK + CELT) encoder for mono 20 ms SWB / FB
+- SNR-validate MB/WB SILK stereo encode + fill NB stereo durations
+- cargo fmt cleanup of decoder/encoder/roundtrip tests
+- adopt slim VideoFrame/AudioFrame shape
+
 ### Added
 
 - Hybrid (SILK + CELT) **10 ms** mono and stereo encoders for SWB
