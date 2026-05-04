@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- Trim crate-level `#![allow]` block from 20 lints to 4. The 16 dropped
+  lints (`useless_vec`, `collapsible_if`, `collapsible_else_if`,
+  `nonminimal_bool`, `manual_range_contains`, `needless_late_init`,
+  `needless_return`, `let_unit_value`, `needless_borrow`, `unused_mut`,
+  `unused_variables`, `unused_assignments`, `unnecessary_cast`,
+  `manual_memcpy`, `neg_multiply`, `precedence`) no longer fire because
+  the underlying call sites have been cleaned up. Resulting `cargo
+  clippy --all-targets -- -D warnings` is green with the trimmed allow
+  set, so any future regression in those categories surfaces in CI
+  rather than being silently masked.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-opus/compare/v0.0.6...v0.0.7) - 2026-05-03
 
 ### Other

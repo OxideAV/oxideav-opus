@@ -136,7 +136,7 @@ pub fn upsample_to_48k(samples: &[f32], src_rate: u32) -> Vec<f32> {
         16_000 => upsample(samples, 3),
         24_000 => upsample(samples, 2),
         48_000 => samples.to_vec(),
-        _ => upsample(samples, 48_000 / src_rate as u32),
+        _ => upsample(samples, 48_000 / src_rate),
     }
 }
 

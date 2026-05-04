@@ -730,7 +730,7 @@ fn decode_celt_frame(
 fn decode_celt_body(
     dec: &mut OpusDecoder,
     toc: &Toc,
-    mut rc: &mut RangeDecoder<'_>,
+    rc: &mut RangeDecoder<'_>,
     channels: usize,
     n_samples: usize,
     start_band: usize,
@@ -741,7 +741,7 @@ fn decode_celt_body(
     let total_bits_raw = (rc.storage() * 8) as i32;
 
     // Silence flag (decoded inside header).
-    let header = match decode_header(&mut rc) {
+    let header = match decode_header(rc) {
         Some(h) => h,
         None => {
             // Reset old energies as libopus does.
@@ -760,7 +760,7 @@ fn decode_celt_body(
 
     // Coarse band energies.
     unquant_coarse_energy(
-        &mut rc,
+        rc,
         &mut state.old_band_e,
         start_band,
         end_band,
@@ -771,14 +771,7 @@ fn decode_celt_body(
 
     // tf_decode (§4.3.4 transient flags per band).
     let mut tf_res = vec![0i32; NB_EBANDS];
-    tf_decode(
-        &mut rc,
-        start_band,
-        end_band,
-        header.transient,
-        &mut tf_res,
-        lm,
-    );
+    tf_decode(rc, start_band, end_band, header.transient, &mut tf_res, lm);
 
     // Spread decision.
     let mut tell = rc.tell();
@@ -793,7 +786,7 @@ fn decode_celt_body(
     let cap = init_caps(lm as usize, channels);
     let mut offsets = [0i32; NB_EBANDS];
     let mut dynalloc_logp = 6i32;
-    let mut total_bits_frac = (total_bits_raw as i32) << BITRES;
+    let mut total_bits_frac = total_bits_raw << BITRES;
     tell = rc.tell_frac() as i32;
     for i in start_band..end_band {
         let width = (channels as i32) * (EBAND_5MS[i + 1] - EBAND_5MS[i]) as i32 * m;
@@ -824,7 +817,7 @@ fn decode_celt_body(
     };
 
     // Bits available for PVQ.
-    let mut bits = ((rc.storage() as i32) * 8 << BITRES) - rc.tell_frac() as i32 - 1;
+    let mut bits = (((rc.storage() as i32) * 8) << BITRES) - rc.tell_frac() as i32 - 1;
     let anti_collapse_rsv = if header.transient && lm >= 2 && bits >= ((lm + 2) << BITRES) {
         1 << BITRES
     } else {
@@ -853,12 +846,12 @@ fn decode_celt_body(
         &mut fine_priority,
         channels as i32,
         lm,
-        &mut rc,
+        rc,
     );
 
     // Fine energies.
     unquant_fine_energy(
-        &mut rc,
+        rc,
         &mut state.old_band_e,
         start_band,
         end_band,
@@ -897,7 +890,7 @@ fn decode_celt_body(
         &tf_res,
         total_pvq_bits,
         balance,
-        &mut rc,
+        rc,
         lm,
         coded_bands,
         &mut rng_local,
@@ -915,7 +908,7 @@ fn decode_celt_body(
     // Final fine-energy pass.
     let bits_left = (rc.storage() as i32) * 8 - rc.tell();
     unquant_energy_finalise(
-        &mut rc,
+        rc,
         &mut state.old_band_e,
         start_band,
         end_band,
@@ -1032,9 +1025,7 @@ fn decode_celt_body(
             out_accum[i] += prev_tail[i];
         }
         // Stash the new tail for next frame.
-        for i in 0..overlap {
-            state.overlap_buf[c][i] = out_accum[n + i];
-        }
+        state.overlap_buf[c][..overlap].copy_from_slice(&out_accum[n..n + overlap]);
         pcm_per_ch[c].copy_from_slice(&out_accum[..n]);
         let _ = win;
     }
@@ -1148,9 +1139,7 @@ fn decode_celt_body(
             state.old_band_e[NB_EBANDS + i] = state.old_band_e[i];
         }
     }
-    state.rng = (state.rng as u32)
-        .wrapping_mul(1_103_515_245)
-        .wrapping_add(12_345);
+    state.rng = state.rng.wrapping_mul(1_103_515_245).wrapping_add(12_345);
     let _ = state.channels;
 
     Ok(pcm_per_ch)
@@ -1276,7 +1265,7 @@ mod tests {
         };
         let mut p = CodecParameters::audio(CodecId::new("opus"));
         p.channels = Some(1);
-        let mut dec = make_decoder(&p).unwrap();
+        let dec = make_decoder(&p).unwrap();
         let _ = (toc, dec);
     }
 

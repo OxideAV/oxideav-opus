@@ -530,9 +530,7 @@ pub fn encode_excitation(
         }
         let base = s * 16;
         let mut arr = [0u32; 16];
-        for i in 0..16 {
-            arr[i] = pulses_per_sample[base + i];
-        }
+        arr.copy_from_slice(&pulses_per_sample[base..base + 16]);
         encode_shell_block_locations(enc, &arr);
     }
 
@@ -665,9 +663,7 @@ pub fn decode_excitation(
 
     // LSBs.
     let mut magnitudes = vec![0u32; frame_len];
-    for i in 0..frame_len {
-        magnitudes[i] = pulses_per_sample[i];
-    }
+    magnitudes[..frame_len].copy_from_slice(&pulses_per_sample[..frame_len]);
     for s in 0..n_shells {
         let k = lsb_counts[s] as usize;
         if k == 0 {
