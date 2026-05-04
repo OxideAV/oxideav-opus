@@ -315,9 +315,21 @@ fn decode_packet(dec: &mut OpusDecoder, packet: &Packet) -> Result<Frame> {
         .collect();
 
     for frame_bytes in parsed.frames.iter() {
-        let mut ch_buf = decode_frame(dec, &parsed.toc, frame_bytes, out_channels as usize)?;
-        for (dst, src) in per_ch.iter_mut().zip(ch_buf.drain(..)) {
-            dst.extend_from_slice(&src);
+        let ch_buf = decode_frame(dec, &parsed.toc, frame_bytes, out_channels as usize)?;
+        // `decode_frame` returns ≤ `out_channels` buffers (it caps to
+        // the TOC-declared channel count to keep CELT/SILK bit
+        // allocators aligned). When the TOC is mono and the output is
+        // stereo, splat the single decoded channel into every output
+        // channel here so the interleaver downstream sees the correct
+        // shape.
+        let decoded_ch = ch_buf.len();
+        for (out_idx, out_buf) in per_ch.iter_mut().enumerate().take(out_channels as usize) {
+            let src_idx = if decoded_ch == 0 {
+                continue;
+            } else {
+                out_idx.min(decoded_ch - 1)
+            };
+            out_buf.extend_from_slice(&ch_buf[src_idx]);
         }
     }
 
@@ -333,12 +345,40 @@ fn decode_packet(dec: &mut OpusDecoder, packet: &Packet) -> Result<Frame> {
     }
     let kept_samples = total_samples - skip;
 
+    // Choose s16 scale per-packet based on the post-IMDCT/post-deemph
+    // peak magnitude on this packet's CELT-bearing channels. CELT's
+    // `denormalise_bands` exponentiates `2^(coarse_log_e + eMeans)`
+    // against the libopus eMeans table, which is calibrated for s16
+    // peaks (~32 768). Packets produced by libopus' float-API encoder
+    // therefore arrive with f32 peaks in the thousands; packets
+    // produced by our in-crate CELT encoder (which runs on
+    // [-1, 1]-scale input without an internal x32 768 cast) arrive
+    // with peaks well under 1.0. SILK-only packets always arrive in
+    // [-1, 1] and route through this same path.
+    //
+    // The historical s16 conversion `(s * 32768.0).clamp(-32768, 32767) as i16`
+    // is correct only for the [-1, 1]-scale path. For the libopus path
+    // it pegs every sample at the rails. Detect the regime per-packet:
+    // CELT-only / Hybrid (which both run through the CELT pipeline)
+    // with a pre-clamp f32 peak above 4.0 are treated as Q15 already,
+    // so no extra scaling is applied. Below that threshold we behave
+    // exactly like before.
+    let likely_q15 = matches!(
+        parsed.toc.mode,
+        crate::toc::OpusMode::CeltOnly | crate::toc::OpusMode::Hybrid
+    ) && per_ch
+        .iter()
+        .take(out_channels as usize)
+        .flat_map(|ch| ch.iter())
+        .any(|s| s.abs() > 4.0);
+    let scale: f32 = if likely_q15 { 1.0 } else { 32768.0 };
+
     let gain = dec.output_gain_linear;
     let mut interleaved = Vec::with_capacity(kept_samples * out_channels as usize * 2);
     for i in skip..total_samples {
         for ch_buf in per_ch.iter().take(out_channels as usize) {
             let s = ch_buf.get(i).copied().unwrap_or(0.0) * gain;
-            let clamped = (s * 32768.0).clamp(-32768.0, 32767.0) as i16;
+            let clamped = (s * scale).clamp(-32768.0, 32767.0) as i16;
             interleaved.extend_from_slice(&clamped.to_le_bytes());
         }
     }
@@ -549,6 +589,16 @@ impl Decoder for MultistreamOpusDecoder {
         }
         let kept_samples = per_frame_samples - skip;
 
+        // Pick s16 scale by peak-magnitude probe (see notes in
+        // `decode_packet`): libopus-encoded CELT/Hybrid sub-streams
+        // arrive in Q15 already, while our in-crate encoders + SILK
+        // arrive in [-1, 1].
+        let likely_q15 = stream_channels
+            .iter()
+            .flat_map(|ch| ch.iter())
+            .any(|s| s.abs() > 4.0);
+        let scale: f32 = if likely_q15 { 1.0 } else { 32768.0 };
+
         // Map to output channels.
         let gain = self.output_gain_linear;
         let out_channels = self.channels as usize;
@@ -563,7 +613,7 @@ impl Decoder for MultistreamOpusDecoder {
                 } else {
                     0.0
                 } * gain;
-                let clamped = (s * 32768.0).clamp(-32768.0, 32767.0) as i16;
+                let clamped = (s * scale).clamp(-32768.0, 32767.0) as i16;
                 interleaved.extend_from_slice(&clamped.to_le_bytes());
             }
         }
@@ -605,10 +655,17 @@ fn decode_frame(
     if bytes.len() <= 1 {
         return Ok(silence(channels, n_samples));
     }
+    // The CELT/SILK decoders' bit allocators are sensitive to the
+    // channel count: passing `2` for a mono TOC reads stereo bit-budget
+    // assignments out of a mono bitstream and emits divergent garbage.
+    // Decode at the TOC-declared channel count and let `decode_*_frame`
+    // (or our caller) splat mono to the requested output width.
+    let toc_ch = toc.channels() as usize;
+    let decode_ch = channels.min(toc_ch.max(1));
     match toc.mode {
-        OpusMode::CeltOnly => decode_celt_frame(dec, toc, bytes, channels, n_samples),
-        OpusMode::SilkOnly => decode_silk_frame(dec, toc, bytes, channels, n_samples),
-        OpusMode::Hybrid => decode_hybrid_frame(dec, toc, bytes, channels, n_samples),
+        OpusMode::CeltOnly => decode_celt_frame(dec, toc, bytes, decode_ch, n_samples),
+        OpusMode::SilkOnly => decode_silk_frame(dec, toc, bytes, decode_ch, n_samples),
+        OpusMode::Hybrid => decode_hybrid_frame(dec, toc, bytes, decode_ch, n_samples),
     }
 }
 

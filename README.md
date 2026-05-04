@@ -9,19 +9,26 @@ mono + stereo (SWB / FB). Zero C dependencies.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
-> **Heads-up on libopus interop:** the SILK and CELT decoders today
-> implement the bitstream the same way the in-crate encoders produce
-> it. Own-encode → own-decode round-trips clear ≥ 20 dB SNR (see
-> `tests/encoder_roundtrip.rs`), but **decoding a libopus-produced
-> packet does not yet sound clean** — typical `.webm` / `.opus`
-> files made by ffmpeg / libopus play back as noise or distortion.
-> RFC 6716 §4.2 (SILK NLSF / LPC / excitation) and §4.3 (CELT PVQ
-> shape, IMDCT scaling, comb post-filter) need to be re-anchored
-> against libopus reference packets, not the in-crate encoder. Until
-> that lands, use this crate for our own encoder's output (e.g.
-> `oxideplay` of an oxideav-opus-encoded file) — for libopus-encoded
-> media, route the audio through ffmpeg or use one of the C bindings
-> outside the workspace. Tracked under "Not yet supported" below.
+> **Heads-up on libopus interop:** the CELT decoder now produces
+> usable output on libopus-encoded packets after a path-aware s16
+> conversion landed (the historical `* 32 768` at the float→s16 site
+> was peg-clipping every sample of a libopus-Q15-scale CELT IMDCT
+> output to the rails — see `decode_packet` in `src/decoder.rs`).
+> Cross-decode PSNR vs ffmpeg `opusdec` for the corpus fixtures
+> (`docs/audio/opus/fixtures/`):
+>
+> - CELT-only mono / stereo @ 64 kbps: **11–21 dB**
+> - CELT-only fullband stereo @ 128 kbps: **10 dB**
+> - CELT multistream 5.1: **17 dB**
+> - SILK NB / MB / WB mono / stereo: **4–7 dB** (still needs work)
+> - Hybrid SWB / FB: **3–4 dB** (SILK low band drags the PSNR down)
+>
+> SILK-only and the SILK portion of Hybrid still saturate ~17 % of
+> samples — RFC 6716 §4.2.7.8 (excitation Q-format scaling, LCG
+> dither) and §4.2.7.9 (LPC synthesis stability, gain interpretation)
+> need a clean-room re-anchor. Voice-band content (SILK / Hybrid)
+> therefore still sounds noisy; music-band CELT-only content is now
+> intelligible. Tracked under "Not yet supported" below.
 
 ## Installation
 
@@ -185,30 +192,44 @@ Two explicit entry points, one per Opus mode:
   packets, and framing codes 1 / 2 / 3 on the encoder side.
 - **Native CELT stereo encoding** (coupled L/R PVQ with intensity and
   dual-stereo) — tracked in `oxideav-celt`.
-- **libopus bitstream interop.** Both decoders pair with the in-crate
-  encoders, not with libopus. Symptoms when fed a libopus-produced
-  packet:
-  - **SILK** — output amplitude is wrong by a constant factor and
-    saturates the s16 output at ±full-scale on ~17 % of samples for
-    a quiet 440 Hz tone (sounds like buzzing or static). The
-    bit-stream layout in `src/silk/` follows RFC 6716 §4.2's header
-    order but the excitation body uses an MVP carrier format (nibble-
-    pair + sign per sample) instead of the RFC §4.2.7.8 shell-pulse
-    coder. Wiring full RFC §4.2 NLSF / LTP / shell-pulse parity is
-    the unblock.
-  - **CELT** — output explodes to ±200 in f32 before s16 clamping
-    on a quiet sine, lands at saturated alternating ±32767 / -32768
-    samples (i.e. a square wave at Nyquist — what users hear as
-    "noise"). The PVQ shape decoder in `oxideav-celt::quant_all_bands`
-    appears to over-decode pulses against a libopus-encoded bitstream
-    even after the RFC §4.3.7.2 single-pole de-emphasis filter is
-    applied (which this crate now wires correctly).
-  - **Hybrid** — both layers compound. PSNR vs libopus is around
-    -10 to 0 dB on the 24 kbps FB stereo test fixture.
+- **libopus bitstream interop.** Decoder symptoms after the round-7
+  s16-scale fix:
+  - **CELT** — works (`pair-mono-48k-64kbps`: 21 dB PSNR vs opusdec;
+    `multistream-5.1`: 17 dB; `celt-fb-stereo-128kbps`: 10 dB). The
+    historical bug was a uniform `* 32 768` at the f32→s16 conversion
+    that pegged every libopus CELT IMDCT output (whose peak is
+    `~32 768` already, because `denormalise_bands` exponentiates
+    against an eMeans table calibrated for Q15) to the rails.
+    `decode_packet` now picks the scale per packet by probing the
+    pre-clamp f32 peak, leaving the in-crate encoder's [-1, 1]-scale
+    output unaffected. The 2.5 ms low-latency CELT case still floors
+    at ~2 dB — LM=0 transient handling needs a separate look.
+  - **SILK** — still wrong. Output amplitude saturates the s16 output
+    at ±full-scale on ~17 % of samples for a quiet 440 Hz tone
+    (sounds like buzzing or static); per-fixture PSNR floors at
+    ~4–7 dB. The synthesis filter in `silk::synth::synthesize`
+    runs at unit scale and clamps every sample to ±1 to keep the IIR
+    stable, then the upsampler's peak-impulse FIR response amplifies
+    the rails by ~1.227× (= `0.2044 × 6` for the 8→48 kHz path).
+    Root causes anchored on RFC 6716:
+    - §4.2.7.4 — `gain_index_to_q16` is a float approximation of
+      `silk_log2lin( silk_SMULWB(0x1D1C71, idx) + 2090 )`; the
+      libopus integer formulation gives gain values in a different
+      range that, paired with the RFC §4.2.7.8 shell-pulse
+      excitation, produces a stable filter input. Our float path
+      currently amplifies the excitation past where the LPC filter
+      can settle.
+    - §4.2.7.8.6 — the LCG dither (per-sample sign perturbation
+      from the `seed` value decoded in §4.2.7.7) is parsed but the
+      `_seed` parameter is unused in `silk::shell::decode_excitation`,
+      so the excitation is missing the bit of pseudorandom dither
+      that keeps the synthesis from periodically going DC.
+  - **Hybrid** — drags down to 3–4 dB because the SILK low band is
+    contributing the same broken energy as SILK-only.
 
   Per-band energy decode (`unquant_coarse_energy` / `…_fine_energy`)
-  appears correct; the gap is in PVQ shape decoding and the excitation
-  / pitch-prediction stages of SILK.
+  appears correct; the gap is in SILK NLSF→LPC stability +
+  excitation Q-format scaling.
 
 - **Bit-exact CELT PVQ + IMDCT output.** Even on the in-crate roundtrip
   (where bitstream parity is guaranteed) the reconstructed waveform

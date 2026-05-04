@@ -62,6 +62,15 @@ enum Tier {
     /// per-channel deltas are logged but not asserted. All fixtures
     /// start here per the brief.
     ReportOnly,
+    /// Aggregate PSNR vs the libopus reference must clear `min_db`.
+    /// Hard-asserted gate that catches scale/saturation regressions
+    /// (the kind of "every sample pegged to ±32 768" bug that
+    /// `Tier::ReportOnly` happily tolerates). Tier values were chosen
+    /// from the steady-state PSNR observed on master after the path-
+    /// aware s16-conversion landed; bumping a fixture's `min_db` up
+    /// requires a real decoder improvement, not just retuning the
+    /// gate.
+    MinPsnr { min_db: f64 },
 }
 
 struct CorpusCase {
@@ -548,6 +557,17 @@ fn evaluate(case: &CorpusCase) {
             // are tracked as follow-up tasks if PSNR drops well below
             // the libopus envelope.
         }
+        Tier::MinPsnr { min_db } => {
+            assert!(
+                psnr_min >= min_db,
+                "{}: aggregate PSNR {:.2} dB below tier floor {:.2} dB \
+                 (this catches the saturation regression where every output \
+                 sample pegs to ±32 768 when the f32→s16 scale is wrong)",
+                case.name,
+                psnr_min,
+                min_db,
+            );
+        }
     }
 }
 
@@ -576,31 +596,37 @@ fn corpus_celt_2_5ms_low_latency() {
 
 #[test]
 fn corpus_celt_fb_stereo_128kbps() {
+    // CELT-only fullband stereo at 128 kbps. Hard-asserted: pre-fix
+    // 0.37 dB → post-fix 10.24 dB. Floor 7 dB.
     evaluate(&CorpusCase {
         name: "celt-fb-stereo-128kbps",
         channels: Some(2),
         sample_rate: Some(48_000),
-        tier: Tier::ReportOnly,
+        tier: Tier::MinPsnr { min_db: 7.0 },
     });
 }
 
 #[test]
 fn corpus_code_0_single_frame() {
+    // Code-0 framing wraps a single CELT-only Opus frame. Hard-
+    // asserted: pre-fix 0.59 dB → post-fix 21.07 dB.
     evaluate(&CorpusCase {
         name: "code-0-single-frame",
         channels: Some(1),
         sample_rate: Some(48_000),
-        tier: Tier::ReportOnly,
+        tier: Tier::MinPsnr { min_db: 15.0 },
     });
 }
 
 #[test]
 fn corpus_code_1_two_equal_frames() {
+    // Code-1 framing wraps two equal-size CELT-only frames. Hard-
+    // asserted: pre-fix 0.59 dB → post-fix 26.27 dB.
     evaluate(&CorpusCase {
         name: "code-1-two-equal-frames",
         channels: Some(1),
         sample_rate: Some(48_000),
-        tier: Tier::ReportOnly,
+        tier: Tier::MinPsnr { min_db: 18.0 },
     });
 }
 
@@ -666,32 +692,43 @@ fn corpus_multistream_5_1() {
     // stream_count / coupled_count / channel-mapping table; the
     // decoder factory routes us through `MultistreamOpusDecoder` which
     // demuxes each Ogg packet into N sub-streams and mixes them up to
-    // the 6-channel output.
+    // the 6-channel output. Hard-asserted: pre-fix 0.69 dB → post-fix
+    // 16.95 dB (each sub-stream's per-channel scale heuristic now
+    // detects libopus' Q15-scale CELT IMDCT outputs and skips the
+    // erroneous extra `* 32 768` at the s16-conversion site).
     evaluate(&CorpusCase {
         name: "multistream-5.1",
         channels: Some(6),
         sample_rate: Some(48_000),
-        tier: Tier::ReportOnly,
+        tier: Tier::MinPsnr { min_db: 12.0 },
     });
 }
 
 #[test]
 fn corpus_pair_cbr_64kbps() {
+    // CELT-only stereo @ 64 kbps. Hard-asserted libopus interop gate
+    // (Track B s16-scale fix from RFC 6716 §4.3): pre-fix this fixture
+    // floored at PSNR 0.47 dB (every sample saturated to ±32 768);
+    // after the fix it lands at ~11.84 dB. Floor set well below
+    // observed value to leave headroom for unrelated PVQ wobble.
     evaluate(&CorpusCase {
         name: "pair-cbr-64kbps",
         channels: Some(2),
         sample_rate: Some(48_000),
-        tier: Tier::ReportOnly,
+        tier: Tier::MinPsnr { min_db: 8.0 },
     });
 }
 
 #[test]
 fn corpus_pair_mono_48k_64kbps() {
+    // CELT-only mono @ 64 kbps. Hard-asserted; pre-fix 0.77 dB →
+    // post-fix 21.07 dB. The cleanest CELT fixture in the corpus,
+    // floor set at 15 dB.
     evaluate(&CorpusCase {
         name: "pair-mono-48k-64kbps",
         channels: Some(1),
         sample_rate: Some(48_000),
-        tier: Tier::ReportOnly,
+        tier: Tier::MinPsnr { min_db: 15.0 },
     });
 }
 
@@ -707,11 +744,13 @@ fn corpus_pair_stereo_48k_64kbps() {
 
 #[test]
 fn corpus_pair_vbr_64kbps() {
+    // CELT-only stereo VBR @ 64 kbps. Hard-asserted; pre-fix 0.47 dB
+    // → post-fix 11.86 dB. Floor 8 dB.
     evaluate(&CorpusCase {
         name: "pair-vbr-64kbps",
         channels: Some(2),
         sample_rate: Some(48_000),
-        tier: Tier::ReportOnly,
+        tier: Tier::MinPsnr { min_db: 8.0 },
     });
 }
 

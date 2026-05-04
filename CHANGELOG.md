@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **libopus CELT interop — path-aware s16 conversion** (RFC 6716 §4.3
+  + §3.2). The single hard-coded `* 32 768` at the f32→s16 site in
+  `decode_packet` / `MultistreamOpusDecoder::receive_frame` was
+  pegging every libopus-encoded CELT/Hybrid packet's output to the
+  ±32 767 rails, because libopus's CELT `denormalise_bands`
+  exponentiates against an `eMeans` table calibrated for Q15 IMDCT
+  peaks (~32 768 already), while our in-crate CELT encoder runs on
+  [-1, 1]-scale input and produces unit-scale IMDCT output. The two
+  conventions can't share a single conversion factor.
+  - The interleaver now picks the s16 scale per packet by probing
+    the pre-clamp f32 peak: CELT-only or Hybrid frames whose post-
+    deemph peak exceeds 4.0 are taken to be in libopus Q15 already
+    (multiplier 1.0); everything else (own-encoder CELT, all SILK)
+    keeps the historical `* 32 768` (multiplier 32 768.0). The
+    threshold of 4.0 sits comfortably above the SILK upsampler's
+    1.227× peak FIR overshoot and well below the libopus CELT
+    minimum useful magnitude (`2^eMeans[0]` ≈ 86).
+  - **PSNR vs `opusdec`** on `docs/audio/opus/fixtures/`:
+    `pair-mono-48k-64kbps` 0.77 → **21.07 dB**, `code-1-two-equal-
+    frames` 0.59 → **26.27 dB**, `multistream-5.1` 0.69 →
+    **16.95 dB**, `celt-fb-stereo-128kbps` 0.37 → **10.24 dB**,
+    `pair-cbr-64kbps` 0.47 → **11.84 dB**. Five CELT-bearing fixtures
+    promoted to a new `Tier::MinPsnr` corpus tier so the gate hard-
+    asserts on the floor (catches the saturation regression that
+    `Tier::ReportOnly` happily tolerates).
+  - SILK-only and the SILK low-band of Hybrid stay where they were
+    (4–7 dB) — those paths' bug is in the synthesis filter / gain /
+    LCG dither, not in the s16 scaling. README now carries the
+    detailed RFC 6716 §4.2.7.4 / §4.2.7.8.6 anchor for the
+    remaining SILK gap.
+
+- **Mono/stereo channel routing on mono-TOC packets** — passing
+  `channels = 2` through to `decode_celt_body` for a TOC-mono packet
+  was reading stereo bit-budget assignments out of a mono bitstream
+  and emitting divergent garbage on both channels (after the deemph
+  IIR integrated the bad input it grew to 4×10⁹ in f32). `decode_frame`
+  now caps the per-frame channel count to `min(out_channels,
+  toc.channels())`, and `decode_packet`'s post-decode loop splats
+  the single decoded channel into every output channel instead of
+  zero-filling the unfilled buffers. Fixes a long-standing
+  `stereo_phase_offset_roundtrip_has_energy_both_channels` failure
+  whose `e_l = 1.5e-9, e_r = 0.83` asymmetry was exactly this CELT-
+  stereo-on-mono garbage leaking through (the test had been passing
+  pre-fix only because every sample saturated to ±32 767 in both
+  channels).
+
 ### Added
 
 - RFC 6716 §4.3.7.2 **CELT post-IMDCT de-emphasis** — the encoder
