@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 7845 §5.1 **OpusHead `output_gain` honoured** — the Q7.8 dB
+  field is now converted to a linear multiplier
+  (`10^(g_q8 / (20 * 256))`) at decoder construction and applied to
+  every emitted sample before the i16 saturate. Wired into both
+  `OpusDecoder` and `MultistreamOpusDecoder`. Was parsed but ignored
+  before, so streams with `output_gain != 0` (mostly user-applied
+  loudness corrections in Ogg-Opus files) decoded at the wrong
+  volume. New `q8_db_to_linear_known_values` test pins the
+  conversion (0 dB → 1.0, +6 dB → 1.995, -6 dB → 0.501,
+  round-trip cancels).
+
 - RFC 7845 §5.1.2 **pre-skip trimming** — when the OpusHead extradata
   carries a non-zero `pre_skip` (the codec startup delay in 48 kHz
   samples), the decoder now drops that many samples from the head of
