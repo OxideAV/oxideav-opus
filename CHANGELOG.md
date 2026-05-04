@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- RFC 7845 §5.1.2 **pre-skip trimming** — when the OpusHead extradata
+  carries a non-zero `pre_skip` (the codec startup delay in 48 kHz
+  samples), the decoder now drops that many samples from the head of
+  the decoded stream before emitting the first AudioFrame. The first
+  emitted frame is shortened by the remaining pre-skip; if pre-skip
+  consumes the whole packet, `receive_frame` returns `Error::NeedMore`
+  so the caller pulls the next packet without seeing a zero-length
+  frame. State updates (CELT IMDCT overlap, SILK LPC history) still
+  run on the skipped samples — only output is suppressed. Wired into
+  both `OpusDecoder` (single-stream) and `MultistreamOpusDecoder`
+  (channel mapping family 1/2). `reset()` replays the original
+  pre-skip so a fresh decode of the stream re-trims correctly.
+
+  Visible in the docs/audio/opus/fixtures/ corpus: 4 fixtures now
+  decode to **exactly** the reference WAV's sample count (was off by
+  exactly one Opus frame each before): celt-2.5ms-low-latency,
+  code-1-two-equal-frames, code-2-two-different-frames, and
+  code-3-arbitrary-frames-with-padding.
+
 ### Other
 
 - Trim crate-level `#![allow]` block from 20 lints to 4. The 16 dropped

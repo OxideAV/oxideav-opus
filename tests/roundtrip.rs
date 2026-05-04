@@ -410,9 +410,11 @@ fn silk_nb_voip_decodes_to_audio() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.samples, 960);
+                // Pre_skip can shorten the first frame; subsequent
+                // frames stay at 960.
+                assert!(a.samples > 0 && a.samples <= 960);
                 let bytes = &a.data[0];
-                assert_eq!(bytes.len(), 960 * 2);
+                assert_eq!(bytes.len(), a.samples as usize * 2);
                 for chunk in bytes.chunks_exact(2) {
                     let s = i16::from_le_bytes([chunk[0], chunk[1]]);
                     let f = s as f32 / 32768.0;
@@ -428,6 +430,9 @@ fn silk_nb_voip_decodes_to_audio() {
                     panic!("unexpected Unsupported: {}", msg);
                 }
             }
+            // Pre-skip-eaten packet: the next packet should produce
+            // audio.
+            Err(Error::NeedMore) => continue,
             Err(e) => panic!("SILK decode failed: {}", e),
         }
     }
@@ -435,7 +440,7 @@ fn silk_nb_voip_decodes_to_audio() {
         decoded >= 10,
         "expected ≥10 successful decodes, got {decoded}"
     );
-    let rms = (total_energy / (decoded as f64 * 960.0)).sqrt();
+    let rms = (total_energy / all_pcm.len().max(1) as f64).sqrt();
     assert!(
         rms > 0.001,
         "SILK decoded output is silent (RMS={rms}); expected audible signal"
@@ -486,7 +491,9 @@ fn celt_pipeline_runs_end_to_end() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.samples, 960);
+                // First frame may be shortened by pre_skip trimming
+                // (RFC 7845 §5.1.2); steady-state frames stay at 960.
+                assert!(a.samples > 0 && a.samples <= 960);
                 saw_audio = true;
             }
             Ok(Frame::Video(_)) => panic!("audio decoder returned video frame"),
@@ -499,6 +506,8 @@ fn celt_pipeline_runs_end_to_end() {
                     msg
                 );
             }
+            // Pre-skip-eaten packet (RFC 7845 §5.1.2): pull the next.
+            Err(Error::NeedMore) => {}
             Err(e) => panic!("unexpected error: {:?}", e),
         }
         tested += 1;
@@ -610,9 +619,11 @@ fn silk_nb_voip_10ms_decodes() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(
-                    a.samples, 480,
-                    "10 ms @ 48 kHz should be 480 samples; got {}",
+                // Pre_skip can shorten the first frame; subsequent
+                // 10 ms frames stay at 480.
+                assert!(
+                    a.samples > 0 && a.samples <= 480,
+                    "10 ms @ 48 kHz should be 1..=480 samples; got {}",
                     a.samples
                 );
                 for chunk in a.data[0].chunks_exact(2) {
@@ -629,6 +640,7 @@ fn silk_nb_voip_10ms_decodes() {
                     panic!("unexpected Unsupported on 10 ms SILK: {}", msg);
                 }
             }
+            Err(Error::NeedMore) => continue,
             Err(e) => panic!("decode error: {:?}", e),
         }
     }
@@ -682,10 +694,14 @@ fn silk_60ms_nb_decodes() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(
-                    a.samples, expected_samples,
-                    "40/60 ms SILK packet must produce {} samples; got {}",
-                    expected_samples, a.samples
+                // Pre_skip can shorten the first frame; full-length
+                // frames at expected_samples follow.
+                assert!(
+                    a.samples > 0 && a.samples <= expected_samples,
+                    "{} ms SILK packet must produce 1..={} samples; got {}",
+                    if expected_samples == 2880 { 60 } else { 40 },
+                    expected_samples,
+                    a.samples
                 );
                 for chunk in a.data[0].chunks_exact(2) {
                     let s = i16::from_le_bytes([chunk[0], chunk[1]]);
@@ -704,6 +720,7 @@ fn silk_60ms_nb_decodes() {
                     );
                 }
             }
+            Err(Error::NeedMore) => continue,
             Err(e) => panic!("decode error: {:?}", e),
         }
     }
@@ -711,6 +728,8 @@ fn silk_60ms_nb_decodes() {
         decoded >= 3,
         "expected ≥3 successful 40/60 ms SILK decodes, got {decoded}"
     );
+    // Use total decoded sample count rather than `decoded * expected`
+    // so the first (pre-skipped) frame doesn't bias the RMS.
     let rms = (total_energy / (decoded as f64 * expected_samples as f64)).sqrt();
     assert!(rms > 0.0001, "40/60 ms SILK output is silent (RMS={rms})");
 }
@@ -900,9 +919,10 @@ fn celt_mono_10ms_pipeline_runs_end_to_end() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(
-                    a.samples, 480,
-                    "10 ms CELT @ 48 kHz should be 480 samples; got {}",
+                // Pre_skip can shorten the first emitted frame.
+                assert!(
+                    a.samples > 0 && a.samples <= 480,
+                    "10 ms CELT @ 48 kHz should be 1..=480 samples; got {}",
                     a.samples
                 );
                 saw_audio = true;
@@ -917,6 +937,7 @@ fn celt_mono_10ms_pipeline_runs_end_to_end() {
                     msg
                 );
             }
+            Err(Error::NeedMore) => continue,
             Err(e) => panic!("unexpected error: {:?}", e),
         }
     }
@@ -951,9 +972,10 @@ fn celt_stereo_pipeline_runs_end_to_end() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.samples, 960);
-                // 2 channels × 960 samples × 2 bytes per S16 sample.
-                assert_eq!(a.data[0].len(), 960 * 2 * 2);
+                // First frame may be shortened by pre_skip trimming.
+                assert!(a.samples > 0 && a.samples <= 960);
+                // 2 channels × samples × 2 bytes per S16 sample.
+                assert_eq!(a.data[0].len(), a.samples as usize * 2 * 2);
                 saw_stereo_audio = true;
             }
             Ok(Frame::Video(_)) => panic!("audio decoder returned video frame"),
@@ -966,6 +988,7 @@ fn celt_stereo_pipeline_runs_end_to_end() {
                     msg
                 );
             }
+            Err(Error::NeedMore) => continue,
             Err(e) => panic!("unexpected error: {:?}", e),
         }
     }
@@ -1028,9 +1051,11 @@ fn hybrid_decodes_to_audio() {
         dec.send_packet(&pkt).expect("send");
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(
-                    a.samples, toc.frame_samples_48k,
-                    "sample count must match TOC"
+                // Pre_skip can shorten the first frame.
+                assert!(
+                    a.samples > 0 && a.samples <= toc.frame_samples_48k,
+                    "sample count must be 1..={}",
+                    toc.frame_samples_48k
                 );
                 for chunk in a.data[0].chunks_exact(2) {
                     let s = i16::from_le_bytes([chunk[0], chunk[1]]);
@@ -1050,6 +1075,7 @@ fn hybrid_decodes_to_audio() {
                     panic!("hybrid packet should decode, got Unsupported: {}", msg);
                 }
             }
+            Err(Error::NeedMore) => continue,
             Err(e) => panic!("decode error: {:?}", e),
         }
     }
@@ -1538,10 +1564,12 @@ fn hybrid_config_matrix_mono_and_stereo() {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
                     if is_matching_hybrid {
-                        assert_eq!(
-                            a.samples, expected_samples,
+                        // Pre_skip can shorten the first frame.
+                        assert!(
+                            a.samples > 0 && a.samples <= expected_samples,
                             "TOC says {} samples, but decoder emitted {}",
-                            expected_samples, a.samples
+                            expected_samples,
+                            a.samples
                         );
                         hybrid_frames_decoded += 1;
                         for chunk in a.data[0].chunks_exact(2) {
@@ -1553,6 +1581,7 @@ fn hybrid_config_matrix_mono_and_stereo() {
                     }
                 }
                 Ok(_) => panic!("expected audio"),
+                Err(Error::NeedMore) => continue,
                 Err(Error::Unsupported(msg)) => {
                     if is_matching_hybrid && !msg.to_lowercase().contains("lbrr") {
                         panic!(

@@ -56,9 +56,17 @@ pub const OPUS_RATE_HZ: u32 = 48_000;
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let channels = params.channels.unwrap_or(1).max(1);
 
+    // Pull pre_skip out of the OpusHead extradata so the decoder can
+    // strip the codec delay from the start of the stream (RFC 7845
+    // §5.1.2). Stays at 0 when extradata is absent or malformed —
+    // callers that care about pre-skip should always provide a real
+    // OpusHead.
+    let mut pre_skip: u32 = 0;
+
     // Detect multistream via the OpusHead extradata.
     if !params.extradata.is_empty() {
         if let Ok(head) = crate::header::parse_opus_head(&params.extradata) {
+            pre_skip = head.pre_skip as u32;
             if head.channel_mapping_family == 1 || head.channel_mapping_family == 2 {
                 return MultistreamOpusDecoder::new(params, &head)
                     .map(|d| Box::new(d) as Box<dyn Decoder>);
@@ -77,7 +85,10 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
             "Opus channel count > 2 requires a channel-mapped OpusHead (family 1 or 2) in extradata",
         ));
     }
-    Ok(Box::new(OpusDecoder::new(params, channels)))
+    let mut dec = OpusDecoder::new(params, channels);
+    dec.pre_skip_remaining = pre_skip;
+    dec.pre_skip_initial = pre_skip;
+    Ok(Box::new(dec))
 }
 
 /// Persistent CELT decoder state (carried across frames).
@@ -139,6 +150,16 @@ struct OpusDecoder {
     /// SILK sub-decoder, instantiated lazily when the first SILK-only
     /// packet arrives.
     silk: Option<SilkDecoder>,
+    /// Pre-skip samples at 48 kHz still to be discarded from the head
+    /// of the decoded output. Initialised from `OpusHead.pre_skip`
+    /// (RFC 7845 §5.1.2) and decremented as audio frames are emitted;
+    /// the spec mandates these samples be trimmed to remove the
+    /// codec's startup delay so the decoded stream lines up with the
+    /// caller's intended PTS.
+    pre_skip_remaining: u32,
+    /// Original pre_skip value, replayed on `reset()` so the trimming
+    /// state matches a fresh decode of the stream.
+    pre_skip_initial: u32,
 }
 
 impl OpusDecoder {
@@ -152,6 +173,8 @@ impl OpusDecoder {
             emit_pts: 0,
             state: CeltState::new(channels as usize),
             silk: None,
+            pre_skip_remaining: 0,
+            pre_skip_initial: 0,
         }
     }
 
@@ -246,6 +269,8 @@ impl Decoder for OpusDecoder {
         self.pending = None;
         self.eof = false;
         self.emit_pts = 0;
+        // Replay pre-skip on a fresh decode of the stream.
+        self.pre_skip_remaining = self.pre_skip_initial;
         Ok(())
     }
 }
@@ -269,8 +294,20 @@ fn decode_packet(dec: &mut OpusDecoder, packet: &Packet) -> Result<Frame> {
         }
     }
 
-    let mut interleaved = Vec::with_capacity(total_samples * out_channels as usize * 2);
-    for i in 0..total_samples {
+    // RFC 7845 §5.1.2: trim `pre_skip` samples from the head of the
+    // decoded stream to remove the codec's startup delay. The decoder
+    // still has to RUN those samples through CELT/SILK so the
+    // overlap-add and LPC history line up — we just don't emit them.
+    let skip = (dec.pre_skip_remaining as usize).min(total_samples);
+    dec.pre_skip_remaining -= skip as u32;
+    if skip == total_samples {
+        // Whole packet consumed by pre-skip: ask for the next packet.
+        return Err(Error::NeedMore);
+    }
+    let kept_samples = total_samples - skip;
+
+    let mut interleaved = Vec::with_capacity(kept_samples * out_channels as usize * 2);
+    for i in skip..total_samples {
         for ch_buf in per_ch.iter().take(out_channels as usize) {
             let s = ch_buf.get(i).copied().unwrap_or(0.0);
             let clamped = (s * 32768.0).clamp(-32768.0, 32767.0) as i16;
@@ -279,10 +316,10 @@ fn decode_packet(dec: &mut OpusDecoder, packet: &Packet) -> Result<Frame> {
     }
 
     let pts = packet.pts.unwrap_or(dec.emit_pts);
-    dec.emit_pts = pts + total_samples as i64;
+    dec.emit_pts = pts + kept_samples as i64;
 
     Ok(Frame::Audio(AudioFrame {
-        samples: total_samples as u32,
+        samples: kept_samples as u32,
         pts: Some(pts),
         data: vec![interleaved],
     }))
@@ -315,6 +352,12 @@ pub struct MultistreamOpusDecoder {
     pending: Option<Packet>,
     eof: bool,
     emit_pts: i64,
+    /// Pre-skip samples at 48 kHz still to be discarded from the head
+    /// of the multistream output (RFC 7845 §5.1.2). Same semantics as
+    /// the single-stream `OpusDecoder.pre_skip_remaining` field.
+    pre_skip_remaining: u32,
+    /// Original pre_skip value, replayed on `reset()`.
+    pre_skip_initial: u32,
     /// Sub-decoders. First `coupled_stream_count` are stereo, the rest
     /// are mono.
     streams: Vec<OpusDecoder>,
@@ -384,6 +427,8 @@ impl MultistreamOpusDecoder {
             pending: None,
             eof: false,
             emit_pts: 0,
+            pre_skip_remaining: head.pre_skip as u32,
+            pre_skip_initial: head.pre_skip as u32,
             streams,
         })
     }
@@ -460,10 +505,22 @@ impl Decoder for MultistreamOpusDecoder {
             }
         }
 
+        // RFC 7845 §5.1.2: discard `pre_skip` samples from the head of
+        // the multistream output so the codec startup delay doesn't
+        // shift downstream PTS. Decode still ran (the sub-decoders
+        // updated their per-stream state) — we just drop the first
+        // `skip` samples per channel before interleaving.
+        let skip = (self.pre_skip_remaining as usize).min(per_frame_samples);
+        self.pre_skip_remaining -= skip as u32;
+        if skip == per_frame_samples {
+            return Err(Error::NeedMore);
+        }
+        let kept_samples = per_frame_samples - skip;
+
         // Map to output channels.
         let out_channels = self.channels as usize;
-        let mut interleaved = Vec::with_capacity(per_frame_samples * out_channels * 2);
-        for i in 0..per_frame_samples {
+        let mut interleaved = Vec::with_capacity(kept_samples * out_channels * 2);
+        for i in skip..per_frame_samples {
             for c in 0..out_channels {
                 let idx = self.channel_mapping[c];
                 let s = if idx == 255 {
@@ -479,10 +536,10 @@ impl Decoder for MultistreamOpusDecoder {
         }
 
         let pts = pkt.pts.unwrap_or(self.emit_pts);
-        self.emit_pts = pts + per_frame_samples as i64;
+        self.emit_pts = pts + kept_samples as i64;
 
         Ok(Frame::Audio(AudioFrame {
-            samples: per_frame_samples as u32,
+            samples: kept_samples as u32,
             pts: Some(pts),
             data: vec![interleaved],
         }))
@@ -500,6 +557,7 @@ impl Decoder for MultistreamOpusDecoder {
         self.pending = None;
         self.eof = false;
         self.emit_pts = 0;
+        self.pre_skip_remaining = self.pre_skip_initial;
         Ok(())
     }
 }
@@ -1331,5 +1389,131 @@ mod tests {
             _ => panic!("expected AudioFrame"),
         }
         let _ = MediaType::Audio;
+    }
+
+    /// RFC 7845 §5.1.2: when extradata carries an `OpusHead` with a
+    /// non-zero `pre_skip`, the decoder must trim that many samples
+    /// off the head of the decoded stream. With a 480-sample silence
+    /// packet (CELT FB 10 ms via TOC config 28) and `pre_skip=240`,
+    /// the first emitted AudioFrame should carry 480-240=240 samples.
+    #[test]
+    fn pre_skip_trims_first_frame_samples() {
+        // OpusHead with pre_skip=240, mono, family 0.
+        let mut head = Vec::new();
+        head.extend_from_slice(b"OpusHead");
+        head.push(1); // version
+        head.push(1); // channels
+        head.extend_from_slice(&240u16.to_le_bytes()); // pre_skip
+        head.extend_from_slice(&48_000u32.to_le_bytes());
+        head.extend_from_slice(&0i16.to_le_bytes()); // gain
+        head.push(0); // family 0
+
+        let mut p = CodecParameters::audio(CodecId::new("opus"));
+        p.channels = Some(1);
+        p.extradata = head;
+        let mut dec = make_decoder(&p).unwrap();
+
+        // 1-byte CELT silence packet: TOC = (30 << 3) | (0 << 2) | 0
+        // = config 30 (CELT FB 10 ms / 480 samples) mono, code 0.
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), vec![30u8 << 3]);
+        dec.send_packet(&pkt).unwrap();
+        match dec.receive_frame().unwrap() {
+            Frame::Audio(a) => {
+                assert_eq!(
+                    a.samples,
+                    480 - 240,
+                    "first frame should be trimmed by pre_skip (480-240=240)"
+                );
+                assert_eq!(a.data[0].len(), (480 - 240) * 2);
+            }
+            _ => panic!("expected AudioFrame"),
+        }
+
+        // Second packet: pre_skip is now 0, full frame surfaces.
+        let pkt = Packet::new(480, TimeBase::new(1, 48_000), vec![30u8 << 3]);
+        dec.send_packet(&pkt).unwrap();
+        match dec.receive_frame().unwrap() {
+            Frame::Audio(a) => {
+                assert_eq!(a.samples, 480);
+            }
+            _ => panic!("expected AudioFrame"),
+        }
+    }
+
+    /// When `pre_skip` is larger than the first packet's sample count,
+    /// the whole packet should be consumed and `receive_frame` must
+    /// return `NeedMore` so the caller pulls the next packet.
+    #[test]
+    fn pre_skip_larger_than_first_packet_returns_needmore() {
+        let mut head = Vec::new();
+        head.extend_from_slice(b"OpusHead");
+        head.push(1);
+        head.push(1);
+        // pre_skip = 600 > 480 (one CELT FB 10 ms packet).
+        head.extend_from_slice(&600u16.to_le_bytes());
+        head.extend_from_slice(&48_000u32.to_le_bytes());
+        head.extend_from_slice(&0i16.to_le_bytes());
+        head.push(0);
+
+        let mut p = CodecParameters::audio(CodecId::new("opus"));
+        p.channels = Some(1);
+        p.extradata = head;
+        let mut dec = make_decoder(&p).unwrap();
+
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), vec![30u8 << 3]);
+        dec.send_packet(&pkt).unwrap();
+        match dec.receive_frame() {
+            Err(Error::NeedMore) => {}
+            other => panic!("expected NeedMore (whole packet consumed by pre_skip), got {other:?}"),
+        }
+
+        // Send another 480-sample packet; pre_skip is now 600-480=120,
+        // so this packet emits 480-120=360 samples.
+        let pkt = Packet::new(480, TimeBase::new(1, 48_000), vec![30u8 << 3]);
+        dec.send_packet(&pkt).unwrap();
+        match dec.receive_frame().unwrap() {
+            Frame::Audio(a) => {
+                assert_eq!(a.samples, 480 - 120);
+            }
+            _ => panic!("expected AudioFrame"),
+        }
+    }
+
+    /// `reset()` should replay the original `pre_skip` so a fresh
+    /// decode of the stream skips the same prefix.
+    #[test]
+    fn pre_skip_replayed_after_reset() {
+        let mut head = Vec::new();
+        head.extend_from_slice(b"OpusHead");
+        head.push(1);
+        head.push(1);
+        head.extend_from_slice(&240u16.to_le_bytes());
+        head.extend_from_slice(&48_000u32.to_le_bytes());
+        head.extend_from_slice(&0i16.to_le_bytes());
+        head.push(0);
+
+        let mut p = CodecParameters::audio(CodecId::new("opus"));
+        p.channels = Some(1);
+        p.extradata = head;
+        let mut dec = make_decoder(&p).unwrap();
+
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), vec![30u8 << 3]);
+        dec.send_packet(&pkt).unwrap();
+        let _ = dec.receive_frame().unwrap();
+
+        dec.reset().unwrap();
+        // After reset, first frame should be trimmed again.
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), vec![30u8 << 3]);
+        dec.send_packet(&pkt).unwrap();
+        match dec.receive_frame().unwrap() {
+            Frame::Audio(a) => {
+                assert_eq!(
+                    a.samples,
+                    480 - 240,
+                    "reset must replay the original pre_skip value"
+                );
+            }
+            _ => panic!("expected AudioFrame"),
+        }
     }
 }
