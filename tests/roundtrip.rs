@@ -1747,3 +1747,105 @@ fn goertzel(samples: &[f32], sample_rate: f32, target_hz: f32) -> f32 {
     }
     (s_prev * s_prev + s_prev2 * s_prev2 - coeff * s_prev * s_prev2).sqrt()
 }
+
+/// Regression smoke test for the user-reported "opus playback = noise"
+/// symptom. Encodes a 440 Hz tone via libopus VOIP-NB (forces SILK NB
+/// mode, the simplest decode path the crate ships) → demuxes via the
+/// Ogg layer → decodes via this crate → asserts the pipeline runs end
+/// to end without panicking, emits ≥ 1.5 s worth of audio, and that
+/// the decoded output is not entirely zero. Audio quality / spectral
+/// purity is not gated here because the SILK and CELT decoders today
+/// are bit-stream-compatible with the in-crate encoders only — see
+/// the README "Not yet supported" section ("libopus interop") for
+/// the tracked follow-up.
+///
+/// What this guards against: a future change that breaks the SILK
+/// dispatch path entirely (e.g. NeedMore loops forever, panics on
+/// the first packet, or returns an empty audio frame). The amplitude /
+/// spectrum acceptance bar lives in the in-crate encoder round-trip
+/// suite (`encoder_roundtrip.rs`), which is the only place we have a
+/// known-good bit-stream pair today.
+#[test]
+fn silk_nb_440hz_e2e_pipeline_runs_end_to_end() {
+    let Some(ffmpeg) = ffmpeg_path() else {
+        eprintln!("skip: ffmpeg unavailable");
+        return;
+    };
+    let path = "/tmp/ref-opus-silk-nb-440hz-e2e.ogg";
+    if !std::path::Path::new(path).exists() {
+        // Force SILK NB: 8 kHz input + 8k bitrate + cutoff 4 kHz +
+        // application VOIP. libopus picks TOC config 1 (SILK NB 20 ms).
+        let status = std::process::Command::new(ffmpeg)
+            .args(["-y", "-hide_banner", "-loglevel", "error"])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=f=440:d=2:sample_rate=8000",
+                "-ac",
+                "1",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "8k",
+                "-application",
+                "voip",
+                "-cutoff",
+                "4000",
+            ])
+            .arg(path)
+            .status();
+        if !matches!(status, Ok(s) if s.success()) || !std::path::Path::new(path).exists() {
+            eprintln!("skip: could not generate SILK NB reference");
+            return;
+        }
+    }
+
+    let mut dmx = open_ogg(path);
+    let params = dmx.streams()[0].params.clone();
+    let mut dec = oxideav_opus::decoder::make_decoder(&params).expect("decoder");
+    let mut total_samples = 0usize;
+    let mut any_non_zero = false;
+    loop {
+        let pkt = match dmx.next_packet() {
+            Ok(p) => p,
+            Err(Error::Eof) => break,
+            Err(e) => panic!("demux: {}", e),
+        };
+        dec.send_packet(&pkt).expect("send");
+        match dec.receive_frame() {
+            Ok(Frame::Audio(a)) => {
+                total_samples += a.samples as usize;
+                for c in a.data[0].chunks_exact(2) {
+                    let s = i16::from_le_bytes([c[0], c[1]]);
+                    if s != 0 {
+                        any_non_zero = true;
+                    }
+                }
+            }
+            Err(Error::NeedMore) => continue,
+            Err(Error::Unsupported(msg)) => {
+                if !msg.to_lowercase().contains("lbrr") {
+                    panic!("unexpected Unsupported on SILK NB e2e: {}", msg);
+                }
+            }
+            Err(e) => panic!("decode error: {:?}", e),
+            Ok(_) => panic!("expected audio frame"),
+        }
+    }
+
+    // 2-second clip at 48 kHz = 96 000 samples. We accept anything
+    // ≥ 75 000 to allow for pre-skip trimming + the last partial
+    // frame.
+    assert!(
+        total_samples >= 75_000,
+        "SILK NB 440 Hz pipeline produced only {} samples (expected ≥75 000) — \
+         decoder dispatch broken?",
+        total_samples,
+    );
+    assert!(
+        any_non_zero,
+        "SILK NB decode produced an all-zero waveform — likely a \
+         pre-skip-eats-everything regression"
+    );
+}

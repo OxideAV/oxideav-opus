@@ -23,7 +23,7 @@
 use oxideav_celt::bands::{anti_collapse, denormalise_bands, quant_all_bands};
 use oxideav_celt::header::decode_header;
 use oxideav_celt::mdct::imdct_sub;
-use oxideav_celt::post_filter::comb_filter;
+use oxideav_celt::post_filter::{comb_filter, deemphasis};
 use oxideav_celt::quant_bands::{
     unquant_coarse_energy, unquant_energy_finalise, unquant_fine_energy,
 };
@@ -126,6 +126,15 @@ struct CeltState {
     pf_tapset: usize,
     /// Range-coder seed.
     rng: u32,
+    /// Per-channel single-pole de-emphasis state (RFC 6716 §4.3.7.2).
+    /// The encoder applies a one-tap pre-emphasis high-pass to its
+    /// input PCM (`y[n] = x[n] - alpha_p * x[n-1]`) before MDCT analysis;
+    /// the decoder MUST run the inverse low-pass de-emphasis
+    /// (`y[n] = x[n] + alpha_p * y[n-1]`) on the post-comb-filter output,
+    /// or every sample comes out as a high-frequency residual that
+    /// saturates the S16 conversion. Carried per-channel across frames
+    /// because the IIR state propagates indefinitely.
+    deemph_state: Vec<f32>,
 }
 
 impl CeltState {
@@ -144,6 +153,7 @@ impl CeltState {
             pf_gain: 0.0,
             pf_tapset: 0,
             rng: 0,
+            deemph_state: vec![0.0; channels],
         }
     }
 }
@@ -1178,6 +1188,24 @@ fn decode_celt_body(
         let dst_start = hlen - take;
         state.history[c][dst_start..].copy_from_slice(&filtered[filtered.len() - take..]);
         pcm_per_ch[c] = filtered;
+    }
+
+    // RFC 6716 §4.3.7.2: single-pole de-emphasis on each channel of the
+    // post-comb-filter output. The encoder inserts a one-tap pre-emphasis
+    // high-pass filter before MDCT analysis (`y[n] = x[n] - alpha_p *
+    // x[n-1]`); without applying the inverse low-pass here every output
+    // sample is the high-frequency residual, which saturates the s16
+    // converter and lands at the +/- full-scale rails. Carries IIR state
+    // across frames per channel — never reset between frames, only on
+    // `Decoder::reset()`.
+    //
+    // Grow the state vector if the channel count expanded (mono → stereo
+    // mid-stream is unusual but legal).
+    if state.deemph_state.len() < channels {
+        state.deemph_state.resize(channels, 0.0);
+    }
+    for c in 0..channels {
+        state.deemph_state[c] = deemphasis(&mut pcm_per_ch[c], state.deemph_state[c]);
     }
 
     // Update post-filter state for next frame.

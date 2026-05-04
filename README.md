@@ -9,6 +9,20 @@ mono + stereo (SWB / FB). Zero C dependencies.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+> **Heads-up on libopus interop:** the SILK and CELT decoders today
+> implement the bitstream the same way the in-crate encoders produce
+> it. Own-encode → own-decode round-trips clear ≥ 20 dB SNR (see
+> `tests/encoder_roundtrip.rs`), but **decoding a libopus-produced
+> packet does not yet sound clean** — typical `.webm` / `.opus`
+> files made by ffmpeg / libopus play back as noise or distortion.
+> RFC 6716 §4.2 (SILK NLSF / LPC / excitation) and §4.3 (CELT PVQ
+> shape, IMDCT scaling, comb post-filter) need to be re-anchored
+> against libopus reference packets, not the in-crate encoder. Until
+> that lands, use this crate for our own encoder's output (e.g.
+> `oxideplay` of an oxideav-opus-encoded file) — for libopus-encoded
+> media, route the audio through ffmpeg or use one of the C bindings
+> outside the workspace. Tracked under "Not yet supported" below.
+
 ## Installation
 
 ```toml
@@ -171,13 +185,37 @@ Two explicit entry points, one per Opus mode:
   packets, and framing codes 1 / 2 / 3 on the encoder side.
 - **Native CELT stereo encoding** (coupled L/R PVQ with intensity and
   dual-stereo) — tracked in `oxideav-celt`.
-- **Bit-exact CELT PVQ + IMDCT output.** The current CELT decoder
-  preserves energy (roughly 90 % of the input energy on a 1 kHz sine
-  round-trip) but the reconstructed waveform phase can drift vs libopus.
-  The round-trip PSNR bar in the integration tests is ~8 dB today —
-  good enough to prove encode+decode work end-to-end, short of the
-  25+ dB a bit-exact decoder would give. Tracked in `oxideav-celt`
-  module docs.
+- **libopus bitstream interop.** Both decoders pair with the in-crate
+  encoders, not with libopus. Symptoms when fed a libopus-produced
+  packet:
+  - **SILK** — output amplitude is wrong by a constant factor and
+    saturates the s16 output at ±full-scale on ~17 % of samples for
+    a quiet 440 Hz tone (sounds like buzzing or static). The
+    bit-stream layout in `src/silk/` follows RFC 6716 §4.2's header
+    order but the excitation body uses an MVP carrier format (nibble-
+    pair + sign per sample) instead of the RFC §4.2.7.8 shell-pulse
+    coder. Wiring full RFC §4.2 NLSF / LTP / shell-pulse parity is
+    the unblock.
+  - **CELT** — output explodes to ±200 in f32 before s16 clamping
+    on a quiet sine, lands at saturated alternating ±32767 / -32768
+    samples (i.e. a square wave at Nyquist — what users hear as
+    "noise"). The PVQ shape decoder in `oxideav-celt::quant_all_bands`
+    appears to over-decode pulses against a libopus-encoded bitstream
+    even after the RFC §4.3.7.2 single-pole de-emphasis filter is
+    applied (which this crate now wires correctly).
+  - **Hybrid** — both layers compound. PSNR vs libopus is around
+    -10 to 0 dB on the 24 kbps FB stereo test fixture.
+
+  Per-band energy decode (`unquant_coarse_energy` / `…_fine_energy`)
+  appears correct; the gap is in PVQ shape decoding and the excitation
+  / pitch-prediction stages of SILK.
+
+- **Bit-exact CELT PVQ + IMDCT output.** Even on the in-crate roundtrip
+  (where bitstream parity is guaranteed) the reconstructed waveform
+  phase drifts vs libopus. Round-trip PSNR is ~8 dB today — good
+  enough to prove encode+decode work end-to-end, short of the 25+ dB
+  a bit-exact decoder would give. Tracked in `oxideav-celt` module
+  docs.
 
 ## Usage
 

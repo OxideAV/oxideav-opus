@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 6716 §4.3.7.2 **CELT post-IMDCT de-emphasis** — the encoder
+  applies a single-pole pre-emphasis high-pass (`y[n] = x[n] -
+  alpha_p * x[n-1]`, `alpha_p = 0.85`) to its input PCM before MDCT
+  analysis; the decoder MUST run the matching low-pass de-emphasis
+  (`y[n] = x[n] + alpha_p * y[n-1]`) on the post-comb-filter output
+  to recover the original sample range. Without it every CELT /
+  Hybrid output sample is the high-frequency residual (visible as
+  sample-by-sample alternation that pegs the s16 converter at
+  ±full-scale). The opus crate's `decode_celt_body` now carries the
+  per-channel `deemph_state` IIR memory across frames, applies the
+  filter via `oxideav_celt::post_filter::deemphasis`, and resets the
+  state on `Decoder::reset()` along with the rest of the CELT
+  cross-frame state. The standalone CELT crate already had this; the
+  opus wrapper was missing it. New
+  `silk_nb_440hz_e2e_pipeline_runs_end_to_end` regression test
+  drives the libopus → demux → decode path end-to-end (pinning the
+  pipeline against a "decoder dispatch broken" regression). README
+  now carries an explicit "libopus interop" disclaimer at the top
+  and a detailed Not-yet-supported entry covering the remaining SILK
+  excitation + CELT PVQ shape gaps.
+
 - RFC 7845 §5.1 **OpusHead `output_gain` honoured** — the Q7.8 dB
   field is now converted to a linear multiplier
   (`10^(g_q8 / (20 * 256))`) at decoder construction and applied to
