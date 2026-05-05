@@ -14,25 +14,31 @@ framework but usable standalone.
 > conversion landed (the historical `* 32 768` at the float→s16 site
 > was peg-clipping every sample of a libopus-Q15-scale CELT IMDCT
 > output to the rails — see `decode_packet` in `src/decoder.rs`).
-> The SILK side now follows the spec literal at §4.2.7.4 (gain index →
-> Q16) + §4.2.7.8.6 (Q23 excitation reconstruction with LCG dither),
-> dropping the saturation rate from ~17 % to ~1.2 %.
+> The SILK side follows the spec literal at §4.2.7.4 (gain index →
+> Q16), §4.2.7.5.x (NLSF stage-1 + stage-2 with per-codebook PDFs +
+> backwards-prediction dequant + IHMW-weighted reconstruction +
+> spec-faithful LSF→LPC), and §4.2.7.8.6 (Q23 excitation with LCG
+> dither).
 > Cross-decode PSNR vs ffmpeg `opusdec` for the corpus fixtures
 > (`docs/audio/opus/fixtures/`):
 >
 > - CELT-only mono / stereo @ 64 kbps: **11–21 dB**
 > - CELT-only fullband stereo @ 128 kbps: **10 dB**
 > - CELT multistream 5.1: **17 dB**
-> - SILK NB / MB / WB mono / stereo: **11–12 dB** (was 4–7 dB)
-> - Hybrid SWB / FB: **3 dB** (SILK low band still wrong on NLSF
->   stage-2)
+> - SILK NB mono @ 16 kbps: **17 dB** (was 11.95)
+> - SILK MB mono 60 ms @ 20 kbps: **18 dB** (was 11.71)
+> - SILK WB stereo @ 20 kbps: **12 dB** (was 11.34, still capped)
+> - Hybrid SWB / FB: **3 dB** (SILK low band same gating as WB stereo)
 >
-> The remaining SILK gap (≈ 12 dB → 20+ dB target) is now in NLSF
-> stage-2 residual decoding (§4.2.7.5.2) — `silk::lsf::decode_nlsf`
-> still uses a uniform-11 stub instead of the per-codebook signed
-> residual tables, so the LPC filter we synthesise diverges from the
-> one libopus encoded against. Tracked under "Not yet supported"
-> below.
+> SILK NB and MB are now half-way to the 20 dB floor. The remaining
+> SILK gap is concentrated on WB-stereo and the §4.2.7.5.5
+> frame-to-frame LSF interpolation (currently parsed-and-discarded —
+> the synthesis path always uses the freshly-decoded NLSF for both
+> halves of a 20 ms frame). The §4.2.7.5.7 / §4.2.7.5.8 bandwidth-
+> expansion + prediction-gain limiting are reduced to a DC-response
+> guard (cap `|sum(lpc)| < 0.05`); a spec-exact Q12 saturation +
+> Levinson reflection-coefficient stability check would let us drop
+> the guard and likely add another few dB.
 
 ## Installation
 
@@ -208,28 +214,30 @@ Two explicit entry points, one per Opus mode:
     pre-clamp f32 peak, leaving the in-crate encoder's [-1, 1]-scale
     output unaffected. The 2.5 ms low-latency CELT case still floors
     at ~2 dB — LM=0 transient handling needs a separate look.
-  - **SILK** — partially landed. The §4.2.7.4 gain dequantisation,
-    §4.2.7.8.6 Q23 excitation reconstruction (with the LCG sign-
-    perturbation), and the `gain_Q16/65536`-only application in the
-    synth filter are now bit-exact per the RFC literal. Saturation
-    rate on a libopus 440 Hz NB clip dropped from ~17 % of samples
-    to ~1.2 %, and per-fixture PSNR climbed from 4–7 dB to 11–12 dB.
-    The remaining gap is the NLSF stage-2 stub:
-    - §4.2.7.5.2 — `silk::lsf::decode_nlsf` reads stage-2 residual
-      magnitudes through a single uniform-11 ICDF instead of the
-      per-codebook signed residual tables (Tables 17-22 / 25-30),
-      so the NLSF vector we synthesise from the index is unrelated
-      to the encoder's actual LPC predictor. The decode bitstream
-      stays aligned (the residuals occupy the right number of
-      symbols) but the LPC filter we run is a generic cosine-spaced
-      template, not the libopus-encoded one. Until that lands,
-      libopus packets decode to a recognisable but spectrally-
-      wrong waveform.
-  - **Hybrid** — drags down to ~3 dB because the SILK low band is
-    contributing the same NLSF-stub energy as SILK-only.
+  - **SILK** — §4.2.7.4 gain dequant, §4.2.7.8.6 Q23 excitation
+    reconstruction with LCG sign-perturbation, §4.2.7.5.{1,2,3,4,6}
+    NLSF stage-1 + stage-2 + IHMW reconstruction + monotone-spacing
+    stabilisation + spec-faithful LSF→LPC are all RFC-literal now.
+    Per-fixture PSNR is **NB 17 dB / MB 18 dB / WB stereo 12 dB**
+    (was 4–7 dB pre-round-7, 11–12 dB after gain+excitation fix).
+    The remaining gaps:
+    - §4.2.7.5.5 frame-to-frame LSF interpolation (parsed but
+      discarded — the synthesis path uses the freshly-decoded NLSF
+      for both halves of a 20 ms frame). This is what bottlenecks
+      WB stereo, where the side channel benefits most from the
+      `n0/n1` interp blend.
+    - §4.2.7.5.7 / §4.2.7.5.8 Q12 LPC saturation + Levinson-driven
+      prediction-gain limiting (we use a coarse DC-response chirp
+      instead).
+    - §4.2.7.9.1 LSF-interpolation rewhitening branch (uses the
+      `ltp_scale_q14` field which is currently parsed-and-discarded
+      on the decode side).
+  - **Hybrid** — still ~3 dB because the SILK low band is the
+    bottleneck (same gating as SILK-only WB stereo above).
 
   Per-band energy decode (`unquant_coarse_energy` / `…_fine_energy`)
-  is correct; the rest of SILK now lives in NLSF stage-2.
+  is correct; the remaining SILK gap is now in §4.2.7.5.5/7/8 and the
+  rewhitening branch listed above.
 
 - **Bit-exact CELT PVQ + IMDCT output.** Even on the in-crate roundtrip
   (where bitstream parity is guaranteed) the reconstructed waveform

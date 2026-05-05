@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **libopus SILK interop — RFC §4.2.7.5.x NLSF stage-2 residual decoder
+  + LSF→LPC + bandwidth-expansion guard** (task #464). The remaining
+  major gap in the SILK decode path is now closed:
+  - `silk::lsf::decode_nlsf` reads the per-codebook stage-2 PDFs
+    (Tables 15 a..h for NB/MB and 16 i..p for WB), the codebook
+    selectors (Tables 17/18), and the magnitude-extension PDF
+    (Table 19) instead of the previous uniform-11 stub. The decoded
+    `I2[k]` chain runs the §4.2.7.5.2 backwards-prediction reconstruction
+    via the prediction-weight tables A..D (Table 20) and the
+    per-coefficient selectors (Tables 21/22) at integer precision.
+  - The §4.2.7.5.3 IHMW weighting is now exact: `w_Q9[k]` is computed
+    via the spec's `ilog`-driven sqrt approximation, falling inside
+    `[1819, 5227]` for every stage-1 codebook entry. NLSF reconstruction
+    is `clamp(0, (cb1_Q8[k]<<7) + (res_Q10[k]<<14)/w_Q9[k], 32767)`
+    verbatim from the spec.
+  - `silk::lsf::stabilize` now runs RFC §4.2.7.5.4 — the small-
+    adjustment loop bounded at 20 iterations against per-coefficient
+    minimum spacing (Table 25 NB/MB and WB rows), followed by the
+    bullet-proof sort + fallback clamp.
+  - `silk::lsf::nlsf_to_lpc` runs the spec's §4.2.7.5.6 P/Q recurrence
+    in i64 Q16 against the Q12 cosine LUT (Table 28) with the LSF
+    ordering from Table 27 (NB and WB columns transcribed verbatim).
+    The resulting LPC matches a float LSP→LPC reference to within
+    rounding noise (`< 5e-3` per coefficient across all 64 codebook
+    entries).
+  - A simplified §4.2.7.5.7/§4.2.7.5.8 bandwidth-expansion guard caps
+    the LPC's DC response at `|sum(lpc)| < 0.05` via up to 32 chirp
+    rounds at γ=0.85 — without this, the spec-correct cb1<<7 NLSF
+    yields LPC vectors aggressive enough to push the float synthesis
+    IIR (which lacks the spec's full Q12 saturation pass) to the ±1
+    rails on sustained inputs.
+  - The encoder side now writes the same per-codebook stage-2 PDFs
+    (so encoder/decoder bit alignment is preserved) and uses the
+    decoder's NLSF reconstruction for analysis. All 32 SILK encoder
+    roundtrip tests still pass at ≥20 dB SNR.
+  - **Per-fixture PSNR** vs `opusdec` on `docs/audio/opus/fixtures/`:
+    `silk-nb-mono-16kbps` 11.95 → **16.62 dB**;
+    `silk-mb-60ms-mono-20kbps` 11.71 → **17.82 dB**;
+    `silk-wb-stereo-20kbps` 11.34 → **11.73 dB**. NB/MB hit the half-
+    way mark to the 20 dB floor; WB barely moves because its synthesis
+    bottleneck is now elsewhere (likely §4.2.7.5.5 LSF interpolation
+    or the side-channel LTP path — both still MVP).
+
 - **libopus SILK interop — RFC §4.2.7.4 gain dequantisation +
   §4.2.7.8.6 excitation reconstruction** (task #464). Three
   bit-stream-spec gaps in the SILK decode path are now closed:

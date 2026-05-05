@@ -116,9 +116,9 @@ pub fn synthesize(
                 }
             }
 
-            // Short-term all-pole LPC synthesis. The spec uses
-            // `lpc[i-k-1]` (the unclamped feedback) in its sum:
-            //   lpc[i] = g*res[i] + LTP + sum_{k=1..order} a[k-1] * lpc[i-k]
+            // Short-term all-pole LPC synthesis. RFC 6716 §4.2.7.9.2
+            // feeds the *unclamped* lpc[i] (pre-clamp) into the sum
+            // for next-sample prediction.
             for k in 1..=lpc_order {
                 let idx = n as i32 - k as i32;
                 let past = if idx >= 0 {
@@ -135,9 +135,8 @@ pub fn synthesize(
         }
     }
 
-    // Update state history for next frame. Per RFC §4.2.7.9.2 the LPC
-    // history feeds the *unclamped* values into the next subframe's
-    // filter, so we save `lpc_ring` (not `out`).
+    // Update state history for next frame — RFC §4.2.7.9.2 carries the
+    // *unclamped* lpc_ring values into the next subframe's LPC sum.
     let lpc_keep = lpc_order.min(lpc_ring.len());
     state.lpc_history = lpc_ring[lpc_ring.len() - lpc_keep..].to_vec();
 

@@ -70,10 +70,10 @@ use crate::silk::pitch_analysis::{analyze_pitch, PitchEstimate};
 use crate::silk::tables;
 use crate::toc::OpusBandwidth;
 
-/// Fixed NLSF stage-1 index used by the encoder. Corresponds to a
-/// moderately-tilted cosine template in the decoder's
-/// `synthesize_nlsf`. The actual value is incidental — the encoder
-/// and decoder only need to agree.
+/// Fixed NLSF stage-1 index used by the encoder. The decoder
+/// reconstructs the corresponding stage-1 codebook entry verbatim via
+/// RFC 6716 §4.2.7.5.3 (Table 23 / 24). The actual value is incidental
+/// — the encoder and decoder only need to agree.
 const NLSF_STAGE1_IDX: usize = 0;
 
 /// Gain index for unvoiced frames.
@@ -141,6 +141,43 @@ fn lcg_step_q23(state: u32, e_raw: i32, offset_q23: i32) -> (i32, u32) {
 fn lcg_pre_flip(state: u32) -> bool {
     let next = state.wrapping_mul(196_314_165).wrapping_add(907_633_515);
     next & 0x8000_0000 != 0
+}
+
+/// Emit a stage-2 NLSF residual sequence per RFC 6716 §4.2.7.5.2.
+///
+/// Each `residuals[k]` lies in `[-10, 10]`; values outside `[-4, 4]`
+/// trigger the Table 19 magnitude-extension PDF after the first
+/// 9-symbol per-codebook PDF. Residuals are clamped to the spec
+/// range before encoding so a sloppy analyser can't desync the
+/// arithmetic stream.
+fn encode_nlsf_stage2(enc: &mut RangeEncoder, i1: usize, residuals: &[i32], is_wb: bool) {
+    for (k, &r) in residuals.iter().enumerate() {
+        let r = r.clamp(-10, 10);
+        let cb_letter = if is_wb {
+            tables::NLSF_WB_STAGE2_SELECT[i1][k] as usize
+        } else {
+            tables::NLSF_NBMB_STAGE2_SELECT[i1][k] as usize
+        };
+        let icdf: &[u8] = if is_wb {
+            &tables::NLSF_WB_STAGE2_ICDF[cb_letter]
+        } else {
+            &tables::NLSF_NBMB_STAGE2_ICDF[cb_letter]
+        };
+        // Determine the in-PDF symbol and the optional extension.
+        let (sym, ext) = if r >= 4 {
+            (8usize, (r - 4) as usize)
+        } else if r <= -4 {
+            (0usize, (-r - 4) as usize)
+        } else {
+            ((r + 4) as usize, 0usize)
+        };
+        enc.encode_icdf(sym, icdf, 8);
+        // Spec: emit the extension PDF whenever |r| >= 4 (i.e., the
+        // 9-symbol PDF saturates at one of its rails).
+        if !(-3..=3).contains(&r) {
+            enc.encode_icdf(ext.min(6), &tables::NLSF_STAGE2_EXTENSION_ICDF, 8);
+        }
+    }
 }
 
 /// Per-bandwidth encoder parameters. A [`SilkFrameEncoder`] is constructed
@@ -354,7 +391,7 @@ impl SilkFrameEncoder {
         // §4.2.7.5 NLSF.
         let residuals = vec![0i32; order];
         let nlsf_q15 = synthesize_nlsf_like_decoder(NLSF_STAGE1_IDX, false, order, &residuals);
-        let nlsf_q15 = lsf::stabilize(&nlsf_q15, order);
+        let nlsf_q15 = lsf::stabilize(&nlsf_q15, order == 16);
         let lpc = lsf::nlsf_to_lpc(&nlsf_q15, self.params.bandwidth);
 
         let gain_index: i32 = GAIN_INDEX_UNVOICED;
@@ -385,9 +422,6 @@ impl SilkFrameEncoder {
                 pred += lpc[k - 1] * past;
             }
             let e_desired = pcm_internal[n] - pred;
-            // Pre-flip target so the §4.2.7.8.6 LCG sign perturbation
-            // cancels: if the decoder will negate this sample, encode
-            // the negated residual to start with.
             let flip = lcg_pre_flip(lcg_state);
             let target = if flip { -e_desired } else { e_desired };
             let signed_mag_f = (target * scale).round();
@@ -395,21 +429,15 @@ impl SilkFrameEncoder {
             let neg = signed_mag_f < 0.0;
             let signed = if neg { -mag_i } else { mag_i };
             signed_mags[n] = signed;
-            // Apply the §4.2.7.8.6 reconstruction the decoder will run so
-            // the closed-loop synthesis lines up exactly.
             let (e_q23, next_state) = lcg_step_q23(lcg_state, signed, offset_q23);
             lcg_state = next_state;
             let e_quant = e_q23 as f32 * inv_q23 * g;
             out[n] = (e_quant + pred).clamp(-1.0, 1.0);
         }
-        // Pad to shell-block alignment (16 samples per shell) and apply
-        // the shell coder's block-level saturation so the reconstructed
-        // signed magnitudes match bit-exact with what the decoder reads.
+        // Shell-coder block saturation.
         let aligned = signed_mags.len().div_ceil(16) * 16;
         signed_mags.resize(aligned, 0);
         let recon = super::shell::quantize_to_shell(&signed_mags);
-        // Rebuild `out[]` using the quantised + reconstructed residual so
-        // LPC/history carry forward exactly what the decoder will see.
         out.fill(0.0);
         let mut lcg_state = ENCODER_LCG_SEED;
         for n in 0..frame_len {
@@ -444,18 +472,17 @@ impl SilkFrameEncoder {
             enc.encode_icdf(4, &tables::GAIN_DELTA_ICDF, 8);
         }
 
-        // NLSF bitstream.
+        // NLSF bitstream — RFC 6716 §4.2.7.5.{1,2}.
         let stage1_icdf: &[u8] = match self.params.bandwidth {
             OpusBandwidth::Wideband => &tables::NLSF_WB_STAGE1_UNVOICED_ICDF,
             _ => &tables::NLSF_NB_STAGE1_UNVOICED_ICDF,
         };
         enc.encode_icdf(NLSF_STAGE1_IDX, stage1_icdf, 8);
-        let uniform_11 = &tables::NLSF_RESIDUAL_UNIFORM_11_ICDF;
-        for &r in &residuals {
-            let mag = (r + 4).clamp(0, 10) as usize;
-            enc.encode_icdf(mag, uniform_11, 8);
-        }
-        enc.encode_icdf(3, &[192, 128, 64, 0], 8);
+        encode_nlsf_stage2(enc, NLSF_STAGE1_IDX, &residuals, order == 16);
+        // §4.2.7.5.5 interpolation factor — pick sym=4 (the highest-prob
+        // entry per the RFC PDF) so the decoder doesn't try to interpolate
+        // against a non-existent prior frame.
+        enc.encode_icdf(4, &tables::NLSF_INTERP_ICDF, 8);
 
         // §4.2.7.6 LTP — unvoiced, decoder skips LTP bits.
 
@@ -466,11 +493,13 @@ impl SilkFrameEncoder {
         let _ = subframe_len;
         super::shell::encode_excitation(enc, &signed_mags, signal_type, 0);
 
-        // Advance state.
+        // Advance state. We carry the clamped `out[]` so the next
+        // frame's predictor sees the same history the decoder will
+        // (decoder's `state.lpc_history` now holds clamped values too;
+        // see synth.rs header note).
         let start = out.len().saturating_sub(order);
         self.prev_synth.clear();
         self.prev_synth.extend_from_slice(&out[start..]);
-        // Shift LTP history forward with the newly-synthesized output.
         shift_ltp_history(&mut self.ltp_history, &out);
         self.prev_pitch_lag = 0;
 
@@ -509,7 +538,7 @@ impl SilkFrameEncoder {
         // NLSF — voiced variant of the fixed template.
         let residuals = vec![0i32; order];
         let nlsf_q15 = synthesize_nlsf_like_decoder(NLSF_STAGE1_IDX, true, order, &residuals);
-        let nlsf_q15 = lsf::stabilize(&nlsf_q15, order);
+        let nlsf_q15 = lsf::stabilize(&nlsf_q15, order == 16);
         let lpc = lsf::nlsf_to_lpc(&nlsf_q15, self.params.bandwidth);
 
         // Gain — same constant gain index as unvoiced path.
@@ -549,7 +578,6 @@ impl SilkFrameEncoder {
 
         let mut lcg_state = ENCODER_LCG_SEED;
         for n in 0..frame_len {
-            // LPC prediction (same as unvoiced).
             let mut lpc_pred = 0f32;
             for k in 1..=order {
                 let idx = n as i32 - k as i32;
@@ -560,9 +588,6 @@ impl SilkFrameEncoder {
                 };
                 lpc_pred += lpc[k - 1] * past;
             }
-
-            // LTP prediction: sum of 5 taps at n-lag+{−2,−1,0,+1,+2}.
-            // Exactly mirrors `synth::synthesize` for voiced frames.
             let mut ltp_sum = 0f32;
             for k in 0..5 {
                 let lag_k = primary_lag + (k as i32 - 2);
@@ -575,12 +600,6 @@ impl SilkFrameEncoder {
                 };
                 ltp_sum += ltp_taps[k] * past;
             }
-            // Decoder synth (per the synth::synthesize MVP):
-            //   s = g*excitation + ltp_sum + lpc_pred
-            //   out[n] = clamp(s)
-            // Solve for the excitation contribution we want:
-            //   excitation = (pcm - ltp_sum - lpc_pred) / g
-            // Then signed = round(excitation * 2^15) (after pre-flip).
             let e_desired_q0 = (pcm_internal[n] - lpc_pred - ltp_sum) / g;
             let flip = lcg_pre_flip(lcg_state);
             let target = if flip { -e_desired_q0 } else { e_desired_q0 };
@@ -592,11 +611,8 @@ impl SilkFrameEncoder {
             let (e_q23, next_state) = lcg_step_q23(lcg_state, signed, offset_q23);
             lcg_state = next_state;
             let e_quant = g * (e_q23 as f32 * inv_q23) + ltp_sum;
-            // Closed-loop synthesis equals what the decoder produces.
             out[n] = (e_quant + lpc_pred).clamp(-1.0, 1.0);
         }
-        // Apply shell-coder block saturation so reconstructed `out[]`
-        // stays bit-exact with what the decoder will produce.
         let aligned = signed_mags.len().div_ceil(16) * 16;
         signed_mags.resize(aligned, 0);
         let recon = super::shell::quantize_to_shell(&signed_mags);
@@ -641,18 +657,14 @@ impl SilkFrameEncoder {
             enc.encode_icdf(4, &tables::GAIN_DELTA_ICDF, 8);
         }
 
-        // NLSF bitstream — use the voiced stage-1 ICDF.
+        // NLSF bitstream — RFC 6716 §4.2.7.5.{1,2}, voiced variant.
         let stage1_icdf: &[u8] = match self.params.bandwidth {
             OpusBandwidth::Wideband => &tables::NLSF_WB_STAGE1_VOICED_ICDF,
             _ => &tables::NLSF_NB_STAGE1_VOICED_ICDF,
         };
         enc.encode_icdf(NLSF_STAGE1_IDX, stage1_icdf, 8);
-        let uniform_11 = &tables::NLSF_RESIDUAL_UNIFORM_11_ICDF;
-        for &r in &residuals {
-            let mag = (r + 4).clamp(0, 10) as usize;
-            enc.encode_icdf(mag, uniform_11, 8);
-        }
-        enc.encode_icdf(3, &[192, 128, 64, 0], 8);
+        encode_nlsf_stage2(enc, NLSF_STAGE1_IDX, &residuals, order == 16);
+        enc.encode_icdf(4, &tables::NLSF_INTERP_ICDF, 8);
 
         // §4.2.7.6 LTP bitstream.
         ltp::encode_primary_pitch_lag(enc, self.params.bandwidth, primary_lag, self.prev_pitch_lag);
@@ -671,7 +683,9 @@ impl SilkFrameEncoder {
         let _ = pitch_lags; // currently passed via primary_lag directly
         super::shell::encode_excitation(enc, &signed_mags, signal_type, 0);
 
-        // Advance state.
+        // Advance state. `prev_synth` and ltp_history both carry the
+        // CLAMPED out[]; matches decoder convention now that the
+        // decoder's LPC history is clamped too.
         let start = out.len().saturating_sub(order);
         self.prev_synth.clear();
         self.prev_synth.extend_from_slice(&out[start..]);
@@ -844,27 +858,95 @@ pub fn stereo_predict_weights_q13(mid: &[f32], side: &[f32]) -> [i32; 2] {
     [clamp(w0), clamp(w1)]
 }
 
-/// A bit-for-bit copy of the decoder's `synthesize_nlsf` helper so the
-/// encoder sees the exact same NLSF template the decoder will
-/// reconstruct. We don't re-export the decoder's copy because it's
-/// private to `silk/lsf.rs`; we keep the logic mirrored here with a
-/// unit test below guarding the drift.
+/// Reconstruct the NLSF the decoder will produce for the given
+/// stage-1 index plus stage-2 residuals.
+///
+/// Mirrors the decoder's RFC 6716 §4.2.7.5.3 reconstruction path so
+/// that encoder analysis sees the same LPC the decoder will use. The
+/// encoder's MVP codes only the stage-1 index plus zero residuals so
+/// this collapses to `NLSF_Q15[k] = cb1_Q8[k] << 7` (then stabilised).
 fn synthesize_nlsf_like_decoder(
     stage1: usize,
     voiced: bool,
     order: usize,
     residuals: &[i32],
 ) -> Vec<i16> {
-    let tilt = (stage1 as f32 / 32.0) * 0.25 + if voiced { 0.0 } else { 0.15 };
+    let _ = voiced; // signal-type only switches stage-1 PDF, not codebook
+    let is_wb = order == 16;
+
+    // Same backwards-prediction reconstruction as the decoder.
+    let qstep: i32 = if is_wb { 9830 } else { 11796 };
+    let mut res_q10 = vec![0i32; order];
+    for k in (0..order).rev() {
+        let prev_term = if k + 1 < order {
+            let pred: u8 = if is_wb {
+                let sel = tables::NLSF_WB_PRED_SELECT[stage1][k] as usize;
+                tables::NLSF_PRED_WEIGHTS[2 + sel][k]
+            } else {
+                let sel = tables::NLSF_NBMB_PRED_SELECT[stage1][k] as usize;
+                tables::NLSF_PRED_WEIGHTS[sel][k]
+            };
+            (res_q10[k + 1] * pred as i32) >> 8
+        } else {
+            0
+        };
+        let i2 = residuals[k].clamp(-10, 10);
+        let sgn = i2.signum();
+        let raw = (i2 << 10) - sgn * 102;
+        res_q10[k] = prev_term + ((raw * qstep) >> 16);
+    }
+
+    // Reconstruct via cb1_Q8 + IHMW (we don't actually need the IHMW
+    // weights for the encoder's all-zero residual path because the
+    // weighted term collapses to zero, but compute them anyway so a
+    // future non-zero-residual encoder mode just works).
+    let cb1_q8: Vec<i32> = if is_wb {
+        tables::NLSF_WB_CB1_Q8[stage1]
+            .iter()
+            .map(|&v| v as i32)
+            .collect()
+    } else {
+        tables::NLSF_NBMB_CB1_Q8[stage1]
+            .iter()
+            .map(|&v| v as i32)
+            .collect()
+    };
+    let w_q9 = ihmw_weights_local(&cb1_q8);
     let mut nlsf = vec![0i16; order];
     for k in 0..order {
-        let base = (k as f32 + 1.0) / (order as f32 + 1.0);
-        let tilted = base.powf(1.0 + tilt);
-        let mut q15 = (tilted * 32768.0) as i32;
-        q15 += residuals[k].clamp(-7, 7) * 128;
-        nlsf[k] = q15.clamp(1, 32767) as i16;
+        let cb_term = cb1_q8[k] << 7;
+        let weighted = (res_q10[k] << 14) / w_q9[k] as i32;
+        nlsf[k] = (cb_term + weighted).clamp(1, 32767) as i16;
     }
     nlsf
+}
+
+/// Local copy of the decoder's IHMW weight calculation. Tested against
+/// the public decoder helper via the integration tests / SNR fixtures.
+fn ihmw_weights_local(cb1_q8: &[i32]) -> Vec<u16> {
+    let order = cb1_q8.len();
+    let mut w = vec![0u16; order];
+    for k in 0..order {
+        let prev = if k == 0 { 0 } else { cb1_q8[k - 1] };
+        let next = if k + 1 == order { 256 } else { cb1_q8[k + 1] };
+        let lo = (cb1_q8[k] - prev).max(1);
+        let hi = (next - cb1_q8[k]).max(1);
+        let w2_q18: i32 = (1024 / lo + 1024 / hi) << 16;
+        let w2 = w2_q18 as u32;
+        if w2 == 0 {
+            w[k] = 1;
+            continue;
+        }
+        let i = 32 - w2.leading_zeros() as i32;
+        let shift = (i - 8).max(0);
+        let f = ((w2 >> shift) & 127) as i32;
+        let base: i32 = if i & 1 == 1 { 32768 } else { 46214 };
+        let shr = ((32 - i) >> 1).max(0);
+        let y = base >> shr;
+        let v = y + ((213 * f * y) >> 16);
+        w[k] = v.clamp(1, u16::MAX as i32) as u16;
+    }
+    w
 }
 
 #[cfg(test)]
@@ -873,15 +955,21 @@ mod tests {
 
     #[test]
     fn nlsf_template_mirrors_decoder() {
-        // Compare encoder's mirror to a tiny hand-expansion of the
-        // decoder's formula. With stage1 = 0, voiced = false, all
-        // residuals 0:
-        //   tilt = 0.15
-        //   nlsf[k] = clamp((k+1)/(order+1))^1.15 * 32768, 1, 32767)
+        // With stage1=0 and all-zero residuals the decoder's NLSF
+        // reconstruction collapses to `cb1_Q8[k] << 7` per RFC 6716
+        // §4.2.7.5.3 (the `(res_Q10[k]<<14)/w_Q9[k]` term is zero
+        // throughout the chain).
         let nlsf = synthesize_nlsf_like_decoder(0, false, 10, &[0; 10]);
         assert_eq!(nlsf.len(), 10);
+        for k in 0..10 {
+            let expected = (tables::NLSF_NBMB_CB1_Q8[0][k] as i32) << 7;
+            assert_eq!(
+                nlsf[k] as i32, expected,
+                "encoder's NLSF mirror diverges from cb1_Q8 << 7 at k={k}"
+            );
+        }
         // Monotonic after stabilisation.
-        let stable = crate::silk::lsf::stabilize(&nlsf, 10);
+        let stable = crate::silk::lsf::stabilize(&nlsf, false);
         for w in stable.windows(2) {
             assert!(
                 w[1] >= w[0],
