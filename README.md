@@ -251,16 +251,15 @@ Two explicit entry points, one per Opus mode:
 ### Decode
 
 ```rust,no_run
-use oxideav_codec::{CodecRegistry, Decoder};
-use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, RuntimeContext, TimeBase};
 
-let mut codecs = CodecRegistry::new();
-oxideav_opus::register(&mut codecs);
+let mut ctx = RuntimeContext::new();
+oxideav_opus::register(&mut ctx);
 
 let mut params = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
 params.channels = Some(2);
 params.sample_rate = Some(48_000);
-let mut dec = codecs.make_decoder(&params)?;
+let mut dec = ctx.codecs.make_decoder(&params)?;
 
 let opus_packet_bytes: Vec<u8> = read_opus_packet_bytes();
 let pkt = Packet::new(0, TimeBase::new(1, 48_000), opus_packet_bytes);

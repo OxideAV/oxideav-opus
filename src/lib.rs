@@ -52,7 +52,7 @@ use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 pub const CODEC_ID_STR: &str = "opus";
 
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::audio("opus_sw")
         .with_lossy(true)
         .with_max_channels(2)
@@ -73,6 +73,12 @@ pub fn register(reg: &mut CodecRegistry) {
     );
 }
 
+/// Unified registration entry point — installs Opus into the codec
+/// sub-registry of the supplied [`oxideav_core::RuntimeContext`].
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
+
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     decoder::make_decoder(params)
 }
@@ -86,3 +92,23 @@ pub use header::{parse_opus_head, OpusHead};
 pub use toc::{
     parse_packet, parse_self_delimited_packet, OpusBandwidth, OpusMode, OpusPacket, Toc,
 };
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        let id = CodecId::new(CODEC_ID_STR);
+        assert!(
+            ctx.codecs.has_decoder(&id),
+            "decoder factory not installed via RuntimeContext"
+        );
+        assert!(
+            ctx.codecs.has_encoder(&id),
+            "encoder factory not installed via RuntimeContext"
+        );
+    }
+}
