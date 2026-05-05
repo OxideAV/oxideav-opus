@@ -79,6 +79,8 @@ pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     register_codecs(&mut ctx.codecs);
 }
 
+oxideav_core::register!("opus", register);
+
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     decoder::make_decoder(params)
 }
