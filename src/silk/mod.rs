@@ -459,7 +459,19 @@ fn decode_frame_body(
     };
     let voiced = signal_type == 2;
 
-    // §4.2.7.4 sub-frame gains.
+    // §4.2.7.4 sub-frame gains. Track `log_gain` (the 6-bit integer
+    // index 0..=63) directly across sub-frames; rounding through Q16
+    // and back biases the delta-coding chain. Per the RFC, the absolute
+    // (first sub-frame) index is `(MSB << 3) | LSB`; subsequent
+    // sub-frames apply
+    //
+    //     log_gain = clamp(0, max(2*delta - 16,
+    //                             prev_log_gain + delta - 4), 63)
+    //
+    // (RFC 6716 §4.2.7.4 — the `max(2*delta - 16, …)` lower-clamp
+    // protects against undershoot when `prev_log_gain` is small and
+    // `delta` is large; the previous code dropped that branch and
+    // produced a chain that drifted toward zero gain on quiet frames.)
     let mut gains_q16 = vec![0i32; n_subframes];
     {
         let msb_icdf: &[u8] = match signal_type {
@@ -469,13 +481,13 @@ fn decode_frame_body(
         };
         let msb = rc.decode_icdf(msb_icdf, 8) as i32;
         let lsb = rc.decode_icdf(&tables::GAIN_LSB_ICDF, 8) as i32;
-        let idx = (msb << 3) | lsb;
-        gains_q16[0] = gain_index_to_q16(idx.clamp(0, 63));
-        let mut prev_log_gain = gain_index_of_q16(gains_q16[0]);
+        let abs_idx = ((msb << 3) | lsb).clamp(0, 63);
+        let mut prev_log_gain = abs_idx;
+        gains_q16[0] = gain_index_to_q16(prev_log_gain);
         for sf in 1..n_subframes {
             let delta = rc.decode_icdf(&tables::GAIN_DELTA_ICDF, 8) as i32;
-            let step = delta - 4;
-            let new_log = (prev_log_gain + step).clamp(0, 63);
+            let candidate = (prev_log_gain + delta - 4).max(2 * delta - 16);
+            let new_log = candidate.clamp(0, 63);
             gains_q16[sf] = gain_index_to_q16(new_log);
             prev_log_gain = new_log;
         }
@@ -672,25 +684,108 @@ fn f32_to_q15_clamp(x: f32) -> i16 {
     s.clamp(-32768.0, 32767.0) as i16
 }
 
-/// Map a 6-bit log-gain index (0..=63) to a Q16 linear gain per the
-/// SILK spec (RFC 6716 §4.2.7.4).
+/// Map a 6-bit log-gain index (0..=63) to a Q16 linear gain per RFC
+/// 6716 §4.2.7.4.
 ///
-/// `silk_log2lin((0x1D1C71 * idx >> 16) + 2090)`. We implement a
-/// float approximation: gain_q16 = round(2^((idx/64)*16 + 2090/65536 *
-/// 16)) which is close enough for the synthesis filter to produce
-/// non-silent audio; bit-exactness here is NOT required for Opus
-/// compliance — libopus rounds to the nearest Q16 but the gain is
-/// further scaled by the LPC/LTP taps.
+/// Bit-exact integer implementation of
+/// `silk_log2lin((0x1D1C71 * log_gain >> 16) + 2090)` where
+/// `silk_log2lin(inLog_Q7)` approximates `2^(inLog_Q7/128.0)` via:
+///
+/// ```text
+/// i = inLog_Q7 >> 7
+/// f = inLog_Q7 & 127
+/// out = (1 << i) + (((-174 * f * (128 - f)) >> 16) + f) * ((1 << i) >> 7)
+/// ```
+///
+/// The RFC pins the output range of `gain_Q16` to `[81920,
+/// 1686110208]` (linear 1.25 .. 25728), which the table below
+/// reproduces exactly.
+///
+/// The previous float approximation effectively computed
+/// `2^(2090/65536) ≈ 1.022 × 65536 ≈ 67000` for `idx = 0`, missing the
+/// true value of 81920 (linear 1.25) by roughly 18%. That mis-scaling
+/// is what made the SILK synthesis filter under-drive the LPC stage
+/// while the matching upper-end overdrive at `idx = 63` saturated the
+/// output to the clamp rails.
 pub(crate) fn gain_index_to_q16(idx: i32) -> i32 {
-    let idx = idx.clamp(0, 63) as f32;
-    let log2 = (0x1D1C71u32 as f32 / 65536.0) * idx + (2090.0 / 65536.0);
-    let lin = 2f32.powf(log2);
-    (lin * 65536.0).round() as i32
+    let log_gain = idx.clamp(0, 63);
+    // (0x1D1C71 * log_gain) >> 16 + 2090 — all arithmetic stays inside
+    // i32: 0x1D1C71 * 63 = 122 808 219 fits comfortably.
+    let in_log_q7 = (((0x1D1C71_i32) * log_gain) >> 16) + 2090;
+    silk_log2lin(in_log_q7)
 }
 
-/// Inverse of `gain_index_to_q16`.
+/// Bit-exact `silk_log2lin(inLog_Q7)` per RFC 6716 §4.2.7.4 — returns
+/// `2^(inLog_Q7/128)` rounded to Q16 via the integer approximation
+/// listed in the spec.
+fn silk_log2lin(in_log_q7: i32) -> i32 {
+    if in_log_q7 < 0 {
+        return 0;
+    }
+    let i = in_log_q7 >> 7; // integer part
+    let f = in_log_q7 & 127; // fractional part (0..=127)
+                             // Guard against shift-overflow if the encoder ever feeds nonsense.
+    if i >= 31 {
+        return i32::MAX;
+    }
+    let one_shl_i: i32 = 1 << i;
+    // Spec: ((-174 * f * (128 - f)) >> 16) + f
+    let inner = ((-174_i32 * f * (128 - f)) >> 16) + f;
+    let extra = inner * (one_shl_i >> 7);
+    one_shl_i + extra
+}
+
+/// Inverse of `gain_index_to_q16`. Used by the encoder only — the
+/// decoder threads `log_gain` (the 6-bit integer index) through
+/// `decode_frame_body` directly to avoid the lossy round-trip.
 pub(crate) fn gain_index_of_q16(gain: i32) -> i32 {
-    let log2 = (gain.max(1) as f32 / 65536.0).log2();
-    let idx = (log2 - 2090.0 / 65536.0) / (0x1D1C71u32 as f32 / 65536.0);
-    idx.round() as i32
+    // For each candidate log_gain index, recompute gain_q16 and pick
+    // the closest match. 64 candidates, called rarely.
+    let mut best_idx = 0i32;
+    let mut best_err = i64::MAX;
+    for idx in 0..=63 {
+        let g = gain_index_to_q16(idx);
+        let err = (g as i64 - gain as i64).abs();
+        if err < best_err {
+            best_err = err;
+            best_idx = idx;
+        }
+    }
+    best_idx
+}
+
+#[cfg(test)]
+mod gain_tests {
+    use super::*;
+
+    #[test]
+    fn rfc_4_2_7_4_endpoints() {
+        // RFC 6716 §4.2.7.4: "The final Q16 gain values lies between
+        // 81920 and 1686110208, inclusive (representing scale factors
+        // of 1.25 to 25728, respectively)."
+        assert_eq!(gain_index_to_q16(0), 81920);
+        assert_eq!(gain_index_to_q16(63), 1_686_110_208);
+        // Approx 1.25 and 25728 in linear.
+        assert!((gain_index_to_q16(0) as f64 / 65536.0 - 1.25).abs() < 1e-9);
+        let top = gain_index_to_q16(63) as f64 / 65536.0;
+        assert!((top - 25728.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn gain_monotone_in_index() {
+        let mut prev = 0;
+        for idx in 0..=63 {
+            let g = gain_index_to_q16(idx);
+            assert!(g > prev, "gain not monotone at idx={idx}");
+            prev = g;
+        }
+    }
+
+    #[test]
+    fn gain_inverse_round_trips_each_index() {
+        for idx in 0..=63 {
+            let g = gain_index_to_q16(idx);
+            assert_eq!(gain_index_of_q16(g), idx, "round-trip mismatch idx={idx}");
+        }
+    }
 }

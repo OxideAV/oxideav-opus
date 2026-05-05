@@ -76,15 +76,22 @@ use crate::toc::OpusBandwidth;
 /// and decoder only need to agree.
 const NLSF_STAGE1_IDX: usize = 0;
 
-/// Gain index bounds (Q16 log-gain, see [`super::gain_index_to_q16`]).
-/// Smallest value yields `gain_q16 ≈ 1.09 × 65536` — big enough to
-/// keep the residual magnitudes well within the 9-bit carrier.
-const GAIN_INDEX_UNVOICED: i32 = 0;
+/// Gain index for unvoiced frames.
+///
+/// Per §4.2.7.8.6 the reconstructed excitation is
+/// `signed * 256 / 2^23 = signed * 2^-15`, so the synth filter's
+/// gain-applied input is `signed * g / 32768`. To keep `signed`
+/// magnitudes inside the shell coder's natural per-block sum cap of
+/// 16 (so `quantize_to_shell` doesn't silently truncate, breaking the
+/// closed-loop analysis-by-synthesis), we want `signed = e_desired *
+/// 32768 / g` to peak around 30-100 for a 0.3-amplitude residual.
+/// `gain_index = 35` puts `g ≈ 310`, giving `signed_peak ≈ 32` —
+/// matches the old `* 128 / g` carrier's range while reproducing the
+/// spec-accurate decoder reconstruction path.
+const GAIN_INDEX_UNVOICED: i32 = 35;
 
-/// Gain index for voiced frames. Same as unvoiced in the MVP: the
-/// actual excitation amplitude is still derived closed-loop from the
-/// quantised residual.
-const GAIN_INDEX_VOICED: i32 = 0;
+/// Gain index for voiced frames. Same as unvoiced.
+const GAIN_INDEX_VOICED: i32 = 35;
 
 /// LTP scaling factor (Q14) used by the voiced encoder path. Value
 /// 15565 is the "strong-periodicity" level (RFC 6716 §4.2.7.6.3 Table
@@ -96,11 +103,45 @@ const LTP_SCALE_Q14_VOICED: i32 = 15565;
 /// helps when the open-loop pitch analyser is confident.
 const LTP_PERIODICITY_VOICED: usize = 2;
 
-/// Ratio used when quantising the residual to signed 8 bits. We pick
-/// a conservative factor so peaks don't clip to ±255 — the decoder's
-/// output already clamps to [-1, 1] and extra headroom helps the
-/// cross-frame continuity when the LPC state is carried over.
-const CARRIER_FULL_SCALE: f32 = 120.0;
+/// Ratio used when quantising the residual to signed magnitudes. Each
+/// magnitude unit corresponds to `2^8 / 2^23 = 2^-15` of the gain-
+/// applied excitation, so 120 covers up to `120 * 2^-15 ≈ 0.00366` of
+/// the un-gained residual — the gain factor is then applied on top.
+/// The shell coder caps per-block sums at 16 so this is a soft cap
+/// rather than a hard one; values above CARRIER_FULL_SCALE just trigger
+/// more LSB shifts at encode time.
+const CARRIER_FULL_SCALE: f32 = 16384.0;
+
+/// LCG seed shipped in every encoded SILK frame (RFC §4.2.7.7). We
+/// always emit 0 so the encoder's prediction of the decoder's output
+/// only needs to track a single, deterministic seed.
+const ENCODER_LCG_SEED: u32 = 0;
+
+/// Step the §4.2.7.8.6 LCG one sample. Returns
+/// `(post_lcg_e_q23, new_state)` for a given pre-recon `e_raw` and
+/// current `state`. Consumed by the analysis-by-synthesis loop.
+#[inline]
+fn lcg_step_q23(state: u32, e_raw: i32, offset_q23: i32) -> (i32, u32) {
+    let sgn = e_raw.signum();
+    let mut e_q23 = (e_raw << 8) - sgn * 20 + offset_q23;
+    let next = state.wrapping_mul(196_314_165).wrapping_add(907_633_515);
+    if next & 0x8000_0000 != 0 {
+        e_q23 = -e_q23;
+    }
+    let next = next.wrapping_add(e_raw as u32);
+    (e_q23, next)
+}
+
+/// Predict whether the §4.2.7.8.6 LCG will flip the sign of the next
+/// reconstructed sample, *before* `e_raw` is chosen. The flip is fully
+/// determined by `state` at this point (the spec's `(seed * 196314165 +
+/// 907633515) & 0x80000000`), so the encoder can pre-flip its target
+/// magnitude to cancel the random sign.
+#[inline]
+fn lcg_pre_flip(state: u32) -> bool {
+    let next = state.wrapping_mul(196_314_165).wrapping_add(907_633_515);
+    next & 0x8000_0000 != 0
+}
 
 /// Per-bandwidth encoder parameters. A [`SilkFrameEncoder`] is constructed
 /// from one of these descriptors so NB / MB / WB share the bulk of the
@@ -319,11 +360,19 @@ impl SilkFrameEncoder {
         let gain_index: i32 = GAIN_INDEX_UNVOICED;
         let gain_q16 = super::gain_index_to_q16(gain_index);
         let g = gain_q16.max(1) as f32 / 65536.0;
-        let scale = 128.0 / g;
+        // Per §4.2.7.8.6: e_quant = (signed * 256 + small_offset) / 2^23
+        //                         ≈ signed * 2^-15 (offsets are ±60 in Q23
+        // so they shift the mean by < 1 magnitude unit). The encoder
+        // therefore picks `signed = round(e_desired * 2^15 / g)`.
+        let scale = 32768.0 / g;
+        let st = (signal_type as usize).min(2);
+        let offset_q23 = super::shell::QUANT_OFFSET_Q23[st][0];
+        let inv_q23 = 1.0_f32 / 8_388_608.0;
 
         let synth_hist = self.prev_synth.clone();
         let mut out = vec![0f32; frame_len];
         let mut signed_mags = vec![0i32; frame_len];
+        let mut lcg_state = ENCODER_LCG_SEED;
         for n in 0..frame_len {
             let mut pred = 0f32;
             for k in 1..=order {
@@ -336,12 +385,21 @@ impl SilkFrameEncoder {
                 pred += lpc[k - 1] * past;
             }
             let e_desired = pcm_internal[n] - pred;
-            let signed_mag_f = (e_desired * scale).round();
+            // Pre-flip target so the §4.2.7.8.6 LCG sign perturbation
+            // cancels: if the decoder will negate this sample, encode
+            // the negated residual to start with.
+            let flip = lcg_pre_flip(lcg_state);
+            let target = if flip { -e_desired } else { e_desired };
+            let signed_mag_f = (target * scale).round();
             let mag_i = signed_mag_f.abs().clamp(0.0, CARRIER_FULL_SCALE) as i32;
             let neg = signed_mag_f < 0.0;
             let signed = if neg { -mag_i } else { mag_i };
             signed_mags[n] = signed;
-            let e_quant = (signed as f32 / 128.0) * g;
+            // Apply the §4.2.7.8.6 reconstruction the decoder will run so
+            // the closed-loop synthesis lines up exactly.
+            let (e_q23, next_state) = lcg_step_q23(lcg_state, signed, offset_q23);
+            lcg_state = next_state;
+            let e_quant = e_q23 as f32 * inv_q23 * g;
             out[n] = (e_quant + pred).clamp(-1.0, 1.0);
         }
         // Pad to shell-block alignment (16 samples per shell) and apply
@@ -350,9 +408,10 @@ impl SilkFrameEncoder {
         let aligned = signed_mags.len().div_ceil(16) * 16;
         signed_mags.resize(aligned, 0);
         let recon = super::shell::quantize_to_shell(&signed_mags);
-        // Rebuild `out[]` using the quantised residual so LPC/history
-        // carry forward exactly what the decoder will see.
+        // Rebuild `out[]` using the quantised + reconstructed residual so
+        // LPC/history carry forward exactly what the decoder will see.
         out.fill(0.0);
+        let mut lcg_state = ENCODER_LCG_SEED;
         for n in 0..frame_len {
             let mut pred = 0f32;
             for k in 1..=order {
@@ -364,7 +423,9 @@ impl SilkFrameEncoder {
                 };
                 pred += lpc[k - 1] * past;
             }
-            let e_quant = (recon[n] as f32 / 128.0) * g;
+            let (e_q23, next_state) = lcg_step_q23(lcg_state, recon[n], offset_q23);
+            lcg_state = next_state;
+            let e_quant = e_q23 as f32 * inv_q23 * g;
             out[n] = (e_quant + pred).clamp(-1.0, 1.0);
         }
         signed_mags = recon;
@@ -455,7 +516,9 @@ impl SilkFrameEncoder {
         let gain_index: i32 = GAIN_INDEX_VOICED;
         let gain_q16 = super::gain_index_to_q16(gain_index);
         let g = gain_q16.max(1) as f32 / 65536.0;
-        let scale = 128.0 / g;
+        let st = (signal_type as usize).min(2);
+        let offset_q23 = super::shell::QUANT_OFFSET_Q23[st][0];
+        let inv_q23 = 1.0_f32 / 8_388_608.0;
 
         // Pick the LTP filter index + taps up front. Use the same
         // taps for every sub-frame (MVP — the spec allows per-sub-frame
@@ -469,14 +532,14 @@ impl SilkFrameEncoder {
         let primary_lag = pitch.lag_internal;
         let pitch_lags = vec![primary_lag; self.n_subframes];
 
-        // LTP scaling (Q14 → f32).
+        // LTP scaling (Q14 → f32). The post-§4.2.7.9.1 spec residual is
+        //   res[i] = e_Q23[i]/2^23 + sum_k(res[i-pitch+2-k] * b_Q7[k]/128)
+        // — there is no extra ltp_scale_q14 factor on the synthesis side
+        // (that field only matters in the §4.2.7.9.1 rewhitening branch
+        // which our MVP doesn't implement). We therefore sum the LTP
+        // contribution at unit weight; the encoder's pred = lpc + g*ltp
+        // because the synth filter applies `g` to the entire residual.
         let ltp_scale_q14 = LTP_SCALE_Q14_VOICED;
-        let ltp_scale = ltp_scale_q14 as f32 / 16384.0;
-        // Match the decoder's `synth::synthesize` 0.25 attenuation on
-        // the LTP contribution (decoder: `e += ltp_sum * ltp_scale *
-        // 0.25`). We apply the exact same factor here so the closed-
-        // loop residual we quantise cancels on the decoder side.
-        let ltp_attn = 0.25_f32;
 
         // Shell-quantise with LTP subtraction.
         let synth_hist = self.prev_synth.clone();
@@ -484,6 +547,7 @@ impl SilkFrameEncoder {
         let mut out = vec![0f32; frame_len];
         let mut signed_mags = vec![0i32; frame_len];
 
+        let mut lcg_state = ENCODER_LCG_SEED;
         for n in 0..frame_len {
             // LPC prediction (same as unvoiced).
             let mut lpc_pred = 0f32;
@@ -511,18 +575,25 @@ impl SilkFrameEncoder {
                 };
                 ltp_sum += ltp_taps[k] * past;
             }
-            let ltp_pred = ltp_sum * ltp_scale * ltp_attn;
-
-            // Residual we want the decoder to reconstruct.
-            let e_desired = pcm_internal[n] - lpc_pred - ltp_pred;
-            let signed_mag_f = (e_desired * scale).round();
+            // Decoder synth (per the synth::synthesize MVP):
+            //   s = g*excitation + ltp_sum + lpc_pred
+            //   out[n] = clamp(s)
+            // Solve for the excitation contribution we want:
+            //   excitation = (pcm - ltp_sum - lpc_pred) / g
+            // Then signed = round(excitation * 2^15) (after pre-flip).
+            let e_desired_q0 = (pcm_internal[n] - lpc_pred - ltp_sum) / g;
+            let flip = lcg_pre_flip(lcg_state);
+            let target = if flip { -e_desired_q0 } else { e_desired_q0 };
+            let signed_mag_f = (target * 32768.0).round();
             let mag_i = signed_mag_f.abs().clamp(0.0, CARRIER_FULL_SCALE) as i32;
             let neg = signed_mag_f < 0.0;
             let signed = if neg { -mag_i } else { mag_i };
             signed_mags[n] = signed;
-            let e_quant = (signed as f32 / 128.0) * g;
+            let (e_q23, next_state) = lcg_step_q23(lcg_state, signed, offset_q23);
+            lcg_state = next_state;
+            let e_quant = g * (e_q23 as f32 * inv_q23) + ltp_sum;
             // Closed-loop synthesis equals what the decoder produces.
-            out[n] = (e_quant + lpc_pred + ltp_pred).clamp(-1.0, 1.0);
+            out[n] = (e_quant + lpc_pred).clamp(-1.0, 1.0);
         }
         // Apply shell-coder block saturation so reconstructed `out[]`
         // stays bit-exact with what the decoder will produce.
@@ -530,6 +601,7 @@ impl SilkFrameEncoder {
         signed_mags.resize(aligned, 0);
         let recon = super::shell::quantize_to_shell(&signed_mags);
         out.fill(0.0);
+        let mut lcg_state = ENCODER_LCG_SEED;
         for n in 0..frame_len {
             let mut lpc_pred = 0f32;
             for k in 1..=order {
@@ -553,9 +625,10 @@ impl SilkFrameEncoder {
                 };
                 ltp_sum += ltp_taps[k] * past;
             }
-            let ltp_pred = ltp_sum * ltp_scale * ltp_attn;
-            let e_quant = (recon[n] as f32 / 128.0) * g;
-            out[n] = (e_quant + lpc_pred + ltp_pred).clamp(-1.0, 1.0);
+            let (e_q23, next_state) = lcg_step_q23(lcg_state, recon[n], offset_q23);
+            lcg_state = next_state;
+            let e_quant = g * (e_q23 as f32 * inv_q23) + ltp_sum;
+            out[n] = (e_quant + lpc_pred).clamp(-1.0, 1.0);
         }
         signed_mags = recon;
 
@@ -837,7 +910,16 @@ mod tests {
         assert_eq!(mb.internal_rate_hz(), 12_000);
     }
 
-    /// Encode a zero frame and decode it; output should be zero.
+    /// Encode a zero frame and decode it; output should be near zero.
+    ///
+    /// Threshold of 0.01 (vs strict 0): per RFC 6716 §4.2.7.8.6 the
+    /// decoder applies a constant `offset_Q23` quantisation offset and
+    /// LCG-driven sign perturbation to *every* sample (including zero
+    /// pulses), so even an all-zero excitation produces a pseudorandom
+    /// `±offset_Q23 / 2^23 ≈ ±3e-6` waveform that the LPC stage then
+    /// integrates up to a few thousandths of a unit. The historical
+    /// threshold of 0.001 dates from the pre-§4.2.7.8.6 path that
+    /// silently dropped the offset + dither and was never spec-compliant.
     #[test]
     fn encode_decode_zero_frame_matches() {
         use oxideav_celt::range_decoder::RangeDecoder;
@@ -865,8 +947,8 @@ mod tests {
         let peak = decoded.iter().copied().fold(0f32, |a, b| a.max(b.abs()));
         println!("zero-frame roundtrip peak = {peak:.6}");
         assert!(
-            peak < 0.001,
-            "zero-frame decode should be ~0, got peak {peak}"
+            peak < 0.01,
+            "zero-frame decode should be quiet (under §4.2.7.8.6 dither floor), got peak {peak}"
         );
     }
 

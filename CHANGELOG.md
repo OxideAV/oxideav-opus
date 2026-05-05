@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **libopus SILK interop — RFC §4.2.7.4 gain dequantisation +
+  §4.2.7.8.6 excitation reconstruction** (task #464). Three
+  bit-stream-spec gaps in the SILK decode path are now closed:
+  - `silk::gain_index_to_q16` is the bit-exact integer form of
+    `silk_log2lin((0x1D1C71 * idx >> 16) + 2090)`. The previous
+    float approximation `2^(2090/65536) ≈ 1.022 * 65536 ≈ 67000`
+    for `idx = 0` undershot the spec's lower bound (81920, linear
+    1.25) by ~18 % and overshot the upper end (1 686 110 208,
+    linear 25728) by enough to pin the synth IIR to its clamp
+    rails. New unit tests pin both endpoints and round-trip every
+    log-gain index 0..=63 through the integer formulation.
+  - The §4.2.7.4 delta-coding chain now uses the spec's full
+    `clamp(0, max(2*delta - 16, prev_log_gain + delta - 4), 63)`
+    formula and tracks `prev_log_gain` as an integer (no Q16 round-
+    trip). The `max(2*delta - 16, …)` branch was missing entirely,
+    biasing quiet-frame chains toward zero gain.
+  - `silk::shell::decode_excitation` now wires the §4.2.7.7 `seed`
+    through to the §4.2.7.8.6 reconstruction step
+    (`e_Q23 = (e_raw << 8) - sign(e_raw)*20 + offset_Q23`, then
+    LCG-driven sign flip + seed update), and emits `e_Q23 / 2^23`
+    in normalised Q0 form so the synth filter can apply
+    `gain_Q16 / 65536` verbatim per §4.2.7.9.2. The previous
+    `signed / 128` scaling silently amplified the excitation by
+    256× and the missing LCG dither let zero runs lock the LPC
+    integrator into a DC offset — both fixed.
+  - `silk::synth::synthesize` now applies `g` only to the
+    excitation (not to the LTP feedback term, which our MVP reads
+    from the post-LPC `out[]` buffer that already carries a `g`
+    factor). Feeding the unclamped LPC ring back into next-
+    subframe synthesis matches RFC §4.2.7.9.2's "save unclamped
+    `lpc[i]`, export clamped `out[i]`" wording.
+  - **Per-fixture PSNR** vs `opusdec` on `docs/audio/opus/fixtures/`:
+    `silk-nb-mono-16kbps` 4.31 → **11.99 dB**;
+    `silk-mb-60ms-mono-20kbps` 3.81 → **11.95 dB**;
+    `silk-wb-stereo-20kbps` 7.04 → **11.34 dB**.
+    **Saturation rate** on the same NB clip: ~17 % → **1.18 %** of
+    s16 output samples at ±32 767 (the synth filter no longer
+    bottoms out the clamp every other sample). Hybrid SILK low band
+    rides the same fix but stays at ~3 dB because the NLSF stage-2
+    residual decode is still a stub (see README "libopus interop").
+
 - **libopus CELT interop — path-aware s16 conversion** (RFC 6716 §4.3
   + §3.2). The single hard-coded `* 32 768` at the f32→s16 site in
   `decode_packet` / `MultistreamOpusDecoder::receive_frame` was

@@ -612,17 +612,63 @@ fn decode_pulse_count(rc: &mut RangeDecoder<'_>, rate_level: usize) -> (u32, u32
     }
 }
 
+/// Quantization offset (Q23) per RFC 6716 §4.2.7.8.6, Table 53.
+/// Indexed `[signal_type][quant_offset_type]`. Voiced/Low = 8,
+/// Voiced/High = 25, Unvoiced/Inactive Low = 25, High = 60.
+pub const QUANT_OFFSET_Q23: [[i32; 2]; 3] = [
+    [25, 60], // Inactive (Low, High)
+    [25, 60], // Unvoiced
+    [8, 25],  // Voiced
+];
+
+/// Compute the §4.2.7.8.6 reconstructed Q0 excitation values
+/// (`e_Q23 / 2^23`) for a given vector of signed pulse magnitudes,
+/// signal/quant-offset selectors, and starting LCG seed. Used by the
+/// encoder's analysis-by-synthesis loop to predict exactly what the
+/// decoder will emit so the closed-loop residual stays consistent
+/// across the bitstream.
+pub fn reconstruct_q23_normalised(
+    signed: &[i32],
+    signal_type: u8,
+    quant_offset_type: u8,
+    seed: u32,
+) -> Vec<f32> {
+    let st = (signal_type as usize).min(2);
+    let qot = (quant_offset_type as usize).min(1);
+    let offset_q23 = QUANT_OFFSET_Q23[st][qot];
+    let mut state = seed;
+    let inv = 1.0_f32 / 8_388_608.0;
+    let mut out = vec![0.0f32; signed.len()];
+    for (i, &e_raw) in signed.iter().enumerate() {
+        let sgn = e_raw.signum();
+        let mut e_q23 = (e_raw << 8) - sgn * 20 + offset_q23;
+        state = state.wrapping_mul(196_314_165).wrapping_add(907_633_515);
+        if state & 0x8000_0000 != 0 {
+            e_q23 = -e_q23;
+        }
+        state = state.wrapping_add(e_raw as u32);
+        out[i] = e_q23 as f32 * inv;
+    }
+    out
+}
+
 /// Decode the excitation signal for a SILK frame using the real shell
-/// coder.
+/// coder + the §4.2.7.8.6 reconstruction step.
 ///
-/// Returns `Vec<f32>` of length `frame_len` in Q0 excitation sample
-/// form (divided by 128.0 to match the MVP carrier's unit-ish scale).
+/// Returns `Vec<f32>` of length `frame_len` carrying `e_Q23[i] /
+/// 2^23` so the synthesis filter can apply the spec's
+/// `gain_Q16/65536` scaling without a hidden constant of its own.
+///
+/// `seed` is the LCG state decoded in §4.2.7.7 — every sample is
+/// pseudo-randomly inverted via `(seed & 0x80000000) != 0` and the
+/// seed is updated by `seed = 196314165*seed + 907633515` then by
+/// `seed += e_raw[i]` after each sample, matching the spec literal.
 pub fn decode_excitation(
     rc: &mut RangeDecoder<'_>,
     frame_len: usize,
     signal_type: u8,
     quant_offset_type: u8,
-    _seed: u32,
+    seed: u32,
 ) -> Vec<f32> {
     assert!(
         frame_len % 16 == 0,
@@ -695,8 +741,20 @@ pub fn decode_excitation(
         }
     }
 
-    // Return a normalised f32 vector (match MVP carrier scaling of /128).
-    signed.into_iter().map(|v| v as f32 / 128.0).collect()
+    // §4.2.7.8.6 reconstruction:
+    //
+    //   e_Q23[i] = (e_raw[i] << 8) - sign(e_raw[i])*20 + offset_Q23;
+    //   seed     = (196314165*seed + 907633515) & 0xFFFFFFFF;
+    //   e_Q23[i] = (seed & 0x80000000) ? -e_Q23[i] : e_Q23[i];
+    //   seed     = (seed + e_raw[i]) & 0xFFFFFFFF;
+    //
+    // The LCG dither (top-bit-driven sign flip, then add e_raw to seed)
+    // is what keeps the synthesis filter from periodically drifting to
+    // a DC offset on long quiet runs — without it every zero sample
+    // stays exactly 0 + offset_Q23 and biases the LPC integrator. We
+    // also normalise to Q0 by dividing by 2^23 so the synth filter can
+    // apply the RFC's `gain_Q16/65536` factor verbatim.
+    reconstruct_q23_normalised(&signed, signal_type, quant_offset_type, seed)
 }
 
 #[cfg(test)]
@@ -742,8 +800,20 @@ mod tests {
         assert_eq!(PULSE_COUNT_ICDF[10][16], 0);
     }
 
+    /// Local thin alias for the public reconstruction helper. The
+    /// indirection lets the unit tests treat the §4.2.7.8.6 transcription
+    /// as the spec oracle and the body of `decode_excitation` as the
+    /// system-under-test, even though they share an implementation.
+    fn expected_q23(signed: &[i32], signal_type: u8, quant_offset_type: u8, seed: u32) -> Vec<f32> {
+        super::reconstruct_q23_normalised(signed, signal_type, quant_offset_type, seed)
+    }
+
     #[test]
     fn roundtrip_zero_excitation() {
+        // RFC §4.2.7.8.6: with all e_raw[i] = 0 the offset_Q23 is still
+        // applied (because sign(0) == 0 → no -20 deduction), so each
+        // sample reconstructs to ±offset_Q23/2^23 with the LCG-driven
+        // sign. Magnitude is tiny (<1e-5) but non-zero by spec.
         let n = 160; // 20 ms NB.
         let sm = vec![0i32; n];
         let mut enc = RangeEncoder::new(128);
@@ -751,8 +821,9 @@ mod tests {
         let buf = enc.done().unwrap();
         let mut dec = RangeDecoder::new(&buf);
         let out = decode_excitation(&mut dec, n, 1, 0, 0);
-        for v in &out {
-            assert_eq!(*v, 0.0);
+        let want = expected_q23(&sm, 1, 0, 0);
+        for (i, (g, w)) in out.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() < 1e-9, "mismatch at {i}: got {g} want {w}");
         }
     }
 
@@ -766,12 +837,9 @@ mod tests {
         let buf = enc.done().unwrap();
         let mut dec = RangeDecoder::new(&buf);
         let out = decode_excitation(&mut dec, 16, 1, 0, 0);
-        for (i, v) in out.iter().enumerate() {
-            let expected = if i == 5 { 1.0 / 128.0 } else { 0.0 };
-            assert!(
-                (v - expected).abs() < 1e-6,
-                "mismatch at {i}: got {v}, want {expected}"
-            );
+        let want = expected_q23(&sm, 1, 0, 0);
+        for (i, (g, w)) in out.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() < 1e-9, "mismatch at {i}: got {g} want {w}");
         }
     }
 
@@ -786,15 +854,13 @@ mod tests {
         let buf = enc.done().unwrap();
         let mut dec = RangeDecoder::new(&buf);
         let out = decode_excitation(&mut dec, 16, 1, 0, 0);
-        // Compare via the quantiser's own reconstruction.
+        // Compare via the quantiser's own reconstruction (the shell
+        // coder may collapse a saturated block) + the §4.2.7.8.6
+        // post-step.
         let recon = quantize_to_shell(&sm);
-        for i in 0..16 {
-            let expected = recon[i] as f32 / 128.0;
-            assert!(
-                (out[i] - expected).abs() < 1e-6,
-                "mismatch at {i}: got {}, want {expected}",
-                out[i]
-            );
+        let want = expected_q23(&recon, 1, 0, 0);
+        for (i, (g, w)) in out.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() < 1e-9, "mismatch at {i}: got {g} want {w}");
         }
     }
 
@@ -809,11 +875,11 @@ mod tests {
         let mut dec = RangeDecoder::new(&buf);
         let out = decode_excitation(&mut dec, 16, 1, 0, 0);
         let recon = quantize_to_shell(&sm);
-        for i in 0..16 {
+        let want = expected_q23(&recon, 1, 0, 0);
+        for (i, (g, w)) in out.iter().zip(want.iter()).enumerate() {
             assert!(
-                (out[i] - recon[i] as f32 / 128.0).abs() < 1e-6,
-                "mismatch at {i}: got {}, recon={}",
-                out[i],
+                (g - w).abs() < 1e-9,
+                "mismatch at {i}: got {g} want {w} recon={}",
                 recon[i]
             );
         }
@@ -832,15 +898,32 @@ mod tests {
         let mut dec = RangeDecoder::new(&buf);
         let out = decode_excitation(&mut dec, sm.len(), 2, 1, 0);
         // The encoder may saturate/quantise when sum per block > 16;
-        // but for these test vectors sums-abs ≤ 16 each so quantisation
-        // to lsb=0 is lossless per-sample.
-        for (i, v) in out.iter().enumerate() {
-            let expected = sm[i] as f32 / 128.0;
-            assert!(
-                (v - expected).abs() < 1e-6,
-                "mismatch at {i}: got {v}, want {expected}"
-            );
+        // here all blocks sum-abs ≤ 16 so signs reproduce exactly.
+        let want = expected_q23(&sm, 2, 1, 0);
+        for (i, (g, w)) in out.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() < 1e-9, "mismatch at {i}: got {g} want {w}");
         }
+    }
+
+    #[test]
+    fn lcg_dither_changes_seed_changes_output() {
+        // Same encoded payload, two different LCG seeds. Per §4.2.7.7 +
+        // §4.2.7.8.6 the seed flips per-sample sign, so the decoded
+        // waveform must differ.
+        let mut sm = vec![0i32; 16];
+        sm[3] = 5;
+        sm[10] = -2;
+        let mut enc = RangeEncoder::new(64);
+        encode_excitation(&mut enc, &sm, 1, 0);
+        let buf = enc.done().unwrap();
+        let mut dec_a = RangeDecoder::new(&buf);
+        let out_a = decode_excitation(&mut dec_a, 16, 1, 0, 0);
+        let mut dec_b = RangeDecoder::new(&buf);
+        let out_b = decode_excitation(&mut dec_b, 16, 1, 0, 3);
+        assert_ne!(
+            out_a, out_b,
+            "seed = 0 and seed = 3 produced identical excitation"
+        );
     }
 
     #[test]

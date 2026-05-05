@@ -14,21 +14,25 @@ framework but usable standalone.
 > conversion landed (the historical `* 32 768` at the float→s16 site
 > was peg-clipping every sample of a libopus-Q15-scale CELT IMDCT
 > output to the rails — see `decode_packet` in `src/decoder.rs`).
+> The SILK side now follows the spec literal at §4.2.7.4 (gain index →
+> Q16) + §4.2.7.8.6 (Q23 excitation reconstruction with LCG dither),
+> dropping the saturation rate from ~17 % to ~1.2 %.
 > Cross-decode PSNR vs ffmpeg `opusdec` for the corpus fixtures
 > (`docs/audio/opus/fixtures/`):
 >
 > - CELT-only mono / stereo @ 64 kbps: **11–21 dB**
 > - CELT-only fullband stereo @ 128 kbps: **10 dB**
 > - CELT multistream 5.1: **17 dB**
-> - SILK NB / MB / WB mono / stereo: **4–7 dB** (still needs work)
-> - Hybrid SWB / FB: **3–4 dB** (SILK low band drags the PSNR down)
+> - SILK NB / MB / WB mono / stereo: **11–12 dB** (was 4–7 dB)
+> - Hybrid SWB / FB: **3 dB** (SILK low band still wrong on NLSF
+>   stage-2)
 >
-> SILK-only and the SILK portion of Hybrid still saturate ~17 % of
-> samples — RFC 6716 §4.2.7.8 (excitation Q-format scaling, LCG
-> dither) and §4.2.7.9 (LPC synthesis stability, gain interpretation)
-> need a clean-room re-anchor. Voice-band content (SILK / Hybrid)
-> therefore still sounds noisy; music-band CELT-only content is now
-> intelligible. Tracked under "Not yet supported" below.
+> The remaining SILK gap (≈ 12 dB → 20+ dB target) is now in NLSF
+> stage-2 residual decoding (§4.2.7.5.2) — `silk::lsf::decode_nlsf`
+> still uses a uniform-11 stub instead of the per-codebook signed
+> residual tables, so the LPC filter we synthesise diverges from the
+> one libopus encoded against. Tracked under "Not yet supported"
+> below.
 
 ## Installation
 
@@ -204,32 +208,28 @@ Two explicit entry points, one per Opus mode:
     pre-clamp f32 peak, leaving the in-crate encoder's [-1, 1]-scale
     output unaffected. The 2.5 ms low-latency CELT case still floors
     at ~2 dB — LM=0 transient handling needs a separate look.
-  - **SILK** — still wrong. Output amplitude saturates the s16 output
-    at ±full-scale on ~17 % of samples for a quiet 440 Hz tone
-    (sounds like buzzing or static); per-fixture PSNR floors at
-    ~4–7 dB. The synthesis filter in `silk::synth::synthesize`
-    runs at unit scale and clamps every sample to ±1 to keep the IIR
-    stable, then the upsampler's peak-impulse FIR response amplifies
-    the rails by ~1.227× (= `0.2044 × 6` for the 8→48 kHz path).
-    Root causes anchored on RFC 6716:
-    - §4.2.7.4 — `gain_index_to_q16` is a float approximation of
-      `silk_log2lin( silk_SMULWB(0x1D1C71, idx) + 2090 )`; the
-      libopus integer formulation gives gain values in a different
-      range that, paired with the RFC §4.2.7.8 shell-pulse
-      excitation, produces a stable filter input. Our float path
-      currently amplifies the excitation past where the LPC filter
-      can settle.
-    - §4.2.7.8.6 — the LCG dither (per-sample sign perturbation
-      from the `seed` value decoded in §4.2.7.7) is parsed but the
-      `_seed` parameter is unused in `silk::shell::decode_excitation`,
-      so the excitation is missing the bit of pseudorandom dither
-      that keeps the synthesis from periodically going DC.
-  - **Hybrid** — drags down to 3–4 dB because the SILK low band is
-    contributing the same broken energy as SILK-only.
+  - **SILK** — partially landed. The §4.2.7.4 gain dequantisation,
+    §4.2.7.8.6 Q23 excitation reconstruction (with the LCG sign-
+    perturbation), and the `gain_Q16/65536`-only application in the
+    synth filter are now bit-exact per the RFC literal. Saturation
+    rate on a libopus 440 Hz NB clip dropped from ~17 % of samples
+    to ~1.2 %, and per-fixture PSNR climbed from 4–7 dB to 11–12 dB.
+    The remaining gap is the NLSF stage-2 stub:
+    - §4.2.7.5.2 — `silk::lsf::decode_nlsf` reads stage-2 residual
+      magnitudes through a single uniform-11 ICDF instead of the
+      per-codebook signed residual tables (Tables 17-22 / 25-30),
+      so the NLSF vector we synthesise from the index is unrelated
+      to the encoder's actual LPC predictor. The decode bitstream
+      stays aligned (the residuals occupy the right number of
+      symbols) but the LPC filter we run is a generic cosine-spaced
+      template, not the libopus-encoded one. Until that lands,
+      libopus packets decode to a recognisable but spectrally-
+      wrong waveform.
+  - **Hybrid** — drags down to ~3 dB because the SILK low band is
+    contributing the same NLSF-stub energy as SILK-only.
 
   Per-band energy decode (`unquant_coarse_energy` / `…_fine_energy`)
-  appears correct; the gap is in SILK NLSF→LPC stability +
-  excitation Q-format scaling.
+  is correct; the rest of SILK now lives in NLSF stage-2.
 
 - **Bit-exact CELT PVQ + IMDCT output.** Even on the in-crate roundtrip
   (where bitstream parity is guaranteed) the reconstructed waveform
