@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-opus/compare/v0.0.7...v0.0.8) - 2026-05-05
+
+### Other
+
+- RFC 4.2.7.5.x NLSF stage-2 + LSF→LPC + BW-expansion guard
+- RFC 4.2.7.4 gain dequant + 4.2.7.8.6 LCG dither
+- path-aware s16 conversion fixes libopus CELT interop
+- apply RFC 6716 §4.3.7.2 CELT post-IMDCT de-emphasis
+- honour OpusHead output_gain (RFC 7845 §5.1)
+- implement RFC 7845 §5.1.2 pre-skip trimming
+- trim crate-level allow block + fix 14 mechanical lints
+- rustfmt fix for tests/docs_corpus.rs
+- wire docs/audio/opus/fixtures/ corpus into integration tests
+
 ### Fixed
 
 - **libopus SILK interop — RFC §4.2.7.5.x NLSF stage-2 residual decoder
