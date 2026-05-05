@@ -502,8 +502,7 @@ fn decode_frame_body(
     // For 10 ms frames: always w_Q2 = 4 (no interpolation).
     // After an uncoded side-channel frame or decoder reset: force w_Q2 = 4.
     let is_20ms = n_subframes == SUBFRAMES_20MS;
-    let (nlsf_q15, raw_interp_coef) =
-        lsf::decode_nlsf(rc, bandwidth, signal_type, is_20ms)?;
+    let (nlsf_q15, raw_interp_coef) = lsf::decode_nlsf(rc, bandwidth, signal_type, is_20ms)?;
 
     // Force w_Q2 = 4 on the first frame (decoder-reset equivalent) or when
     // the previous frame's NLSFs aren't available.

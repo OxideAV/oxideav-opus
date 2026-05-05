@@ -162,24 +162,30 @@ const LTP_P2_Q7: [[i8; 5]; 32] = [
 /// periodicity. Must match `decode_ltp_filter` exactly so encoder and
 /// decoder agree on the synthesis coefficients for self-encoded streams.
 ///
-/// For the MVP encoder we use a smooth linear approximation that
-/// interpolates a single centred filter shape across the index range, which
-/// gives good roundtrip SNR without a full RFC codebook search.
-///
-/// Taps are in the same {Q7/128} normalisation the decoder returns.
+/// Returns the RFC Tables 39-41 Q7 coefficients divided by 128.0,
+/// exactly matching the decoder path. For indices beyond the table size,
+/// falls back to the last valid entry.
 pub fn ltp_filter_from_index(idx: usize, periodicity: usize) -> [f32; 5] {
-    // Smooth interpolation across the index range. The real RFC Tables 39-41
-    // are non-monotone and require a proper codebook search (deferred). The
-    // approximation preserves encoder↔decoder symmetry for self-encoded
-    // streams, which is what the roundtrip unit tests exercise.
-    let _ = periodicity;
-    let s = (idx as f32 - 4.0) / 32.0;
+    let row: [i8; 5] = match periodicity {
+        0 => {
+            let i = idx.min(LTP_P0_Q7.len() - 1);
+            LTP_P0_Q7[i]
+        }
+        1 => {
+            let i = idx.min(LTP_P1_Q7.len() - 1);
+            LTP_P1_Q7[i]
+        }
+        _ => {
+            let i = idx.min(LTP_P2_Q7.len() - 1);
+            LTP_P2_Q7[i]
+        }
+    };
     [
-        -0.05 - s * 0.02,
-        0.10,
-        0.70 + s * 0.10,
-        0.10,
-        -0.05 - s * 0.02,
+        row[0] as f32 / 128.0,
+        row[1] as f32 / 128.0,
+        row[2] as f32 / 128.0,
+        row[3] as f32 / 128.0,
+        row[4] as f32 / 128.0,
     ]
 }
 

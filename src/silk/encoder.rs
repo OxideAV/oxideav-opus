@@ -557,30 +557,43 @@ impl SilkFrameEncoder {
         // filter indices but the analyser is frame-level).
         let periodicity = LTP_PERIODICITY_VOICED;
         let primary_lag = pitch.lag_internal;
-        let ltp_filter_idx = ltp::pick_ltp_filter_index(pitch.correlation, periodicity);
+        // Use the proper codebook search against the LTP history when we
+        // have a valid lag; fall back to correlation-based index otherwise.
+        let ltp_filter_idx = if primary_lag > 2 {
+            ltp::pick_ltp_filter_from_history(
+                pcm_internal,
+                &self.ltp_history,
+                primary_lag,
+                periodicity,
+            )
+        } else {
+            ltp::pick_ltp_filter_index(pitch.correlation, periodicity)
+        };
         let ltp_taps = ltp::ltp_filter_from_index(ltp_filter_idx, periodicity);
 
         // Per-subframe pitch lags — use the primary lag everywhere (the
         // decoder's `expand_pitch_contour` does the same).
         let pitch_lags = vec![primary_lag; self.n_subframes];
 
-        // LTP scaling (Q14 → f32). The post-§4.2.7.9.1 spec residual is
-        //   res[i] = e_Q23[i]/2^23 + sum_k(res[i-pitch+2-k] * b_Q7[k]/128)
-        // — there is no extra ltp_scale_q14 factor on the synthesis side
-        // (that field only matters in the §4.2.7.9.1 rewhitening branch
-        // which our MVP doesn't implement). We therefore sum the LTP
-        // contribution at unit weight; the encoder's pred = lpc + g*ltp
-        // because the synth filter applies `g` to the entire residual.
+        // LTP scaling (Q14 → f32). RFC §4.2.7.9.1 residual:
+        //   res[i] = g*e[i] + sum_k(b_Q7[k]/128 * ltp_scale * res[i-pitch+2-k])
+        // The encoder mirrors the decoder: LTP operates in *residual* space,
+        // not output space. We keep a separate res[] buffer for this purpose.
         let ltp_scale_q14 = LTP_SCALE_Q14_VOICED;
+        let ltp_scale = ltp_scale_q14 as f32 / 16384.0;
 
         // Shell-quantise with LTP subtraction.
+        // `res[]` mirrors synth.rs `res_ring[]` — pre-LPC residual values.
+        // `out[]` mirrors synth.rs `lpc_ring[]` — post-LPC unclamped output.
         let synth_hist = self.prev_synth.clone();
         let ltp_hist_len = self.ltp_history.len();
         let mut out = vec![0f32; frame_len];
+        let mut res_enc = vec![0f32; frame_len]; // residual history (pre-LPC)
         let mut signed_mags = vec![0i32; frame_len];
 
         let mut lcg_state = ENCODER_LCG_SEED;
         for n in 0..frame_len {
+            // LPC prediction reads from post-LPC output history.
             let mut lpc_pred = 0f32;
             for k in 1..=order {
                 let idx = n as i32 - k as i32;
@@ -591,17 +604,17 @@ impl SilkFrameEncoder {
                 };
                 lpc_pred += lpc[k - 1] * past;
             }
+            // LTP prediction reads from residual history (RFC §4.2.7.9.1).
             let mut ltp_sum = 0f32;
             for k in 0..5 {
-                let lag_k = primary_lag + (k as i32 - 2);
-                let idx = n as i32 - lag_k;
+                let idx = n as i32 - primary_lag + 2 - k as i32;
                 let past = if idx >= 0 {
-                    out[idx as usize]
+                    res_enc[idx as usize]
                 } else {
                     let hi = (ltp_hist_len as i32 + idx) as usize;
                     self.ltp_history.get(hi).copied().unwrap_or(0.0)
                 };
-                ltp_sum += ltp_taps[k] * past;
+                ltp_sum += ltp_taps[k] * ltp_scale * past;
             }
             let e_desired_q0 = (pcm_internal[n] - lpc_pred - ltp_sum) / g;
             let flip = lcg_pre_flip(lcg_state);
@@ -614,14 +627,17 @@ impl SilkFrameEncoder {
             let (e_q23, next_state) = lcg_step_q23(lcg_state, signed, offset_q23);
             lcg_state = next_state;
             let e_quant = g * (e_q23 as f32 * inv_q23) + ltp_sum;
-            out[n] = (e_quant + lpc_pred).clamp(-1.0, 1.0);
+            res_enc[n] = e_quant; // store residual (pre-LPC)
+            out[n] = e_quant + lpc_pred; // unclamped for LPC feedback
         }
         let aligned = signed_mags.len().div_ceil(16) * 16;
         signed_mags.resize(aligned, 0);
         let recon = super::shell::quantize_to_shell(&signed_mags);
         out.fill(0.0);
+        res_enc.fill(0.0);
         let mut lcg_state = ENCODER_LCG_SEED;
         for n in 0..frame_len {
+            // LPC prediction reads from post-LPC output history.
             let mut lpc_pred = 0f32;
             for k in 1..=order {
                 let idx = n as i32 - k as i32;
@@ -632,22 +648,23 @@ impl SilkFrameEncoder {
                 };
                 lpc_pred += lpc[k - 1] * past;
             }
+            // LTP prediction reads from residual history (RFC §4.2.7.9.1).
             let mut ltp_sum = 0f32;
             for k in 0..5 {
-                let lag_k = primary_lag + (k as i32 - 2);
-                let idx = n as i32 - lag_k;
+                let idx = n as i32 - primary_lag + 2 - k as i32;
                 let past = if idx >= 0 {
-                    out[idx as usize]
+                    res_enc[idx as usize]
                 } else {
                     let hi = (ltp_hist_len as i32 + idx) as usize;
                     self.ltp_history.get(hi).copied().unwrap_or(0.0)
                 };
-                ltp_sum += ltp_taps[k] * past;
+                ltp_sum += ltp_taps[k] * ltp_scale * past;
             }
             let (e_q23, next_state) = lcg_step_q23(lcg_state, recon[n], offset_q23);
             lcg_state = next_state;
             let e_quant = g * (e_q23 as f32 * inv_q23) + ltp_sum;
-            out[n] = (e_quant + lpc_pred).clamp(-1.0, 1.0);
+            res_enc[n] = e_quant; // store residual (pre-LPC)
+            out[n] = e_quant + lpc_pred; // unclamped for LPC feedback
         }
         signed_mags = recon;
 
@@ -689,13 +706,16 @@ impl SilkFrameEncoder {
         let _ = pitch_lags; // currently passed via primary_lag directly
         super::shell::encode_excitation(enc, &signed_mags, signal_type, 0);
 
-        // Advance state. `prev_synth` and ltp_history both carry the
-        // CLAMPED out[]; matches decoder convention now that the
-        // decoder's LPC history is clamped too.
+        // Advance state.
+        // `prev_synth` carries the *unclamped* out[] for next frame's LPC
+        // feedback — mirrors decoder's lpc_history which holds the unclamped
+        // lpc_ring values (synth.rs: `state.lpc_history = lpc_ring[...]`).
+        // `ltp_history` carries the pre-LPC residuals res_enc[] — mirrors
+        // synth.rs which stores res_ring[] (not the clamped output).
         let start = out.len().saturating_sub(order);
         self.prev_synth.clear();
         self.prev_synth.extend_from_slice(&out[start..]);
-        shift_ltp_history(&mut self.ltp_history, &out);
+        shift_ltp_history(&mut self.ltp_history, &res_enc);
         self.prev_pitch_lag = primary_lag;
 
         Ok(())

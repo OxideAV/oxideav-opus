@@ -22,11 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **RFC 6716 Tables 39-41 LTP codebook transcription** — the exact Q7
   coefficients for periodicity indices 0 (8 entries), 1 (16 entries), and
   2 (32 entries) are transcribed from the RFC into `ltp.rs` as named
-  constants (`LTP_P0_Q7`, `LTP_P1_Q7`, `LTP_P2_Q7`). A helper
-  `pick_ltp_filter_from_history` is provided for future proper open-loop
-  codebook search. The encoder-side `ltp_filter_from_index` continues to
-  use the smooth linear approximation until a full codebook search is
-  implemented.
+  constants (`LTP_P0_Q7`, `LTP_P1_Q7`, `LTP_P2_Q7`). The encoder now uses
+  `pick_ltp_filter_from_history` (proper cross-correlation codebook search)
+  for voiced frames when the pitch lag exceeds 2; `ltp_filter_from_index`
+  (correlation-index map) is retained as a fallback.
 
 ### Fixed
 
@@ -37,6 +36,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for 10 ms frames"), so for 10 ms encode paths the range coder lost sync
   after the NLSF block. All three 10 ms internal-rate SNR roundtrip tests
   (`encode_decode_nb/mb/wb_10ms_internal_rate_snr`) now pass.
+
+- **RFC §4.2.7.9.1 rewhitening — LTP now operates in residual space** —
+  the SILK synthesis filter (`synth.rs`) previously fed the post-LPC
+  clamped output back into the LTP loop; it now maintains a separate
+  `res_ring` buffer for pre-LPC residuals and stores that in
+  `state.ltp_history` instead. The encoder's voiced path is updated in
+  lockstep: `res_enc[]` replaces `out[]` as the LTP history, and
+  `ltp_scale_q14` is applied consistently in both encoder and decoder.
+  This aligns with libopus `silk_LTP_analysis_filter_FIX.c` semantics and
+  improves MB cross-decode SNR by 0.11 dB (17.82→17.93 dB).
 
 ### Changed
 

@@ -16,6 +16,13 @@
 //! factor w_Q2 < 4, sub-frames 0 and 1 use LPC coefficients derived from
 //! the interpolated NLSFs. The caller passes `lpc_per_sf` with one LPC
 //! array per sub-frame; this function selects the right one for each sf.
+//!
+//! §4.2.7.9.1 Rewhitening: for voiced frames the LTP residual `res[]` is
+//! computed separately from the LPC synthesis output `out[]`. The LTP
+//! feedback loop runs in residual space (pre-LPC-synthesis), not in output
+//! space. This is the "rewhitening" pass referred to in the RFC and libopus
+//! source (silk_LTP_analysis_filter_FIX.c). Keeping separate `res_ring[]`
+//! and `out[]` histories is critical for correct voiced reconstruction.
 
 use crate::silk::SilkChannelState;
 
@@ -50,7 +57,6 @@ pub fn synthesize(
     interp_coef: u8,
     state: &mut SilkChannelState,
 ) -> Vec<f32> {
-    let _ = ltp_scale_q14;
     let _ = interp_coef;
     let frame_len = excitation.len();
     let mut out = vec![0f32; frame_len];
@@ -59,86 +65,103 @@ pub fn synthesize(
     if state.lpc_history.len() < lpc_order {
         state.lpc_history.resize(lpc_order, 0.0);
     }
+    // The LTP history stores the *residual* values (res[]) from which
+    // LTP predictions are drawn, per RFC §4.2.7.9.1. The history must
+    // be long enough to hold the maximum pitch lag (288 samples for WB)
+    // plus the LTP filter half-width (2 samples either side of centre).
+    // 480 samples is sufficient for all bandwidths.
     let ltp_hist_len = 480usize;
     if state.ltp_history.len() < ltp_hist_len {
         state.ltp_history.resize(ltp_hist_len, 0.0);
     }
 
-    // Per RFC §4.2.7.9.2 the LPC ring keeps the *unclamped* lpc[i]
-    // values for next-subframe feedback, while the *clamped* out[i] is
-    // exported. Splitting them is needed to keep the IIR behaviour the
-    // RFC specifies — feeding clamped values back into the filter
-    // under-drives the synthesis whenever the unclamped values exceed ±1
-    // (common when `g` is large or the NLSF template is mismatched to
-    // the source signal).
+    // RFC §4.2.7.9.1 / §4.2.7.9.2 two-stage synthesis:
+    //
+    //   Stage 1 — LTP (voiced only): build residual res[] from excitation
+    //   and past residuals. LTP feedback is in *residual* space so the
+    //   LTP filter sees the pre-LPC-synthesis signal, not the all-pole
+    //   output (this is the "rewhitening" distinction from §4.2.7.9.1).
+    //
+    //   Stage 2 — LPC synthesis: run the all-pole short-term IIR on res[]
+    //   to get out[]. The feedback in stage 2 is the *unclamped* IIR
+    //   output (pre-clamp) so the AR filter stays accurate even when
+    //   individual samples clip.
+    //
+    // Keeping a separate res_ring[] is necessary because LTP taps index
+    // res[i - lag + 2 - k], which crosses sub-frame boundaries and even
+    // crosses into the previous frame (via state.ltp_history). Using
+    // out[] for LTP would mix the LPC gain into the LTP loop twice.
+
+    // LTP scale factor: Q14 → float. RFC §4.2.7.6.3 Table 43 values
+    // {15565, 12288, 8192} divide by 16384.0.
+    let ltp_scale = ltp_scale_q14 as f32 / 16384.0;
+
+    // Per-frame residual buffer. Used for LTP indexing within this frame;
+    // the sub-frame loop writes here before using it for LPC.
+    let mut res_ring = vec![0.0f32; frame_len];
+
+    // Per-frame LPC ring: unclamped IIR values for cross-subframe feedback.
     let mut lpc_ring = vec![0.0f32; frame_len];
 
     for sf in 0..n_subframes {
         let sf_start = sf * subframe_len;
         let sf_end = sf_start + subframe_len;
         let lpc = &lpc_per_sf[sf];
-        // Overall short-term LPC gain for this sub-frame (Q16 → f32).
-        // RFC §4.2.7.9.2: lpc[i] = (gain_Q16[s]/65536) * res[i] + …
+        // Overall gain: Q16 → f32.
         let g = gains_q16[sf].max(1) as f32 / 65536.0;
         let taps = &ltp_filter[sf];
         let lag = pitch_lags[sf];
 
         for n in sf_start..sf_end {
-            // RFC §4.2.7.9.1 voiced residual: res[i] = e_Q23[i]/2^23 +
-            // sum_{k=0..5} res[i - pitch_lag + 2 - k] * b_Q7[k]/128.
-            // Apply the gain to the excitation first; the LTP feedback is
-            // added at unit weight because our MVP reads `past` from the
-            // post-LPC `out[]` buffer (which is approximately `g * res[]`),
-            // so multiplying again by `g` would re-apply the gain and make
-            // the LTP loop unstable. This approximation is audibility-correct
-            // for an MVP (strict spec-bit-exactness requires a separate
-            // res[] ring and rewhitening, deferred).
-            let mut s = g * excitation[n];
+            // RFC §4.2.7.9.1 voiced residual.
+            let mut res = g * excitation[n];
             if voiced && lag > 0 {
-                for k in 0..5 {
-                    // RFC §4.2.7.9.1: res[i - pitch_lag + 2 - k].
+                for k in 0..5usize {
                     let idx = n as i32 - lag + 2 - k as i32;
-                    let past = if idx >= 0 && (idx as usize) < n {
-                        out[idx as usize]
+                    let past_res = if idx >= 0 && (idx as usize) < n {
+                        res_ring[idx as usize]
                     } else if idx >= 0 {
                         0.0
                     } else {
-                        let hi = (ltp_hist_len as i32 + idx) as usize;
-                        state.ltp_history.get(hi).copied().unwrap_or(0.0)
+                        let abs_j = ltp_hist_len as i32 + idx;
+                        if abs_j >= 0 {
+                            state.ltp_history[abs_j as usize]
+                        } else {
+                            0.0
+                        }
                     };
-                    s += taps[k] * past;
+                    res += taps[k] * ltp_scale * past_res;
                 }
             }
+            res_ring[n] = res;
 
-            // Short-term all-pole LPC synthesis. RFC 6716 §4.2.7.9.2
-            // feeds the *unclamped* lpc[i] (pre-clamp) into the sum
-            // for next-sample prediction.
+            // Stage 2: LPC synthesis.
+            let mut s = res;
             for k in 1..=lpc_order {
                 let idx = n as i32 - k as i32;
-                let past = if idx >= 0 {
+                let past_out = if idx >= 0 {
                     lpc_ring[idx as usize]
                 } else {
                     let h_idx = (state.lpc_history.len() as i32 + idx) as usize;
                     state.lpc_history.get(h_idx).copied().unwrap_or(0.0)
                 };
-                s += lpc[k - 1] * past;
+                s += lpc[k - 1] * past_out;
             }
             lpc_ring[n] = s;
-            // RFC §4.2.7.9.2: out[i] = clamp(-1.0, lpc[i], 1.0).
             out[n] = s.clamp(-1.0, 1.0);
         }
     }
 
-    // Update state history for next frame — RFC §4.2.7.9.2 carries the
-    // *unclamped* lpc_ring values into the next subframe's LPC sum.
+    // Persist LPC history (unclamped values for next frame's IIR).
     let lpc_keep = lpc_order.min(lpc_ring.len());
     state.lpc_history = lpc_ring[lpc_ring.len() - lpc_keep..].to_vec();
 
-    // Shift LTP history.
+    // Persist LTP history: shift in the residuals from this frame so the
+    // next frame's LTP lookup can reach them.
     let keep = ltp_hist_len.saturating_sub(frame_len);
     let mut new_ltp = Vec::with_capacity(ltp_hist_len);
     new_ltp.extend_from_slice(&state.ltp_history[ltp_hist_len - keep..]);
-    new_ltp.extend_from_slice(&out);
+    new_ltp.extend_from_slice(&res_ring);
     if new_ltp.len() > ltp_hist_len {
         let drop = new_ltp.len() - ltp_hist_len;
         new_ltp.drain(0..drop);
