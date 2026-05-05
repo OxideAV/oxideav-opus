@@ -479,10 +479,13 @@ impl SilkFrameEncoder {
         };
         enc.encode_icdf(NLSF_STAGE1_IDX, stage1_icdf, 8);
         encode_nlsf_stage2(enc, NLSF_STAGE1_IDX, &residuals, order == 16);
-        // §4.2.7.5.5 interpolation factor — pick sym=4 (the highest-prob
-        // entry per the RFC PDF) so the decoder doesn't try to interpolate
-        // against a non-existent prior frame.
-        enc.encode_icdf(4, &tables::NLSF_INTERP_ICDF, 8);
+        // §4.2.7.5.5 interpolation factor — only emitted for 20 ms frames
+        // (RFC §4.2.7.5.5: "This field is not transmitted for 10 ms frames").
+        // Decoder reads it only when n_subframes == 4; if we emit it for 10 ms
+        // frames the decoder will not consume it and the bitstream desyncs.
+        if self.n_subframes == 4 {
+            enc.encode_icdf(4, &tables::NLSF_INTERP_ICDF, 8);
+        }
 
         // §4.2.7.6 LTP — unvoiced, decoder skips LTP bits.
 
@@ -553,12 +556,12 @@ impl SilkFrameEncoder {
         // taps for every sub-frame (MVP — the spec allows per-sub-frame
         // filter indices but the analyser is frame-level).
         let periodicity = LTP_PERIODICITY_VOICED;
+        let primary_lag = pitch.lag_internal;
         let ltp_filter_idx = ltp::pick_ltp_filter_index(pitch.correlation, periodicity);
         let ltp_taps = ltp::ltp_filter_from_index(ltp_filter_idx, periodicity);
 
         // Per-subframe pitch lags — use the primary lag everywhere (the
         // decoder's `expand_pitch_contour` does the same).
-        let primary_lag = pitch.lag_internal;
         let pitch_lags = vec![primary_lag; self.n_subframes];
 
         // LTP scaling (Q14 → f32). The post-§4.2.7.9.1 spec residual is
@@ -664,7 +667,10 @@ impl SilkFrameEncoder {
         };
         enc.encode_icdf(NLSF_STAGE1_IDX, stage1_icdf, 8);
         encode_nlsf_stage2(enc, NLSF_STAGE1_IDX, &residuals, order == 16);
-        enc.encode_icdf(4, &tables::NLSF_INTERP_ICDF, 8);
+        // §4.2.7.5.5: interpolation factor only emitted for 20 ms frames.
+        if self.n_subframes == 4 {
+            enc.encode_icdf(4, &tables::NLSF_INTERP_ICDF, 8);
+        }
 
         // §4.2.7.6 LTP bitstream.
         ltp::encode_primary_pitch_lag(enc, self.params.bandwidth, primary_lag, self.prev_pitch_lag);

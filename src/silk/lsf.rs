@@ -22,10 +22,9 @@
 //!
 //! What stays MVP:
 //!
-//! * §4.2.7.5.5 frame-to-frame LSF interpolation (the 2-bit factor is
-//!   parsed and emitted to the caller, but interpolation against the
-//!   previous frame's NLSFs is left to the synthesis layer — the
-//!   bitstream stays in sync regardless).
+//! * §4.2.7.5.5 frame-to-frame LSF interpolation: the 2-bit factor is
+//!   parsed and returned to the caller, which uses it to compute
+//!   interpolated NLSFs for sub-frames 0-1 of 20 ms frames.
 //! * §4.2.7.5.7 / §4.2.7.5.8 LPC bandwidth-expansion + prediction-gain
 //!   limiting are reduced to a small bandwidth-expansion safety
 //!   factor (γ^k); the synthesis filter is float, not Q12 fixed-point,
@@ -41,13 +40,18 @@ use crate::toc::OpusBandwidth;
 /// Decode the NLSF coefficients for a SILK frame at the given
 /// bandwidth + signal type.
 ///
-/// Returns NLSF in Q15 (each entry in `[1, 32767]`, monotonically
-/// increasing). Length is 10 for NB/MB, 16 for WB.
+/// Returns `(nlsf_q15, interp_coef_q2)` where:
+/// * `nlsf_q15` — NLSF in Q15 (each entry in `[1, 32767]`, monotonically
+///   increasing). Length is 10 for NB/MB, 16 for WB.
+/// * `interp_coef_q2` — 2-bit interpolation factor from §4.2.7.5.5 (Table 26).
+///   Values 0..=3 mean "interpolate subframes 0-1"; value 4 means "no interp".
+///   Always 4 for 10 ms frames (caller must override it before calling this).
 pub fn decode_nlsf(
     rc: &mut RangeDecoder<'_>,
     bw: OpusBandwidth,
     signal_type: u8,
-) -> Result<Vec<i16>> {
+    is_20ms: bool,
+) -> Result<(Vec<i16>, u8)> {
     let voiced = signal_type == 2;
     let is_wb = matches!(bw, OpusBandwidth::Wideband);
     let order = if is_wb { 16 } else { 10 };
@@ -95,12 +99,14 @@ pub fn decode_nlsf(
     }
 
     // -------------------------------------------------------------
-    // §4.2.7.5.5 Interpolation factor (Table 26). We parse it so the
-    // bitstream stays aligned; the value isn't used inside this
-    // function, but the caller may consume it via `state.prev_nlsf_q15`
-    // bookkeeping. (Future work: thread w_Q2 to the synthesis path.)
+    // §4.2.7.5.5 Interpolation factor (Table 26). Only coded for 20 ms
+    // frames; 10 ms frames implicitly use w_Q2 = 4 (no interpolation).
     // -------------------------------------------------------------
-    let _interp_coef = rc.decode_icdf(&tables::NLSF_INTERP_ICDF, 8);
+    let interp_coef: u8 = if is_20ms {
+        rc.decode_icdf(&tables::NLSF_INTERP_ICDF, 8) as u8
+    } else {
+        4
+    };
 
     // -------------------------------------------------------------
     // §4.2.7.5.2 Inverse backwards prediction
@@ -163,7 +169,7 @@ pub fn decode_nlsf(
     // -------------------------------------------------------------
     // §4.2.7.5.4 Stabilise (monotone, min-spacing).
     // -------------------------------------------------------------
-    Ok(stabilize(&nlsf_q15, is_wb))
+    Ok((stabilize(&nlsf_q15, is_wb), interp_coef))
 }
 
 /// Backwards-prediction weight selector (`pred_Q8[k]`) from Tables
@@ -388,7 +394,7 @@ pub fn nlsf_to_lpc(nlsf_q15: &[i16], _bw: OpusBandwidth) -> Vec<f32> {
     // coefficient stability check; our synthesiser is float, so we use
     // a cheap proxy: detect filter resonance via the DC response
     // (`|sum(lpc)|` close to 1 means the IIR is near-singular) and apply
-    // up to 16 chirp rounds at γ = 0.99 until the DC margin opens up.
+    // up to 32 chirp rounds at γ = 0.85 until the DC margin opens up.
     // A final γ = 0.98 chirp keeps modest filters comfortably bounded.
     let mut lpc = vec![0f32; order];
     for k in 0..order {
@@ -396,7 +402,7 @@ pub fn nlsf_to_lpc(nlsf_q15: &[i16], _bw: OpusBandwidth) -> Vec<f32> {
     }
     // Iteratively bandwidth-expand if the DC response leaves too little
     // headroom — IIR gain is `1/(1-dc)` so dc=0.5 → gain ≈ 2, dc=0.7 →
-    // gain ≈ 3.3, dc=0.8 → gain ≈ 5. Target dc < 0.5 keeps the
+    // gain ≈ 3.3, dc=0.8 → gain ≈ 5. Target dc < 0.02 keeps the
     // synthesis filter solidly inside [-1, 1] for sustained inputs.
     for _round in 0..32 {
         let dc: f32 = lpc.iter().sum();

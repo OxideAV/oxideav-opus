@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **RFC 6716 §4.2.7.5.5 LSF interpolation** — implemented for 20 ms SILK
+  frames. `silk::lsf::decode_nlsf` now returns `(nlsf_q15, interp_coef_q2)`
+  and the decoder builds per-sub-frame LPC coefficient vectors: sub-frames 0
+  and 1 use NLSFs interpolated between the previous frame's NLSFs (`n0_Q15`)
+  and the current frame's NLSFs (`n2_Q15`) according to
+  `n1_Q15[k] = n0_Q15[k] + (w_Q2*(n2_Q15[k]-n0_Q15[k]) >> 2)` when
+  `w_Q2 < 4`; sub-frames 2 and 3 always use the uninterpolated NLSFs. The
+  SILK decoder now stores `prev_nlsf_q15` across frames and forces
+  `w_Q2 = 4` on the first frame or after a decoder reset.
+
+- **RFC 6716 Tables 39-41 LTP codebook transcription** — the exact Q7
+  coefficients for periodicity indices 0 (8 entries), 1 (16 entries), and
+  2 (32 entries) are transcribed from the RFC into `ltp.rs` as named
+  constants (`LTP_P0_Q7`, `LTP_P1_Q7`, `LTP_P2_Q7`). A helper
+  `pick_ltp_filter_from_history` is provided for future proper open-loop
+  codebook search. The encoder-side `ltp_filter_from_index` continues to
+  use the smooth linear approximation until a full codebook search is
+  implemented.
+
+### Fixed
+
+- **Encoder bitstream desynced for 10 ms SILK frames** — the encoder
+  previously emitted `NLSF_INTERP_ICDF` (the §4.2.7.5.5 interpolation
+  factor) for both 10 ms and 20 ms frames. The decoder only reads this
+  field for 20 ms frames (RFC §4.2.7.5.5: "This field is not transmitted
+  for 10 ms frames"), so for 10 ms encode paths the range coder lost sync
+  after the NLSF block. All three 10 ms internal-rate SNR roundtrip tests
+  (`encode_decode_nb/mb/wb_10ms_internal_rate_snr`) now pass.
+
 ### Changed
 
 - **`register` entry point unified on `RuntimeContext`** (task #502).

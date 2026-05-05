@@ -8,35 +8,37 @@
 //! emits the post-§4.2.7.8.6 reconstructed value already divided by
 //! 2^23). Per RFC §4.2.7.9.1 the unvoiced residual is the excitation
 //! verbatim; the voiced residual additionally folds in five rescaled
-//! past-residual taps via the LTP filter. §4.2.7.9.2 then runs the
-//! short-term all-pole LPC synthesis with the scalar gain factor
-//! `gain_Q16[s]/65536`, and the final output is clamped to [-1, 1].
+//! past LTP taps via the LTP filter. §4.2.7.9.2 then runs the short-term
+//! all-pole LPC synthesis with the scalar gain factor `gain_Q16[s]/65536`,
+//! and the final output is clamped to [-1, 1].
 //!
-//! This MVP keeps the filter strictly causal — it does not implement
-//! the §4.2.7.9.1 "rewhitening" path that re-derives residual values
-//! across an LSF interpolation boundary, so the LTP history carries
-//! the *clamped* `out[]` samples instead of the unclamped `lpc[]`.
-//! That's audibility-correct but not bit-exact.
+//! LSF interpolation (§4.2.7.5.5): for 20 ms frames where the interpolation
+//! factor w_Q2 < 4, sub-frames 0 and 1 use LPC coefficients derived from
+//! the interpolated NLSFs. The caller passes `lpc_per_sf` with one LPC
+//! array per sub-frame; this function selects the right one for each sf.
 
 use crate::silk::SilkChannelState;
 
 /// Synthesize internal-rate output from excitation + filter parameters.
 ///
 /// * `excitation` — Q0 excitation samples, length = frame_len.
-/// * `lpc` — LPC coefficients (length = `lpc_order`).
-/// * `gains_q16` — per sub-frame synthesis gain (Q16). Length must
-///   match `n_subframes`.
-/// * `pitch_lags` / `ltp_filter` — per sub-frame LTP params; applied
-///   for voiced sub-frames. Length must match `n_subframes`.
-/// * `ltp_scale_q14` — LTP scaling factor (Q14).
+/// * `lpc_per_sf` — per-sub-frame LPC coefficients (length `n_subframes`).
+///   Each entry has length `lpc_order`. Sub-frames 0-1 may carry
+///   interpolated NLSFs when `interp_coef < 4`; sub-frames 2-3 always
+///   use the uninterpolated NLSFs.
+/// * `gains_q16` — per sub-frame synthesis gain (Q16).
+/// * `pitch_lags` / `ltp_filter` — per sub-frame LTP params.
+/// * `ltp_scale_q14` — LTP scaling factor (Q14, decoded per §4.2.7.6.3).
 /// * `subframe_len` — sub-frame length at internal rate (40/60/80).
 /// * `n_subframes` — 2 for a 10 ms SILK frame, 4 for a 20 ms frame.
 /// * `lpc_order` — 10 for NB/MB, 16 for WB.
 /// * `voiced` — apply LTP only when true.
-/// * `state` — persistent state (history buffers, prev gain).
+/// * `interp_coef` — w_Q2 from §4.2.7.5.5 (4 = no interpolation). Unused
+///   in the synthesis itself; carried for callers that thread it through.
+/// * `state` — persistent state (history buffers).
 pub fn synthesize(
     excitation: &[f32],
-    lpc: &[f32],
+    lpc_per_sf: &[Vec<f32>],
     gains_q16: &[i32],
     pitch_lags: &[i32],
     ltp_filter: &[[f32; 5]],
@@ -45,8 +47,11 @@ pub fn synthesize(
     n_subframes: usize,
     lpc_order: usize,
     voiced: bool,
+    interp_coef: u8,
     state: &mut SilkChannelState,
 ) -> Vec<f32> {
+    let _ = ltp_scale_q14;
+    let _ = interp_coef;
     let frame_len = excitation.len();
     let mut out = vec![0f32; frame_len];
 
@@ -59,29 +64,21 @@ pub fn synthesize(
         state.ltp_history.resize(ltp_hist_len, 0.0);
     }
 
-    // `ltp_scale_q14` is unused on the synthesis side once the §4.2.7.8.6
-    // Q23-scaled excitation reaches us — it only matters in the spec's
-    // §4.2.7.9.1 "rewhitening" branch which our MVP doesn't implement.
-    // Keep the parameter so callers don't have to thread a No-op.
-    let _ = ltp_scale_q14;
-
     // Per RFC §4.2.7.9.2 the LPC ring keeps the *unclamped* lpc[i]
     // values for next-subframe feedback, while the *clamped* out[i] is
     // exported. Splitting them is needed to keep the IIR behaviour the
-    // RFC specifies — the previous MVP fed clamped values back into the
-    // filter, which under-drove the synthesis whenever the unclamped
-    // values exceeded ±1 (common when `g` is large or the fixed-NLSF
-    // template is mismatched to the source signal).
-    let mut lpc_ring = vec![0.0f32; out.len()];
+    // RFC specifies — feeding clamped values back into the filter
+    // under-drives the synthesis whenever the unclamped values exceed ±1
+    // (common when `g` is large or the NLSF template is mismatched to
+    // the source signal).
+    let mut lpc_ring = vec![0.0f32; frame_len];
 
     for sf in 0..n_subframes {
         let sf_start = sf * subframe_len;
         let sf_end = sf_start + subframe_len;
+        let lpc = &lpc_per_sf[sf];
         // Overall short-term LPC gain for this sub-frame (Q16 → f32).
         // RFC §4.2.7.9.2: lpc[i] = (gain_Q16[s]/65536) * res[i] + …
-        // Excitation arrives in Q23 / 2^23 form already, so multiplying
-        // by `gain_q16/65536` reproduces the spec's per-sample
-        // input level directly.
         let g = gains_q16[sf].max(1) as f32 / 65536.0;
         let taps = &ltp_filter[sf];
         let lag = pitch_lags[sf];
@@ -89,16 +86,13 @@ pub fn synthesize(
         for n in sf_start..sf_end {
             // RFC §4.2.7.9.1 voiced residual: res[i] = e_Q23[i]/2^23 +
             // sum_{k=0..5} res[i - pitch_lag + 2 - k] * b_Q7[k]/128.
-            // For unvoiced frames res[i] = e_Q23[i]/2^23 only — the LTP
-            // taps decoder skipped because no LTP block was emitted.
-            // Apply the gain to the §4.2.7.8.6 reconstructed excitation
-            // first; the LTP feedback term is added at unit weight
-            // because our MVP reads `past` from the post-LPC `out[]`
-            // buffer (which is approximately `g * res[]`), so multiplying
-            // again by `g` would re-apply the gain and turn the LTP loop
-            // unstable. Strict spec-bit-exactness keeps `res[]` and
-            // `out[]` separate and applies `g` only to `res[i]`; that
-            // refactor is deferred (see crate README "libopus interop").
+            // Apply the gain to the excitation first; the LTP feedback is
+            // added at unit weight because our MVP reads `past` from the
+            // post-LPC `out[]` buffer (which is approximately `g * res[]`),
+            // so multiplying again by `g` would re-apply the gain and make
+            // the LTP loop unstable. This approximation is audibility-correct
+            // for an MVP (strict spec-bit-exactness requires a separate
+            // res[] ring and rewhitening, deferred).
             let mut s = g * excitation[n];
             if voiced && lag > 0 {
                 for k in 0..5 {

@@ -493,9 +493,56 @@ fn decode_frame_body(
         }
     }
 
-    // §4.2.7.5 NLSF decoding.
-    let nlsf_q15 = lsf::decode_nlsf(rc, bandwidth, signal_type)?;
-    let lpc = lsf::nlsf_to_lpc(&nlsf_q15, bandwidth);
+    // §4.2.7.5 NLSF decoding + §4.2.7.5.5 LSF interpolation.
+    //
+    // For 20 ms frames: `interp_coef` (w_Q2) is 0..=4. When < 4, the first
+    // two sub-frames use NLSFs interpolated between the previous frame's
+    // final NLSFs (n0_Q15) and the current frame's NLSFs (n2_Q15):
+    //   n1_Q15[k] = n0_Q15[k] + (w_Q2*(n2_Q15[k] - n0_Q15[k]) >> 2)
+    // For 10 ms frames: always w_Q2 = 4 (no interpolation).
+    // After an uncoded side-channel frame or decoder reset: force w_Q2 = 4.
+    let is_20ms = n_subframes == SUBFRAMES_20MS;
+    let (nlsf_q15, raw_interp_coef) =
+        lsf::decode_nlsf(rc, bandwidth, signal_type, is_20ms)?;
+
+    // Force w_Q2 = 4 on the first frame (decoder-reset equivalent) or when
+    // the previous frame's NLSFs aren't available.
+    let interp_coef: u8 = if state.first_frame || state.prev_nlsf_q15.is_empty() {
+        4
+    } else {
+        raw_interp_coef
+    };
+
+    // Build per-sub-frame LPC arrays.
+    // Sub-frames 0-1 use interpolated NLSFs when w_Q2 < 4; sub-frames 2-3
+    // (and 10 ms frames) always use the uninterpolated n2_Q15.
+    let lpc_uninterp = lsf::nlsf_to_lpc(&nlsf_q15, bandwidth);
+    let lpc_per_sf: Vec<Vec<f32>> = (0..n_subframes)
+        .map(|sf| {
+            // §4.2.7.5.5: first two sub-frames of a 20 ms frame are
+            // interpolated when w_Q2 < 4.
+            if is_20ms && sf < 2 && interp_coef < 4 {
+                let order = nlsf_q15.len();
+                let prev = &state.prev_nlsf_q15;
+                if prev.len() == order {
+                    let w = interp_coef as i32;
+                    let n1_q15: Vec<i16> = (0..order)
+                        .map(|k| {
+                            let n0 = prev[k] as i32;
+                            let n2 = nlsf_q15[k] as i32;
+                            let n1 = n0 + (w * (n2 - n0) >> 2);
+                            n1.clamp(0, 32767) as i16
+                        })
+                        .collect();
+                    lsf::nlsf_to_lpc(&n1_q15, bandwidth)
+                } else {
+                    lpc_uninterp.clone()
+                }
+            } else {
+                lpc_uninterp.clone()
+            }
+        })
+        .collect();
 
     // §4.2.7.6.1 Primary pitch lag (voiced only).
     let mut pitch_lags = vec![0i32; n_subframes];
@@ -547,7 +594,7 @@ fn decode_frame_body(
     // §4.2.7.9 Synthesis.
     let output = synth::synthesize(
         &excitation,
-        &lpc,
+        &lpc_per_sf,
         &gains_q16,
         &pitch_lags,
         &ltp_filter,
@@ -556,6 +603,7 @@ fn decode_frame_body(
         n_subframes,
         lpc_order,
         voiced,
+        interp_coef,
         state,
     );
 
