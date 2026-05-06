@@ -84,9 +84,14 @@ pub struct SilkChannelState {
     pub prev_nlsf_q15: Vec<i16>,
     /// Synthesis output buffer (one sub-frame of LPC order history).
     pub lpc_history: Vec<f32>,
-    /// Excitation history for LTP taps (long enough for pitch_lag +
-    /// LTP_ORDER/2).
+    /// Past *residual* history for the LTP feedback loop (RFC
+    /// §4.2.7.9.1 voiced LPC residual). Long enough for pitch_lag +
+    /// LTP_ORDER/2 across frame boundaries.
     pub ltp_history: Vec<f32>,
+    /// Past *clamped output* `out[]` ring used by the §4.2.7.9.1
+    /// rewhitening pass. Sized to cover `max_pitch_lag(WB) + d_LPC + 2`
+    /// = 306 samples plus a small alignment margin.
+    pub out_history: Vec<f32>,
     /// `prev_gain_Q16` of the previous sub-frame.
     pub prev_gain_q16: i32,
     /// First-frame flag — after a decoder reset or a LBRR gap, the
@@ -102,6 +107,7 @@ impl SilkChannelState {
             prev_nlsf_q15: Vec::new(),
             lpc_history: Vec::new(),
             ltp_history: vec![0.0; 480],
+            out_history: vec![0.0; 320],
             prev_gain_q16: 0,
             first_frame: true,
         }
@@ -529,7 +535,7 @@ fn decode_frame_body(
                         .map(|k| {
                             let n0 = prev[k] as i32;
                             let n2 = nlsf_q15[k] as i32;
-                            let n1 = n0 + (w * (n2 - n0) >> 2);
+                            let n1 = n0 + ((w * (n2 - n0)) >> 2);
                             n1.clamp(0, 32767) as i16
                         })
                         .collect();

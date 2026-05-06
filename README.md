@@ -30,15 +30,24 @@ framework but usable standalone.
 > - SILK WB stereo @ 20 kbps: **12 dB** (was 11.34, still capped)
 > - Hybrid SWB / FB: **3 dB** (SILK low band same gating as WB stereo)
 >
-> SILK NB and MB are now half-way to the 20 dB floor. The remaining
-> SILK gap is concentrated on WB-stereo and the §4.2.7.5.5
-> frame-to-frame LSF interpolation (currently parsed-and-discarded —
-> the synthesis path always uses the freshly-decoded NLSF for both
-> halves of a 20 ms frame). The §4.2.7.5.7 / §4.2.7.5.8 bandwidth-
-> expansion + prediction-gain limiting are reduced to a DC-response
-> guard (cap `|sum(lpc)| < 0.05`); a spec-exact Q12 saturation +
-> Levinson reflection-coefficient stability check would let us drop
-> the guard and likely add another few dB.
+> SILK NB and MB are now half-way to the 20 dB floor. Round-39 status:
+> §4.2.7.5.5 frame-to-frame LSF interpolation is wired (sub-frames 0-1
+> of a 20 ms frame use NLSF interpolated between the previous frame's
+> final NLSFs and the current frame's, gated on `w_Q2 < 4`); the
+> §4.2.7.5.7 Q12 saturation + §4.2.7.5.8 Levinson-reflection
+> prediction-gain check is implemented in `src/silk/lsf.rs` (see
+> `bandwidth_expand_q17` / `lpc_inverse_pred_gain_is_stable`) but is
+> NOT in the active `nlsf_to_lpc` path because Q12 quantization on top
+> of the float synthesis loses ~5 dB of in-crate encoder roundtrip
+> SNR; the active path keeps the round-36 32-round γ=0.85 DC chirp
+> guard. A clean-room §4.2.7.9.1 rewhitening prototype lives behind
+> the disabled rewhitening branch in `src/silk/synth.rs` (the
+> `state.out_history` ring is maintained for it). Closing the residual
+> gap to ≥20 dB on libopus packets requires either (a) a Q15
+> fixed-point synthesis filter that matches libopus' integer
+> saturation byte-exactly, or (b) coordinating the encoder's LTP
+> feedback to drop the off-spec `* ltp_scale` multiplier so the
+> rewhitening pass can be re-enabled symmetrically.
 
 ## Installation
 

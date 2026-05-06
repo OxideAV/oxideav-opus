@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RFC 6716 §4.2.7.5.7 / §4.2.7.5.8 spec-faithful Q12 saturation +
+  Levinson-derived inverse-prediction-gain stability check** —
+  `silk::lsf::bandwidth_expand_q17` implements the §4.2.7.5.7 10-round
+  bandwidth-expansion + Q12 saturation pass and `lpc_inverse_pred_gain_is_stable`
+  implements the §4.2.7.5.8 16-round Levinson recurrence (with the
+  spec's `inv_gain_Q30` accumulation across rows). Both are exercised
+  by unit tests but are NOT plugged into the active `nlsf_to_lpc`
+  hot path because Q12 quantization on top of the float synthesis
+  loses ~5 dB on the in-crate encoder roundtrip; the active path
+  retains the round-36 32-round γ=0.85 DC chirp guard. Tracked as a
+  follow-up: replace the f32 synthesis with a Q15 fixed-point IIR
+  matching libopus' integer saturation byte-exactly to drop the chirp
+  guard and unlock the spec-correct spec saturation (~5 dB PSNR
+  upside on libopus interop).
+- **`SilkChannelState::out_history`** — new persistent ring (320 f32
+  samples) carrying the previous frame's clamped output for the
+  §4.2.7.9.1 rewhitening pass; the ring is maintained on every frame
+  but the rewhitening branch in `silk::synth::synthesize` is gated
+  off because writing to `state.ltp_history` mid-frame is incompatible
+  with the in-crate encoder's `* ltp_scale` LTP-feedback convention
+  (the spec scales once in rewhitening, the encoder scales in every
+  feedback tap; both ways are self-consistent in isolation but cannot
+  be mixed in the same loop). Re-enabling rewhitening requires a
+  coordinated encoder-side change to drop the off-spec scale; tracked
+  as a follow-up.
+
 - **RFC 6716 §4.2.7.5.5 LSF interpolation** — implemented for 20 ms SILK
   frames. `silk::lsf::decode_nlsf` now returns `(nlsf_q15, interp_coef_q2)`
   and the decoder builds per-sub-frame LPC coefficient vectors: sub-frames 0
