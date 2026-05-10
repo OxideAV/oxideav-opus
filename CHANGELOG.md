@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-opus/compare/v0.0.8...v0.0.9) - 2026-05-06
+
+### Other
+
+- drop dead `linkme` dep
+- clean-room §4.2.7.5.7/§4.2.7.5.8 + §4.2.7.9.1 rewhitening scaffold
+- rewhitening §4.2.7.9.1 + RFC LTP codebook + proper filter search
+- §4.2.7.5.5 LSF interp + RFC LTP codebook transcription + 10ms bitstream fix
+- add oxideav_core::register! auto-registration macro
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-opus/pull/502))
+
 ### Added
 
 - **RFC 6716 §4.2.7.5.7 / §4.2.7.5.8 spec-faithful Q12 saturation +
