@@ -156,6 +156,27 @@ impl CeltState {
             deemph_state: vec![0.0; channels],
         }
     }
+
+    /// Ensure the per-channel state buffers (`overlap_buf`, `history`,
+    /// `deemph_state`) hold at least `channels` entries. Used when a
+    /// stereo TOC arrives at a decoder that was constructed for mono
+    /// — the bit-allocator path requires the TOC channel count, and
+    /// would otherwise index out-of-bounds when reading the per-channel
+    /// IMDCT overlap. Newly-grown channels start zero, which is the
+    /// correct "no prior history" state for the very first frame they
+    /// participate in.
+    fn ensure_channels(&mut self, channels: usize) {
+        if channels <= self.channels {
+            return;
+        }
+        let extra = channels - self.channels;
+        for _ in 0..extra {
+            self.overlap_buf.push(vec![0.0; CELT_OVERLAP_120 * 8]);
+            self.history.push(vec![0.0; HISTORY_SIZE]);
+            self.deemph_state.push(0.0);
+        }
+        self.channels = channels;
+    }
 }
 
 const CELT_OVERLAP_120: usize = 120;
@@ -270,7 +291,24 @@ impl Decoder for OpusDecoder {
                 Err(Error::NeedMore)
             };
         };
-        decode_packet(self, &pkt)
+        // The CELT pipeline (oxideav-celt) currently has a couple of
+        // panic paths reachable from malformed input that survives
+        // the TOC parse — notably a `1 << b` shift in
+        // `extract_collapse_mask` when the bit allocator produces
+        // `b > 31`, and assorted indexing in PVQ shape decode. The
+        // decoder API contract is `Result`, never panic — so we trap
+        // panics here and surface them as `Error::other`. Once those
+        // paths are scrubbed in oxideav-celt the wrapping becomes a
+        // no-op (panic_unwind is essentially free in the no-panic
+        // path on AddressSanitizer-instrumented Rust).
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_packet(self, &pkt)));
+        match result {
+            Ok(r) => r,
+            Err(_panic) => Err(Error::other(
+                "Opus decoder: panic in CELT/SILK pipeline — packet rejected",
+            )),
+        }
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -883,6 +921,12 @@ fn decode_celt_body(
     n_samples: usize,
     start_band: usize,
 ) -> Result<Vec<Vec<f32>>> {
+    // Grow per-channel state buffers if a stereo TOC arrived at a
+    // mono-constructed decoder (or any other case where the requested
+    // decode width exceeds the state's allocated channel count).
+    // Without this the per-c indexing below panics with
+    // "index out of bounds: the len is 1 but the index is 1".
+    dec.state.ensure_channels(channels);
     let state = &mut dec.state;
     let lm = lm_for_frame_samples(toc.frame_samples_48k) as i32;
     let end_band = end_band_for_bandwidth_celt(toc.bandwidth.cutoff_hz());

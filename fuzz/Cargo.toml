@@ -1,0 +1,50 @@
+[package]
+name = "oxideav-opus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+# libloading is the only libopus interop: the cross-decode harness
+# `dlopen`s the system-installed libopus shared library at startup. No
+# `*-sys` crate, no libopus source pulled into the dep tree. Workspace
+# policy bars vendoring libopus / ffmpeg / libavcodec source — we only
+# inspect the public C header (`<opus/opus.h>`) for function signatures.
+libloading = "0.8"
+
+[dependencies.oxideav-opus]
+path = ".."
+
+[lib]
+name = "oxideav_opus_fuzz"
+path = "src/lib.rs"
+
+# Prevent this from interfering with the umbrella workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "panic_free_decode"
+path = "fuzz_targets/panic_free_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "opus_oracle_decode"
+path = "fuzz_targets/opus_oracle_decode.rs"
+test = false
+doc = false

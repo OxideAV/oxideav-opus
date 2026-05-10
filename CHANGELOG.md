@@ -20,6 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fuzz/` cargo-fuzz harness with three targets**:
+  `panic_free_decode` (`Decoder::decode(arbitrary_bytes)` returns
+  `Result`, never panics), `roundtrip` (random PCM →
+  `OpusEncoder::encode` → `OpusDecoder::decode` shape contract),
+  and `opus_oracle_decode` (libopus's `opus_decode` via
+  `libloading` as oracle; same sample-count contract; PCM ±2 LSB
+  divergence is logging-only until the oxideav-celt PVQ/IMDCT path
+  is bit-exact). New `.github/workflows/fuzz.yml` schedules the
+  daily run; uses the shared `OxideAV/.github` `crate-fuzz`
+  workflow with `libopus0 + libopus-dev + opus-tools` apt packages
+  preinstalled so the oracle actually validates.
+
 - **RFC 6716 §4.2.7.5.7 / §4.2.7.5.8 spec-faithful Q12 saturation +
   Levinson-derived inverse-prediction-gain stability check** —
   `silk::lsf::bandwidth_expand_q17` implements the §4.2.7.5.7 10-round
@@ -65,6 +77,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (correlation-index map) is retained as a fallback.
 
 ### Fixed
+
+- **Decoder panic when stereo TOC arrives at a mono-constructed
+  decoder** — `CeltState`'s per-channel buffers (`overlap_buf`,
+  `history`, `deemph_state`) were sized at construction by
+  `params.channels`. A stereo TOC byte then drove
+  `decode_celt_body` to index `state.overlap_buf[1]` on a 1-element
+  Vec, panicking with `index out of bounds: the len is 1 but the
+  index is 1`. Found by the new `panic_free_decode` cargo-fuzz
+  harness on input `[0x26, 0xbc, 0xbc, 0xff]`. Fix: new
+  `CeltState::ensure_channels(channels)` grows the per-channel
+  buffers (zero-initialised — correct "no prior history" state) on
+  the first frame that needs them; `decode_celt_body` calls it up
+  front.
+
+- **Decoder panics from CELT pipeline now surface as `Err`** —
+  `OpusDecoder::receive_frame` now wraps `decode_packet` in
+  `std::panic::catch_unwind` and returns `Error::other("Opus
+  decoder: panic in CELT/SILK pipeline — packet rejected")` on a
+  caught panic. Restores the `Decoder` trait contract that
+  `receive_frame` returns `Result`, never panics, even when the
+  internal CELT/SILK pipeline trips an `unreachable_unchecked` /
+  shift-overflow / index-out-of-bounds on malformed input.
 
 - **Encoder bitstream desynced for 10 ms SILK frames** — the encoder
   previously emitted `NLSF_INTERP_ICDF` (the §4.2.7.5.5 interpolation
