@@ -12,26 +12,38 @@
 //!
 //! ## What the PCM comparison checks (and what it doesn't)
 //!
-//! Per the oxideav-opus decoder docs (`src/decoder.rs` module head),
-//! the CELT pipeline's PVQ shape recurrence and IMDCT are **not yet
-//! bit-exact with libopus** — which is why `tests/encoder_roundtrip.rs`
-//! uses an "energy survives" criterion rather than a tight PSNR bar.
-//! A strict ±2-LSB window therefore divergence-trips on essentially
-//! every packet that exercises the CELT path, which buries the more
-//! interesting bugs (sample-count mismatches, panic-on-libopus-accept).
+//! Per the oxideav-opus decoder docs (`src/decoder.rs` module head)
+//! and the oxideav-celt crate header, the CELT pipeline's PVQ shape
+//! recurrence and IMDCT are **not yet bit-exact with libopus** — which
+//! is why `tests/encoder_roundtrip.rs` uses an "energy survives"
+//! criterion rather than a tight PSNR bar. A strict ±2-LSB window
+//! therefore divergence-trips on essentially every packet that
+//! exercises the CELT path, which buries the more interesting bugs
+//! (sample-count mismatches, panic-on-libopus-accept).
 //!
-//! We therefore assert the structural contract only:
+//! Hard-asserted contract today:
 //!   1. `samples_per_channel` matches libopus exactly,
 //!   2. our decoder produces the expected byte count for that shape,
 //!   3. our decoder did not panic when libopus accepted.
 //!
-//! That contract is reachable today and still finds real bugs (a
-//! divergent sample count means we're decoding to the wrong frame
-//! length, which downstream muxers will refuse to align). The
-//! eventual ±2-LSB sweep is wired up below as a **logging-only**
-//! `eprintln!` so the divergences are visible in the fuzz log
-//! without flunking CI — flip `STRICT_PCM` to `true` once the
-//! oxideav-celt PVQ/IMDCT bit-exact rebuild lands.
+//! Logged-only (CI grep target):
+//!   * Per-mode divergence histogram every power-of-two iterations,
+//!     bucketed at 0 / ≤1 / ≤2 / ≤4 / ≤16 / ≤64 / ≤1024 / >1024 LSB.
+//!     Distribution shape over time tells you whether a fix moved the
+//!     needle or just shifted noise.
+//!   * Throttled per-divergence trace (1 in 64 packets) for triage
+//!     when a regression first lands.
+//!   * **Scale-saturation gate**: when libopus reports the packet as
+//!     near-silent (max |sample| ≤ `SILENCE_LIBOPUS_MAX`), our
+//!     decoder should also stay below `SILENCE_OXIDEAV_RAIL`. The
+//!     round-next sweep found 16 / 1248 corpus packets that violate
+//!     it (10 hybrid, 4 silk-only, 2 celt-only — see CHANGELOG and
+//!     the round-next dispatch brief for the per-mode root-cause
+//!     hypotheses). Once those land, swap the `eprintln!` at the
+//!     `[oracle silence-saturation]` site for an `assert!`.
+//!
+//! Flip `STRICT_PCM` to `true` once oxideav-celt's PVQ/IMDCT bit-exact
+//! rebuild lands.
 //!
 //! When libopus isn't installed the harness `eprintln!`s a
 //! `[oracle skip]` marker once per process and returns — **NO
@@ -41,6 +53,7 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_opus_fuzz::libopus;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// PCM tolerance in 16-bit code units when `STRICT_PCM` is on. The
@@ -53,6 +66,28 @@ const PCM_TOL: i32 = 2;
 /// CELT-bearing packets and a strict assertion would bury more
 /// interesting bugs.
 const STRICT_PCM: bool = false;
+
+/// libopus-said-silent threshold: if libopus's max |sample| on this
+/// packet is below this, the packet is effectively silence/DTX. Our
+/// decoder is required to also stay below `SILENCE_OUR_RAIL` — i.e.
+/// no scale-saturation regression that turns silence into ±32k. Set
+/// generously: real DTX yields max ≤ 1; real low-energy speech can
+/// still legitimately reach a few hundred LSB.
+const SILENCE_LIBOPUS_MAX: i32 = 64;
+/// When `libopus_max <= SILENCE_LIBOPUS_MAX`, our decoder MUST stay
+/// below this. This is the "no rail saturation on silence" assertion
+/// — catches the historical scale-detection regression where a quiet
+/// CELT packet mis-routed to the `× 32 768` path and pegged every
+/// sample at ±32k. Achievable on the current corpus.
+const SILENCE_OXIDEAV_RAIL: i32 = 8_000;
+
+/// Histogram bucket boundaries for per-class divergence reporting.
+/// Each slot counts packets whose max |diff| is `<= boundary` (and
+/// greater than the previous boundary).
+const DIVERGENCE_BUCKETS: [i32; 8] = [0, 1, 2, 4, 16, 64, 1024, i32::MAX];
+const DIVERGENCE_LABELS: [&str; 8] = [
+    "= 0", "<= 1", "<= 2", "<= 4", "<= 16", "<= 64", "<= 1024", "> 1024",
+];
 
 fuzz_target!(|data: &[u8]| {
     static SKIP_LOGGED: OnceLock<()> = OnceLock::new();
@@ -138,11 +173,13 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // PCM-by-PCM compare with tolerance — see STRICT_PCM doc for why
-    // this is logging-only today. We still walk every sample so the
-    // cost is paid against the oxideav decoder (catching e.g. NaN
-    // spills via the i16 round-trip).
+    // strict equality is logging-only today. We still walk every
+    // sample so the cost is paid against the oxideav decoder (catching
+    // e.g. NaN spills via the i16 round-trip).
     let mut max_diff: i32 = 0;
     let mut max_at: usize = 0;
+    let mut libopus_max: i32 = 0;
+    let mut ours_max: i32 = 0;
     for i in 0..n_samples_total {
         let off = i * 2;
         let ours = i16::from_le_bytes([our_pcm_bytes[off], our_pcm_bytes[off + 1]]) as i32;
@@ -152,7 +189,41 @@ fuzz_target!(|data: &[u8]| {
             max_diff = d;
             max_at = i;
         }
+        if theirs.abs() > libopus_max {
+            libopus_max = theirs.abs();
+        }
+        if ours.abs() > ours_max {
+            ours_max = ours.abs();
+        }
     }
+
+    // "No scale-saturation on silence" gate. When libopus reports a
+    // near-silent packet (DTX or low-energy tail) our decoder should
+    // also stay quiet. Today this is logged not asserted: a sweep of
+    // the round-next divergence corpus turned up 16 / 1248 packets
+    // (10 hybrid, 4 silk-only, 2 celt-only) that violate it — the
+    // round-next dispatch brief tracks the per-mode breakdown for
+    // follow-up. Once the silk LBRR-state, hybrid scale-detection, and
+    // celt energy-overflow edges are all fixed, swap the `eprintln!`
+    // for an `assert!` to catch regressions.
+    if libopus_max <= SILENCE_LIBOPUS_MAX && ours_max > SILENCE_OXIDEAV_RAIL {
+        eprintln!(
+            "[oracle silence-saturation] mode={} libopus_max={libopus_max} \
+             ours_max={ours_max} (sr={sample_rate}, ch={channels}, \
+             samples/ch={}, payload[0]=0x{:02x})",
+            packet_mode(payload),
+            oracle.samples_per_channel,
+            payload[0]
+        );
+    }
+
+    // Per-mode bucket histogram. Logged once per N divergences via
+    // `should_log_progress` so a CI run produces a digestible
+    // summary tail without per-input spam. Distribution shape over
+    // time tells you whether a fix moved the needle.
+    let mode_class = packet_mode(payload);
+    record_divergence(mode_class, max_diff);
+
     if STRICT_PCM {
         assert!(
             max_diff <= PCM_TOL,
@@ -160,11 +231,11 @@ fuzz_target!(|data: &[u8]| {
              (sr={sample_rate}, ch={channels}, samples/ch={})",
             oracle.samples_per_channel
         );
-    } else if max_diff > PCM_TOL {
-        // Logging-only: dump the max diff so a CI grep can track
-        // divergence reduction over time without flunking the run.
+    } else if max_diff > PCM_TOL && should_log_individual() {
+        // Per-divergence trace, throttled. The per-mode histogram in
+        // `record_divergence` is the primary dashboard.
         eprintln!(
-            "[oracle pcm-diverge] {max_diff} LSB at sample {max_at} \
+            "[oracle pcm-diverge] mode={mode_class} {max_diff} LSB at sample {max_at} \
              (sr={sample_rate}, ch={channels}, samples/ch={})",
             oracle.samples_per_channel
         );
@@ -182,4 +253,114 @@ fn run_oxideav_no_assert(payload: &[u8], channels: u16, sample_rate: u32) {
     let pkt = Packet::new(0, TimeBase::new(1, sample_rate as i64), payload.to_vec());
     let _ = dec.send_packet(&pkt);
     let _ = dec.receive_frame();
+}
+
+/// Classify the packet by its TOC config field for per-mode reporting.
+/// Mirrors RFC 6716 §3.1 Table 2.
+fn packet_mode(payload: &[u8]) -> &'static str {
+    if payload.is_empty() {
+        return "empty";
+    }
+    let config = (payload[0] >> 3) & 0x1f;
+    match config {
+        0..=11 => "silk",
+        12..=15 => "hybrid",
+        16..=31 => "celt",
+        _ => "?",
+    }
+}
+
+/// Per-mode divergence histogram counters. Indexed by
+/// `mode_index(class) * DIVERGENCE_BUCKETS.len() + bucket`. Atomic so
+/// libfuzzer's parallel iterations don't race the counters; relaxed
+/// ordering is fine since we only print a snapshot.
+static HIST: [AtomicU64; 4 * 8] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn mode_index(class: &str) -> usize {
+    match class {
+        "silk" => 0,
+        "hybrid" => 1,
+        "celt" => 2,
+        _ => 3,
+    }
+}
+
+fn record_divergence(class: &str, max_diff: i32) {
+    let m = mode_index(class);
+    for (i, bucket) in DIVERGENCE_BUCKETS.iter().enumerate() {
+        if max_diff <= *bucket {
+            HIST[m * DIVERGENCE_BUCKETS.len() + i].fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+    }
+    // Periodically dump the histogram so libfuzzer's stdout has a
+    // running snapshot. Every 1024 inputs produces a few lines per
+    // session — enough to track regressions, light enough to grep.
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let seen = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if seen.is_power_of_two() && seen >= 1024 {
+        dump_hist(seen);
+    }
+}
+
+fn dump_hist(seen: u64) {
+    eprintln!("[oracle hist] after {seen} inputs");
+    for (m, class) in ["silk", "hybrid", "celt", "?"].iter().enumerate() {
+        let row: Vec<u64> = (0..DIVERGENCE_BUCKETS.len())
+            .map(|i| HIST[m * DIVERGENCE_BUCKETS.len() + i].load(Ordering::Relaxed))
+            .collect();
+        let total: u64 = row.iter().sum();
+        if total == 0 {
+            continue;
+        }
+        let parts: Vec<String> = DIVERGENCE_LABELS
+            .iter()
+            .zip(row.iter())
+            .filter(|(_, &n)| n > 0)
+            .map(|(l, n)| format!("{l}:{n}"))
+            .collect();
+        eprintln!("  [{class}] n={total} {}", parts.join(" "));
+    }
+}
+
+/// Throttle individual divergence eprintln!s to one in 64 — we still
+/// get a representative trickle, but a fuzzing session of 100k inputs
+/// doesn't drown CI in lines.
+fn should_log_individual() -> bool {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    n & 0x3F == 0
 }

@@ -253,34 +253,68 @@ fn shift_ring(ring: &mut Vec<f32>, frame: &[f32], cap: usize) {
     *ring = new_ring;
 }
 
-/// Upsample the internal-rate signal to 48 kHz.
+/// Upsample the internal-rate signal to 48 kHz (stateless variant).
 ///
-/// Uses a simple 2× zero-stuff + 2-tap FIR for 8→16, repeated for
-/// 16→48 (×3 zero-stuff + FIR). Not a perfect filter but adequate for
-/// an audibility test.
+/// Each frame is treated in isolation, so the leading and trailing
+/// edges of every output frame are convolved against zeros. This is
+/// fine for one-shot tests but not for stream decoding — see
+/// [`upsample_to_48k_with_state`] for the cross-frame-continuous
+/// version that the SILK decoder uses.
 pub fn upsample_to_48k(samples: &[f32], src_rate: u32) -> Vec<f32> {
-    match src_rate {
-        8_000 => upsample(samples, 6),
-        12_000 => upsample(samples, 4),
-        16_000 => upsample(samples, 3),
-        24_000 => upsample(samples, 2),
-        48_000 => samples.to_vec(),
-        _ => upsample(samples, 48_000 / src_rate),
-    }
+    let mut scratch: Vec<f32> = Vec::new();
+    upsample_to_48k_with_state(samples, src_rate, &mut scratch)
+}
+
+/// Upsample the internal-rate signal to 48 kHz, retaining the
+/// trailing-edge history needed to make consecutive calls bit-identical
+/// to a single hypothetical call on the concatenated input.
+///
+/// `history` carries the last `factor` internal-rate samples (the
+/// half-window of the FIR kernel) from the previous frame. Empty on
+/// the first frame; populated on return. The decoder stores it on
+/// `SilkChannelState.upsample_history`.
+///
+/// Without this state the windowed-sinc convolution sees zeros at
+/// every frame boundary and produces an audible amplitude dip every
+/// 10 / 20 / 60 ms — a measurable opus-side bug independent of the
+/// CELT bit-exactness gap (RFC 6716 §4.2.9 mandates a continuous
+/// resampler chain).
+pub fn upsample_to_48k_with_state(
+    samples: &[f32],
+    src_rate: u32,
+    history: &mut Vec<f32>,
+) -> Vec<f32> {
+    let factor = match src_rate {
+        8_000 => 6,
+        12_000 => 4,
+        16_000 => 3,
+        24_000 => 2,
+        48_000 => return samples.to_vec(),
+        _ => 48_000 / src_rate,
+    };
+    upsample_with_state(samples, factor, history)
 }
 
 /// Integer-ratio upsample by `factor`, followed by a short low-pass
 /// FIR to smear the zero-inserted samples.
-fn upsample(samples: &[f32], factor: u32) -> Vec<f32> {
+///
+/// `history` is the previous frame's tail — exactly `factor`
+/// internal-rate samples once seeded. The function prepends them to
+/// the input, runs the upsample + filter, then discards the
+/// `factor * factor` leading output samples that correspond to the
+/// prepended history's centre region. On return, `history` is
+/// overwritten with the last `factor` samples of `samples` for the
+/// next call.
+fn upsample_with_state(samples: &[f32], factor: u32, history: &mut Vec<f32>) -> Vec<f32> {
     let f = factor as usize;
     if f <= 1 {
         return samples.to_vec();
     }
-    let mut upsampled = vec![0f32; samples.len() * f];
-    for (i, &s) in samples.iter().enumerate() {
-        upsampled[i * f] = s * (f as f32);
-    }
-    // Simple symmetric low-pass (hann window, length = 2*f+1).
+    let hist_len = f; // half-window length of the FIR (in internal-rate samples)
+
+    // Window once per call. Could be cached in a OnceLock per ratio,
+    // but the decoder runs once per 10..60 ms frame so the cost is
+    // negligible compared to the convolution proper.
     let win_len = 2 * f + 1;
     let mut win = vec![0f32; win_len];
     for k in 0..win_len {
@@ -299,17 +333,64 @@ fn upsample(samples: &[f32], factor: u32) -> Vec<f32> {
         *w /= gain;
     }
 
-    let mut out = vec![0f32; upsampled.len()];
-    for n in 0..upsampled.len() {
+    // Prepend `hist_len` internal-rate samples of history (zero-pad if
+    // we have fewer — first-frame case). Build the zero-stuffed buffer
+    // straight from the concatenation.
+    let leading_internal = hist_len;
+    let total_internal = leading_internal + samples.len();
+    let mut upsampled = vec![0f32; total_internal * f];
+    for i in 0..leading_internal {
+        let h_idx_from_end = leading_internal - i; // i=0 -> oldest, i=hist_len-1 -> newest
+        let val = if history.len() >= h_idx_from_end {
+            history[history.len() - h_idx_from_end]
+        } else {
+            0.0
+        };
+        upsampled[i * f] = val * (f as f32);
+    }
+    for (i, &s) in samples.iter().enumerate() {
+        upsampled[(leading_internal + i) * f] = s * (f as f32);
+    }
+
+    // Convolve. Output positions are in the upsampled-domain index
+    // space; we discard the `leading_internal * f` leading positions
+    // (everything that "belongs to" the prepended history).
+    let total_upsampled = upsampled.len();
+    let drop_lead = leading_internal * f;
+    let out_len = samples.len() * f;
+    let mut out = vec![0f32; out_len];
+    for n in 0..out_len {
+        let upsampled_pos = drop_lead + n;
         let mut acc = 0f32;
+        // Filter taps: idx = upsampled_pos + k - f for k in 0..win_len.
         for k in 0..win_len {
-            let idx = n as i32 + k as i32 - f as i32;
-            if idx >= 0 && (idx as usize) < upsampled.len() {
+            let idx = upsampled_pos as i32 + k as i32 - f as i32;
+            if idx >= 0 && (idx as usize) < total_upsampled {
                 acc += win[k] * upsampled[idx as usize];
             }
         }
         out[n] = acc;
     }
+
+    // Persist the tail of the input as next-frame history. Take the
+    // last `hist_len` internal-rate samples; if the input is shorter,
+    // splice with whatever history we held.
+    let mut new_hist = Vec::with_capacity(hist_len);
+    let need = hist_len;
+    if samples.len() >= need {
+        new_hist.extend_from_slice(&samples[samples.len() - need..]);
+    } else {
+        let from_old = need - samples.len();
+        if history.len() >= from_old {
+            new_hist.extend_from_slice(&history[history.len() - from_old..]);
+        } else {
+            new_hist.resize(from_old - history.len(), 0.0);
+            new_hist.extend_from_slice(history);
+        }
+        new_hist.extend_from_slice(samples);
+    }
+    *history = new_hist;
+
     out
 }
 
@@ -329,5 +410,47 @@ mod tests {
         let input = vec![1.0, 2.0, 3.0];
         let out = upsample_to_48k(&input, 48_000);
         assert_eq!(out, input);
+    }
+
+    /// History persistence sanity: after a stateful call the `history`
+    /// buffer holds exactly `factor` internal-rate samples, drawn from
+    /// the tail of the input. This is the contract the SILK decoder
+    /// relies on; without it, every frame would be upsampled from a
+    /// zero-history baseline.
+    #[test]
+    fn stateful_upsample_persists_input_tail_as_history() {
+        let signal: Vec<f32> = (0..50).map(|i| (i as f32) * 0.01).collect();
+        let mut hist: Vec<f32> = Vec::new();
+        let _ = upsample_to_48k_with_state(&signal, 16_000, &mut hist);
+        // factor at 16_000→48_000 is 3.
+        assert_eq!(hist.len(), 3);
+        assert_eq!(hist, signal[signal.len() - 3..].to_vec());
+
+        // Empty input must not corrupt history.
+        let saved = hist.clone();
+        let out = upsample_to_48k_with_state(&[], 16_000, &mut hist);
+        assert!(out.is_empty());
+        assert_eq!(hist, saved);
+    }
+
+    /// `upsample_to_48k` (stateless) routes through the stateful path
+    /// with a scratch history. On a single call the two must agree
+    /// exactly — the stateful path's only behavioural difference shows
+    /// up across calls.
+    #[test]
+    fn stateless_and_stateful_agree_on_single_call() {
+        let signal: Vec<f32> = (0..40).map(|i| (i as f32 * 0.13).sin()).collect();
+        for &rate in &[8_000u32, 12_000, 16_000, 24_000] {
+            let stateless = upsample_to_48k(&signal, rate);
+            let mut hist: Vec<f32> = Vec::new();
+            let stateful = upsample_to_48k_with_state(&signal, rate, &mut hist);
+            assert_eq!(stateless.len(), stateful.len(), "rate={rate}");
+            for (i, (a, b)) in stateless.iter().zip(stateful.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "rate={rate} sample={i}: stateless={a} stateful={b}"
+                );
+            }
+        }
     }
 }

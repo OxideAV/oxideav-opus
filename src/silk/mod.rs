@@ -97,6 +97,13 @@ pub struct SilkChannelState {
     /// First-frame flag — after a decoder reset or a LBRR gap, the
     /// first frame is coded specially (absolute coding).
     pub first_frame: bool,
+    /// Trailing internal-rate samples kept by the 8/12/16→48 kHz
+    /// upsampler so the windowed-sinc convolution sees real history at
+    /// the leading edge of the next frame instead of zeros. Two
+    /// internal-rate samples are enough to cover the half-window
+    /// `f` (= 2..6) of the kernel for any supported ratio. Empty on
+    /// first frame; reset by `reset()`.
+    pub upsample_history: Vec<f32>,
 }
 
 impl SilkChannelState {
@@ -110,6 +117,7 @@ impl SilkChannelState {
             out_history: vec![0.0; 320],
             prev_gain_q16: 0,
             first_frame: true,
+            upsample_history: Vec::new(),
         }
     }
 
@@ -354,10 +362,20 @@ impl SilkDecoder {
                 vec![0.0f32; frame_len_internal]
             };
 
-            // Upsample both to 48 kHz.
-            let mid_48k = synth::upsample_to_48k(&mid_internal, internal_rate);
+            // Upsample both to 48 kHz with cross-frame state so the
+            // windowed-sinc convolution sees real history at the
+            // leading edge of each frame instead of zeros.
+            let mid_48k = synth::upsample_to_48k_with_state(
+                &mid_internal,
+                internal_rate,
+                &mut self.state.upsample_history,
+            );
             let side_48k = if n_internal_channels == 2 && !decode_only_mid {
-                synth::upsample_to_48k(&side_internal, internal_rate)
+                synth::upsample_to_48k_with_state(
+                    &side_internal,
+                    internal_rate,
+                    &mut self.side_state.upsample_history,
+                )
             } else {
                 Vec::new()
             };

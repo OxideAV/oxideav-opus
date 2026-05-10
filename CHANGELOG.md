@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`SilkChannelState::upsample_history`** — new persistent state
+  carrying the previous frame's last `factor` internal-rate samples
+  (where `factor` is 6 / 4 / 3 for NB / MB / WB at 8 / 12 / 16 → 48 kHz)
+  through the windowed-sinc upsampler so the FIR convolution sees real
+  history at the leading edge of each frame instead of zeros. Without
+  it, every SILK frame boundary saw zero-history lookback — a real
+  opus-side discontinuity (RFC 6716 §4.2.9 mandates a continuous
+  resampler chain). New `synth::upsample_to_48k_with_state` API takes
+  the history by `&mut Vec<f32>`; the existing stateless
+  `upsample_to_48k` is retained for tests and routes through a scratch
+  history. PSNR impact on the docs corpus is small because the
+  half-window contribution is small relative to the per-sample synthesis
+  divergence the celt-bit-exact rebuild has to close, but the change is
+  correct in the "concatenation of stateful calls equals one big call"
+  sense and clears the way for future improvements to the resampler
+  kernel itself.
+
+- **Fuzz oracle: per-mode divergence histogram + scale-saturation
+  gate** in `fuzz_targets/opus_oracle_decode.rs`. Replaces the single
+  per-divergence `eprintln!` with two new layers:
+
+  * **Per-mode bucket histogram** (`silk` / `hybrid` / `celt`) bucketed
+    at `0 / ≤1 / ≤2 / ≤4 / ≤16 / ≤64 / ≤1024 / >1024` LSB, dumped
+    every power-of-two iterations from 1024 onward. Distribution shape
+    over time tells future agents whether a fix moved the needle or
+    just shifted noise.
+  * **Scale-saturation gate** — when libopus reports a near-silent
+    packet (max |sample| ≤ 64 LSB), our decoder should also stay
+    below 8000 LSB. The 1248-input round-next sweep found 16
+    violations (10 hybrid, 4 silk-only, 2 celt-only) so the gate is
+    `eprintln!` not `assert!` today; once those land, the
+    `[oracle silence-saturation]` site flips to a hard panic.
+
+  Throttled the per-divergence trace to 1 in 64 packets. Documented the
+  full contract in the file header.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-opus/compare/v0.0.8...v0.0.9) - 2026-05-06
 
 ### Other
