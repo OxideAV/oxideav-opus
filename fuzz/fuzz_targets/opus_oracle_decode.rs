@@ -35,18 +35,35 @@
 //!     when a regression first lands.
 //!   * **Scale-saturation gate**: when libopus reports the packet as
 //!     near-silent (max |sample| ≤ `SILENCE_LIBOPUS_MAX`), our
-//!     decoder should also stay below `SILENCE_OXIDEAV_RAIL`. The
-//!     round-prior sweep found 16 / 1248 corpus packets that violated
-//!     it (10 hybrid, 4 silk-only, 2 celt-only); the silence-rail
-//!     fix that landed in this round (corrected SILK §4.2.7.3 +
-//!     §4.2.7.4 ICDFs) cuts that to 15 / 1248 with the silk-only
-//!     mode dropping from 4 → 1 (75 % reduction). The remaining
-//!     offenders are hybrid + 2 celt-only and require the still-WIP
-//!     CELT bit-exact path. Once those land, swap the `eprintln!` at
-//!     the `[oracle silence-saturation]` site for an `assert!`.
+//!     decoder should also stay below `SILENCE_OXIDEAV_RAIL`. Sweep
+//!     history on the on-disk 1248-packet corpus:
+//!
+//!     | round | silk | hybrid | celt | total |
+//!     |------:|-----:|-------:|-----:|------:|
+//!     | r44   |    4 |     10 |    2 |    16 |
+//!     | r45   |    1 |     10 |    2 |    13 | silk §4.2.7.3 ICDF fix |
+//!     | r46   |    1 |     12 |    2 |    15 | celt 0.1.5 publish (mixed-radix FFT + norm_len) |
+//!
+//!     The hybrid count nudged 10→12 after the celt 0.1.5 update —
+//!     two short hybrid packets (cfg=12, cfg=14) that previously
+//!     just-cleared 8 000 LSB on the broken-FFT codepath now rail
+//!     on the corrected one. They share the cfg-12/14 hybrid shape
+//!     so the failure mode is hybrid bit-allocation / start-band
+//!     interaction, not a celt regression. Per-mode follow-up is
+//!     queued.
 //!
 //! Flip `STRICT_PCM` to `true` once oxideav-celt's PVQ/IMDCT bit-exact
-//! rebuild lands.
+//! rebuild lands. Post-celt-0.1.5 baseline against the on-disk corpus
+//! (1248 inputs, 1194 oracle-accepted):
+//!
+//!   * silk-only   n=316: = 0 → 10  (3.2 % bit-exact)
+//!   * hybrid      n=106: = 0 →  0
+//!   * celt-only   n=772: = 0 → 13  (1.7 % bit-exact)
+//!
+//! Tightening `PCM_TOL` from ±2 → ±16 won't materially change which
+//! packets fall under STRICT_PCM (≤16 only adds 6 silk / 0 hybrid /
+//! 1 celt packets over `= 0`), so the global gate stays off until
+//! oxideav-celt's PVQ / fine-energy refinement lands.
 //!
 //! When libopus isn't installed the harness `eprintln!`s a
 //! `[oracle skip]` marker once per process and returns — **NO
@@ -202,13 +219,14 @@ fuzz_target!(|data: &[u8]| {
 
     // "No scale-saturation on silence" gate. When libopus reports a
     // near-silent packet (DTX or low-energy tail) our decoder should
-    // also stay quiet. Today this is logged not asserted: a sweep of
-    // the round-next divergence corpus turned up 16 / 1248 packets
-    // (10 hybrid, 4 silk-only, 2 celt-only) that violate it — the
-    // round-next dispatch brief tracks the per-mode breakdown for
-    // follow-up. Once the silk LBRR-state, hybrid scale-detection, and
-    // celt energy-overflow edges are all fixed, swap the `eprintln!`
-    // for an `assert!` to catch regressions.
+    // also stay quiet. Today this is logged not asserted: post-r45
+    // sweep of the on-disk corpus shows 15 / 1248 packets violate
+    // it (12 hybrid, 1 silk-only, 2 celt-only). The silk path is
+    // now within one stray; the hybrid offenders (mostly cfg=14/15
+    // short payloads, 3-11 B) and the two cfg=16/27 celt-only ones
+    // still need the hybrid bit-allocation + celt fine-energy
+    // tightening. Once those land, swap the `eprintln!` for an
+    // `assert!` to catch regressions.
     if libopus_max <= SILENCE_LIBOPUS_MAX && ours_max > SILENCE_OXIDEAV_RAIL {
         eprintln!(
             "[oracle silence-saturation] mode={} libopus_max={libopus_max} \

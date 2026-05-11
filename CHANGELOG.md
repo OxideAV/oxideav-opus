@@ -61,6 +61,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bit-exact landing to track the remaining hybrid + celt-only
   offenders.
 
+- **Fuzz scratch tool: `examples/scan_histogram.rs`** — companion to
+  `scan_silence`: walks the same corpus, decodes through both libopus
+  and oxideav-opus, and prints the per-mode max-|PCM-diff| histogram
+  (silk / hybrid / celt × buckets `= 0 / ≤1 / ≤2 / ≤4 / ≤16 / ≤64 /
+  ≤1024 / >1024` LSB). Avoids spinning up cargo-fuzz for the common
+  "did my fix move the needle?" question — runs in one cargo invocation
+  against the 1 248-packet on-disk corpus.
+
+### Changed
+
+- **Fuzz oracle: post-celt-0.1.5 baseline recorded** in
+  `fuzz_targets/opus_oracle_decode.rs`. With the celt 0.1.5 mixed-radix
+  FFT + `norm_len` fixes (issue #762) plus this round's silk ICDF
+  correction, the on-disk corpus (1 248 inputs, 1 194 oracle-accepted)
+  now distributes:
+  | mode | n | = 0 | ≤ 16 | ≤ 1024 | > 1024 |
+  |------|--:|----:|----:|------:|------:|
+  | silk-only | 316 | 10 (3.2 %) | 19 | 55 | 261 |
+  | hybrid | 106 | 0 | 0 | 18 | 88 |
+  | celt-only | 772 | 13 (1.7 %) | 14 | 51 | 721 |
+  Bit-exact celt-only packet count went 0 → 13 — the headline
+  improvement from celt 0.1.5. `STRICT_PCM` stays `false`: tightening
+  `PCM_TOL` ±2 → ±16 would only add 6 silk / 0 hybrid / 1 celt to the
+  exact-match bucket, so the global strict-equality gate would still
+  trip on 1 094 / 1 194 = 92 % of the corpus.
+- **Silence-rail count: 16 → 15** on the same corpus after celt 0.1.5
+  publish. Per-mode breakdown shifted to **12 hybrid / 1 silk / 2
+  celt**. The silk count is now within one stray (was 4). Hybrid went
+  10 → 12: two short cfg=12/14 hybrid packets (3-11 B payload) that
+  previously just-cleared the 8 000-LSB rail on the broken-FFT codepath
+  now saturate on the corrected one. The hybrid bit-allocation +
+  start-band-17 path is the next round's target.
+
 ### Added (round-prior, retained)
 
 - **`SilkChannelState::upsample_history`** — new persistent state
