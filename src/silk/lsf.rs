@@ -390,36 +390,22 @@ pub fn nlsf_to_lpc(nlsf_q15: &[i16], _bw: OpusBandwidth) -> Vec<f32> {
 
     // §4.2.7.5.7 / §4.2.7.5.8 Bandwidth expansion + prediction-gain limit.
     //
-    // The spec specifies a chirp + saturate-to-Q12 + Levinson-derived
-    // stability check pipeline that operates on the integer Q17 form.
+    // The clean-room f32 path uses a hand-rolled DC-guard
+    // (`|sum(lpc)| < 0.02` chirp by γ=0.85) instead of the spec's
+    // chirp + saturate-to-Q12 + Levinson-derived stability test. The
+    // Q12 saturation step quantises coefficients to a 13-bit grid,
+    // which is fine for the Q-domain IIR with rounded accumulators
+    // but adds ~5-8 dB of quantization error to a float IIR that has
+    // no other saturation; the encoder roundtrip drops from ~25 dB to
+    // ~17 dB if we Q12-quantize at this point.
+    //
     // The fixed-point spec algorithm is implemented in
-    // `bandwidth_expand_q17` below for completeness and is exercised by
-    // unit tests, but it is NOT applied to the f32 path here for two
-    // reasons:
-    //
-    // 1. The Q12 saturation step quantizes coefficients to a 13-bit
-    //    grid, which is fine for the Q-domain IIR with rounded
-    //    accumulators but adds ~5 dB of quantization error to a float
-    //    IIR that has no other saturation. The encoder roundtrip drops
-    //    from ~25 dB to ~17 dB if we Q12-quantize at this point.
-    //
-    // 2. The §4.2.7.5.8 inverse-prediction-gain check is a sufficient
-    //    stability test on the Q12 representation, but does NOT bound
-    //    the f32 impulse-response amplitude — a filter whose
-    //    `sum(a_Q12)` is just under 4096 (the spec's stability
-    //    ceiling) can still amplify the float IIR ~10x because the
-    //    synthesis gain blows up near DC. libopus avoids that peg by
-    //    running the entire pipeline in Q-domain integer arithmetic
-    //    where the saturation rounds toward -32768/+32767 every
-    //    sample.
-    //
-    // We instead apply a float-domain DC-guard: iteratively chirp the
-    // LPC by γ=0.85 until `|sum(lpc)| < 0.02`, then a final mild
-    // γ=0.98 pass. This recovers ~5-6 dB of libopus interop PSNR vs
-    // the unguarded f32 spec output. Closing the residual gap to
-    // ≥20 dB requires either matching libopus' Q12 IIR saturation
-    // byte-exactly (significant rewrite) or replacing the float synth
-    // with a Q15 fixed-point path; tracked as a follow-up.
+    // `bandwidth_expand_q17` below and exercised by unit tests, so a
+    // future Q15 fixed-point synth path can adopt it without another
+    // table-transcription pass. The silence-rail regressions in
+    // commit a6ca9ea were not caused by this approximation — they
+    // were caused by the wrong §4.2.7.3 + §4.2.7.4 ICDF tables, fixed
+    // in this round.
     let mut lpc = vec![0f32; order];
     for k in 0..order {
         lpc[k] = (a32_q17[k] as f32) / (1 << 17) as f32;

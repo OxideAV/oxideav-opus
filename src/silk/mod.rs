@@ -466,9 +466,13 @@ fn decode_frame_body(
     debug_assert!(n_subframes == SUBFRAMES_10MS || n_subframes == SUBFRAMES_20MS);
     let frame_len = subframe_len * n_subframes;
 
-    // §4.2.7.3 frame type (signal + quantization offset).
+    // §4.2.7.3 frame type (signal + quantization offset). Table 9's
+    // PDF has the two leading zero-prob entries 0 and 1 dropped for
+    // the active table (they would overflow the u8 ICDF cell); we
+    // therefore offset the decoded symbol by +2 in the active branch
+    // before mapping through Table 10.
     let frame_type_sym = if vad_flag {
-        rc.decode_icdf(&tables::FRAME_TYPE_ACTIVE_ICDF, 8)
+        rc.decode_icdf(&tables::FRAME_TYPE_ACTIVE_ICDF, 8) + 2
     } else {
         rc.decode_icdf(&tables::FRAME_TYPE_INACTIVE_ICDF, 8)
     };

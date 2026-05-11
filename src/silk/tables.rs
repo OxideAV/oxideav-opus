@@ -5,45 +5,79 @@
 //! `ft = 256` (so `ftb = 8`). Entries are monotonically non-increasing
 //! and the last entry is zero.
 //!
-//! For this MVP decoder many tables are simplified approximations
-//! rather than the verbatim §4.2 distributions: the decoder needs
-//! valid (monotone) ICDFs for the range coder to not underflow, but
-//! exact bit-level compatibility with libopus is out of scope for a
-//! first-cut "audible output" implementation.
+//! As of the round-next silence-rail fix, the §4.2.7.3 frame-type +
+//! §4.2.7.4 sub-frame gain tables are bit-exact with the RFC PDFs (the
+//! `silk::tables::gain_icdf_tests` mod pins each one). Some of the
+//! larger NLSF / pitch-contour / shell-coder ICDFs further down are
+//! still simplified approximations against the spec, kept until the
+//! next round of clean-room transcription against `docs/audio/opus/`.
+//! Search the file for "approximation" or "MVP" to find the remaining
+//! ones.
 
 // -------------------------------------------------------------------
 // §4.2.7.3 Frame type coding.
 // -------------------------------------------------------------------
 
-/// Frame type when VAD_flag = 0 (inactive). 2 symbols.
-/// PDF ≈ {26, 230}/256 → ICDF {230, 0}.
+/// Frame type when VAD_flag = 0 (inactive). RFC 6716 §4.2.7.3
+/// Table 9: PDF `{26, 230}/256`. 2 symbols, mapping to frame type
+/// 0 (Inactive/Low) and 1 (Inactive/High).
 pub const FRAME_TYPE_INACTIVE_ICDF: [u8; 2] = [230, 0];
 
-/// Frame type when VAD_flag = 1 (active). 6 symbols per RFC Table 7
-/// mapping (decoder: 0/1 inactive, 2/3 unvoiced, 4/5 voiced).
-///
-/// PDF ≈ {16, 16, 80, 80, 32, 32}/256 → ICDF {240, 224, 144, 64, 32, 0}.
-pub const FRAME_TYPE_ACTIVE_ICDF: [u8; 6] = [240, 224, 144, 64, 32, 0];
+/// Frame type when VAD_flag = 1 (active). RFC 6716 §4.2.7.3 Table 9:
+/// the 6-symbol PDF `{0, 0, 24, 74, 148, 10}/256` is stored here as
+/// the trailing 4 non-zero entries `{24, 74, 148, 10}/256`. Decoded
+/// symbols 0..=3 map to frame types 2..=5 (Unvoiced/Low,
+/// Unvoiced/High, Voiced/Low, Voiced/High) — see `decode_frame_body`
+/// in `silk::mod` where the `+2` offset is applied. Skipping the two
+/// zero-prob symbols at the head is the standard libopus convention
+/// because storing `ICDF[0] = ft = 256` would overflow the u8 cell.
+pub const FRAME_TYPE_ACTIVE_ICDF: [u8; 4] = [232, 158, 10, 0];
 
 // -------------------------------------------------------------------
 // §4.2.7.4 Sub-frame gains.
 // -------------------------------------------------------------------
 
-/// First sub-frame gain MSB (3 bits = 8 symbols). One approximation
-/// per signal type, all ending at 0.
-pub const GAIN_MSB_INACTIVE_ICDF: [u8; 8] = [224, 160, 112, 80, 48, 32, 16, 0];
-pub const GAIN_MSB_UNVOICED_ICDF: [u8; 8] = [240, 200, 160, 120, 80, 48, 24, 0];
-pub const GAIN_MSB_VOICED_ICDF: [u8; 8] = [248, 220, 180, 140, 96, 56, 24, 0];
+/// First sub-frame gain MSB (3 bits = 8 symbols), one PDF per signal
+/// type per RFC 6716 §4.2.7.4 Table 11.
+///
+/// Round-prior to the silence-rail fix these tables held simplified
+/// approximations (e.g. inactive PDF `{32, 96, 48, 32, 16, 16, 16, 0}`
+/// instead of the spec's `{32, 112, 68, 29, 12, 1, 1, 1}`); on
+/// minimum-bitrate libopus packets the wrong cumfreq buckets shifted
+/// the absolute MSB read by 1-3 indices, doubling the SF0 gain and
+/// then compounding the error through the delta-coded SF1+ gains.
+/// Combined with the broken `GAIN_DELTA_ICDF` and the broken
+/// `FRAME_TYPE_ACTIVE_ICDF`, the cascade saturated the SILK synth IIR
+/// to ±0.7 — the silence-saturation regression in commit a6ca9ea.
+///
+/// Inactive: PDF `{32, 112, 68, 29, 12, 1, 1, 1}/256`.
+pub const GAIN_MSB_INACTIVE_ICDF: [u8; 8] = [224, 112, 44, 15, 3, 2, 1, 0];
+/// Unvoiced: PDF `{2, 17, 45, 60, 62, 47, 19, 4}/256`.
+pub const GAIN_MSB_UNVOICED_ICDF: [u8; 8] = [254, 237, 192, 132, 70, 23, 4, 0];
+/// Voiced: PDF `{1, 3, 26, 71, 94, 50, 9, 2}/256`.
+pub const GAIN_MSB_VOICED_ICDF: [u8; 8] = [255, 252, 226, 155, 61, 11, 2, 0];
 
 /// First sub-frame gain LSB (3 bits uniform).
 pub const GAIN_LSB_ICDF: [u8; 8] = [224, 192, 160, 128, 96, 64, 32, 0];
 
-/// Delta gain coding for sub-frames 1..=3 (RFC Table 14). 41 symbols.
-/// ICDF built from an approximately Gaussian distribution centred at
-/// symbol 4 (which maps to "no change").
+/// Delta gain coding for sub-frames 1..=3 (RFC 6716 §4.2.7.4 Table 13).
+/// 41 symbols, centred at symbol 4 (which maps to "no change").
+///
+/// PDF (per RFC Table 13): `{6, 5, 11, 31, 132, 21, 8, 4, 3, 2, 2, 2,
+/// 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+/// 1, 1, 1, 1, 1, 1, 1}/256`. ICDF is `256 - cumfreq[k+1]`.
+///
+/// Round-prior to the silence-rail fix this table held a hand-shifted
+/// approximation that mis-decoded the high-probability symbol 4 ("no
+/// change") as 5, and pushed the long tail (delta ≥ 8) toward smaller
+/// indices. On minimum-bitrate libopus packets the wrong ICDF produced
+/// `delta = 24` at the bitstream tail (instead of 4 = no change),
+/// inflating the sub-frame 1 log_gain by ~+20 indices and driving the
+/// SILK synthesis IIR to ±0.7 — exactly the silence-rail saturation
+/// regression observed in commit a6ca9ea.
 pub const GAIN_DELTA_ICDF: [u8; 41] = [
-    250, 244, 239, 228, 197, 65, 44, 36, 32, 28, 26, 24, 22, 20, 19, 18, 17, 16, 15, 14, 13, 12,
-    11, 10, 9, 8, 7, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 1, 1, 0,
+    250, 245, 234, 203, 71, 50, 42, 38, 35, 33, 31, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18,
+    17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
 ];
 
 // -------------------------------------------------------------------
@@ -631,3 +665,88 @@ pub const STEREO_PRED_QUANT_Q13: [i16; 16] = [
 pub const LBRR_FLAGS_2_ICDF: [u8; 3] = [203, 150, 0];
 /// LBRR flags iCDF for a 60 ms packet (3 sub-frames, 7 symbols).
 pub const LBRR_FLAGS_3_ICDF: [u8; 7] = [215, 195, 166, 125, 110, 82, 0];
+
+#[cfg(test)]
+mod gain_icdf_tests {
+    //! Pin the §4.2.7.3 + §4.2.7.4 gain / frame-type ICDFs against the
+    //! RFC 6716 PDF tables verbatim. Round-prior to the silence-rail
+    //! fix all four of these tables held simplified approximations
+    //! that on minimum-bitrate libopus packets mis-decoded the gain
+    //! delta into the long tail and saturated the SILK synth IIR to
+    //! ±0.7-1.0 (commit a6ca9ea silence-rail report). These tests
+    //! prevent the regression by reconstructing each PDF from the
+    //! stored ICDF and asserting it equals the RFC table.
+    use super::*;
+    fn pdf_from_icdf(icdf: &[u8]) -> Vec<u8> {
+        let mut pdf = Vec::with_capacity(icdf.len());
+        let mut prev: u16 = 256;
+        for &v in icdf {
+            // Each PDF entry = `prev_cumfreq - cumfreq`, where
+            // `cumfreq = 256 - icdf[k]`.
+            let cum = 256u16 - v as u16;
+            assert!(cum >= 256u16 - prev, "icdf must be non-increasing");
+            pdf.push((cum - (256u16 - prev)) as u8);
+            prev = v as u16;
+        }
+        let total: u32 = pdf.iter().map(|&p| p as u32).sum();
+        assert_eq!(total, 256, "PDF must sum to 256");
+        pdf
+    }
+
+    #[test]
+    fn frame_type_inactive_icdf_matches_rfc_table9() {
+        // RFC 6716 §4.2.7.3 Table 9, Inactive row.
+        assert_eq!(pdf_from_icdf(&FRAME_TYPE_INACTIVE_ICDF), vec![26, 230]);
+    }
+
+    #[test]
+    fn frame_type_active_icdf_matches_rfc_table9() {
+        // RFC 6716 §4.2.7.3 Table 9, Active row: `{0, 0, 24, 74, 148,
+        // 10}/256` with the leading two zero-prob entries dropped (see
+        // table doc comment for the offset convention).
+        assert_eq!(
+            pdf_from_icdf(&FRAME_TYPE_ACTIVE_ICDF),
+            vec![24, 74, 148, 10]
+        );
+    }
+
+    #[test]
+    fn gain_msb_inactive_icdf_matches_rfc_table11() {
+        assert_eq!(
+            pdf_from_icdf(&GAIN_MSB_INACTIVE_ICDF),
+            vec![32, 112, 68, 29, 12, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn gain_msb_unvoiced_icdf_matches_rfc_table11() {
+        assert_eq!(
+            pdf_from_icdf(&GAIN_MSB_UNVOICED_ICDF),
+            vec![2, 17, 45, 60, 62, 47, 19, 4]
+        );
+    }
+
+    #[test]
+    fn gain_msb_voiced_icdf_matches_rfc_table11() {
+        assert_eq!(
+            pdf_from_icdf(&GAIN_MSB_VOICED_ICDF),
+            vec![1, 3, 26, 71, 94, 50, 9, 2]
+        );
+    }
+
+    #[test]
+    fn gain_lsb_icdf_matches_rfc_table12() {
+        assert_eq!(
+            pdf_from_icdf(&GAIN_LSB_ICDF),
+            vec![32, 32, 32, 32, 32, 32, 32, 32]
+        );
+    }
+
+    #[test]
+    fn gain_delta_icdf_matches_rfc_table13() {
+        // RFC 6716 §4.2.7.4 Table 13: 41-symbol delta gain PDF.
+        let mut expected = vec![6u8, 5, 11, 31, 132, 21, 8, 4, 3, 2, 2, 2];
+        expected.extend(std::iter::repeat(1u8).take(29));
+        assert_eq!(pdf_from_icdf(&GAIN_DELTA_ICDF), expected);
+    }
+}

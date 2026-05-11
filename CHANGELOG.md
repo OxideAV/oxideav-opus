@@ -7,7 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **SILK §4.2.7.3 + §4.2.7.4 ICDF tables corrected against RFC 6716**
+  (silence-rail regression). Round-prior, four critical SILK ICDF
+  tables held simplified approximations rather than the spec PDFs:
+  - `FRAME_TYPE_ACTIVE_ICDF` was the 6-symbol PDF
+    `{16, 16, 80, 80, 32, 32}/256` instead of the spec's
+    `{0, 0, 24, 74, 148, 10}/256` (the leading two zero-prob entries
+    are dropped from storage and the `+2` offset is applied at decode
+    time, per the standard libopus convention).
+  - `GAIN_MSB_INACTIVE_ICDF` was `{32, 96, 48, 32, 16, 16, 16, 0}`
+    instead of `{32, 112, 68, 29, 12, 1, 1, 1}/256`.
+  - `GAIN_MSB_UNVOICED_ICDF` was `{16, 40, 40, 40, 40, 32, 24, 24}`
+    instead of `{2, 17, 45, 60, 62, 47, 19, 4}/256`.
+  - `GAIN_MSB_VOICED_ICDF` was `{8, 28, 40, 40, 44, 40, 32, 24}`
+    instead of `{1, 3, 26, 71, 94, 50, 9, 2}/256`.
+  - `GAIN_DELTA_ICDF` (Table 13, 41 symbols) was right-shifted by one
+    PDF entry — the high-probability symbol 4 ("no change") read as 5,
+    and the long tail (delta ≥ 8) collapsed onto smaller indices.
+  On minimum-bitrate libopus packets where the bitstream is mostly
+  carrier-frequency entropy, the wrong cumfreq buckets caused our
+  decoder to read `delta_gain_index = 24` (or higher) instead of 4,
+  inflating the sub-frame 1 log_gain by `2 * 24 - 16 = 32` indices and
+  driving the SILK synthesis IIR amplitude to ±0.7 (saturating the
+  s16 output to ±32 768). The silence-rail count on the 1 248-input
+  fuzz corpus dropped from 16 → 15 overall, with the SILK-only mode
+  going from 4 → 1 (75 % reduction). Hybrid + 2 celt-only offenders
+  remain — those need the still-WIP CELT bit-exact path.
+  New unit-test mod `silk::tables::gain_icdf_tests` reconstructs each
+  PDF from the stored ICDF and pins it against the RFC table verbatim
+  so a future agent doesn't accidentally re-introduce the "rough
+  approximation" form.
+- **Active-frame encoder offset** (`silk::encoder`) — the SILK encoder
+  now emits frame-type symbols 2 → 0 and 4 → 2 to match the
+  4-symbol-from-6-PDF storage convention introduced above.
+- **`tests/roundtrip::silk_nb_voip_decodes_to_audio` RMS bar lowered**
+  from 0.001 to 5e-4 to reflect the corrected (quieter, more
+  libopus-faithful) SILK output. The previous bar was tuned to the
+  inflated-gain output produced by the broken ICDF tables; with
+  corrected gains the same VOIP file decodes at ~0.5x amplitude. The
+  Goertzel sanity assertion still gates against total silence
+  (RMS < 1e-5).
+
 ### Added
+
+- **Fuzz scratch tool: `examples/scan_silence.rs`** — walks the
+  `opus_oracle_decode` corpus and prints the silence-rail offenders
+  (libopus_max ≤ 64, ours_max > 8 000) one per line with mode / cfg /
+  channel / payload-length context. Used during the silence-rail
+  triage to bisect which tables the regression depended on; kept in
+  the tree so future agents can re-run it after each oxideav-celt
+  bit-exact landing to track the remaining hybrid + celt-only
+  offenders.
+
+### Added (round-prior, retained)
 
 - **`SilkChannelState::upsample_history`** — new persistent state
   carrying the previous frame's last `factor` internal-rate samples

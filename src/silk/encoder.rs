@@ -384,8 +384,10 @@ impl SilkFrameEncoder {
         let frame_len = self.frame_len();
         let subframe_len = self.params.subframe_len;
 
-        // §4.2.7.3 frame type — unvoiced/active (sym=2).
-        enc.encode_icdf(2, &tables::FRAME_TYPE_ACTIVE_ICDF, 8);
+        // §4.2.7.3 frame type — unvoiced/active (frame_type=2). The
+        // active ICDF stores only symbols 2..=5 with the leading two
+        // zero-prob entries dropped, so encode the offset (2-2 = 0).
+        enc.encode_icdf(0, &tables::FRAME_TYPE_ACTIVE_ICDF, 8);
         let signal_type: u8 = 1;
 
         // §4.2.7.5 NLSF.
@@ -533,9 +535,10 @@ impl SilkFrameEncoder {
         let frame_len = self.frame_len();
         let subframe_len = self.params.subframe_len;
 
-        // §4.2.7.3 frame type — voiced/active (sym=4: signal_type=2,
-        // quant_offset=0).
-        enc.encode_icdf(4, &tables::FRAME_TYPE_ACTIVE_ICDF, 8);
+        // §4.2.7.3 frame type — voiced/active (frame_type=4 →
+        // signal_type=2, quant_offset=0). With the leading two
+        // zero-prob entries dropped, encode the offset (4-2 = 2).
+        enc.encode_icdf(2, &tables::FRAME_TYPE_ACTIVE_ICDF, 8);
         let signal_type: u8 = 2;
 
         // NLSF — voiced variant of the fixed template.

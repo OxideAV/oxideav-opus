@@ -441,8 +441,16 @@ fn silk_nb_voip_decodes_to_audio() {
         "expected ≥10 successful decodes, got {decoded}"
     );
     let rms = (total_energy / all_pcm.len().max(1) as f64).sqrt();
+    // Round-prior to the silence-rail fix this bar was 0.001, matching
+    // the inflated-gain output produced by the broken
+    // `GAIN_MSB_*_ICDF` / `GAIN_DELTA_ICDF` / `FRAME_TYPE_ACTIVE_ICDF`
+    // tables. With the correct RFC §4.2.7.3 / §4.2.7.4 PDFs in place,
+    // SILK decodes the same VOIP file at a quieter (and more
+    // libopus-faithful) ~0.5x amplitude. Bar dropped to 5e-4 so the
+    // Goertzel-ish "audible" sanity assertion still gates against
+    // total silence (RMS would be < 1e-5 in that case).
     assert!(
-        rms > 0.001,
+        rms > 5e-4,
         "SILK decoded output is silent (RMS={rms}); expected audible signal"
     );
 

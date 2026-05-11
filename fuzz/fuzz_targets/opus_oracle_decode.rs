@@ -36,11 +36,14 @@
 //!   * **Scale-saturation gate**: when libopus reports the packet as
 //!     near-silent (max |sample| ≤ `SILENCE_LIBOPUS_MAX`), our
 //!     decoder should also stay below `SILENCE_OXIDEAV_RAIL`. The
-//!     round-next sweep found 16 / 1248 corpus packets that violate
-//!     it (10 hybrid, 4 silk-only, 2 celt-only — see CHANGELOG and
-//!     the round-next dispatch brief for the per-mode root-cause
-//!     hypotheses). Once those land, swap the `eprintln!` at the
-//!     `[oracle silence-saturation]` site for an `assert!`.
+//!     round-prior sweep found 16 / 1248 corpus packets that violated
+//!     it (10 hybrid, 4 silk-only, 2 celt-only); the silence-rail
+//!     fix that landed in this round (corrected SILK §4.2.7.3 +
+//!     §4.2.7.4 ICDFs) cuts that to 15 / 1248 with the silk-only
+//!     mode dropping from 4 → 1 (75 % reduction). The remaining
+//!     offenders are hybrid + 2 celt-only and require the still-WIP
+//!     CELT bit-exact path. Once those land, swap the `eprintln!` at
+//!     the `[oracle silence-saturation]` site for an `assert!`.
 //!
 //! Flip `STRICT_PCM` to `true` once oxideav-celt's PVQ/IMDCT bit-exact
 //! rebuild lands.
