@@ -184,6 +184,16 @@ Two explicit entry points, one per Opus mode:
     `src/silk/excitation.rs` (nibble-pair + sign per sample in place of
     the RFC's shell-pulse split). Byte-exact parity with libopus'
     `silk_enc` bit-stream is a tracked follow-up.
+  - **NLSF stage-1 codebook search** (RFC 6716 §4.2.7.5.1) — every
+    frame runs an open-loop search over the 32 candidate stage-1
+    codebook entries and picks the one whose all-zero-residual LPC
+    minimises the prediction residual on the input. Replaces the prior
+    fixed idx-0 fallback so the encoded LPC tracks the signal's actual
+    spectral envelope. Per-frame hysteresis + cold-start anchor keep
+    near-stationary content (held vowels, tones, noise) on a single
+    LPC across the run; clearly-different content (vowel transitions,
+    formant slides) flips the index. See
+    `silk::encoder::pick_nlsf_stage1_index`.
 
 - Input sample formats (all encoders): `S16`, `S16P`, `F32`, `F32P`.
 

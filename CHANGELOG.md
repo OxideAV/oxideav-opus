@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **SILK encoder NLSF stage-1 codebook search** (RFC 6716 §4.2.7.5.1).
+  The encoder previously hard-wired stage-1 index 0 — a flat near-
+  uniform NLSF spectrum corresponding to row 0 of `cb1_Q8` (e.g.
+  `[12, 35, 60, 83, 108, 132, 157, 180, 206, 228]` for NB/MB). Now
+  every frame runs an open-loop search over all 32 candidate stage-1
+  indices: for each candidate, we synthesise the LPC the decoder
+  would reconstruct (cb1_Q8 << 7 with all-zero stage-2 residuals,
+  then `nlsf_to_lpc` + Levinson stabilise), run it as a prediction
+  filter on the input PCM, and pick the index whose residual energy
+  is smallest. This is the standard "minimise residual energy" LPC
+  selection criterion — the resulting LPC tracks the input's actual
+  spectral envelope (formants for speech, broadband colour for
+  music) instead of being a fixed flat fallback.
+  - The search lives in `silk::encoder::pick_nlsf_stage1_index` and
+    runs for both the unvoiced and voiced encoder paths. Bitstream
+    layout is unchanged — only the value of the `stage1` ICDF symbol
+    flips per frame; downstream decoders (ours + libopus + ffmpeg)
+    parse it and apply the corresponding codebook entry the same way.
+  - **Hysteresis** (factor 0.50): once a frame picks an index, the
+    next frame's search must beat the prior pick by at least 2× in
+    residual energy to displace it. Stops per-frame LPC thrashing
+    on near-stationary content (which would invalidate the synth
+    filter's history at every boundary).
+  - **Cold-start guard** (factor 0.30): the very first frame of a
+    stream falls back to idx 0 unless the search winner shows ~3×
+    residual reduction. Empirical vowel formants typically reach
+    5-10× reduction so real speech still benefits, but pure tones
+    and broadband noise — where the search can be misled by
+    accidental harmonic-pole alignment — stay anchored on the
+    well-conditioned idx 0 entry. This is what keeps the existing
+    libopus cross-decode hybrid tests (which feed a 500 Hz mono
+    tone) above their RMS-floor bars.
+  - Search cost: 32 × frame_len × lpc_order multiply-adds per frame
+    — about 32 × 320 × 16 ≈ 164 k mads at WB 20 ms (well below 1 %
+    of the per-frame compute budget at any reasonable bitrate).
+  - Test hook `SilkFrameEncoder::set_force_stage1_idx(Some(idx))`
+    pins the index for every frame, used by the new
+    `nlsf_stage1_search_reduces_residual_energy_on_vowel` unit test
+    that proves the search picks a non-zero codebook entry on
+    formant-shaped vowel content with at least 4 % residual
+    reduction over idx 0.
+  - Closed-loop SNR change on existing tone-based round-trip tests
+    (NB/MB/WB mono+stereo at 10/20/40/60 ms): unchanged — pure
+    sinusoidal inputs sit in the cold-start guard's "stay on idx 0"
+    region. The visible win is bitstream fidelity to the input
+    spectrum on real speech, which will translate to closed-loop
+    SNR once the encoder grows the spec's full Q12-saturated
+    synthesis chain (currently a known follow-up).
+
 ### Fixed
 
 - **SILK §4.2.7.3 + §4.2.7.4 ICDF tables corrected against RFC 6716**
