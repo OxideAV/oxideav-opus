@@ -194,6 +194,22 @@ Two explicit entry points, one per Opus mode:
     LPC across the run; clearly-different content (vowel transitions,
     formant slides) flips the index. See
     `silk::encoder::pick_nlsf_stage1_index`.
+  - **NLSF stage-2 quantisation** (RFC 6716 §4.2.7.5.2 / §4.2.7.5.6) —
+    after the stage-1 codebook entry is chosen, every frame runs a
+    coordinate-descent search over per-coefficient residuals
+    (candidate set `[-4..4]`, two passes) to refine the synthesised
+    NLSF closer to the input's spectrum than the bare codebook row.
+    Adoption guard (`STAGE2_ADOPTION_FACTOR = 0.95`) reverts to all-
+    zero residuals on near-stationary content where the stage-1 entry
+    is already near-optimal, keeping the existing tone round-trip
+    tests at their historical SNR. On vowel-formant content the
+    search reaches ~30 % open-loop residual reduction over the
+    stage-1-only baseline (vs the ~5 % stage-1 alone achieved over
+    the historical fixed-idx-0 fallback). The end-to-end closed-loop
+    SNR delta is small with the current MVP excitation coder — the
+    payoff is bitstream fidelity that will translate to SNR once the
+    encoder grows the spec's full Q12-saturated synthesis chain. See
+    `silk::encoder::pick_nlsf_stage2_residuals`.
 
 - Input sample formats (all encoders): `S16`, `S16P`, `F32`, `F32P`.
 

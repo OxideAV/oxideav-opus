@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SILK encoder NLSF stage-2 quantisation** (RFC 6716 §4.2.7.5.2 +
+  §4.2.7.5.6). Round 70 (`f994810`) added stage-1 codebook search but
+  left the per-coefficient stage-2 residuals at all zero — the decoder
+  reconstructs the NLSF as a bare `cb1_Q8[k] << 7` (the row that
+  stage-1 picked). This round adds the per-coefficient residual
+  quantisation that refines the synthesised NLSF closer to the input's
+  actual spectrum than the bare codebook row.
+  - `silk::encoder::pick_nlsf_stage2_residuals` runs a coordinate-
+    descent search over per-coefficient residuals (candidate set
+    `[-4..4]`, two passes), iterating `k = order-1 .. 0` so the
+    decoder's backwards prediction (`pred_Q8[k]` feedback from
+    `res_Q10[k+1]`) sees a freshly-decided neighbour residual on each
+    visit. Score is the same open-loop prediction residual energy used
+    by the stage-1 search: `||pcm - LPC_pred(pcm)||²`. The cb1_Q8 →
+    pred_Q8 dequant + IHMW reconstruction + `lsf::stabilize` +
+    `lsf::nlsf_to_lpc` is mirrored exactly via the existing helper
+    `synthesize_nlsf_like_decoder` — encoder and decoder agree on the
+    NLSF reconstruction round-trip-clean.
+  - **Adoption guard** (factor 0.95): on near-stationary content
+    (steady tones, broadband noise) the open-loop search winner
+    typically only beats the all-zero baseline by 0.5-3 %, and at the
+    encoder's current operating point (gain index 35, shell coder cap
+    16, per-sample §4.2.7.8.6 LCG dither) the corresponding closed-
+    loop reconstruction can degrade by a fraction of a dB. The guard
+    reverts to all-zero residuals unless the search beats the baseline
+    by ≥ 5 %, keeping the MB / WB 40 ms tone round-trip tests at
+    their historical 20 dB SNR floor while letting genuine vowel /
+    formant content (typically 20-50 % reduction at WB) through.
+  - Bitstream side: the stage-2 residuals flow through the existing
+    `encode_nlsf_stage2` helper which emits the Table 17/18 per-
+    codebook PDFs + Table 19 magnitude-extension PDF per RFC
+    §4.2.7.5.7. Decoder side already handles non-zero stage-2 since
+    the very first SILK landing; our own decoder round-trips both
+    paths cleanly.
+  - Search cost: `2 * order * 9 * frame_len * order` multiply-adds
+    per frame — about `2 × 16 × 9 × 320 × 16 ≈ 1.5M` mads at WB 20 ms
+    (~3 % of the per-frame compute budget at any reasonable bitrate).
+  - Test hook `SilkFrameEncoder::set_force_zero_stage2(true)` pins
+    residuals to all zero (the round-70 stage-1-only baseline) for
+    A/B comparison.
+  - New test `nlsf_stage2_quantisation_reduces_residual_on_vowel`
+    synthesises the same noise-excited two-formant /a/ vowel the
+    round-70 stage-1 test uses, runs the stage-2 search against the
+    stage-1 winner (idx 30), and asserts:
+    - The search produces at least one non-zero residual.
+    - Open-loop prediction residual energy is reduced by ≥ 4 % vs
+      the stage-1-only baseline. Headline empirical reduction on the
+      mid-fixture frame: ~30 %.
+    - Closed-loop encode → our-decoder round-trip on both paths
+      still produces finite, non-empty output (no decoder desync).
+      Closed-loop SNR delta is logged as diagnostics but not
+      asserted — at the current encoder operating point the
+      excitation coder is the SNR bottleneck rather than LPC fit.
+  - All existing tests pass (97 lib + 18 integration + 32 round-trip
+    + 32 hybrid + 18 docs corpus = 197 → 198 with the new test).
+    No regression on the 10 / 20 / 40 / 60 ms tone round-trip SNR
+    bars nor the libopus cross-decode hybrid tests.
+
 - **SILK encoder NLSF stage-1 codebook search** (RFC 6716 §4.2.7.5.1).
   The encoder previously hard-wired stage-1 index 0 — a flat near-
   uniform NLSF spectrum corresponding to row 0 of `cb1_Q8` (e.g.
