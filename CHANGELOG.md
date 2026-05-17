@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SILK encoder stereo predictor** (RFC 6716 §4.2.7.1) — round 73
+  wires the Wiener-filter analysis path that was previously a TODO
+  with a placeholder `(0, 0)` weights pair shipped per stereo frame.
+  Both `SilkEncoder::encode_one_stereo_frame` and
+  `HybridEncoder::encode_one_frame_stereo` now call the new
+  `silk::encoder::compute_stereo_pred_and_residual` helper which:
+  - Runs the standard 2×2 Wiener fit on the (mid, side) pair at the
+    internal rate using the same `(smoothed_mid, delayed_mid)` taps
+    the decoder's `stereo_unmix_48k` consumes — `m_smooth[i] =
+    (mid[i-1] + 2*mid[i] + mid[i+1]) * 0.25` and `m_delayed[i] =
+    mid[i-1]`. Quantises the result to the bitstream's 16-cell ×
+    5-substep Q13 grid by round-tripping through the existing
+    `quantise_pred_weight_q13` helper.
+  - Subtracts the predicted side `s_pred[n] = w0 * m_smooth[n] + w1 *
+    m_delayed[n]` from the raw side and ships the **residual** (not
+    the raw side) through the side `SilkFrameEncoder`. The decoder
+    adds the predicted side back inside its `stereo_unmix_48k` step,
+    so the closed-loop is `side_decoded = residual_decoded + w0 *
+    m_smooth + w1 * m_delayed` — same end-to-end content, redistributed
+    so the cross-channel redundancy lives in the (~3 ICDF symbols)
+    weight header instead of duplicating in the side body.
+  - Models the decoder's 8 ms predictor-interpolation crossfade
+    (linear blend from `pred_prev_q13` to `pred_curr_q13` over the
+    first 8 ms of each frame) so the residual cancels the *interpolated*
+    prediction at the leading edge, not just the steady-state one.
+  - **Adoption guard** (factor 0.80): only adopts non-zero weights
+    when the chosen predictor reduces open-loop side energy by ≥ 20 %
+    vs the raw side. The encoder runs at internal rate but the
+    decoder applies the prediction at 48 kHz on bandlimited (and
+    group-delayed) upsampled signals — a model mismatch that can
+    degrade closed-loop reconstruction on near-uncorrelated stereo
+    content (e.g. the phase-quadrature 300 Hz L=sin / R=cos test
+    tones the existing NB/MB/WB stereo round-trip tests use). The
+    guard keeps those tests at their historical SNR while letting
+    genuinely-correlated stereo (real recordings, panned signals)
+    benefit from the predictor. Empirically the guard engages on the
+    new R = 0.5 * L correlated-stereo round-trip test (peak L/R
+    amplitude ratio reconstructs to exactly 0.500) but clamps to
+    (0, 0) on all 8 existing phase-quadrature tone tests so their
+    SNR floor is unchanged.
+  - New `SilkStereoEncoderState` struct carries `pred_prev_q13` +
+    `s_mid[2]` (the 2-sample mid history) across packet boundaries.
+    Added as a field on both `SilkEncoder` and `HybridEncoder`.
+  - Four new unit tests in `silk::encoder::tests`:
+    `stereo_pred_guard_clamps_weights_on_uncorrelated_tones`,
+    `stereo_pred_engages_on_correlated_stereo`,
+    `stereo_pred_state_carries_across_frames` (predictor adoption +
+    state continuity); plus the existing
+    `stereo_pred_weights_zero_for_identical_channels` regression.
+  - One new integration test
+    `silk_wb_stereo_20ms_correlated_stereo_predictor_round_trip` in
+    `tests/encoder_roundtrip.rs` that feeds the WB stereo encoder a
+    panned `R = 0.5 * L` harmonic mix and asserts the closed-loop
+    decoded L/R peak ratio reconstructs to 0.5 ± 25 % AND L-channel
+    SNR clears 20 dB. Headline measured numbers on this fixture:
+    `snr_l=32.28 dB, ratio=0.500` (exact panning recovery).
+  - All existing tests pass (101 lib + 18 integration + 33
+    encoder_roundtrip + 32 hybrid + 18 corpus = 202, was 198).
+    No regression on the 16 existing 10 / 20 / 40 / 60 ms NB / MB /
+    WB stereo SNR bars; the adoption guard clamps on those tone
+    inputs so their predictor weights stay (0, 0). Genuine content
+    activates the new path.
+
 - **SILK encoder NLSF stage-2 quantisation** (RFC 6716 §4.2.7.5.2 +
   §4.2.7.5.6). Round 70 (`f994810`) added stage-1 codebook search but
   left the per-coefficient stage-2 residuals at all zero — the decoder

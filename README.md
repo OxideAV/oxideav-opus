@@ -220,12 +220,25 @@ Two explicit entry points, one per Opus mode:
   yet decoded. Packets that enable LBRR return `Error::Unsupported`.
 - **Channel mapping family 1 / 2** (Vorbis / ambisonic multistream,
   more than 2 channels).
-- **SILK stereo predictor** — the stereo encoder currently emits
-  prediction weights of (0, 0). Wiring the full Wiener-filter analysis
-  path in `silk::encoder::stereo_predict_weights_q13` is a follow-up
-  (the function is already in place; the remaining work is subtracting
-  the predicted side from the coded side before it reaches the
-  SilkFrameEncoder).
+- **SILK stereo predictor refinements** — round-73 wires the
+  Wiener-filter `silk::encoder::compute_stereo_pred_and_residual` path
+  end-to-end: encoder picks Q13 weights per 20 ms frame from
+  cross-correlation of (mid, side), encodes the prediction-residual
+  side (instead of the raw side) through the side `SilkFrameEncoder`,
+  and ships non-zero weights in the bitstream. Carries the previous
+  frame's weights + 2-sample mid history in `SilkStereoEncoderState`
+  so the analysis matches the decoder's 8 ms linear interpolation at
+  the leading edge of each frame. An adoption guard (require ≥ 20 %
+  side-energy reduction) falls back to (0, 0) on near-uncorrelated
+  stereo (phase-quadrature test tones, music with broadband stereo
+  imaging) where the encoder's internal-rate analysis vs the decoder's
+  48 kHz application model mismatch can hurt closed-loop SNR.
+  Remaining follow-ups: (a) move the analysis to 48 kHz on upsampled
+  mid/side so the predictor model matches the decoder exactly,
+  (b) coordinate the side `SilkFrameEncoder`'s LTP history with the
+  residual instead of the raw side (LTP history currently sees the
+  residual, which differs from libopus' "code the prediction-residual
+  but keep LTP analysis on the original" convention).
 - **10 ms Hybrid** (configs 12 / 14) — 20 ms mono + stereo Hybrid is
   wired (configs 13 / 15); 10 ms Hybrid needs the LM=2 CELT encoder
   path which still runs LM=3 only.

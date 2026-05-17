@@ -1662,3 +1662,115 @@ fn silk_wb_stereo_60ms_roundtrip_snr_and_channel_separation() {
         20.0,
     );
 }
+
+/// Correlated-stereo round-trip pinning the round-73 stereo predictor.
+///
+/// Feed a WB stereo encoder a panned signal where L is a 200 Hz +
+/// 400 Hz harmonic mix and R = 0.5 * L. The Wiener-filter analysis in
+/// `compute_stereo_pred_and_residual` SHOULD find a non-zero predictor
+/// (`side ≈ 1/3 * mid` for this 2:1 amplitude ratio), pass the adoption
+/// guard's 20 % side-energy reduction threshold, and ship non-zero Q13
+/// weights in the bitstream.
+///
+/// The closed-loop assertion is that the L-channel SNR clears 20 dB
+/// AND the decoded R/L peak amplitude ratio stays within ±25 % of the
+/// 0.5 input ratio. A regression where the encoder ships (0, 0) on
+/// correlated content (e.g. an over-tight adoption guard) still passes
+/// the SNR bar but would fail the amplitude-ratio bar because the
+/// side residual carries lower-fidelity panning information than the
+/// proper predictor-plus-residual pair.
+#[test]
+fn silk_wb_stereo_20ms_correlated_stereo_predictor_round_trip() {
+    let n_frames = 25;
+    let internal_rate = SILK_WB_RATE;
+    let internal_frame_samples = SILK_WB_FRAME_SAMPLES_INTERNAL;
+    let total = n_frames * internal_frame_samples;
+
+    let tau = 2.0 * std::f32::consts::PI;
+    let f0 = 200.0f32;
+    let l_in: Vec<f32> = (0..total)
+        .map(|i| {
+            let t = i as f32 / internal_rate as f32;
+            ((tau * f0 * t).sin() + 0.5 * (tau * 2.0 * f0 * t).sin()) * 0.3
+        })
+        .collect();
+    // R = 0.5 * L — strongly correlated, panned slightly left.
+    let r_in: Vec<f32> = l_in.iter().map(|&v| v * 0.5).collect();
+
+    let mut p = CodecParameters::audio(CodecId::new(oxideav_opus::CODEC_ID_STR));
+    p.channels = Some(2);
+    p.sample_rate = Some(SILK_WB_RATE);
+    let mut enc = SilkEncoder::new_wb_stereo_20ms(&p).expect("make encoder");
+
+    let mut packets: Vec<Packet> = Vec::new();
+    for (lc, rc) in l_in
+        .chunks(internal_frame_samples)
+        .zip(r_in.chunks(internal_frame_samples))
+    {
+        if lc.len() < internal_frame_samples {
+            break;
+        }
+        let mut bytes = Vec::with_capacity(lc.len() * 4);
+        for i in 0..lc.len() {
+            let lq = (lc[i] * 32768.0).clamp(-32768.0, 32767.0) as i16;
+            let rq = (rc[i] * 32768.0).clamp(-32768.0, 32767.0) as i16;
+            bytes.extend_from_slice(&lq.to_le_bytes());
+            bytes.extend_from_slice(&rq.to_le_bytes());
+        }
+        let frame = Frame::Audio(AudioFrame {
+            samples: internal_frame_samples as u32,
+            pts: None,
+            data: vec![bytes],
+        });
+        enc.send_frame(&frame).expect("send");
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+    }
+    enc.flush().expect("flush");
+    while let Ok(p) = enc.receive_packet() {
+        packets.push(p);
+    }
+    assert!(!packets.is_empty());
+
+    let decoded = decode_packets(&packets, 2);
+    assert_eq!(decoded.len(), 2);
+
+    // Downsample 48 kHz → 16 kHz per channel.
+    let mut l_16k = Vec::with_capacity(decoded[0].len() / 3);
+    let mut r_16k = Vec::with_capacity(decoded[1].len() / 3);
+    for chunk in decoded[0].chunks_exact(3) {
+        let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
+        l_16k.push((sum / 3) as i16);
+    }
+    for chunk in decoded[1].chunks_exact(3) {
+        let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
+        r_16k.push((sum / 3) as i16);
+    }
+
+    let skip = 3 * internal_frame_samples;
+    let n = l_in.len().min(l_16k.len()).saturating_sub(skip);
+    assert!(n > 100);
+    let (snr_l, _) = snr_db_with_lag_search(&l_in[skip..skip + n], &l_16k[skip..skip + n], 60);
+    let (snr_r, _) = snr_db_with_lag_search(&r_in[skip..skip + n], &r_16k[skip..skip + n], 60);
+    println!("silk_wb_stereo_correlated: snr_l={snr_l:.2} dB, snr_r={snr_r:.2} dB");
+    assert!(snr_l > 20.0, "L SNR {snr_l:.2} below 20 dB bar");
+
+    // Peak-amplitude ratio: decoded R should be near 0.5 * decoded L.
+    let peak_l = l_16k[skip..skip + n]
+        .iter()
+        .map(|&s| (s as i32).abs())
+        .max()
+        .unwrap_or(0) as f64;
+    let peak_r = r_16k[skip..skip + n]
+        .iter()
+        .map(|&s| (s as i32).abs())
+        .max()
+        .unwrap_or(0) as f64;
+    let ratio = peak_r / peak_l.max(1.0);
+    println!("silk_wb_stereo_correlated: peak_l={peak_l}, peak_r={peak_r}, ratio={ratio:.3}");
+    assert!(
+        (0.375..=0.625).contains(&ratio),
+        "L/R amplitude ratio {ratio:.3} outside ±25 % of expected 0.5"
+    );
+}

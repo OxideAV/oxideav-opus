@@ -940,28 +940,30 @@ pub fn encode_stereo_pred_weights(enc: &mut RangeEncoder, pred_q13: [i32; 2]) {
 
 /// Compute the Q13 mid/side prediction weights for a stereo frame.
 ///
-/// SILK's stereo predictor minimises `E{(S - w0*M - w1*M_shifted)^2}`
-/// where `M_shifted` is the mid channel one sample in the past. The
-/// closed form is the standard 2×2 Wiener filter; we implement it in
-/// f64 then quantise to Q13.
+/// SILK's stereo predictor minimises `E{(S - w0*M_smooth - w1*M_shifted)^2}`
+/// where `M_smooth = (M[n-1] + 2*M[n] + M[n+1]) / 4` is the 3-tap-smoothed
+/// mid channel and `M_shifted = M[n-1]` is the 1-sample-delayed mid (these
+/// match the taps the decoder's `stereo_unmix_48k` uses to reconstruct the
+/// predicted side). The closed form is the standard 2×2 Wiener filter; we
+/// implement it in f64 then quantise to Q13.
 ///
-/// `side_rms_floor` avoids a divide-by-zero when the side channel is
-/// silent.
+/// The function ignores the first and last samples of `mid` so the
+/// 3-tap smoothing window stays inside the buffer.
 pub fn stereo_predict_weights_q13(mid: &[f32], side: &[f32]) -> [i32; 2] {
     debug_assert_eq!(mid.len(), side.len());
     let n = mid.len();
-    if n < 2 {
+    if n < 3 {
         return [0, 0];
     }
-    // Auto / cross correlations, shifted by 1 sample for the 2-tap
-    // predictor. We use f64 for numerical stability.
+    // Auto / cross correlations for the 2-tap predictor (smoothed mid +
+    // delayed mid against side). We use f64 for numerical stability.
     let mut r_mm = 0f64;
     let mut r_mm1 = 0f64;
     let mut r_m1m1 = 0f64;
     let mut r_sm = 0f64;
     let mut r_sm1 = 0f64;
-    for i in 1..n {
-        let m = mid[i] as f64;
+    for i in 1..n - 1 {
+        let m = (mid[i - 1] + 2.0 * mid[i] + mid[i + 1]) as f64 * 0.25;
         let m1 = mid[i - 1] as f64;
         let s = side[i] as f64;
         r_mm += m * m;
@@ -984,6 +986,191 @@ pub fn stereo_predict_weights_q13(mid: &[f32], side: &[f32]) -> [i32; 2] {
         q.clamp(-13500.0, 13500.0) as i32
     };
     [clamp(w0), clamp(w1)]
+}
+
+/// Encoder-side counterpart to the decoder's [`crate::silk::SilkStereoState`].
+///
+/// The stereo predictor lives on top of the mid/side split: the encoder
+/// computes `side_pred[n] = w0 * M_smooth[n] + w1 * M[n-1]` and ships
+/// `side_residual[n] = side[n] - side_pred[n]` (instead of the raw side)
+/// through the side `SilkFrameEncoder`. The decoder then reconstructs the
+/// full side as `side_decoded[n] = side_residual[n] + w0 * M_smooth[n] +
+/// w1 * M[n-1]` inside `stereo_unmix_48k`.
+///
+/// `s_mid` holds the previous frame's last 2 internal-rate mid samples so
+/// the 3-tap smoother + delayed-mid taps have correct history at the
+/// leading edge of each frame (mirroring `SilkStereoState::s_mid`).
+///
+/// `pred_prev_q13` mirrors the decoder's same-named field — it lets the
+/// encoder model the decoder's 8 ms linear interpolation between the
+/// previous frame's predictor and the current frame's predictor over the
+/// leading region (so the encoded residual cancels the interpolated
+/// predictor, not the steady-state one).
+#[derive(Debug, Clone, Default)]
+pub struct SilkStereoEncoderState {
+    pub pred_prev_q13: [i32; 2],
+    pub s_mid: [f32; 2],
+}
+
+impl SilkStereoEncoderState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Compute the stereo-prediction weights for a frame and produce the
+/// coded-side residual the side SILK frame encoder will quantise.
+///
+/// * `mid` / `side` — internal-rate input samples (length = frame_len).
+/// * `state` — persistent encoder state (history + previous weights).
+/// * `internal_rate_hz` — used to size the 8 ms predictor-interpolation
+///   region in samples (8 ms at 8/12/16 kHz = 64/96/128 internal samples).
+///
+/// Returns `(pred_q13, side_residual)` where:
+/// * `pred_q13` is the pair the decoder will reconstruct via
+///   [`encode_stereo_pred_weights`].
+/// * `side_residual` is the value the side `SilkFrameEncoder` should
+///   quantise instead of the raw `side` input.
+///
+/// **Adoption guard**: the function only adopts non-zero weights when
+/// the chosen predictor reduces the open-loop side energy by at least
+/// 20 % vs the raw side. The encoder operates at internal rate but the
+/// decoder applies the prediction at 48 kHz on bandlimited (and
+/// group-delayed) upsampled signals — a model mismatch that can
+/// degrade the closed-loop reconstruction on near-uncorrelated stereo
+/// content (e.g. phase-quadrature test tones). Falling back to (0, 0)
+/// when the analysis can't beat the threshold keeps such content at
+/// its historical SNR while still letting genuinely-correlated stereo
+/// (real recordings, panned signals) benefit from prediction.
+///
+/// On exit, `state` is updated for the next frame.
+pub fn compute_stereo_pred_and_residual(
+    mid: &[f32],
+    side: &[f32],
+    state: &mut SilkStereoEncoderState,
+    internal_rate_hz: u32,
+) -> ([i32; 2], Vec<f32>) {
+    debug_assert_eq!(mid.len(), side.len());
+    let n = mid.len();
+
+    // Wiener-filter analysis on the full frame; quantise to Q13 + the
+    // bitstream's 16-cell × 5-substep grid by round-tripping through the
+    // existing encoder helper. The round-trip lets the residual cancel
+    // exactly what the decoder will reconstruct.
+    let raw_q13 = stereo_predict_weights_q13(mid, side);
+    let mut curr_q13 = quantise_round_trip(raw_q13);
+
+    // Build the (smoothed-mid, delayed-mid) tap pair, taking 2-sample
+    // history from `state` for the leading edge of the frame.
+    let mut x1 = vec![0.0f32; n + 2];
+    x1[0] = state.s_mid[0];
+    x1[1] = state.s_mid[1];
+    x1[2..(n + 2)].copy_from_slice(&mid[..n]);
+    // Save the last two mid samples for the next frame.
+    state.s_mid[0] = x1[n];
+    state.s_mid[1] = x1[n + 1];
+
+    // 8 ms interpolation region in internal-rate samples (matches the
+    // decoder's `interp_len = (8 * 48).min(n)` at 48 kHz; here we use the
+    // internal rate so the encoder's residual cancels the *interpolated*
+    // prediction the decoder will apply at the leading edge).
+    let interp_len = ((8 * internal_rate_hz as usize) / 1000).min(n);
+
+    // Adoption guard — score both candidates (Wiener-fit + zero
+    // fallback) by their open-loop side residual energy, accept the
+    // non-zero pair only if it beats the raw side by ≥ 20 %.
+    let raw_side_energy: f64 = side.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    let predicted_energy =
+        predicted_residual_energy(&x1, side, curr_q13, state.pred_prev_q13, interp_len);
+    const ADOPTION_RATIO: f64 = 0.80; // require ≥ 20 % side energy drop
+    if predicted_energy > ADOPTION_RATIO * raw_side_energy.max(1e-12) {
+        curr_q13 = [0, 0];
+    }
+
+    let prev0 = state.pred_prev_q13[0] as f32;
+    let prev1 = state.pred_prev_q13[1] as f32;
+    let curr0 = curr_q13[0] as f32;
+    let curr1 = curr_q13[1] as f32;
+    let q13_scale = 1.0 / 8192.0;
+
+    let mut residual = vec![0.0f32; n];
+    for idx in 0..n {
+        let t = if idx < interp_len {
+            (idx + 1) as f32 / interp_len as f32
+        } else {
+            1.0
+        };
+        let p0 = (prev0 + (curr0 - prev0) * t) * q13_scale;
+        let p1 = (prev1 + (curr1 - prev1) * t) * q13_scale;
+        let m_smooth = (x1[idx] + 2.0 * x1[idx + 1] + x1[idx + 2]) * 0.25;
+        let m_delayed = x1[idx + 1];
+        let s_pred = m_smooth * p0 + m_delayed * p1;
+        residual[idx] = side[idx] - s_pred;
+    }
+
+    state.pred_prev_q13[0] = curr_q13[0];
+    state.pred_prev_q13[1] = curr_q13[1];
+
+    (curr_q13, residual)
+}
+
+/// Open-loop side residual energy for the adoption guard. Mirrors the
+/// per-sample prediction formula in `compute_stereo_pred_and_residual`
+/// but accumulates `sum((side - pred)^2)` and returns it as f64.
+fn predicted_residual_energy(
+    x1: &[f32],
+    side: &[f32],
+    curr_q13: [i32; 2],
+    prev_q13: [i32; 2],
+    interp_len: usize,
+) -> f64 {
+    let n = side.len();
+    let prev0 = prev_q13[0] as f32;
+    let prev1 = prev_q13[1] as f32;
+    let curr0 = curr_q13[0] as f32;
+    let curr1 = curr_q13[1] as f32;
+    let q13_scale = 1.0 / 8192.0;
+    let mut e = 0f64;
+    for idx in 0..n {
+        let t = if idx < interp_len {
+            (idx + 1) as f32 / interp_len as f32
+        } else {
+            1.0
+        };
+        let p0 = (prev0 + (curr0 - prev0) * t) * q13_scale;
+        let p1 = (prev1 + (curr1 - prev1) * t) * q13_scale;
+        let m_smooth = (x1[idx] + 2.0 * x1[idx + 1] + x1[idx + 2]) * 0.25;
+        let m_delayed = x1[idx + 1];
+        let s_pred = m_smooth * p0 + m_delayed * p1;
+        let r = side[idx] - s_pred;
+        e += (r as f64) * (r as f64);
+    }
+    e
+}
+
+/// Round-trip a Q13 weight pair through the encoder's 16-cell × 5-substep
+/// quantiser so analysis uses the same value the decoder will reconstruct.
+fn quantise_round_trip(pred_q13: [i32; 2]) -> [i32; 2] {
+    // Match the encoder's `encode_stereo_pred_weights` convention: the
+    // bitstream codes `(w0+w1, w1)` rather than `(w0, w1)`; the decoder's
+    // final step is `pred_q13[0] -= pred_q13[1]`.
+    let w0_coded = pred_q13[0] + pred_q13[1];
+    let w1_coded = pred_q13[1];
+    let ix0 = quantise_pred_weight_q13(w0_coded);
+    let ix1 = quantise_pred_weight_q13(w1_coded);
+    // Reconstruct the level the decoder produces.
+    let reconstruct = |ix: [i32; 3]| -> i32 {
+        let cell = (ix[0] + 3 * ix[2]) as usize;
+        let cell = cell.min(15);
+        let low_q13 = tables::STEREO_PRED_QUANT_Q13[cell] as i32;
+        let high_q13 = tables::STEREO_PRED_QUANT_Q13[cell + 1] as i32;
+        let step_q13 = ((high_q13 - low_q13) * 6554) >> 16;
+        low_q13 + step_q13 * (2 * ix[1] + 1)
+    };
+    let w0_dec = reconstruct(ix0);
+    let w1_dec = reconstruct(ix1);
+    // Decoder's final `pred_q13[0] -= pred_q13[1]` step.
+    [w0_dec - w1_dec, w1_dec]
 }
 
 /// Reconstruct the NLSF the decoder will produce for the given
@@ -1576,6 +1763,116 @@ mod tests {
             let rec_r = (m[i] - s[i]) * 0.5;
             assert!((rec_l - l[i]).abs() < 1e-6);
             assert!((rec_r - r[i]).abs() < 1e-6);
+        }
+    }
+
+    /// Stereo predictor adoption guard: when L and R are
+    /// phase-quadrature sines (correlation near zero), the Wiener
+    /// weights solve the analysis but the open-loop residual energy
+    /// barely drops — the guard MUST clamp the emitted weights back to
+    /// (0, 0) so the encoder doesn't ship a noisy predictor that hurts
+    /// closed-loop SNR (regression that round 73's first cut introduced
+    /// on the existing NB tone tests).
+    #[test]
+    fn stereo_pred_guard_clamps_weights_on_uncorrelated_tones() {
+        let rate = 8_000u32;
+        let n = 160usize; // 20 ms @ 8 kHz
+        let tau = 2.0 * std::f32::consts::PI;
+        let f = 300.0f32;
+        let l: Vec<f32> = (0..n)
+            .map(|i| (tau * f * i as f32 / rate as f32).sin() * 0.3)
+            .collect();
+        let r: Vec<f32> = (0..n)
+            .map(|i| (tau * f * i as f32 / rate as f32).cos() * 0.3)
+            .collect();
+        let (m, s) = stereo_mid_side(&l, &r);
+        let mut state = SilkStereoEncoderState::new();
+        let (w, _residual) = compute_stereo_pred_and_residual(&m, &s, &mut state, rate);
+        assert_eq!(w, [0, 0], "guard should clamp on uncorrelated tones");
+    }
+
+    /// Stereo predictor engagement: when L and R are strongly
+    /// correlated (R = L scaled and slightly shifted), the predictor
+    /// SHOULD emit non-zero weights AND the open-loop side-residual
+    /// energy should be measurably lower than the raw side energy.
+    /// This pins the search → non-zero adoption path so a future
+    /// regression that always falls back gets caught.
+    #[test]
+    fn stereo_pred_engages_on_correlated_stereo() {
+        let rate = 16_000u32;
+        let n = 320usize; // 20 ms @ 16 kHz
+        let tau = 2.0 * std::f32::consts::PI;
+        let f0 = 200.0f32;
+        // L: fundamental + 2nd harmonic.
+        let l: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / rate as f32;
+                ((tau * f0 * t).sin() + 0.5 * (tau * 2.0 * f0 * t).sin()) * 0.3
+            })
+            .collect();
+        // R: same signal at 0.6 amplitude (panned to the left). Side is
+        // a scaled copy of mid → predictor should find ≈ 0.25.
+        let r: Vec<f32> = l.iter().map(|&v| v * 0.6).collect();
+        let (m, s) = stereo_mid_side(&l, &r);
+        let mut state = SilkStereoEncoderState::new();
+        let (w, residual) = compute_stereo_pred_and_residual(&m, &s, &mut state, rate);
+        let raw_e: f64 = s.iter().map(|&v| (v as f64).powi(2)).sum();
+        let res_e: f64 = residual.iter().map(|&v| (v as f64).powi(2)).sum();
+        assert!(
+            w != [0, 0],
+            "weights should engage on correlated stereo (got {w:?})"
+        );
+        assert!(
+            res_e < 0.80 * raw_e,
+            "side energy reduction below 20 % threshold (raw={raw_e:.3e}, res={res_e:.3e})"
+        );
+    }
+
+    /// Stereo predictor state continuity: when the same correlated
+    /// stereo content is fed across multiple consecutive frames, the
+    /// per-frame predictor weights should be stable (the state carries
+    /// the mid history + previous weights for the decoder's 8 ms
+    /// crossfade).
+    #[test]
+    fn stereo_pred_state_carries_across_frames() {
+        let rate = 16_000u32;
+        let n = 320usize;
+        let n_frames = 4;
+        let tau = 2.0 * std::f32::consts::PI;
+        let f0 = 180.0f32;
+        let total = n * n_frames;
+        let l: Vec<f32> = (0..total)
+            .map(|i| (tau * f0 * i as f32 / rate as f32).sin() * 0.3)
+            .collect();
+        let r: Vec<f32> = l.iter().map(|&v| v * 0.5).collect();
+        let mut state = SilkStereoEncoderState::new();
+        let mut weights: Vec<[i32; 2]> = Vec::with_capacity(n_frames);
+        for f in 0..n_frames {
+            let lc = &l[f * n..(f + 1) * n];
+            let rc = &r[f * n..(f + 1) * n];
+            let (mid, side) = stereo_mid_side(lc, rc);
+            let (w, _) = compute_stereo_pred_and_residual(&mid, &side, &mut state, rate);
+            weights.push(w);
+        }
+        // All frames should adopt non-zero weights on this strongly-
+        // correlated content.
+        for (i, w) in weights.iter().enumerate() {
+            assert!(*w != [0, 0], "frame {i} fell back to zero ({w:?})");
+        }
+        // Weights should be near-stable across frames (the signal is
+        // stationary). Allow each weight to vary by at most 1 quantiser
+        // cell (≈ 800 Q13 units) between consecutive frames.
+        for i in 1..weights.len() {
+            let dw0 = (weights[i][0] - weights[i - 1][0]).abs();
+            let dw1 = (weights[i][1] - weights[i - 1][1]).abs();
+            assert!(
+                dw0 < 1500 && dw1 < 1500,
+                "weights drifted between frames {} and {} ({:?} → {:?})",
+                i - 1,
+                i,
+                weights[i - 1],
+                weights[i]
+            );
         }
     }
 

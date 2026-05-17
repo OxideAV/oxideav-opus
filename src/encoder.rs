@@ -614,6 +614,11 @@ pub struct SilkEncoder {
     silk_mid: crate::silk::encoder::SilkFrameEncoder,
     /// Side-channel encoder (stereo only).
     silk_side: Option<crate::silk::encoder::SilkFrameEncoder>,
+    /// Cross-frame state for the stereo predictor (stereo only). Carries
+    /// the previous frame's quantised Q13 weights + 2-sample mid history
+    /// so the encoder applies the same interpolated prediction the
+    /// decoder will reconstruct.
+    stereo_enc_state: crate::silk::encoder::SilkStereoEncoderState,
     /// Pending internal-rate samples. For stereo, interleaved L/R.
     pending_internal: VecDeque<f32>,
     /// Expected input sample rate (internal or 48 kHz).
@@ -807,6 +812,7 @@ impl SilkEncoder {
             mode,
             silk_mid,
             silk_side,
+            stereo_enc_state: crate::silk::encoder::SilkStereoEncoderState::new(),
             pending_internal: VecDeque::with_capacity(per_frame_items * 2),
             input_sample_rate: sr,
             input_sample_format,
@@ -902,15 +908,25 @@ impl SilkEncoder {
         // + one mid body + one side body per sub-frame (RFC §4.2.4).
         let per_silk = self.mode.samples_per_silk_frame();
         let n = self.mode.silk_frames_per_packet();
+        let internal_rate = self.mode.internal_rate();
         for i in 0..n {
             let start = i * per_silk;
             let lc = &left[start..start + per_silk];
             let rc = &right[start..start + per_silk];
 
-            // Stereo prediction weights (0, 0) for the MVP — see the
-            // comment in the 20 ms path.
+            // Mid/side split, then run the stereo predictor: compute Q13
+            // weights via Wiener-filter analysis on (mid, side) and ship
+            // the residual `side - predicted_side` through the side SILK
+            // encoder so the encoded side is the prediction residual the
+            // decoder expects (RFC §4.2.7.1).
             let (mid, side) = crate::silk::encoder::stereo_mid_side(lc, rc);
-            crate::silk::encoder::encode_stereo_pred_weights(&mut re, [0, 0]);
+            let (pred_q13, side_residual) = crate::silk::encoder::compute_stereo_pred_and_residual(
+                &mid,
+                &side,
+                &mut self.stereo_enc_state,
+                internal_rate,
+            );
+            crate::silk::encoder::encode_stereo_pred_weights(&mut re, pred_q13);
 
             // Mid then side body. The decoder reads the mid-only flag
             // only when the side VAD is 0; we emit VAD=1 for the side
@@ -920,7 +936,7 @@ impl SilkEncoder {
                 .silk_side
                 .as_mut()
                 .ok_or_else(|| Error::other("SILK stereo encoder: missing side state"))?;
-            side_enc.encode_frame_body(&side, &mut re)?;
+            side_enc.encode_frame_body(&side_residual, &mut re)?;
         }
 
         let body = re
@@ -1306,6 +1322,10 @@ pub struct HybridEncoder {
     silk_mid: crate::silk::encoder::SilkFrameEncoder,
     /// SILK frame encoder for the side channel (stereo only).
     silk_side: Option<crate::silk::encoder::SilkFrameEncoder>,
+    /// Cross-frame state for the stereo predictor (stereo only). Mirrors
+    /// the field on `SilkEncoder`; Hybrid always runs SILK at WB
+    /// (16 kHz internal) regardless of TOC bandwidth.
+    stereo_enc_state: crate::silk::encoder::SilkStereoEncoderState,
     /// CELT encoder used for the high-band only — mono (1 ch) or
     /// dual-stereo (2 ch) at 48 kHz. Built with
     /// `new_with_frame_samples(_, 960)` for 20 ms and
@@ -1461,6 +1481,7 @@ impl HybridEncoder {
             frame_samples_48k,
             silk_mid,
             silk_side,
+            stereo_enc_state: crate::silk::encoder::SilkStereoEncoderState::new(),
             celt,
             pending_48k: VecDeque::with_capacity(SILK_FRAME_SAMPLES_48K * 4),
             input_sample_format,
@@ -1561,9 +1582,17 @@ impl HybridEncoder {
         debug_assert_eq!(r_internal.len(), self.silk_mid.frame_len());
         let (mid, side) = crate::silk::encoder::stereo_mid_side(&l_internal, &r_internal);
 
-        // SILK stereo prediction header: emit (0, 0) for the MVP — the
-        // existing SILK stereo encoder uses the same placeholder.
-        crate::silk::encoder::encode_stereo_pred_weights(&mut re, [0, 0]);
+        // SILK stereo prediction header — Wiener-filter weights computed
+        // on (mid, side) at the WB internal rate (16 kHz). The decoder
+        // reconstructs the predicted side and adds the encoded residual
+        // back to it before the unmix step.
+        let (pred_q13, side_residual) = crate::silk::encoder::compute_stereo_pred_and_residual(
+            &mid,
+            &side,
+            &mut self.stereo_enc_state,
+            SILK_WB_RATE,
+        );
+        crate::silk::encoder::encode_stereo_pred_weights(&mut re, pred_q13);
 
         // Mid then side body. Both VAD bits are 1 (set in the header
         // above) so the mid-only flag is implicitly absent.
@@ -1572,7 +1601,7 @@ impl HybridEncoder {
             .silk_side
             .as_mut()
             .ok_or_else(|| Error::other("Hybrid stereo encoder: missing side state"))?;
-        side_enc.encode_frame_body(&side, &mut re)?;
+        side_enc.encode_frame_body(&side_residual, &mut re)?;
 
         // CELT high-band — dual-stereo, start_band=17.
         let end_band = self.bw.celt_end_band();
