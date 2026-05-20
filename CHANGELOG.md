@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-opus/compare/v0.0.9...v0.0.10) - 2026-05-20
+
+### Other
+
+- encoder adaptive gain index (RFC 6716 §4.2.7.4)
+- encoder stereo predictor (RFC 6716 §4.2.7.1)
+- NLSF stage-2 quantisation (RFC 6716 §4.2.7.5.2 + §4.2.7.5.6)
+- NLSF stage-1 codebook search (RFC 6716 §4.2.7.5.1)
+- record post-celt-0.1.5 divergence histogram + per-mode silence-rail
+- fix §4.2.7.3 + §4.2.7.4 ICDF tables (silence-rail regression)
+- stateful upsampler + per-mode divergence histogram
+- add cargo-fuzz harness + libopus oracle + fix two decoder panics
+
 ### Added
 
 - **SILK encoder adaptive gain index** (RFC 6716 §4.2.7.4) — round 78
