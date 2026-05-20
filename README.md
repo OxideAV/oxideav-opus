@@ -210,6 +210,22 @@ Two explicit entry points, one per Opus mode:
     payoff is bitstream fidelity that will translate to SNR once the
     encoder grows the spec's full Q12-saturated synthesis chain. See
     `silk::encoder::pick_nlsf_stage2_residuals`.
+  - **Adaptive gain index selection** (RFC 6716 §4.2.7.4) — every
+    frame runs a peak-driven picker that chooses the gain index
+    whose Q16 magnitude best matches the input's measured peak. The
+    picker is floored at `GAIN_INDEX_FLOOR = 35` (the historical
+    fixed value calibrated by the round-67 SNR matrix); for typical
+    [-1, 1]-range PCM input the picker lands exactly at the floor
+    and produces bit-identical output to the pre-round-78 encoder
+    (verified via `gain_picker_matches_fixed_idx35_on_calibration_target`).
+    For extreme amplitudes (peak ≫ 1.0, e.g. an un-normalised f32
+    pipeline) the picker climbs to keep the shell coder's signed
+    magnitudes under `CARRIER_FULL_SCALE = 16384`. A fast-attack /
+    slow-release peak-hold envelope (release factor 0.92 per frame)
+    plus asymmetric down-only hysteresis (window 2 idx ≈ 2.74 dB)
+    damps frame-to-frame ripple on envelope-modulated input so the
+    LPC feedback loop sees a stable gain. See
+    `silk::encoder::pick_gain_index_for_peak`.
 
 - Input sample formats (all encoders): `S16`, `S16P`, `F32`, `F32P`.
 

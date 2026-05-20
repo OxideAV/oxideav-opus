@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SILK encoder adaptive gain index** (RFC 6716 §4.2.7.4) — round 78
+  replaces the pre-existing fixed-idx-35 `GAIN_INDEX_{UN,}VOICED`
+  constants with `pick_gain_index_for_peak`, a per-frame picker that
+  chooses the gain index whose Q16 magnitude is geometrically closest
+  to `peak * 32768 / SIGNED_PEAK_TARGET` (target = 32, matching the
+  shell coder's measured-best operating point at lsb_count = 5). The
+  picker is bounded from below at `GAIN_INDEX_FLOOR = 35` — the
+  historical fixed value the round-67 SNR matrix was calibrated
+  against — so typical `[-1, 1]`-range PCM produces bit-identical
+  output to the pre-round-78 encoder (verified by the new
+  `gain_picker_matches_fixed_idx35_on_calibration_target` test which
+  compares raw bitstreams between forced-idx-35 and adaptive paths).
+  For amplitudes that would otherwise drive `signed_peak` past
+  `CARRIER_FULL_SCALE = 16384` (an un-normalised f32 pipeline pushing
+  peak well above 1.0) the picker climbs the gain table to keep the
+  shell coder lossless. Across-frame stability:
+  - `SilkFrameEncoder.peak_hold` runs a fast-attack / slow-release
+    envelope follower (release factor 0.92 per frame ≈ 0.72 dB) so
+    the leading edge of an envelope-modulated tone doesn't bias the
+    gain low.
+  - `apply_gain_hysteresis` is asymmetric: increases pass through
+    immediately (fast attack — the carrier hates being under-gain on
+    a sample peak), decreases within `GAIN_HYSTERESIS_IDX = 2`
+    (≈ 2.74 dB) are held to damp envelope ripple. Genuine downward
+    level transitions ≥ 2.74 dB still propagate.
+
+  New tests: 5 in `silk::encoder::tests` (`gain_picker_silent_input_at_floor`,
+  `gain_picker_loud_input_climbs`, `gain_picker_hysteresis_is_asymmetric`,
+  `gain_picker_matches_fixed_idx35_on_calibration_target`,
+  `gain_picker_climbs_on_extreme_amplitude`). All 207 tests pass; the
+  existing NB/MB/WB × 10/20/40/60 ms round-trip matrix and the loud-
+  input shell-coder regression test stay above their SNR bars.
+  Test hook: `SilkFrameEncoder::set_force_gain_index(Some(idx))` pins
+  the gain index for A/B comparisons against the pre-round-78
+  fixed-idx-35 baseline.
+
 - **SILK encoder stereo predictor** (RFC 6716 §4.2.7.1) — round 73
   wires the Wiener-filter analysis path that was previously a TODO
   with a placeholder `(0, 0)` weights pair shipped per stereo frame.

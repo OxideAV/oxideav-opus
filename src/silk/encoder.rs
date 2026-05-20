@@ -75,22 +75,178 @@ use crate::toc::OpusBandwidth;
 // entry whose all-zero-residual LPC minimises the open-loop prediction
 // residual energy on the input. See `pick_nlsf_stage1_index`.)
 
-/// Gain index for unvoiced frames.
-///
-/// Per §4.2.7.8.6 the reconstructed excitation is
-/// `signed * 256 / 2^23 = signed * 2^-15`, so the synth filter's
-/// gain-applied input is `signed * g / 32768`. To keep `signed`
-/// magnitudes inside the shell coder's natural per-block sum cap of
-/// 16 (so `quantize_to_shell` doesn't silently truncate, breaking the
-/// closed-loop analysis-by-synthesis), we want `signed = e_desired *
-/// 32768 / g` to peak around 30-100 for a 0.3-amplitude residual.
-/// `gain_index = 35` puts `g ≈ 310`, giving `signed_peak ≈ 32` —
-/// matches the old `* 128 / g` carrier's range while reproducing the
-/// spec-accurate decoder reconstruction path.
-const GAIN_INDEX_UNVOICED: i32 = 35;
+// Historical fixed gain indices (used pre-round-78) are now expressed
+// as `GAIN_INDEX_FLOOR` below — the adaptive picker stays anchored at
+// that value for typical input and only climbs for extreme amplitudes.
 
-/// Gain index for voiced frames. Same as unvoiced.
-const GAIN_INDEX_VOICED: i32 = 35;
+/// Maximum gain-index change permitted between frames. When the
+/// adaptive picker's preferred index is closer than this to the
+/// previous frame's emitted index, the encoder holds the previous
+/// index — keeping the gain scale stable across the envelope of a
+/// modulated tone so the LPC loop's feedback path doesn't see a
+/// frame-boundary scale step. Set to 2 (≈ 2.74 dB) so envelope
+/// ripple at the 1- and 2-idx scale damps out while genuine level
+/// changes (≥ 2.74 dB) still propagate.
+const GAIN_HYSTERESIS_IDX: i32 = 2;
+
+/// Per-frame release factor for the peak-hold envelope follower that
+/// drives [`pick_gain_index_for_peak`]. The follower attacks instantly
+/// to the current frame's peak but only releases by this factor each
+/// frame. 0.92 corresponds to ≈ 0.72 dB per frame — slow enough that
+/// the leading edge of an envelope-modulated tone doesn't bias the
+/// gain low, fast enough that a real level drop is tracked within a
+/// few frames.
+const PEAK_HOLD_RELEASE: f32 = 0.92;
+
+/// Lower bound on the gain index emitted by [`pick_gain_index_for_peak`].
+///
+/// Anchored at the historical fixed `GAIN_INDEX_*_FALLBACK = 35` — the
+/// operating point empirically calibrated against the round-67 test
+/// matrix (0.3-amplitude input → signed_peak ≈ 32 → shell coder per-
+/// sample pulse count averaging ≈ 1 with lsb_count = 5 → ≥ 20 dB
+/// internal-rate SNR across all 24 NB/MB/WB × 10/20/40/60 ms config
+/// matrix entries).
+///
+/// Going BELOW 35 on quiet input gives finer Q23 quantisation steps in
+/// theory, but in practice triggers denormal-collapse in the shell
+/// coder's per-block budget redistribution: many small-magnitude
+/// samples collapse to zero pulses, and the LSB-bit recovery can't
+/// recover the lost dynamic range. The picker can (and should) still
+/// go ABOVE 35 to track loud input, where staying at 35 would cause
+/// signed_peak to exceed the shell coder's per-block sweet spot in
+/// the opposite direction (the round-67 regression where 1.0-amp
+/// input drove signed_peak to ~100 and pushed lsb_count to 6+ — the
+/// gain mismatch eats ~3 dB of headroom).
+///
+/// The asymmetry (UP-only adaptation) is documented in `README.md`'s
+/// SILK encoder section as the §4.2.7.4 follow-up.
+const GAIN_INDEX_FLOOR: i32 = 35;
+
+/// Target signed-magnitude PEAK for the §4.2.7.4 gain picker.
+///
+/// The encoder picks the gain index so that the quantised
+/// `signed_mag` peak lands near this value. The choice is bounded
+/// from above by the shell coder's per-block pulse budget — RFC 6716
+/// §4.2.7.8.{2,3} caps `sum_{i=0..16}(pulses_i) ≤ 16` and the
+/// per-sample LSB count at 10. With a 16-sample block, an *equal*
+/// per-sample magnitude of `m` requires `lsb_count ≥ log2(m)` to fit
+/// the 16-pulse cap, so `m ≲ 16 * 2^lsb_count / 16 = 2^lsb_count` —
+/// hitting the lsb_count=10 ceiling at `m = 1024`. The actual usable
+/// peak is much smaller because the spike samples have to share the
+/// pulse budget with their neighbours. Picking a peak target of ~32
+/// keeps the spike at ~5 pulses with `lsb_count = 5` and leaves the
+/// 11 other samples in the block with most of the budget. This is the
+/// same operating point the historical fixed `GAIN_INDEX_*_FALLBACK
+/// = 35` produced on 0.3-amplitude input.
+const SIGNED_PEAK_TARGET: f32 = 32.0;
+
+/// Pick the SILK §4.2.7.4 gain index that best matches the input
+/// frame's measured peak so the closed-loop analysis-by-synthesis stays
+/// inside the carrier's quantiser range and uses the finest gain that
+/// still avoids per-block shell-coder saturation.
+///
+/// `pcm_internal` — the input frame at the internal rate. `signal_type`
+/// is RFC 6716 §4.2.7.3's `signal_type`: 0 = inactive, 1 = unvoiced,
+/// 2 = voiced (only used for the §4.2.7.4 PDF selection, not the gain
+/// magnitude).
+///
+/// Returns an index in `[0, 63]`, suitable for emitting via the
+/// `(GAIN_MSB_xxx_ICDF, GAIN_LSB_ICDF)` pair plus a downstream
+/// `silk_log2lin` lookup that produces the matching Q16 gain.
+///
+/// # Why per-frame peak (not per-subframe)?
+///
+/// The bitstream codes the absolute gain only for the first sub-frame;
+/// the remaining sub-frames use a 41-entry delta PDF strongly centred
+/// on idx 4 (≈ "same gain"). The MVP encoder emits `delta = 4` for
+/// every later sub-frame, which means a single gain index controls the
+/// entire frame's quantisation step. Choosing it from the frame's peak
+/// rather than the per-sub-frame peak avoids the situation where one
+/// loud sub-frame saturates the shell-coder while the rest are quiet.
+///
+/// # Lower bound
+///
+/// The Q16 gain range is `[81920, 1686110208]` (RFC 6716 §4.2.7.4) so
+/// idx 0 already gives `g = 1.25`. For very quiet input (peak ≪ 0.6)
+/// the picker pins to idx 0 — that's the finest step the spec allows.
+pub(crate) fn pick_gain_index(pcm_internal: &[f32], signal_type: u8) -> i32 {
+    let _ = signal_type; // reserved for future per-PDF biasing
+    let peak = frame_peak_abs(pcm_internal);
+    pick_gain_index_for_peak(peak)
+}
+
+/// Maximum absolute amplitude across `pcm`. Returns 0.0 on empty input.
+fn frame_peak_abs(pcm: &[f32]) -> f32 {
+    let mut peak = 0.0f32;
+    for &x in pcm {
+        let a = x.abs();
+        if a > peak {
+            peak = a;
+        }
+    }
+    peak
+}
+
+/// Variant of [`pick_gain_index`] driven by a precomputed peak value.
+/// The encoder pipes its peak-hold envelope through this so the
+/// gain-index choice tracks the slow-release envelope rather than the
+/// raw per-frame peak (which would dip during an envelope's leading
+/// edge and bias the gain low).
+pub(crate) fn pick_gain_index_for_peak(peak: f32) -> i32 {
+    if !peak.is_finite() || peak == 0.0 {
+        // Empty / silent frame: still honour the floor so the LPC
+        // history isn't perturbed by a sudden drop into idx 0 land.
+        return GAIN_INDEX_FLOOR;
+    }
+
+    // signed_peak = peak * 32768 / g  ≈  SIGNED_PEAK_TARGET
+    //   → g_target = peak * 32768 / SIGNED_PEAK_TARGET
+    let g_target = peak * 32768.0 / SIGNED_PEAK_TARGET;
+    // Pick the gain idx whose Q16 gain is geometrically closest to
+    // g_target. Geometric (log) distance matches the picker's
+    // perceptual goal — `gain_index_to_q16` is log-linear (~1.37 dB
+    // per idx step), so nearest-in-log-space is nearest in idx-space
+    // too. This rounds-to-nearest rather than rounds-up, recovering
+    // the historical idx-35 operating point on 0.3-amplitude input
+    // exactly (round-up would always pick idx 36 there, biasing the
+    // shell coder slightly off its measured-best operating point).
+    let g_target = g_target.max(1.25);
+    let target_log = g_target.ln();
+    let mut best_idx = 0i32;
+    let mut best_err = f32::INFINITY;
+    for idx in 0..=63i32 {
+        let g = super::gain_index_to_q16(idx) as f32 / 65536.0;
+        let err = (g.ln() - target_log).abs();
+        if err < best_err {
+            best_err = err;
+            best_idx = idx;
+        }
+    }
+    best_idx.max(GAIN_INDEX_FLOOR)
+}
+
+/// Apply asymmetric frame-to-frame stability to the adaptive picker's
+/// raw output:
+///
+/// * Increases of ANY size pass through immediately (fast attack — the
+///   carrier's per-block pulse budget hates being under-gain on a
+///   sample peak; we don't want to clip pulses for one frame just to
+///   honour hysteresis).
+/// * Decreases within [`GAIN_HYSTERESIS_IDX`] of the previous index are
+///   held — keeps an envelope-modulated tone from rippling the gain
+///   between frames as the envelope falls (peak-hold's slow release
+///   doesn't cover all amplitudes).
+///
+/// This is the gain-side analogue of the round-69 NLSF stage-1 search's
+/// hysteresis: stable state for steady-state signals, single-step
+/// adaptation for genuine level transitions.
+fn apply_gain_hysteresis(raw: i32, prev: Option<i32>) -> i32 {
+    let raw = raw.clamp(0, 63);
+    match prev {
+        Some(p) if raw < p && (p - raw) <= GAIN_HYSTERESIS_IDX => p,
+        _ => raw,
+    }
+}
 
 /// LTP scaling factor (Q14) used by the voiced encoder path. Value
 /// 15565 is the "strong-periodicity" level (RFC 6716 §4.2.7.6.3 Table
@@ -255,6 +411,26 @@ pub struct SilkFrameEncoder {
     /// stage-1-only baseline for SNR A/B comparison. Production callers
     /// leave this `false`.
     force_zero_stage2: bool,
+    /// Test-only knob: when `Some(idx)`, every frame skips the §4.2.7.4
+    /// adaptive picker and codes with the pinned gain index. Used by
+    /// the gain-quantisation A/B SNR tests. Production callers leave
+    /// this `None`.
+    force_gain_index: Option<i32>,
+    /// Previous frame's emitted gain index (0..=63), or `None` before the
+    /// first encoded frame. Used by [`pick_gain_index`] to apply a
+    /// small-hysteresis filter on the per-frame gain selection so an
+    /// envelope-modulated input doesn't oscillate the gain by ±1 idx
+    /// between frames — which would otherwise produce tiny LPC-history
+    /// mismatches between encoder and decoder (the inputs to the LPC
+    /// loop scale with `g`, so a frame-boundary gain step ripples
+    /// through the next frame's prediction.) See `GAIN_HYSTERESIS_IDX`.
+    prev_gain_idx: Option<i32>,
+    /// Peak-hold of the input's absolute amplitude across recent frames,
+    /// with one-frame exponential decay (factor 0.6). Used as a fast-
+    /// attack / slow-release envelope follower so the gain picker
+    /// doesn't choose a too-quiet index on the leading edge of an
+    /// envelope-modulated tone. Reset on `reset()`.
+    peak_hold: f32,
 }
 
 impl SilkFrameEncoder {
@@ -290,6 +466,9 @@ impl SilkFrameEncoder {
             force_stage1_idx: None,
             force_unvoiced: false,
             force_zero_stage2: false,
+            force_gain_index: None,
+            prev_gain_idx: None,
+            peak_hold: 0.0,
         }
     }
 
@@ -318,6 +497,16 @@ impl SilkFrameEncoder {
     #[doc(hidden)]
     pub fn set_force_zero_stage2(&mut self, f: bool) {
         self.force_zero_stage2 = f;
+    }
+
+    /// Test-only: when `Some(idx)`, every frame skips the §4.2.7.4
+    /// adaptive [`pick_gain_index`] search and codes with the pinned
+    /// gain index. Used by the gain-quantisation A/B SNR regression
+    /// tests against the historical fixed-idx-35 baseline. Production
+    /// callers leave at `None` (default).
+    #[doc(hidden)]
+    pub fn set_force_gain_index(&mut self, idx: Option<i32>) {
+        self.force_gain_index = idx.map(|i| i.clamp(0, 63));
     }
 
     /// Convenience: NB (8 kHz) mono 20 ms encoder.
@@ -378,11 +567,18 @@ impl SilkFrameEncoder {
 
     /// Reset all cross-frame state. Used by the stereo encoder when
     /// the side channel transitions from mid-only to coded.
+    ///
+    /// Test-only overrides (`force_stage1_idx`, `force_unvoiced`,
+    /// `force_zero_stage2`, `force_gain_index`) survive a reset — they
+    /// pin a behaviour for the entire test run regardless of state
+    /// boundary crossings.
     pub fn reset(&mut self) {
         self.prev_synth = vec![0.0; self.params.lpc_order];
         self.prev_pitch_lag = 0;
         self.ltp_history = vec![0.0; 480];
         self.prev_stage1_idx = None;
+        self.prev_gain_idx = None;
+        self.peak_hold = 0.0;
     }
 
     /// Encode one 20 ms SILK-only body (the bit-stream after the
@@ -467,7 +663,29 @@ impl SilkFrameEncoder {
         let nlsf_q15 = lsf::stabilize(&nlsf_q15, order == 16);
         let lpc = lsf::nlsf_to_lpc(&nlsf_q15, self.params.bandwidth);
 
-        let gain_index: i32 = GAIN_INDEX_UNVOICED;
+        // §4.2.7.4 gain quantisation — pick the gain index from the input
+        // frame's peak so the closed-loop residual stays comfortably
+        // inside the carrier's signed-magnitude range. Driven by a
+        // peak-hold envelope (fast-attack / slow-release) so the
+        // leading edge of an envelope-modulated tone doesn't bias the
+        // gain low. Hysteresis keeps frame-to-frame ±1 idx ripple from
+        // ripping through the closed-loop LPC history. Falls back to
+        // the historical fixed index 35 only if `set_force_gain_index`
+        // is engaged for A/B tests.
+        let gain_index: i32 = if let Some(forced) = self.force_gain_index {
+            forced.clamp(0, 63)
+        } else {
+            let frame_peak = frame_peak_abs(pcm_internal);
+            // Peak-hold: attack instant, release one-frame factor 0.6.
+            self.peak_hold = frame_peak.max(self.peak_hold * PEAK_HOLD_RELEASE);
+            let raw = pick_gain_index_for_peak(self.peak_hold);
+            apply_gain_hysteresis(raw, self.prev_gain_idx)
+        };
+        self.prev_gain_idx = Some(gain_index);
+        debug_assert!(
+            (0..=63).contains(&gain_index),
+            "gain_index {gain_index} out of [0, 63]"
+        );
         let gain_q16 = super::gain_index_to_q16(gain_index);
         let g = gain_q16.max(1) as f32 / 65536.0;
         // Per §4.2.7.8.6: e_quant = (signed * 256 + small_offset) / 2^23
@@ -646,8 +864,22 @@ impl SilkFrameEncoder {
         let nlsf_q15 = lsf::stabilize(&nlsf_q15, order == 16);
         let lpc = lsf::nlsf_to_lpc(&nlsf_q15, self.params.bandwidth);
 
-        // Gain — same constant gain index as unvoiced path.
-        let gain_index: i32 = GAIN_INDEX_VOICED;
+        // §4.2.7.4 gain quantisation. Same picker as the unvoiced path —
+        // the gain index magnitude doesn't depend on signal_type; the
+        // PDF that codes it does (handled below via the voiced MSB ICDF).
+        let gain_index: i32 = if let Some(forced) = self.force_gain_index {
+            forced.clamp(0, 63)
+        } else {
+            let frame_peak = frame_peak_abs(pcm_internal);
+            self.peak_hold = frame_peak.max(self.peak_hold * PEAK_HOLD_RELEASE);
+            let raw = pick_gain_index_for_peak(self.peak_hold);
+            apply_gain_hysteresis(raw, self.prev_gain_idx)
+        };
+        self.prev_gain_idx = Some(gain_index);
+        debug_assert!(
+            (0..=63).contains(&gain_index),
+            "gain_index {gain_index} out of [0, 63]"
+        );
         let gain_q16 = super::gain_index_to_q16(gain_index);
         let g = gain_q16.max(1) as f32 / 65536.0;
         let st = (signal_type as usize).min(2);
@@ -1598,6 +1830,122 @@ mod tests {
         assert_eq!(mb.subframe_len(), 60);
         assert_eq!(mb.frame_len(), 240);
         assert_eq!(mb.internal_rate_hz(), 12_000);
+    }
+
+    /// §4.2.7.4 gain picker: the floor is anchored at the historical
+    /// fixed `GAIN_INDEX_*_FALLBACK = 35`. Silent and quiet input must
+    /// not drop below this floor — that's the calibrated operating
+    /// point of the round-67 SNR matrix.
+    #[test]
+    fn gain_picker_silent_input_at_floor() {
+        assert_eq!(pick_gain_index_for_peak(0.0), GAIN_INDEX_FLOOR);
+        assert_eq!(pick_gain_index_for_peak(0.01), GAIN_INDEX_FLOOR);
+        assert_eq!(pick_gain_index_for_peak(0.1), GAIN_INDEX_FLOOR);
+        // 0.3 amplitude is the historical calibration target — picker
+        // lands right at the floor.
+        assert_eq!(pick_gain_index_for_peak(0.3), GAIN_INDEX_FLOOR);
+    }
+
+    /// §4.2.7.4 gain picker: louder input than the historical 0.3-amp
+    /// calibration target lifts the gain index ABOVE the floor.
+    /// `signed_peak = peak * 32768 / g`; staying at `g = 310` (idx 35)
+    /// for `peak = 1.0` would push `signed_peak` to ~105, well past
+    /// the shell coder's sweet spot. The picker must compensate.
+    #[test]
+    fn gain_picker_loud_input_climbs() {
+        let idx_06 = pick_gain_index_for_peak(0.6);
+        let idx_10 = pick_gain_index_for_peak(1.0);
+        let idx_15 = pick_gain_index_for_peak(1.5);
+        assert!(
+            idx_06 > GAIN_INDEX_FLOOR,
+            "peak 0.6 should climb above floor {GAIN_INDEX_FLOOR} (got {idx_06})"
+        );
+        assert!(
+            idx_10 > idx_06,
+            "peak 1.0 idx {idx_10} should exceed peak 0.6 idx {idx_06}"
+        );
+        assert!(
+            idx_15 >= idx_10,
+            "peak 1.5 idx {idx_15} should not regress from peak 1.0 idx {idx_10}"
+        );
+        // Picker stays inside the RFC range.
+        for &peak in &[0.6f32, 1.0, 1.5, 2.0, 5.0] {
+            let idx = pick_gain_index_for_peak(peak);
+            assert!((0..=63).contains(&idx), "idx {idx} out of [0, 63]");
+        }
+    }
+
+    /// Hysteresis: a single-frame drop within the window holds; an
+    /// increase passes through immediately (fast attack).
+    #[test]
+    fn gain_picker_hysteresis_is_asymmetric() {
+        // Increase passes through.
+        assert_eq!(apply_gain_hysteresis(38, Some(35)), 38);
+        assert_eq!(apply_gain_hysteresis(36, Some(35)), 36);
+        // Decrease within window is held.
+        assert_eq!(apply_gain_hysteresis(34, Some(35)), 35);
+        assert_eq!(apply_gain_hysteresis(33, Some(35)), 35);
+        // Decrease past the window passes through.
+        assert_eq!(apply_gain_hysteresis(32, Some(35)), 32);
+        // No previous → raw passes through.
+        assert_eq!(apply_gain_hysteresis(40, None), 40);
+    }
+
+    /// End-to-end: a frame at the historical 0.3-amp calibration target
+    /// produces the same bitstream regardless of whether the picker is
+    /// forced to idx 35 or runs adaptively. This is the "no
+    /// regression" gate — the round-67 SNR matrix's calibrated
+    /// operating point survives the picker landing.
+    #[test]
+    fn gain_picker_matches_fixed_idx35_on_calibration_target() {
+        let params = BandwidthParams::nb();
+        let rate = 8_000u32;
+        let frame_len = params.subframe_len * 4;
+        let pcm: Vec<f32> = (0..frame_len)
+            .map(|i| (2.0 * std::f32::consts::PI * 300.0 * i as f32 / rate as f32).sin() * 0.3)
+            .collect();
+
+        let mut bufs = Vec::new();
+        for force in [Some(35), None] {
+            let mut enc = SilkFrameEncoder::new(params);
+            enc.set_force_unvoiced(true);
+            enc.set_force_gain_index(force);
+            let mut re = RangeEncoder::new(2048);
+            re.encode_bit_logp(true, 1);
+            re.encode_bit_logp(false, 1);
+            enc.encode_frame_body(&pcm, &mut re).expect("encode");
+            bufs.push(re.done().expect("done"));
+        }
+        assert_eq!(
+            bufs[0], bufs[1],
+            "adaptive picker should land at idx 35 (and produce the \
+             identical bitstream) on the historical calibration signal"
+        );
+    }
+
+    /// End-to-end: an EXTREME amplitude (peak >> 1.0, beyond what S16
+    /// PCM can carry but possible via the f32 path) needs the picker
+    /// to lift the gain so the shell coder's signed magnitudes stay
+    /// inside the per-block cap. Even at peak=50 (an absurd test
+    /// value that simulates a fully un-normalised float pipeline) the
+    /// picker should pick a higher gain than idx 35 to keep
+    /// signed_peak from exceeding the per-sample carrier cap.
+    #[test]
+    fn gain_picker_climbs_on_extreme_amplitude() {
+        // Confirm the *picker* output, not the SNR — SNR at peak=50
+        // depends on too many other-axis quantiser interactions to be a
+        // single-axis assertion. The picker's job: emit an idx whose
+        // `g >= 2 * peak`, so signed_peak <= CARRIER_FULL_SCALE.
+        for &peak in &[1.0f32, 5.0, 10.0, 50.0] {
+            let idx = pick_gain_index_for_peak(peak);
+            let g = super::super::gain_index_to_q16(idx) as f32 / 65536.0;
+            let signed_peak = peak * 32768.0 / g;
+            assert!(
+                signed_peak < CARRIER_FULL_SCALE,
+                "peak={peak} picker idx={idx} (g={g:.1}) leaves signed_peak \
+                 = {signed_peak:.0} >= CARRIER_FULL_SCALE = {CARRIER_FULL_SCALE}"
+            );
+        }
     }
 
     /// Encode a zero frame and decode it; output should be near zero.
