@@ -4,6 +4,13 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-opus/compare/v0.0.9...v0.0.10) - 2026-05-20
+
+### Other
+
+- round 1: RFC 6716 §3.1 packet TOC byte parser
+- orphan rebuild: clean-room scaffold post 2026-05-20 audit
+
 ### Added
 
 * **Clean-room round 1 (2026-05-20):** RFC 6716 §3.1 packet TOC byte
