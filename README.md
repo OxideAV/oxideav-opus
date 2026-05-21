@@ -2,11 +2,12 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-21 (clean-room round 4)
+## Status — 2026-05-22 (clean-room round 5)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
-SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder; no SILK gains / LSF
-stage-2 / LTP / excitation yet, no CELT band machinery yet.**
+SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
+gains; no LSF stage-2 / LTP / excitation yet, no CELT band machinery
+yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -120,12 +121,54 @@ weights and mid-only flag), stereo-side, and LBRR configurations,
 plus a random-buffer sweep of the stereo-prediction decoder to
 confirm `wi*` clamping keeps the Table 7 lookup in-bounds.
 
-Total crate test count: 68 (5 TOC + 27 frame-packing + 19 range
-decoder + 17 SILK header).
+Round 5 (2026-05-22) lands the SILK subframe quantization-gain
+decoder for RFC 6716 §4.2.7.4 behind a new `SubframeGains` /
+`SubframeGainsConfig` API. The caller passes the signal type
+(`SignalType` from the §4.2.7.3 frame-type symbol), the subframe
+count (2 for 10 ms SILK frames, 4 for 20 ms / Hybrid), whether the
+first subframe is independently coded per the §4.2.7.4 enumeration
+("first SILK frame of its type for this channel in the current Opus
+frame, OR previous SILK frame of the same type was not coded"), and
+the previous SILK frame's last-subframe `log_gain` if available.
+`decode` returns:
 
-Actual SILK gain / LSF stage-2 / LTP / excitation decoding, the
-full CELT band machinery, and the §5 encoder pipeline remain out of
-scope; the higher-level encode / decode entry points still return
+* An array of up to 4 `SubframeGain { log_gain: u8 }` values in
+  `0..=63`.
+* The independent path decodes the 3-bit MSB from one of three
+  signal-type-conditioned PDFs (Table 11: Inactive `{32, 112, 68,
+  29, 12, 1, 1, 1}/256`; Unvoiced `{2, 17, 45, 60, 62, 47, 19,
+  4}/256`; Voiced `{1, 3, 26, 71, 94, 50, 9, 2}/256`), then a
+  uniform 3-bit LSB from Table 12 `{32, …, 32}/256`. The two are
+  joined into `gain_index = (msb << 3) | lsb` and clamped with
+  `log_gain = max(gain_index, previous_log_gain - 16)` (the clamp
+  is skipped after a decoder reset / on a side channel whose
+  predecessor was not coded — caller passes `None`).
+* The delta path decodes a 41-symbol `delta_gain_index` from Table
+  13 `{6, 5, 11, 31, 132, 21, 8, 4, 3, 2, 2, 2, 1, 1, …, 1}/256`
+  then folds it into the previous coded gain via
+  `log_gain = clamp(0, max(2*delta - 16, prev + delta - 4), 63)`.
+
+The §4.2.7.4 tail-end `silk_log2lin` conversion to `gain_Q16` lives
+in the excitation stage and is intentionally left to a later round.
+
+Twenty new unit tests cover PDF→iCDF transcription self-checks
+(Tables 11 / 12 / 13 each sum to 256), the four signal-type → iCDF
+routings, the §4.2.7.4 clamp behaviour (no prev / low prev no-op /
+high prev raises floor / sub-16 prev saturates at 0), the delta
+path's dual-max + clamp formula reproduced against an independent
+range-decoder pass, end-to-end decode for mono-inactive 4-subframe,
+mono-unvoiced 2-subframe with prev, mono-voiced 4-subframe with
+prev (asserting the clamp floor), the rejection of a
+"first-subframe delta without prev" / non-{2,4} num_subframes
+malformed input, and a four-subframe chain-consistency check that
+re-derives the gain chain from the raw PDF reads.
+
+Total crate test count: 88 (5 TOC + 27 frame-packing + 19 range
+decoder + 17 SILK header + 20 subframe gains).
+
+Actual LSF stage-2 / LTP / excitation decoding, the full CELT band
+machinery, and the §5 encoder pipeline remain out of scope; the
+higher-level encode / decode entry points still return
 `Error::NotImplemented`.
 
 ## Planned clean-room sources

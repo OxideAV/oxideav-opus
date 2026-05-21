@@ -6,6 +6,39 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 5 (2026-05-22):** RFC 6716 §4.2.7.4 SILK
+  subframe quantization-gain decoder behind a new `SubframeGains` /
+  `SubframeGainsConfig` API. Two coding paths:
+  - Independent (Table 11 signal-type-conditioned 3-bit MSB +
+    Table 12 uniform 3-bit LSB) joined into `gain_index ∈ 0..=63`
+    and clamped with `log_gain = max(gain_index, previous_log_gain
+    - 16)` per §4.2.7.4. The clamp is skipped when the caller
+    passes no previous gain (decoder reset / side-channel
+    previously uncoded / packet loss).
+  - Delta (Table 13 41-symbol iCDF) folded into the previous gain
+    via `log_gain = clamp(0, max(2*delta - 16, prev + delta - 4),
+    63)`.
+  The first subframe of a SILK frame uses the independent path
+  iff the §4.2.7.4 enumeration triggers ("first SILK frame of its
+  type for this channel in the current Opus frame, OR previous
+  SILK frame of the same type was not coded"); every other
+  subframe uses the delta path. Output is the integer `log_gain
+  ∈ 0..=63` per subframe; the §4.2.7.4 tail-end conversion to
+  `gain_Q16` via `silk_log2lin` is part of the excitation stage
+  and not wired up here.
+  20 new unit tests (88 total in the crate) covering PDF→iCDF
+  transcription self-checks (Tables 11 / 12 / 13 each sum to
+  256), all four `SignalType` → iCDF routings, the §4.2.7.4
+  clamp behaviour across the four prev-value regimes (None, low,
+  high, sub-16-saturate-to-zero), the delta path's dual-max +
+  clamp formula reproduced against an independent range-decoder
+  pass, end-to-end decode for mono-inactive 4-subframe,
+  mono-unvoiced 2-subframe-with-prev, mono-voiced 4-subframe with
+  high prev (asserting the floor clamp), the rejection of a
+  pathological "first-subframe-delta without prev" config and
+  num_subframes ∉ {2, 4}, and a four-subframe chain-consistency
+  check that re-derives the gain chain from the raw PDF reads.
+
 * **Clean-room round 4 (2026-05-21):** RFC 6716 §4.2.7.1 through
   §4.2.7.5.1 SILK frame-header decoder behind a new `SilkFrameHeader`
   type. The caller passes a `SilkFrameHeaderConfig` describing whether

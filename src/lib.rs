@@ -33,10 +33,23 @@
 //!   (gains, LSF stage-2, LTP, excitation). Implemented as
 //!   inverse-CDF reads against the range decoder, with the PDFs
 //!   transcribed from Tables 6, 8, 9, and 14.
+//! * Round 5 lands the [`SubframeGains`] decoder for RFC 6716
+//!   §4.2.7.4 — per-subframe quantization gains for the two- or
+//!   four-subframe SILK frame. The first subframe is **independently**
+//!   coded (Table 11 signal-type-conditioned MSB PDF + Table 12
+//!   uniform LSB PDF + the `max(gain_index, previous_log_gain - 16)`
+//!   clamp from §4.2.7.4) when the §4.2.7.4 enumeration triggers;
+//!   otherwise it's coded as a 41-symbol delta (Table 13) against
+//!   the previous coded subframe gain via the `clamp(0,
+//!   max(2*delta - 16, prev + delta - 4), 63)` rule. All subsequent
+//!   subframes in the frame use the delta path. Output is integer
+//!   `log_gain` in `0..=63`; the §4.2.7.4 tail-end `gain_Q16`
+//!   conversion (`silk_log2lin`) is part of the excitation stage
+//!   and not wired up yet.
 //!
-//! Subsequent SILK stages (subframe gains §4.2.7.4, LSF stage-2
-//! residual §4.2.7.5.2, LTP §4.2.7.6, LCG seed §4.2.7.7, excitation
-//! §4.2.7.8) and the CELT layer are not yet wired up; the
+//! Subsequent SILK stages (LSF stage-2 residual §4.2.7.5.2, LSF
+//! stabilization §4.2.7.5.4, LTP §4.2.7.6, LCG seed §4.2.7.7,
+//! excitation §4.2.7.8) and the CELT layer are not yet wired up; the
 //! [`Decoder`] / [`Encoder`] entry points still return
 //! [`Error::NotImplemented`].
 
@@ -87,6 +100,7 @@ impl std::error::Error for Error {}
 pub mod frames;
 pub mod range_decoder;
 pub mod silk_frame;
+pub mod silk_gains;
 pub mod toc;
 
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
@@ -95,6 +109,7 @@ pub use silk_frame::{
     FrameKind, QuantizationOffsetType, SignalType, SilkFrameHeader, SilkFrameHeaderConfig,
     StereoPredictionWeights,
 };
+pub use silk_gains::{SubframeGain, SubframeGains, SubframeGainsConfig, SILK_MAX_SUBFRAMES};
 pub use toc::{Bandwidth, ChannelMapping, FrameCountCode, Mode, OpusTocByte};
 
 /// No-op codec registration — the orphan-rebuild scaffold registers
