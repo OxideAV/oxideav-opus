@@ -6,6 +6,66 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 6 (2026-05-22):** RFC 6716 §4.2.7.5.2 Normalized
+  LSF Stage-2 decoder behind a new `LsfStage2` API. The caller passes
+  the SILK-layer bandwidth (`Nb` / `Mb` / `Wb`) and the stage-1 codebook
+  index `I1 ∈ 0..32` (returned by the §4.2.7.5.1 decoder). The decoder:
+  - Reads `d_LPC` stage-2 residual indices `I2[k]` (10 cells for
+    NB / MB, 16 for WB) using one of 16 signal-shape codebook PDFs
+    (Tables 15 a..h for NB/MB, Table 16 i..p for WB). The
+    `(bandwidth, I1) → codebook` mapping comes from Table 17 (NB/MB)
+    or Table 18 (WB). Each raw symbol is `0..=8`; after the `-4`
+    subtraction the index is `[-4, 4]`. If `|idx| == 4`, the Table 19
+    extension PDF (`{156, 60, 24, 9, 4, 2, 1}/256`) supplies an
+    additional `0..=6` magnitude with the same sign, giving
+    `I2[k] ∈ [-10, 10]`.
+  - Undoes the backwards-prediction step with the §4.2.7.5.2 formula
+    `res_Q10[k] = (k+1 < d_LPC ? (res_Q10[k+1]*pred_Q8[k])>>8 : 0)
+    + ((((I2[k]<<10) - sign(I2[k])*102) * qstep) >> 16)` running
+    `k = d_LPC-1` down to `0`. `qstep = 11796 (Q16)` for NB / MB and
+    `9830` for WB. The Q8 prediction weight is chosen per-coefficient
+    from Table 20 lists A / B (NB/MB) or C / D (WB) via Table 21
+    (NB/MB) or Table 22 (WB).
+  - Returns `i2[]` and `res_Q10[]`; the §4.2.7.5.3 reconstruction
+    (stage-1 codebook lookup + IHMW weights + final `NLSF_Q15[k]`),
+    §4.2.7.5.4 stabilization, and §4.2.7.5.5 interpolation are
+    deferred to round 7+.
+
+  The RFC 6716 Table 17 row at `I1 = 6` is mislabelled `g` in the
+  source PDF; the row's cells (`a c c c c c c c c b`) are valid
+  codebook letters and the table is transcribed with the I1 row-label
+  restored, matching the table's documented intent.
+
+  30 new unit tests (148 total in the crate) covering:
+  - All 16 stage-2 PDFs sum to 256 and their transcribed iCDFs are
+    monotone non-increasing with a trailing zero (Tables 15, 16).
+  - The Table 19 extension PDF sums to 256 and the iCDF cells match
+    `256 - fh[k]`.
+  - Tables 17, 18, 21, 22 row widths match `d_LPC` (NB/MB) and
+    `d_LPC` / `d_LPC - 1` (WB pred-weight); all entries fall in
+    `0..=7` (codebook selection) or `0..=1` (prediction-weight
+    selection).
+  - Table 17 `I1 = 0` (all-`a`), `I1 = 2`, and the `I1 = 6` typo-row
+    spot-checks; Table 18 `I1 = 0` (all-`i`), `I1 = 6` (all-`i`),
+    `I1 = 9` (`k j i ...`) spot-checks.
+  - Table 20 A[0] = 179, B[0] = 116, A[8] = 163, B[8] = 92,
+    C[0] = 175, D[0] = 68, C[14] = 182, D[14] = 155 spot-checks;
+    Table 21 / 22 `I1 = 0` rows.
+  - `pred_weight` resolves the right A/B and C/D list cells per
+    coefficient against the Table 21 / 22 selection rows.
+  - End-to-end decode for `(Nb, I1=0)`, `(Mb, I1=5)`, `(Wb, I1=0)`,
+    `(Wb, I1=9)` with `i2[k] ∈ [-10, 10]` for every populated
+    coefficient.
+  - Independent rejection of `I1 = 32` (out of range), `Swb`, and
+    `Fb` (SILK never sees SWB / FB after the §4.2.2 hybrid split).
+  - `res_Q10[]` from `LsfStage2::decode` exactly reproduces the
+    §4.2.7.5.2 formula re-applied to the decoded `i2[]` for both
+    NB/MB and WB.
+  - Sweep across all 32 I1 values × {NB, MB, WB} confirming every
+    decode succeeds and `i2[k] ∈ [-10, 10]` for every coefficient.
+  - `RangeDecoder::tell()` is monotone non-decreasing across a
+    stage-2 decode (the decoder consumes ≥ 1 bit).
+
 * **Clean-room round 5 (2026-05-22):** RFC 6716 §4.2.7.4 SILK
   subframe quantization-gain decoder behind a new `SubframeGains` /
   `SubframeGainsConfig` API. Two coding paths:

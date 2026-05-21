@@ -2,11 +2,12 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-22 (clean-room round 5)
+## Status — 2026-05-22 (clean-room round 6)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
-gains; no LSF stage-2 / LTP / excitation yet, no CELT band machinery
+gains + §4.2.7.5.2 LSF Stage-2 residual; no §4.2.7.5.3 LSF
+reconstruction yet, no LTP / excitation, no CELT band machinery
 yet.**
 
 The prior implementation was retired under the workspace clean-room
@@ -163,13 +164,53 @@ prev (asserting the clamp floor), the rejection of a
 malformed input, and a four-subframe chain-consistency check that
 re-derives the gain chain from the raw PDF reads.
 
-Total crate test count: 88 (5 TOC + 27 frame-packing + 19 range
-decoder + 17 SILK header + 20 subframe gains).
+Round 6 (2026-05-22) lands the SILK Normalized LSF Stage-2 decoder
+for RFC 6716 §4.2.7.5.2 behind a new `LsfStage2` API. The caller
+passes the SILK-layer bandwidth (NB / MB / WB) and the stage-1 index
+`I1 ∈ 0..32` (returned by the §4.2.7.5.1 decoder). `decode` returns:
 
-Actual LSF stage-2 / LTP / excitation decoding, the full CELT band
-machinery, and the §5 encoder pipeline remain out of scope; the
-higher-level encode / decode entry points still return
-`Error::NotImplemented`.
+* `i2: &[i8]` of length `d_LPC` (10 for NB / MB, 16 for WB) — the
+  signed stage-2 residual indices `I2[k] ∈ [-10, 10]`. Each
+  coefficient reads one symbol from one of the 16 Table 15 (NB / MB
+  `a..h`) or Table 16 (WB `i..p`) PDFs, indexed by
+  Table 17 / Table 18 against `(I1, k)`. The raw symbol `0..=8` is
+  shifted by `-4`; if the resulting `|idx| == 4`, a second symbol
+  is drawn from the Table 19 extension PDF (7-cell
+  `{156, 60, 24, 9, 4, 2, 1}/256`) and added to the magnitude with
+  the same sign.
+* `res_q10: &[i32]` of length `d_LPC` — the Q10 stage-2 residual
+  after the §4.2.7.5.2 backwards-prediction inverse. The recursion
+  runs `k = d_LPC-1` down to `0` per
+  `res_Q10[k] = (k+1 < d_LPC ? (res_Q10[k+1]*pred_Q8[k])>>8 : 0)
+  + ((((I2[k]<<10) - sign(I2[k])*102) * qstep) >> 16)`. `qstep` is
+  `11796` (Q16, ≈0.18) for NB / MB and `9830` (≈0.15) for WB. The
+  Q8 prediction weight `pred_Q8[k]` is one of A/B (NB/MB) or C/D
+  (WB) from Table 20, selected per-coefficient by Table 21 / 22.
+
+The RFC's Table 17 row label at `I1 = 6` is mistyped as "g" in the
+source PDF; the row's cells (`a c c c c c c c c b`) are valid
+codebook letters and the table is transcribed with the I1 row-label
+restored. A unit test pins the exact row contents.
+
+Thirty new unit tests cover the 16 Table 15 / Table 16 PDF→iCDF
+transcriptions (each sums to 256 with monotone-decreasing iCDFs),
+the Table 19 extension PDF, the four Table 17 / 18 / 21 / 22 table
+row-widths and value ranges, the `pred_weight` A↔B and C↔D
+resolution, end-to-end decode for NB/MB/WB at several `I1` values
+(asserting every `i2[k] ∈ [-10, 10]`), rejection of `I1 ≥ 32` /
+SWB / FB, the `res_Q10[]` formula re-derivation against the decoded
+`i2[]` for both NB/MB and WB, a sweep of all 32 `I1` values across
+{NB, MB, WB}, and a `tell()` monotonicity check.
+
+Total crate test count: 118 (5 TOC + 27 frame-packing + 19 range
+decoder + 17 SILK header + 20 subframe gains + 30 LSF stage-2).
+
+Round 6 stops at `res_Q10[]`; §4.2.7.5.3 codebook lookup + IHMW
+weights + final `NLSF_Q15[k]`, §4.2.7.5.4 stabilization, and
+§4.2.7.5.5 interpolation are deferred to round 7+. LTP / excitation
+decoding, the full CELT band machinery, and the §5 encoder pipeline
+remain out of scope; the higher-level encode / decode entry points
+still return `Error::NotImplemented`.
 
 ## Planned clean-room sources
 

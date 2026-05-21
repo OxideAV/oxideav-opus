@@ -47,8 +47,20 @@
 //!   conversion (`silk_log2lin`) is part of the excitation stage
 //!   and not wired up yet.
 //!
-//! Subsequent SILK stages (LSF stage-2 residual §4.2.7.5.2, LSF
-//! stabilization §4.2.7.5.4, LTP §4.2.7.6, LCG seed §4.2.7.7,
+//! * Round 6 lands the [`LsfStage2`] decoder for RFC 6716 §4.2.7.5.2 —
+//!   the per-coefficient stage-2 residual indices `I2[k] ∈ [-10, 10]`
+//!   plus the backwards-prediction-undone `res_Q10[k]`. Tables 15
+//!   (NB/MB) and 16 (WB) are the eight signal-shape codebooks; Tables
+//!   17 (NB/MB) and 18 (WB) map `(I1, k)` → codebook letter; Table 19
+//!   is the 7-cell extension PDF for the `|I2| == 4` saturation case;
+//!   Table 20 holds the four prediction-weight lists (A/B for NB/MB,
+//!   C/D for WB); Tables 21 (NB/MB) and 22 (WB) map `(I1, k)` →
+//!   weight-list. Output stops at `res_Q10[]`; §4.2.7.5.3 codebook
+//!   reconstruction, IHMW weighting, §4.2.7.5.4 stabilization, and
+//!   §4.2.7.5.5 interpolation are deferred to round 7+.
+//!
+//! Subsequent SILK stages (LSF stabilization §4.2.7.5.4, LSF
+//! interpolation §4.2.7.5.5, LTP §4.2.7.6, LCG seed §4.2.7.7,
 //! excitation §4.2.7.8) and the CELT layer are not yet wired up; the
 //! [`Decoder`] / [`Encoder`] entry points still return
 //! [`Error::NotImplemented`].
@@ -101,6 +113,7 @@ pub mod frames;
 pub mod range_decoder;
 pub mod silk_frame;
 pub mod silk_gains;
+pub mod silk_lsf_stage2;
 pub mod toc;
 
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
@@ -110,6 +123,9 @@ pub use silk_frame::{
     StereoPredictionWeights,
 };
 pub use silk_gains::{SubframeGain, SubframeGains, SubframeGainsConfig, SILK_MAX_SUBFRAMES};
+pub use silk_lsf_stage2::{
+    LsfStage2, D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB, QSTEP_NB_MB_Q16, QSTEP_WB_Q16,
+};
 pub use toc::{Bandwidth, ChannelMapping, FrameCountCode, Mode, OpusTocByte};
 
 /// No-op codec registration — the orphan-rebuild scaffold registers
