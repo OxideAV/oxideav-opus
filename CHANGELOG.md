@@ -6,6 +6,37 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 4 (2026-05-21):** RFC 6716 §4.2.7.1 through
+  §4.2.7.5.1 SILK frame-header decoder behind a new `SilkFrameHeader`
+  type. The caller passes a `SilkFrameHeaderConfig` describing whether
+  the current SILK frame is mid- or side-channel of a stereo Opus
+  frame, whether the side channel is otherwise required (driving the
+  presence of the mid-only flag), the frame kind (regular-inactive /
+  regular-active / LBRR), and the SILK-layer audio bandwidth (NB / MB
+  / WB). `SilkFrameHeader::decode` returns:
+  - `stereo_pred: Option<StereoPredictionWeights>` per §4.2.7.1 with
+    the three sub-symbols (Table 6 stage-1 25-cell, two stage-2
+    3-cell, two stage-3 5-cell) composed into `(w0_Q13, w1_Q13)` per
+    the spec formula and Table 7 weight table.
+  - `mid_only_flag: Option<bool>` per §4.2.7.2 (Table 8 PDF
+    `{192, 64}/256`).
+  - `frame_type: u8` in `0..=5` per §4.2.7.3 (Table 9 inactive /
+    active PDFs; active rows use a 4-entry tail-truncated iCDF with
+    a +2 caller offset, since the §4.1.3.3 primitive cannot model
+    leading-zero-mass cells).
+  - `signal_type: SignalType`, `qoff_type: QuantizationOffsetType`
+    decoded from `frame_type` via Table 10.
+  - `lsf_stage1: u8` in `0..32` per §4.2.7.5.1 with the PDF chosen
+    from Table 14 by `(bandwidth, signal_type)`.
+  17 new unit tests (68 total in the crate) covering PDF→iCDF
+  transcription self-checks (Tables 6 / 8 / 9 / 14 each sum to 256
+  with monotone-decreasing iCDFs), the Table 7 weight-table symmetry
+  (`w[15-k] == -w[k]`), the Table 10 frame-type → `(signal, qoff)`
+  mapping, end-to-end decode against the range coder for mono
+  inactive / mono active / stereo mid-channel / stereo side-channel
+  / LBRR configurations, and a random-buffer sweep of
+  `decode_stereo_pred` to confirm `wi0/wi1 ≤ 14` clamping keeps the
+  Table 7 lookup in-bounds.
 * **Clean-room round 3 (2026-05-21):** RFC 6716 §4.1 range decoder
   behind a new `RangeDecoder` API — the shared entropy primitive
   consumed by every SILK and CELT symbol. Implements §4.1.1

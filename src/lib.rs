@@ -25,8 +25,18 @@
 //!   layers. The sibling `oxideav-celt` crate owns an independent
 //!   clean-room copy of the same primitive; both crates carry their
 //!   own copy until a shared low-level primitives crate exists.
+//! * Round 4 lands the [`SilkFrameHeader`] decoder for RFC 6716
+//!   §4.2.7.1 (stereo prediction weights), §4.2.7.2 (mid-only flag),
+//!   §4.2.7.3 (frame type / quantization-offset type), and §4.2.7.5.1
+//!   (normalized LSF stage-1 codebook index `I1`). These are the four
+//!   structural decisions that gate every subsequent SILK stage
+//!   (gains, LSF stage-2, LTP, excitation). Implemented as
+//!   inverse-CDF reads against the range decoder, with the PDFs
+//!   transcribed from Tables 6, 8, 9, and 14.
 //!
-//! Actual SILK / CELT frame decoding is not yet wired up; the
+//! Subsequent SILK stages (subframe gains §4.2.7.4, LSF stage-2
+//! residual §4.2.7.5.2, LTP §4.2.7.6, LCG seed §4.2.7.7, excitation
+//! §4.2.7.8) and the CELT layer are not yet wired up; the
 //! [`Decoder`] / [`Encoder`] entry points still return
 //! [`Error::NotImplemented`].
 
@@ -76,10 +86,15 @@ impl std::error::Error for Error {}
 
 pub mod frames;
 pub mod range_decoder;
+pub mod silk_frame;
 pub mod toc;
 
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
 pub use range_decoder::RangeDecoder;
+pub use silk_frame::{
+    FrameKind, QuantizationOffsetType, SignalType, SilkFrameHeader, SilkFrameHeaderConfig,
+    StereoPredictionWeights,
+};
 pub use toc::{Bandwidth, ChannelMapping, FrameCountCode, Mode, OpusTocByte};
 
 /// No-op codec registration — the orphan-rebuild scaffold registers

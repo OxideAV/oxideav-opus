@@ -2,10 +2,11 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-21 (clean-room round 3)
+## Status — 2026-05-21 (clean-room round 4)
 
-**Packet header + §3.2 frame-packing parser + §4.1 range decoder;
-no SILK / CELT band machinery yet.**
+**Packet header + §3.2 frame-packing parser + §4.1 range decoder +
+SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder; no SILK gains / LSF
+stage-2 / LTP / excitation yet, no CELT band machinery yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -86,12 +87,46 @@ single-symbol coverage, `tell()` and `tell_frac()` monotonicity, the
 §4.1.6.1 ceiling identity, and the `dec_bits` zero-width and
 over-large-width guards.
 
-Total crate test count: 51 (5 TOC + 27 frame-packing + 19 range
-decoder).
+Round 4 (2026-05-21) lands the SILK per-frame header decoder for
+RFC 6716 §4.2.7.1 through §4.2.7.5.1 behind a new `SilkFrameHeader`
+type. The caller passes a `SilkFrameHeaderConfig` describing whether
+the current SILK frame is mid- or side-channel of a stereo Opus
+frame, the side-channel-required flag (driving §4.2.7.2), the frame
+kind (regular-inactive / regular-active / LBRR), and the SILK-layer
+bandwidth (NB / MB / WB). `decode` returns:
 
-Actual SILK / CELT band decoding and the §5 encoder pipeline remain
-out of scope; the higher-level encode / decode entry points still
-return `Error::NotImplemented`.
+* `stereo_pred: Option<StereoPredictionWeights>` per §4.2.7.1 — the
+  three sub-symbols (Table 6 stage-1 25-cell PDF, two stage-2 3-cell
+  PDFs, two stage-3 5-cell PDFs) composed via the §4.2.7.1 formula
+  into `(w0_Q13, w1_Q13)` against Table 7 (16-entry Q13 weight
+  table).
+* `mid_only_flag: Option<bool>` per §4.2.7.2 (Table 8 PDF
+  `{192, 64}/256`).
+* `frame_type: u8` ∈ `0..=5` per §4.2.7.3 (Table 9 inactive / active
+  PDFs; active rows are transcribed as 4-entry iCDFs with a +2
+  caller offset since the §4.1.3.3 primitive cannot model
+  leading-zero-mass cells).
+* `signal_type: SignalType`, `qoff_type: QuantizationOffsetType`
+  decoded from `frame_type` via Table 10.
+* `lsf_stage1: u8` ∈ `0..32` per §4.2.7.5.1 with PDF chosen from
+  Table 14 by `(bandwidth, signal_type)`.
+
+Seventeen new unit tests cover PDF→iCDF transcription self-checks
+(Tables 6 / 8 / 9 / 14 each sum to 256), the Table 7 weight-table
+symmetry (`w[15-k] == -w[k]`), the Table 10 frame-type → signal /
+qoff mapping, end-to-end decode against the range coder for the
+mono-inactive, mono-active, stereo-mid (with both stereo prediction
+weights and mid-only flag), stereo-side, and LBRR configurations,
+plus a random-buffer sweep of the stereo-prediction decoder to
+confirm `wi*` clamping keeps the Table 7 lookup in-bounds.
+
+Total crate test count: 68 (5 TOC + 27 frame-packing + 19 range
+decoder + 17 SILK header).
+
+Actual SILK gain / LSF stage-2 / LTP / excitation decoding, the
+full CELT band machinery, and the §5 encoder pipeline remain out of
+scope; the higher-level encode / decode entry points still return
+`Error::NotImplemented`.
 
 ## Planned clean-room sources
 
