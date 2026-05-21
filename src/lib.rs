@@ -20,6 +20,11 @@
 //!   padding). The returned slices borrow from the input packet, so
 //!   the SILK / CELT decoders can be hooked up against them in a
 //!   subsequent round without copying.
+//! * Round 3 lands the [`RangeDecoder`] RFC 6716 §4.1 range coder —
+//!   the shared entropy primitive consumed by both the SILK and CELT
+//!   layers. The sibling `oxideav-celt` crate owns an independent
+//!   clean-room copy of the same primitive; both crates carry their
+//!   own copy until a shared low-level primitives crate exists.
 //!
 //! Actual SILK / CELT frame decoding is not yet wired up; the
 //! [`Decoder`] / [`Encoder`] entry points still return
@@ -70,9 +75,11 @@ impl core::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub mod frames;
+pub mod range_decoder;
 pub mod toc;
 
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
+pub use range_decoder::RangeDecoder;
 pub use toc::{Bandwidth, ChannelMapping, FrameCountCode, Mode, OpusTocByte};
 
 /// No-op codec registration — the orphan-rebuild scaffold registers

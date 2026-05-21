@@ -2,9 +2,10 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-21 (clean-room round 2)
+## Status — 2026-05-21 (clean-room round 3)
 
-**Packet header + §3.2 frame-packing parser; no SILK/CELT yet.**
+**Packet header + §3.2 frame-packing parser + §4.1 range decoder;
+no SILK / CELT band machinery yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -48,12 +49,49 @@ Twenty-seven new unit tests cover each `c` code (round-trip plus
 under-length and over-length rejections), the §3.2.1 length encoding
 end-to-end (including the 252/255 extension boundaries), the
 padding-chain 255-extension behaviour, the R5 cap at 48 frames, and
-the R6/R7 boundary conditions. Total crate test count: 32 (5 TOC + 27
-frame-packing).
+the R6/R7 boundary conditions.
 
-Actual SILK / CELT frame decoding, the §4 range coder, and the §5
-encoder pipeline remain out of scope; the higher-level encode / decode
-entry points still return `Error::NotImplemented`.
+Round 3 (2026-05-21) lands the RFC 6716 §4.1 range decoder behind a
+new `RangeDecoder` API. This is the shared entropy primitive that
+every SILK and CELT symbol passes through. The implementation covers:
+
+* §4.1.1 initialization (`b0 >> 1` into `val`, leftover bit into the
+  renorm buffer, immediate renormalization to the `rng > 2^23`
+  invariant).
+* §4.1.2 generic symbol decode (`ec_decode` / `ec_dec_update`) and
+  §4.1.2.1 renormalization (MSB-first byte intake with the
+  zero-extension past end-of-frame).
+* §4.1.3.1 `decode_bin` for power-of-two `ft`.
+* §4.1.3.2 `dec_bit_logp` for `2^-logp` binary symbols.
+* §4.1.3.3 `dec_icdf` for inverse-CDF table decoding.
+* §4.1.4 `dec_bits` for raw bits packed LSB-first from the end of
+  the frame, with §4.1.4 zero-extension.
+* §4.1.5 `dec_uint` covering both the small (`ftb <= 8`) range-coded
+  branch and the large (`ftb > 8`) range-plus-raw-bits branch, with
+  the §4.1.5 corrupt-frame error-flag latch.
+* §4.1.6.1 `tell()` and §4.1.6.2 `tell_frac()` accounting, satisfying
+  the `tell() == ceil(tell_frac() / 8.0)` identity.
+
+The sibling `oxideav-celt` crate carries an independent clean-room
+copy of the same primitive — both crates own their own copy until a
+shared low-level primitives crate is introduced.
+
+Nineteen new unit tests cover: initialization on empty + non-empty
+buffers, `dec_bit_logp` bias under extreme inputs, raw-bit LSB-first
+ordering, zero-extension past EOF, `dec_uint` degenerate (`ft=0`,
+`ft=1`) and both ftb regimes, `decode_bin` matching the generic
+`decode(1<<ftb)` path bit-for-bit, `dec_icdf` agreement with
+`dec_bit_logp` on binary distributions plus uniform and
+single-symbol coverage, `tell()` and `tell_frac()` monotonicity, the
+§4.1.6.1 ceiling identity, and the `dec_bits` zero-width and
+over-large-width guards.
+
+Total crate test count: 51 (5 TOC + 27 frame-packing + 19 range
+decoder).
+
+Actual SILK / CELT band decoding and the §5 encoder pipeline remain
+out of scope; the higher-level encode / decode entry points still
+return `Error::NotImplemented`.
 
 ## Planned clean-room sources
 

@@ -6,6 +6,22 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 3 (2026-05-21):** RFC 6716 §4.1 range decoder
+  behind a new `RangeDecoder` API — the shared entropy primitive
+  consumed by every SILK and CELT symbol. Implements §4.1.1
+  initialization, §4.1.2 generic symbol decode, §4.1.2.1
+  renormalization (with §4.1.4 zero-extension past EOF), §4.1.3.1
+  `decode_bin` for power-of-two `ft`, §4.1.3.2 `dec_bit_logp` for
+  `2^-logp` binaries, §4.1.3.3 `dec_icdf` for inverse-CDF tables,
+  §4.1.4 `dec_bits` LSB-first raw bits from the END of the frame,
+  §4.1.5 `dec_uint` (both small-ftb range-only and large-ftb
+  range-plus-raw branches, with the corrupt-frame sticky error
+  latch), §4.1.6.1 `tell()`, and §4.1.6.2 `tell_frac()` (with the
+  `tell() == ceil(tell_frac() / 8.0)` identity holding across mixed
+  operations). The sibling `oxideav-celt` crate carries an
+  independent clean-room copy of the same primitive — both own
+  their own copy until a shared low-level primitives crate exists.
+  19 new unit tests (51 total in the crate).
 * **Clean-room round 2 (2026-05-21):** RFC 6716 §3.2 frame-packing
   parser behind a new `OpusPacket::parse` entry point covering all
   four `c` codes:
