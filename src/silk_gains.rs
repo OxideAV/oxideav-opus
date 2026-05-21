@@ -630,17 +630,20 @@ mod tests {
 
     #[test]
     fn signal_type_routes_to_correct_icdf() {
-        assert!(std::ptr::eq(
+        // Compare by VALUE — pointer identity isn't guaranteed across
+        // toolchains (Windows MSVC deduplicates `&[u8]` literals
+        // differently from x86_64-unknown-linux-gnu and aarch64-apple-darwin).
+        assert_eq!(
             SubframeGains::icdf_for_signal_type(SignalType::Inactive),
             GAIN_MSB_ICDF_INACTIVE
-        ));
-        assert!(std::ptr::eq(
+        );
+        assert_eq!(
             SubframeGains::icdf_for_signal_type(SignalType::Unvoiced),
             GAIN_MSB_ICDF_UNVOICED
-        ));
-        assert!(std::ptr::eq(
+        );
+        assert_eq!(
             SubframeGains::icdf_for_signal_type(SignalType::Voiced),
             GAIN_MSB_ICDF_VOICED
-        ));
+        );
     }
 }
