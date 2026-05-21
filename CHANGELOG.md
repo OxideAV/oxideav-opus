@@ -6,6 +6,24 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 2 (2026-05-21):** RFC 6716 §3.2 frame-packing
+  parser behind a new `OpusPacket::parse` entry point covering all
+  four `c` codes:
+  * Code 0 (§3.2.2) — one frame, remaining `N - 1` bytes.
+  * Code 1 (§3.2.3) — two equal-size frames; R3 odd-payload rejection.
+  * Code 2 (§3.2.4) — one- or two-byte §3.2.1 length sequence then
+    `N1` + remainder; R4 length-exceeds-remaining rejection.
+  * Code 3 (§3.2.5) — `M ∈ 1..=48` (R5) frame-count byte with the
+    `v|p|M` bit layout; optional Opus padding with the §3.2.5
+    255-byte-extension chain; CBR with R6 `R % M == 0` check; VBR
+    with `M - 1` declared lengths and implicit final-frame size,
+    R7 length-overrun rejection.
+  * §3.2.1 length helper: `0` (DTX), `1..=251` single-byte,
+    `252..=255` two-byte `(second * 4 + first)` up to 1275 (R2).
+  Frame slices borrow from the input buffer via `OpusPacket::frames()
+  -> &[&[u8]]`; padding length is exposed separately. Adds
+  `Error::MalformedPacket` for §3.2 requirement violations. 27 new
+  unit tests (32 total in the crate).
 * **Clean-room round 1 (2026-05-20):** RFC 6716 §3.1 packet TOC byte
   parser. `OpusTocByte::parse` / `OpusTocByte::from_byte` decode the
   five-bit `config` against Table 2 (32 mode × bandwidth × frame-size

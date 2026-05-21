@@ -2,9 +2,9 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-20 (clean-room round 1)
+## Status — 2026-05-21 (clean-room round 2)
 
-**Orphan-rebuild scaffold, TOC byte parser only.**
+**Packet header + §3.2 frame-packing parser; no SILK/CELT yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -13,30 +13,47 @@ governs every crate in this workspace. Per workspace policy, the only
 acceptable response is a full clean-room re-implementation against the
 Opus standards documents and black-box validator binaries.
 
-Round 1 lands the RFC 6716 §3.1 packet TOC byte parser:
+Round 1 (2026-05-20) landed the RFC 6716 §3.1 packet TOC byte parser:
+the 32-config × stereo-flag × frame-count-code triple plus the
+implied `(min, max)` frame-count range. Five unit tests sweep Table 2,
+Table 3, Table 4 and the R1 empty-packet rejection.
 
-* Five-bit `config` decoded against Table 2 (32 entries × mode ×
-  bandwidth × frame-size).
-* `s` stereo bit decoded against the Table 3 prose immediately
-  following Table 2 (0 = mono, 1 = stereo).
-* `c` two-bit frame-count code decoded against the Table 4 prose
-  (codes 0..3 → one frame / two-equal / two-unequal / arbitrary).
-* `frame_count_range()` returns the implied `(min, max)` frame count
-  without consulting further bytes (codes 0/1/2 are exact; code 3
-  reports the legal `(1, 48)` range derived from §3.2.5's "no more
-  than 120 ms total" rule).
-* `parse(packet)` rejects an empty packet per requirement R1 of §3.1.
+Round 2 (2026-05-21) lands the RFC 6716 §3.2 frame-packing parser
+behind a new `OpusPacket::parse` entry point:
 
-Five unit tests cover the entire enumeration: the 32 configs (Table
-2), the stereo bit polarity across all `(config, c)` combinations
-(Table 3), the four frame-count codes with their `(min, max)` frame
-ranges (Table 4), the R1 empty-packet rejection, and a spot-check
-parse of a hand-assembled byte at both ends of the config space.
+* **Code 0** (§3.2.2) — one frame, the remaining `N - 1` bytes.
+* **Code 1** (§3.2.3) — two equal-size frames; rejects odd `(N - 1)`
+  per requirement R3.
+* **Code 2** (§3.2.4) — two frames with a one- or two-byte §3.2.1
+  length prefix for the first; rejects R4 violations
+  (length-exceeds-remaining, length-byte missing, etc.).
+* **Code 3** (§3.2.5) — signalled frame count `M ∈ 1..=48` (R5) in
+  the frame-count byte, optional Opus padding (with the §3.2.5
+  "value 255 chains another length byte" extension), then either CBR
+  (every frame is `R / M` bytes; R6 enforces `R % M == 0`) or VBR
+  (`M − 1` §3.2.1 length sequences with the final frame implicit;
+  R7 enforces no length overrun).
 
-Actual SILK / CELT frame decoding, the §3.2 frame-packing layer, the
-§4 range coder, and the §5 encoder pipeline are out of scope for
-round 1; the encode / decode entry points still return
-`Error::NotImplemented`.
+The §3.2.1 helper decodes the one- and two-byte length sequence
+(`0`, `1..=251`, `252..=255 → (second*4 + first)`) and treats length
+zero as a valid DTX / lost-frame marker (zero-byte slice in the
+returned list).
+
+`OpusPacket::frames()` returns `&[&[u8]]` borrowed from the input
+buffer; the slices are ready to feed into the SILK / CELT decoders
+once those land. Padding length is exposed separately so the caller
+can sanity-check against the §3.2.5 budget.
+
+Twenty-seven new unit tests cover each `c` code (round-trip plus
+under-length and over-length rejections), the §3.2.1 length encoding
+end-to-end (including the 252/255 extension boundaries), the
+padding-chain 255-extension behaviour, the R5 cap at 48 frames, and
+the R6/R7 boundary conditions. Total crate test count: 32 (5 TOC + 27
+frame-packing).
+
+Actual SILK / CELT frame decoding, the §4 range coder, and the §5
+encoder pipeline remain out of scope; the higher-level encode / decode
+entry points still return `Error::NotImplemented`.
 
 ## Planned clean-room sources
 
