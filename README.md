@@ -2,13 +2,13 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-22 (clean-room round 6)
+## Status — 2026-05-22 (clean-room round 7)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
-gains + §4.2.7.5.2 LSF Stage-2 residual; no §4.2.7.5.3 LSF
-reconstruction yet, no LTP / excitation, no CELT band machinery
-yet.**
+gains + §4.2.7.5.2 LSF Stage-2 residual + §4.2.7.5.3 NLSF
+reconstruction; no §4.2.7.5.4 stabilization yet, no LTP /
+excitation, no CELT band machinery yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -202,15 +202,53 @@ SWB / FB, the `res_Q10[]` formula re-derivation against the decoded
 `i2[]` for both NB/MB and WB, a sweep of all 32 `I1` values across
 {NB, MB, WB}, and a `tell()` monotonicity check.
 
-Total crate test count: 118 (5 TOC + 27 frame-packing + 19 range
-decoder + 17 SILK header + 20 subframe gains + 30 LSF stage-2).
+Round 7 (2026-05-22) lifts `res_Q10[]` to the final normalized LSF
+vector `NLSF_Q15[]` per RFC 6716 §4.2.7.5.3 behind a new
+`NlsfReconstructed::from_stage1_and_stage2(bandwidth, lsf_stage1,
+&stage2)` API. Three steps run inline:
 
-Round 6 stops at `res_Q10[]`; §4.2.7.5.3 codebook lookup + IHMW
-weights + final `NLSF_Q15[k]`, §4.2.7.5.4 stabilization, and
-§4.2.7.5.5 interpolation are deferred to round 7+. LTP / excitation
-decoding, the full CELT band machinery, and the §5 encoder pipeline
-remain out of scope; the higher-level encode / decode entry points
-still return `Error::NotImplemented`.
+* **Table 23 / 24 stage-1 codebook lookup.** 32 × 10 NB/MB and
+  32 × 16 WB rows of `cb1_Q8[]` are transcribed verbatim. The
+  `(bandwidth, I1) → cb1_Q8[..d_LPC]` mapping is the `cb1_q8()`
+  helper.
+* **IHMW weights `w_Q9[k]`.** Closed-form derivation from
+  `cb1_Q8[]` with boundary `cb1_Q8[-1] = 0` /
+  `cb1_Q8[d_LPC] = 256`:
+  `w2_Q18[k] = (1024 / d_left + 1024 / d_right) << 16`
+  (integer division), reduced through `i = ilog(w2_Q18)`,
+  `f = (w2_Q18 >> (i-8)) & 127`,
+  `y = ((i & 1) ? 32768 : 46214) >> ((32-i) >> 1)`,
+  `w_Q9[k] = y + ((213 * f * y) >> 16)`. The spec asserts the
+  resulting 13-bit weights tabulate to `1819..=5227` — a property
+  the test sweep verifies across all 32 × {NB, MB, WB} codebook
+  rows.
+* **Final reconstruction.**
+  `NLSF_Q15[k] = clamp(0, (cb1_Q8[k]<<7)
+                       + (res_Q10[k]<<14) / w_Q9[k], 32767)`
+  with integer division. Each `NLSF_Q15[k]` is held as `i16` in
+  `[0, 32767]`.
+
+26 new unit tests (144 lib tests total in the crate, up from 118 at
+round-6 close) cover Table 23 / 24 transcription (strict monotone +
+row widths + spot-checks of rows 0 and 31), the `cb1_q8()` routing
+table (Nb/Mb → 23, Wb → 24, plus Swb/Fb and out-of-range I1
+rejection), `ilog()` against the seven RFC §1.1.10 examples,
+concrete hand-computed IHMW matches (NB I1=0 k=0 → 2897; WB I1=0
+k=0 → 3657), the IHMW 13-bit-range assertion across every cell,
+the zero-residual identity `NLSF_Q15[k] == cb1_Q8[k] << 7`, and
+all-`I1` round-trips on a synthetic range-decoder buffer for NB /
+MB / WB confirming the final `NLSF_Q15[]` exactly matches the
+formula re-applied to `res_Q10[k]` and `w_Q9[k]`.
+
+Total crate test count: 144 (5 TOC + 27 frame-packing + 19 range
+decoder + 17 SILK header + 20 subframe gains + 30 LSF stage-2 +
+26 LSF reconstruction).
+
+Round 7 stops after `NLSF_Q15[]`; §4.2.7.5.4 stabilization and
+§4.2.7.5.5 interpolation are deferred to a later round. LTP /
+excitation decoding, the full CELT band machinery, and the §5
+encoder pipeline remain out of scope; the higher-level encode /
+decode entry points still return `Error::NotImplemented`.
 
 ## Planned clean-room sources
 

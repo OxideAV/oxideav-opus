@@ -6,6 +6,67 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 7 (2026-05-22):** RFC 6716 §4.2.7.5.3 SILK
+  Normalized LSF reconstruction behind a new `NlsfReconstructed` API
+  (`silk_lsf_recon` module). Lifts the stage-2 residual `res_Q10[]`
+  (returned by round 6's `LsfStage2`) to the final `NLSF_Q15[]`
+  coefficient vector in three steps:
+
+  - **Tables 23 / 24 lookup.** The 32 × 10 NB/MB and 32 × 16 WB
+    stage-1 codebook vectors `cb1_Q8[]` are transcribed verbatim from
+    the RFC text. The `(bandwidth, I1)` lookup yields a slice of
+    `d_LPC` Q8 cells.
+  - **IHMW weights `w_Q9[k]`.** The low-complexity Inverse Harmonic
+    Mean Weighting derivation
+    `w2_Q18[k] = (1024/(cb1_Q8[k]-cb1_Q8[k-1])
+                + 1024/(cb1_Q8[k+1]-cb1_Q8[k])) << 16`
+    (with boundary `cb1_Q8[-1] = 0` and `cb1_Q8[d_LPC] = 256` and
+    integer division) is reduced through the spec's square-root
+    approximation: `i = ilog(w2_Q18[k])`,
+    `f = (w2_Q18[k] >> (i-8)) & 127`,
+    `y = ((i & 1) ? 32768 : 46214) >> ((32-i) >> 1)`,
+    `w_Q9[k] = y + ((213 * f * y) >> 16)`. Every weight across the
+    full 32 × {NB/MB d_LPC=10, WB d_LPC=16} sweep falls inside the
+    spec's documented 13-bit `[1819, 5227]` range.
+  - **Final NLSF.**
+    `NLSF_Q15[k] = clamp(0, (cb1_Q8[k]<<7) + (res_Q10[k]<<14)/w_Q9[k], 32767)`,
+    integer division throughout. The §4.2.7.5.4 stabilization and
+    §4.2.7.5.5 interpolation passes that consume `NLSF_Q15[]` are
+    deferred to a later round.
+
+  26 new unit tests (144 lib tests total in the crate; up from 118 in
+  the round-6 close) covering:
+
+  - `ilog(n)` matches the RFC §1.1.10 examples for `n ∈ {-1, 0, 1,
+    2, 3, 4, 7}`, plus 8 / 255 / 256 / 2^24.
+  - Tables 23 and 24 rows are strictly monotone increasing (a
+    pre-condition of the IHMW divisor being positive).
+  - Tables 23 / 24 row widths equal `D_LPC_NB_MB` (10) and
+    `D_LPC_WB` (16).
+  - Table 23 row 0 (`12 35 60 83 108 132 157 180 206 228`),
+    Table 23 row 31, Table 24 row 0
+    (`7 23 38 54 69 85 100 116 131 147 162 178 193 208 223 239`),
+    Table 24 row 31 spot-checks.
+  - `cb1_q8()` routes Nb / Mb to Table 23 and Wb to Table 24, and
+    rejects `I1 >= 32` and Swb / Fb (SILK never sees the latter
+    after the §4.2.2 hybrid split).
+  - All 32 × NB IHMW weights and all 32 × WB IHMW weights are in
+    `[1819, 5227]` (the spec's own documented range for the 13-bit
+    tabulated form).
+  - Concrete hand-computed IHMW match: NB I1=0 k=0 → 2897; WB I1=0
+    k=0 → 3657 — both derived from `1024/diff` integer arithmetic
+    against the transcribed `cb1_Q8` cells.
+  - With `res_Q10[k] == 0`, every reconstructed `NLSF_Q15[k]` equals
+    `cb1_Q8[k] << 7` (bounded by `242 << 7 = 30976`, within the
+    `32767` clamp).
+  - Sweep across all 32 `I1` values × {NB, MB, WB} via a synthetic
+    range-decoder buffer: every reconstructed `NLSF_Q15[k]` is in
+    `[0, 32767]` and exactly reproduces the §4.2.7.5.3 formula
+    re-applied to the decoded `res_Q10[k]` and `w_Q9[k]`.
+  - `from_stage1_and_stage2` rejects mismatched bandwidth ↔ stage-2
+    length (e.g. WB-decoded stage-2 with NB reconstruction),
+    out-of-range `I1`, and Swb / Fb bandwidths.
+
 * **Clean-room round 6 (2026-05-22):** RFC 6716 §4.2.7.5.2 Normalized
   LSF Stage-2 decoder behind a new `LsfStage2` API. The caller passes
   the SILK-layer bandwidth (`Nb` / `Mb` / `Wb`) and the stage-1 codebook

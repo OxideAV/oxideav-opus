@@ -55,9 +55,19 @@
 //!   is the 7-cell extension PDF for the `|I2| == 4` saturation case;
 //!   Table 20 holds the four prediction-weight lists (A/B for NB/MB,
 //!   C/D for WB); Tables 21 (NB/MB) and 22 (WB) map `(I1, k)` →
-//!   weight-list. Output stops at `res_Q10[]`; §4.2.7.5.3 codebook
-//!   reconstruction, IHMW weighting, §4.2.7.5.4 stabilization, and
-//!   §4.2.7.5.5 interpolation are deferred to round 7+.
+//!   weight-list. Output stops at `res_Q10[]`.
+//!
+//! * Round 7 lands the [`NlsfReconstructed`] decoder for RFC 6716
+//!   §4.2.7.5.3 — the stage-1 codebook lookup (Tables 23 NB/MB and
+//!   24 WB carrying `cb1_Q8[]` for each `I1 ∈ 0..32`), the
+//!   low-complexity Inverse Harmonic Mean Weighting (IHMW) derivation
+//!   of `w_Q9[k]` from `cb1_Q8[]` via
+//!   `w2_Q18[k] = (1024/(cb1_Q8[k]-cb1_Q8[k-1]) + 1024/(cb1_Q8[k+1]-cb1_Q8[k])) << 16`
+//!   reduced through the spec's square-root approximation, and the
+//!   final reconstructed
+//!   `NLSF_Q15[k] = clamp(0, (cb1_Q8[k]<<7) + (res_Q10[k]<<14)/w_Q9[k], 32767)`.
+//!   The §4.2.7.5.4 stabilization and §4.2.7.5.5 interpolation steps
+//!   that consume `NLSF_Q15[]` are deferred to a later round.
 //!
 //! Subsequent SILK stages (LSF stabilization §4.2.7.5.4, LSF
 //! interpolation §4.2.7.5.5, LTP §4.2.7.6, LCG seed §4.2.7.7,
@@ -113,6 +123,7 @@ pub mod frames;
 pub mod range_decoder;
 pub mod silk_frame;
 pub mod silk_gains;
+pub mod silk_lsf_recon;
 pub mod silk_lsf_stage2;
 pub mod toc;
 
@@ -123,6 +134,7 @@ pub use silk_frame::{
     StereoPredictionWeights,
 };
 pub use silk_gains::{SubframeGain, SubframeGains, SubframeGainsConfig, SILK_MAX_SUBFRAMES};
+pub use silk_lsf_recon::{cb1_q8, NlsfReconstructed};
 pub use silk_lsf_stage2::{
     LsfStage2, D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB, QSTEP_NB_MB_Q16, QSTEP_WB_Q16,
 };
