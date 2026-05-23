@@ -2,13 +2,14 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-23 (clean-room round 8)
+## Status — 2026-05-24 (clean-room round 9)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
 gains + §4.2.7.5.2 LSF Stage-2 residual + §4.2.7.5.3 NLSF
-reconstruction + §4.2.7.5.4 NLSF stabilization; no §4.2.7.5.5
-interpolation yet, no LTP / excitation, no CELT band machinery yet.**
+reconstruction + §4.2.7.5.4 NLSF stabilization + §4.2.7.5.5 NLSF
+interpolation; no §4.2.7.5.6 LSF→LPC conversion yet, no LTP /
+excitation, no CELT band machinery yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -284,15 +285,52 @@ the spacing post-condition, the `[0, 32767]` bound, and strict
 monotonicity), length-matches-bandwidth checks, and the SWB/FB +
 length-mismatch rejections.
 
-Total crate test count: 163 (5 TOC + 27 frame-packing + 19 range
-decoder + 17 SILK header + 20 subframe gains + 30 LSF stage-2 +
-26 LSF reconstruction + 19 LSF stabilization).
+Round 9 (2026-05-24) lands the SILK Normalized LSF interpolation for
+RFC 6716 §4.2.7.5.5 behind a new `LsfInterpolated` /
+`LsfInterpContext` API. For a 20 ms SILK frame the first half (the
+first two subframes) may use NLSF coefficients interpolated between
+the most recent coded frame's vector `n0_Q15[]` and the current
+stabilized vector `n2_Q15[]`. `decode` takes the range decoder, the
+§4.2.7.5.4 `NlsfStabilized` (`n2`), the prior frame's `n0_Q15[]`
+(or `None`), and an `LsfInterpContext`:
 
-Round 8 stops after stabilization; §4.2.7.5.5 LSF interpolation and
-§4.2.7.5.6 LSF→LPC conversion are deferred to a later round. LTP /
-excitation decoding, the full CELT band machinery, and the §5
-encoder pipeline remain out of scope; the higher-level encode /
-decode entry points still return `Error::NotImplemented`.
+* **`TwentyMs`** — decode the Q2 factor `w_Q2 ∈ 0..=4` from the
+  Table 26 PDF (`{13, 22, 29, 11, 181}/256`, iCDF `[243, 221, 192,
+  181, 0]`) and compute
+  `n1_Q15[k] = n0_Q15[k] + (w_Q2*(n2_Q15[k] - n0_Q15[k]) >> 2)`.
+* **`TwentyMsAfterResetOrUncoded`** — the factor is still decoded
+  (the range coder must stay in sync) but its value is discarded and
+  `4` is substituted, so `n1_Q15[] == n2_Q15[]` (no interpolation).
+  This is also the behaviour whenever `n0_Q15[]` is `None`
+  (no prior-frame history).
+* **`TenMs`** — the factor is not present in the bitstream; nothing is
+  decoded and there is no first-half vector.
+
+The result exposes the decoded `w_q2()` (`None` for 10 ms) and the
+first-half `n1_q15()` (`None` for 10 ms). The second half of a 20 ms
+frame and the whole of a 10 ms frame always use `n2_Q15[]` directly —
+that is the caller's responsibility.
+
+Ten new unit tests cover the Table 26 PDF→iCDF transcription
+(sum-to-256 and monotone-decreasing self-checks), the 10 ms
+no-read / no-first-half path (range coder untouched), the
+end-to-end 20 ms interpolation against an independent formula
+re-derivation, the `w_Q2 == 0 → n0` and `w_Q2 == 4 → n2` algebraic
+identities, the reset/uncoded context decoding-then-forcing-4
+behaviour (with a `tell()` parity check against the normal context),
+the no-history `n0 = None` forced-`n2` path, the `n0`-length-mismatch
+rejection, and a sweep asserting every interpolated value stays in
+`[0, 32767]` across {NB, MB, WB} × all 32 `I1` × `w_Q2 ∈ 0..=4`.
+
+Total crate test count: 173 (5 TOC + 27 frame-packing + 19 range
+decoder + 17 SILK header + 20 subframe gains + 30 LSF stage-2 +
+26 LSF reconstruction + 19 LSF stabilization + 10 LSF interpolation).
+
+Round 9 stops after interpolation; §4.2.7.5.6 LSF→LPC conversion is
+deferred to a later round. LTP / excitation decoding, the full CELT
+band machinery, and the §5 encoder pipeline remain out of scope; the
+higher-level encode / decode entry points still return
+`Error::NotImplemented`.
 
 ## Planned clean-room sources
 

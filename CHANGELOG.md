@@ -6,6 +6,48 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 9 (2026-05-24):** RFC 6716 §4.2.7.5.5 SILK
+  Normalized LSF interpolation behind a new `LsfInterpolated` /
+  `LsfInterpContext` API (`silk_lsf_interp` module). For a 20 ms SILK
+  frame the first half (the first two subframes) may use NLSF
+  coefficients interpolated between the most recent coded frame's
+  vector `n0_Q15[]` and the current §4.2.7.5.4-stabilized vector
+  `n2_Q15[]`:
+
+  - **`TwentyMs`** decodes the Q2 factor `w_Q2 ∈ 0..=4` from the
+    Table 26 PDF (`{13, 22, 29, 11, 181}/256`; iCDF
+    `[243, 221, 192, 181, 0]`) and computes
+    `n1_Q15[k] = n0_Q15[k] + (w_Q2*(n2_Q15[k] - n0_Q15[k]) >> 2)`.
+  - **`TwentyMsAfterResetOrUncoded`** still decodes the factor (to keep
+    the range coder in sync) but discards it and uses `4` instead, so
+    `n1_Q15[] == n2_Q15[]`. The same forced-4 behaviour applies when
+    `n0_Q15[]` is `None` (no prior-frame history).
+  - **`TenMs`** reads no factor (it is not present in the bitstream)
+    and produces no first-half vector.
+
+  The result exposes the decoded `w_q2()` (`None` for 10 ms) and the
+  first-half `n1_q15()` (`None` for 10 ms). The second half of a 20 ms
+  frame and the whole of a 10 ms frame always use `n2_Q15[]` directly.
+
+  10 new unit tests (173 lib tests total in the crate; up from 163 in
+  the round-8 close) covering:
+
+  - Table 26 PDF→iCDF transcription (sum-to-256 and strict
+    monotone-decreasing iCDF self-checks; exactly five factors).
+  - 10 ms path reads nothing (`tell()` unchanged) and has no
+    first-half vector.
+  - End-to-end 20 ms interpolation matching an independent
+    re-derivation of the §4.2.7.5.5 formula.
+  - The `w_Q2 == 0 → n1 == n0` and `w_Q2 == 4 → n1 == n2` algebraic
+    identities.
+  - The reset/uncoded context decodes the factor then forces `4`
+    (asserting `tell()` parity with the normal context).
+  - The no-history `n0 = None` path forces `n1 == n2` even in the
+    normal context while still decoding the factor.
+  - `n0`-length-mismatch rejection (`Error::MalformedPacket`).
+  - A sweep asserting every interpolated value stays in `[0, 32767]`
+    across {NB, MB, WB} × all 32 `I1` × `w_Q2 ∈ 0..=4`.
+
 * **Clean-room round 8 (2026-05-23):** RFC 6716 §4.2.7.5.4 SILK
   Normalized LSF stabilization behind a new `NlsfStabilized` API
   (`silk_lsf_stabilize` module). Consumes the §4.2.7.5.3

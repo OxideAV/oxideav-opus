@@ -80,10 +80,20 @@
 //!   forward-`max` + backward-`min` sweep. The fallback's forward sweep
 //!   uses 16-bit saturating addition per the RFC 8251 §7 erratum.
 //!
-//! Subsequent SILK stages (LSF interpolation §4.2.7.5.5, LSF→LPC
-//! conversion §4.2.7.5.6, LTP §4.2.7.6, LCG seed §4.2.7.7,
-//! excitation §4.2.7.8) and the CELT layer are not yet wired up; the
-//! [`Decoder`] / [`Encoder`] entry points still return
+//! * Round 9 lands the [`LsfInterpolated`] decoder for RFC 6716
+//!   §4.2.7.5.5 — the normalized-LSF interpolation that produces the
+//!   first-half coefficients of a 20 ms SILK frame. A Q2 factor
+//!   `w_Q2 ∈ 0..=4` is decoded from the Table 26 PDF and
+//!   `n1_Q15[k] = n0_Q15[k] + (w_Q2*(n2_Q15[k] - n0_Q15[k]) >> 2)` blends
+//!   the prior coded frame's NLSF vector (`n0`) with the current
+//!   stabilized one (`n2`). After a decoder reset or an uncoded regular
+//!   side-channel SILK frame the factor is still decoded (to keep the
+//!   range coder in sync) but discarded and `4` is used instead; for a
+//!   10 ms SILK frame no factor is present at all.
+//!
+//! Subsequent SILK stages (LSF→LPC conversion §4.2.7.5.6, LTP §4.2.7.6,
+//! LCG seed §4.2.7.7, excitation §4.2.7.8) and the CELT layer are not yet
+//! wired up; the [`Decoder`] / [`Encoder`] entry points still return
 //! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
@@ -134,6 +144,7 @@ pub mod frames;
 pub mod range_decoder;
 pub mod silk_frame;
 pub mod silk_gains;
+pub mod silk_lsf_interp;
 pub mod silk_lsf_recon;
 pub mod silk_lsf_stabilize;
 pub mod silk_lsf_stage2;
@@ -146,6 +157,7 @@ pub use silk_frame::{
     StereoPredictionWeights,
 };
 pub use silk_gains::{SubframeGain, SubframeGains, SubframeGainsConfig, SILK_MAX_SUBFRAMES};
+pub use silk_lsf_interp::{LsfInterpContext, LsfInterpolated};
 pub use silk_lsf_recon::{cb1_q8, NlsfReconstructed};
 pub use silk_lsf_stabilize::NlsfStabilized;
 pub use silk_lsf_stage2::{
