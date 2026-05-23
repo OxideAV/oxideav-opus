@@ -2,14 +2,15 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-24 (clean-room round 9)
+## Status — 2026-05-24 (clean-room round 10)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
 gains + §4.2.7.5.2 LSF Stage-2 residual + §4.2.7.5.3 NLSF
 reconstruction + §4.2.7.5.4 NLSF stabilization + §4.2.7.5.5 NLSF
-interpolation; no §4.2.7.5.6 LSF→LPC conversion yet, no LTP /
-excitation, no CELT band machinery yet.**
+interpolation + §4.2.7.5.6 NLSF→LPC core conversion (`silk_NLSF2A`);
+no §4.2.7.5.7 LPC range-limiting yet, no §4.2.7.5.8 prediction-gain
+stability check, no LTP / excitation, no CELT band machinery yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -322,15 +323,65 @@ the no-history `n0 = None` forced-`n2` path, the `n0`-length-mismatch
 rejection, and a sweep asserting every interpolated value stays in
 `[0, 32767]` across {NB, MB, WB} × all 32 `I1` × `w_Q2 ∈ 0..=4`.
 
-Total crate test count: 173 (5 TOC + 27 frame-packing + 19 range
-decoder + 17 SILK header + 20 subframe gains + 30 LSF stage-2 +
-26 LSF reconstruction + 19 LSF stabilization + 10 LSF interpolation).
+Round 10 (2026-05-24) lands the SILK Normalized LSF → LPC core
+conversion for RFC 6716 §4.2.7.5.6 behind a new `LpcQ17` API. Given a
+stabilized / interpolated `nlsf_q15[]` (the §4.2.7.5.4 / §4.2.7.5.5
+output) and the SILK-layer bandwidth (NB / MB / WB), the three-step
+`silk_NLSF2A` procedure runs:
 
-Round 9 stops after interpolation; §4.2.7.5.6 LSF→LPC conversion is
-deferred to a later round. LTP / excitation decoding, the full CELT
-band machinery, and the §5 encoder pipeline remain out of scope; the
-higher-level encode / decode entry points still return
-`Error::NotImplemented`.
+* **`silk_NLSF2A_cos` (Table 27 + Table 28).** The 129-entry Q12
+  cosine table (`cos_Q12[0]=4096`, `cos_Q12[64]=0`,
+  `cos_Q12[128]=-4096`, anti-symmetric about i=64) is transcribed
+  verbatim. Each coefficient splits into top-7-bits `i = nlsf >> 8`
+  and next-8-bits `f = nlsf & 255`; the §4.2.7.5.6 piecewise-linear
+  interpolation `c_Q17[ordering[k]] = (cos_Q12[i]*256 +
+  (cos_Q12[i+1]-cos_Q12[i])*f + 4) >> 3` populates the re-ordered Q17
+  cosine vector. Table 27's `ordering[]` is `[0,9,6,3,4,5,8,1,2,7]`
+  for NB/MB and `[0,15,8,7,4,11,12,3,2,13,10,5,6,9,14,1]` for WB.
+* **`silk_NLSF2A_find_poly` recurrence.** Two rolling-row passes on
+  the even-indexed (P) and odd-indexed (Q) `c_Q17[]` cells run
+  `p[k][j] = p[k-1][j] + p[k-1][j-2] - ((c*p[k-1][j-1] + 32768)>>16)`
+  with the §4.2.7.5.6 boundary conditions `p[k][j<0] = 0` and
+  `p[k][k+2] = p[k][k]`. Intermediates are computed in i64 to absorb
+  the spec's noted "up to 48 bits of intermediate precision".
+* **`silk_NLSF2A` last-row assembly.** The final P / Q rows are
+  folded into the 32-bit Q17 LPC coefficients via the §4.2.7.5.6
+  sum / difference pair `a32_Q17[k] = -((q_diff) + (p_sum))` and
+  `a32_Q17[d_LPC-k-1] = (q_diff) - (p_sum)`, where
+  `q_diff = q[d2-1][k+1] - q[d2-1][k]` and
+  `p_sum = p[d2-1][k+1] + p[d2-1][k]`.
+
+The §4.2.7.5.7 range-limiting bandwidth-expansion loop (shrinks
+`a32_Q17[]` to fit Q12) and the §4.2.7.5.8 prediction-gain stability
+check (chirps until `silk_LPC_inverse_pred_gain_QA` passes) are both
+deferred to subsequent rounds.
+
+22 new unit tests (195 lib tests total in the crate, up from 173 at
+round-9 close) cover Table 27 row-widths + permutation-of-`0..d_LPC`
+self-checks + bandwidth routing (SWB / FB rejected), Table 28 length
++ three anchor cells + strict-monotone-decreasing pairwise check +
+the anti-symmetric-about-64 invariant + Q12-range bound + four row
+spot-checks, `nlsf_to_c_q17` at the table anchor points (`f == 0`
+round-trip against `cos_Q12[8*k]`) and at the linear-interpolation
+midpoint (`f == 128` matching the `16*(a+b)` algebraic identity),
+SWB / FB and length-mismatch rejection, the production
+`LpcQ17::from_nlsf` agreeing bit-for-bit with an independent
+2D-matrix spec-transcription oracle on synthetic ascending NLSF
+vectors for both NB and WB, the same production / oracle agreement
+across the full §4.2.7.5.2 → §4.2.7.5.3 → §4.2.7.5.4 pipeline ×
+all 32 `I1` × {NB, MB, WB}, and a no-panic sweep over three buffers
+× all 32 `I1` × {NB, MB, WB}.
+
+Total crate test count: 195 (5 TOC + 27 frame-packing + 19 range
+decoder + 17 SILK header + 20 subframe gains + 30 LSF stage-2 +
+26 LSF reconstruction + 19 LSF stabilization + 10 LSF interpolation
++ 22 LSF → LPC).
+
+Round 10 stops after the §4.2.7.5.6 core; §4.2.7.5.7 range-limiting
+and §4.2.7.5.8 prediction-gain stability are deferred to a later
+round. LTP / excitation decoding, the full CELT band machinery, and
+the §5 encoder pipeline remain out of scope; the higher-level encode
+/ decode entry points still return `Error::NotImplemented`.
 
 ## Planned clean-room sources
 

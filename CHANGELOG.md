@@ -6,6 +6,63 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 10 (2026-05-24):** RFC 6716 §4.2.7.5.6 SILK
+  Normalized LSF → LPC core conversion behind a new `LpcQ17` API
+  (`silk_lsf_to_lpc` module). Consumes a stabilized / interpolated
+  `nlsf_q15[]` (the §4.2.7.5.4 / §4.2.7.5.5 output) and runs the
+  `silk_NLSF2A` procedure in three steps:
+
+  - **Table 27 ordering + Table 28 cosine table (`silk_NLSF2A_cos`).**
+    The 129-entry Q12 cosine table (`cos_Q12[0]=4096`, `cos_Q12[64]=0`,
+    `cos_Q12[128]=-4096`, anti-symmetric about i=64) is transcribed
+    verbatim. For each coefficient `i = nlsf >> 8`, `f = nlsf & 255`
+    and the §4.2.7.5.6 piecewise-linear interpolation
+    `c_Q17[ordering[k]] = (cos_Q12[i]*256 + (cos_Q12[i+1]-cos_Q12[i])*f
+    + 4) >> 3` lands the re-ordered Q17 cosine vector. The Table 27
+    `ordering[]` vectors are NB/MB `[0,9,6,3,4,5,8,1,2,7]` and WB
+    `[0,15,8,7,4,11,12,3,2,13,10,5,6,9,14,1]`.
+  - **`silk_NLSF2A_find_poly` P/Q recurrence.** Two rolling-row passes
+    on the even-indexed (P) and odd-indexed (Q) `c_Q17[]` cells run
+    `p[k][j] = p[k-1][j] + p[k-1][j-2] - ((c*p[k-1][j-1] + 32768)>>16)`
+    in i64 to absorb the spec's noted "up to 48 bits of intermediate
+    precision" requirement, with the §4.2.7.5.6 boundary conditions
+    `p[k][j<0] = 0` and `p[k][k+2] = p[k][k]`.
+  - **`silk_NLSF2A` last-row assembly.** The final i64 rows are folded
+    into the 32-bit Q17 LPC coefficients via the §4.2.7.5.6 sum/diff
+    pair: `a32_Q17[k] = -((q_diff) + (p_sum))` and
+    `a32_Q17[d_LPC-k-1] = (q_diff) - (p_sum)`, where
+    `q_diff = q[d2-1][k+1] - q[d2-1][k]` and
+    `p_sum  = p[d2-1][k+1] + p[d2-1][k]`.
+
+  The §4.2.7.5.7 range-limiting bandwidth-expansion loop (up to 10
+  rounds shrinking `a32_Q17[]` so it fits Q12) and the §4.2.7.5.8
+  prediction-gain stability check (up to 16 chirp rounds + the
+  `silk_LPC_inverse_pred_gain_QA` test) are deferred to subsequent
+  rounds.
+
+  22 new unit tests (195 lib tests total in the crate; up from 173 in
+  the round-9 close) covering:
+
+  - Table 27 row-widths, permutation-of-0..d_LPC self-checks, and
+    bandwidth routing (`ordering()` rejects SWB / FB).
+  - Table 28 length (129), the three anchors (0 → 4096; 64 → 0;
+    128 → -4096), the strict-monotone-decreasing pairwise check, the
+    anti-symmetric-about-64 invariant, the Q12-range bound, and four
+    row spot-checks (rows 0, 16, 60, 64, 124).
+  - `nlsf_to_c_q17` at the table anchor points (`f == 0` round-trip
+    against `cos_Q12[8*k]`) and at the linear-interpolation midpoint
+    (`f == 128` matching the `16*(a+b)` algebraic identity).
+  - `nlsf_to_c_q17` rejects SWB / FB and `nlsf_q15.len() != d_LPC`.
+  - `LpcQ17` length, SWB / FB and length-mismatch rejection.
+  - Production `LpcQ17::from_nlsf` agrees bit-for-bit with an
+    independent 2D-matrix spec-transcription oracle of the §4.2.7.5.6
+    recurrence on synthetic ascending NLSF vectors for both NB and WB.
+  - Production `LpcQ17::from_nlsf` agrees with the same oracle when
+    driven by the full §4.2.7.5.2 → §4.2.7.5.3 → §4.2.7.5.4 decoder
+    pipeline across all 32 `I1` values × {NB, MB, WB}.
+  - A no-panic sweep over three buffers × all 32 `I1` × {NB, MB, WB}
+    confirming the full §4.2.7.5.2..§4.2.7.5.6 path is panic-free.
+
 * **Clean-room round 9 (2026-05-24):** RFC 6716 §4.2.7.5.5 SILK
   Normalized LSF interpolation behind a new `LsfInterpolated` /
   `LsfInterpContext` API (`silk_lsf_interp` module). For a 20 ms SILK

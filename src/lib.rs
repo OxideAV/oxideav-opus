@@ -91,10 +91,21 @@
 //!   range coder in sync) but discarded and `4` is used instead; for a
 //!   10 ms SILK frame no factor is present at all.
 //!
-//! Subsequent SILK stages (LSF→LPC conversion §4.2.7.5.6, LTP §4.2.7.6,
-//! LCG seed §4.2.7.7, excitation §4.2.7.8) and the CELT layer are not yet
-//! wired up; the [`Decoder`] / [`Encoder`] entry points still return
-//! [`Error::NotImplemented`].
+//! * Round 10 lands the [`LpcQ17`] core converter for RFC 6716
+//!   §4.2.7.5.6 — the NLSF → LPC reconstruction (`silk_NLSF2A`). The
+//!   Table 28 Q12 cosine table with linear interpolation produces the
+//!   re-ordered Q17 cosine vector `c_Q17[]` per Table 27, the
+//!   `silk_NLSF2A_find_poly` P/Q recurrence runs in i64 to absorb the
+//!   "up to 48 bits of intermediate precision" the spec calls out, and
+//!   the last-row sum/difference assembly produces the 32-bit
+//!   `a32_Q17[]`. The §4.2.7.5.7 bandwidth-expansion range-limiting
+//!   loop and the §4.2.7.5.8 prediction-gain stability check are
+//!   deferred to subsequent rounds.
+//!
+//! Subsequent SILK stages (LPC range-limiting §4.2.7.5.7, LPC stability
+//! §4.2.7.5.8, LTP §4.2.7.6, LCG seed §4.2.7.7, excitation §4.2.7.8) and
+//! the CELT layer are not yet wired up; the [`Decoder`] / [`Encoder`]
+//! entry points still return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -148,6 +159,7 @@ pub mod silk_lsf_interp;
 pub mod silk_lsf_recon;
 pub mod silk_lsf_stabilize;
 pub mod silk_lsf_stage2;
+pub mod silk_lsf_to_lpc;
 pub mod toc;
 
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
@@ -163,6 +175,7 @@ pub use silk_lsf_stabilize::NlsfStabilized;
 pub use silk_lsf_stage2::{
     LsfStage2, D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB, QSTEP_NB_MB_Q16, QSTEP_WB_Q16,
 };
+pub use silk_lsf_to_lpc::{nlsf_to_c_q17, ordering, LpcQ17};
 pub use toc::{Bandwidth, ChannelMapping, FrameCountCode, Mode, OpusTocByte};
 
 /// No-op codec registration — the orphan-rebuild scaffold registers
