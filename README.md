@@ -2,13 +2,13 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-22 (clean-room round 7)
+## Status — 2026-05-23 (clean-room round 8)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
 gains + §4.2.7.5.2 LSF Stage-2 residual + §4.2.7.5.3 NLSF
-reconstruction; no §4.2.7.5.4 stabilization yet, no LTP /
-excitation, no CELT band machinery yet.**
+reconstruction + §4.2.7.5.4 NLSF stabilization; no §4.2.7.5.5
+interpolation yet, no LTP / excitation, no CELT band machinery yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -240,12 +240,56 @@ all-`I1` round-trips on a synthetic range-decoder buffer for NB /
 MB / WB confirming the final `NLSF_Q15[]` exactly matches the
 formula re-applied to `res_Q10[k]` and `w_Q9[k]`.
 
-Total crate test count: 144 (5 TOC + 27 frame-packing + 19 range
-decoder + 17 SILK header + 20 subframe gains + 30 LSF stage-2 +
-26 LSF reconstruction).
+Round 8 (2026-05-23) stabilizes the reconstructed `NLSF_Q15[]` per
+RFC 6716 §4.2.7.5.4 behind a new
+`NlsfStabilized::from_reconstructed(bandwidth, &recon)` API, ensuring
+consecutive coefficients stay at least the Table 25 minimum spacing
+apart (the 0.01-percentile spacing of the SILK training set). The
+boundary conventions are `NLSF_Q15[-1] = 0` and `NLSF_Q15[d_LPC] =
+32768`; Table 25's `NDeltaMin_Q15[]` carries `d_LPC + 1` entries (one
+trailing entry for the spacing against the implicit upper edge).
 
-Round 7 stops after `NLSF_Q15[]`; §4.2.7.5.4 stabilization and
-§4.2.7.5.5 interpolation are deferred to a later round. LTP /
+* **Up to 20 distortion-minimizing passes.** Each pass scans
+  `i ∈ 0..=d_LPC` for the smallest `NLSF_Q15[i] - NLSF_Q15[i-1] -
+  NDeltaMin_Q15[i]` (ties to lower `i`). If non-negative, the
+  coefficients already satisfy every constraint and the procedure
+  stops. Otherwise: `i == 0` sets `NLSF_Q15[0] = NDeltaMin_Q15[0]`;
+  `i == d_LPC` sets `NLSF_Q15[d_LPC-1] = 32768 - NDeltaMin_Q15[d_LPC]`;
+  any interior `i` re-centres the pair via the `min_center` /
+  `max_center` running-sum band and the
+  `center_freq = clamp(min_center, (NLSF[i-1]+NLSF[i]+1)>>1,
+  max_center)` midpoint, then writes
+  `NLSF_Q15[i-1] = center_freq - (NDeltaMin_Q15[i]>>1)` and
+  `NLSF_Q15[i] = NLSF_Q15[i-1] + NDeltaMin_Q15[i]`.
+* **Fallback (once, after the 20th pass).** Sort ascending, then a
+  forward `max(NLSF[k], NLSF[k-1] + NDeltaMin[k])` sweep and a
+  backward `min(NLSF[k], NLSF[k+1] - NDeltaMin[k+1])` sweep that
+  mechanically guarantee the spacing. Per the **RFC 8251 §7**
+  erratum the forward sweep's addition is performed with 16-bit
+  saturating addition (`silk_ADD_SAT16`) so an adversarial input near
+  `i16::MAX` cannot wrap around into a negative value.
+
+19 new unit tests cover Table 25 lengths and spot-checks (NB/MB index
+0 = 250 / index 10 = 461; WB index 0 = 100 / index 2 = 40 / index 16
+= 347), the SWB/FB column rejection, `add_sat16` saturation, an
+"already-stable input is left untouched" identity for NB and WB, the
+two boundary branches (first coefficient pushed up to `NDeltaMin[0]`,
+last coefficient pulled down to `32768 - NDeltaMin[d_LPC]`), an
+interior re-centring with hand-computed exact `NLSF_Q15[i-1]` /
+`NLSF_Q15[i]` values, the fallback path on a fully reversed input,
+all-zero and all-32767 inputs spread to valid spacing, the RFC 8251
+no-wrap guard near `i16::MAX`, an all-`I1` × {NB, MB, WB} end-to-end
+sweep wired through the §4.2.7.5.2 / §4.2.7.5.3 decoders (asserting
+the spacing post-condition, the `[0, 32767]` bound, and strict
+monotonicity), length-matches-bandwidth checks, and the SWB/FB +
+length-mismatch rejections.
+
+Total crate test count: 163 (5 TOC + 27 frame-packing + 19 range
+decoder + 17 SILK header + 20 subframe gains + 30 LSF stage-2 +
+26 LSF reconstruction + 19 LSF stabilization).
+
+Round 8 stops after stabilization; §4.2.7.5.5 LSF interpolation and
+§4.2.7.5.6 LSF→LPC conversion are deferred to a later round. LTP /
 excitation decoding, the full CELT band machinery, and the §5
 encoder pipeline remain out of scope; the higher-level encode /
 decode entry points still return `Error::NotImplemented`.

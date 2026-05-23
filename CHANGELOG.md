@@ -6,6 +6,60 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 8 (2026-05-23):** RFC 6716 §4.2.7.5.4 SILK
+  Normalized LSF stabilization behind a new `NlsfStabilized` API
+  (`silk_lsf_stabilize` module). Consumes the §4.2.7.5.3
+  `NlsfReconstructed` output and enforces the Table 25 minimum spacing
+  between consecutive `NLSF_Q15[]` coefficients, with the boundary
+  conventions `NLSF_Q15[-1] = 0` / `NLSF_Q15[d_LPC] = 32768` and a
+  Table 25 column of `d_LPC + 1` entries.
+
+  - **Up to 20 distortion-minimizing passes.** Each pass finds the
+    smallest `NLSF_Q15[i] - NLSF_Q15[i-1] - NDeltaMin_Q15[i]` over
+    `i ∈ 0..=d_LPC` (ties to lower `i`); stops if non-negative.
+    Otherwise `i == 0` → `NLSF_Q15[0] = NDeltaMin_Q15[0]`,
+    `i == d_LPC` → `NLSF_Q15[d_LPC-1] = 32768 - NDeltaMin_Q15[d_LPC]`,
+    and any interior `i` re-centres the pair via the
+    `min_center`/`max_center` running sums and
+    `center_freq = clamp(min_center, (NLSF[i-1]+NLSF[i]+1)>>1,
+    max_center)`, then `NLSF_Q15[i-1] = center_freq -
+    (NDeltaMin_Q15[i]>>1)` and `NLSF_Q15[i] = NLSF_Q15[i-1] +
+    NDeltaMin_Q15[i]`.
+  - **Fallback (once after the 20th pass).** Sort ascending, then a
+    forward `max(NLSF[k], NLSF[k-1] + NDeltaMin[k])` sweep and a
+    backward `min(NLSF[k], NLSF[k+1] - NDeltaMin[k+1])` sweep.
+  - **RFC 8251 §7 erratum.** The fallback forward sweep's addition
+    uses 16-bit saturating addition (`silk_ADD_SAT16`) to avoid the
+    integer wrap-around the erratum documents on adversarial inputs
+    with extremely large high-LSF parameters.
+
+  Table 25 is transcribed verbatim: NB/MB column
+  `{250, 3, 6, 3, 3, 3, 4, 3, 3, 3, 461}`, WB column
+  `{100, 3, 40, 3, 3, 3, 5, 14, 14, 10, 11, 3, 8, 9, 7, 3, 347}`.
+
+  19 new unit tests (163 lib tests total in the crate; up from 144 in
+  the round-7 close) covering:
+
+  - Table 25 lengths (`d_LPC + 1` for NB/MB and WB) and spot-checks.
+  - `ndelta_min_q15` rejects SWB / FB.
+  - `add_sat16` saturates at both `i16` bounds.
+  - An already-stable comfortably-spaced input is left bit-identical
+    (NB and WB).
+  - First-coefficient-too-low pushed up to `NDeltaMin[0]`;
+    last-coefficient-too-high pulled down to `32768 - NDeltaMin[d_LPC]`.
+  - Interior re-centring with hand-computed exact `NLSF_Q15[i-1]` /
+    `NLSF_Q15[i]` values for an isolated tight pair.
+  - The fallback sort + sweeps fix a fully-reversed input; all-zero
+    and all-32767 inputs are spread to valid spacing.
+  - The RFC 8251 §7 no-wrap guard: an all-`i16::MAX` input stays in
+    `[0, 32767]` (a wrap-around would produce a negative value).
+  - End-to-end sweep across all 32 `I1` values × {NB, MB, WB} wired
+    through the §4.2.7.5.2 / §4.2.7.5.3 decoders, asserting the
+    spacing post-condition, the `[0, 32767]` bound, and strict
+    monotonicity of every stabilized vector.
+  - `from_reconstructed` rejects SWB / FB and a bandwidth ↔ recon
+    length mismatch.
+
 * **Clean-room round 7 (2026-05-22):** RFC 6716 §4.2.7.5.3 SILK
   Normalized LSF reconstruction behind a new `NlsfReconstructed` API
   (`silk_lsf_recon` module). Lifts the stage-2 residual `res_Q10[]`

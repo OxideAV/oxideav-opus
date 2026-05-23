@@ -66,11 +66,22 @@
 //!   reduced through the spec's square-root approximation, and the
 //!   final reconstructed
 //!   `NLSF_Q15[k] = clamp(0, (cb1_Q8[k]<<7) + (res_Q10[k]<<14)/w_Q9[k], 32767)`.
-//!   The §4.2.7.5.4 stabilization and §4.2.7.5.5 interpolation steps
-//!   that consume `NLSF_Q15[]` are deferred to a later round.
+//!   The §4.2.7.5.5 interpolation step that consumes the stabilized
+//!   `NLSF_Q15[]` is deferred to a later round.
 //!
-//! Subsequent SILK stages (LSF stabilization §4.2.7.5.4, LSF
-//! interpolation §4.2.7.5.5, LTP §4.2.7.6, LCG seed §4.2.7.7,
+//! * Round 8 lands the [`NlsfStabilized`] decoder for RFC 6716
+//!   §4.2.7.5.4 — the normalized-LSF stabilization that enforces the
+//!   Table 25 minimum spacing between consecutive `NLSF_Q15[]` entries.
+//!   Up to 20 distortion-minimizing re-centring passes run first
+//!   (finding the smallest-spacing pair, then the `min_center` /
+//!   `max_center` / `center_freq` re-centring, with special handling
+//!   for the implicit `NLSF_Q15[-1] = 0` and `NLSF_Q15[d_LPC] = 32768`
+//!   edges), falling back after the 20th pass to a guaranteed sort +
+//!   forward-`max` + backward-`min` sweep. The fallback's forward sweep
+//!   uses 16-bit saturating addition per the RFC 8251 §7 erratum.
+//!
+//! Subsequent SILK stages (LSF interpolation §4.2.7.5.5, LSF→LPC
+//! conversion §4.2.7.5.6, LTP §4.2.7.6, LCG seed §4.2.7.7,
 //! excitation §4.2.7.8) and the CELT layer are not yet wired up; the
 //! [`Decoder`] / [`Encoder`] entry points still return
 //! [`Error::NotImplemented`].
@@ -124,6 +135,7 @@ pub mod range_decoder;
 pub mod silk_frame;
 pub mod silk_gains;
 pub mod silk_lsf_recon;
+pub mod silk_lsf_stabilize;
 pub mod silk_lsf_stage2;
 pub mod toc;
 
@@ -135,6 +147,7 @@ pub use silk_frame::{
 };
 pub use silk_gains::{SubframeGain, SubframeGains, SubframeGainsConfig, SILK_MAX_SUBFRAMES};
 pub use silk_lsf_recon::{cb1_q8, NlsfReconstructed};
+pub use silk_lsf_stabilize::NlsfStabilized;
 pub use silk_lsf_stage2::{
     LsfStage2, D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB, QSTEP_NB_MB_Q16, QSTEP_WB_Q16,
 };
