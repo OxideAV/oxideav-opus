@@ -6,6 +6,39 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 13 (2026-05-24):** RFC 6716 §4.2.7.6 SILK Long-Term
+  Prediction parameters behind a new `LtpParameters` / `LtpConfig` API
+  (`silk_ltp` module). Decodes the §4.2.7.6.1 primary pitch lag (either
+  absolute, via Table 29 high-part + Table 30 bandwidth-conditioned
+  low-part / scale / lag-range, or relative, via the Table 31 21-entry
+  delta PDF with a zero-delta fallback to absolute coding), the
+  pitch-contour VQ index (Table 32 PDF; Tables 33–36 codebooks) that
+  refines the primary lag into per-subframe pitch lags clamped to the
+  bandwidth's `[lag_min, lag_max]`, the §4.2.7.6.2 periodicity index
+  (Table 37) and per-subframe 5-tap Q7 LTP filter taps (Table 38 PDFs;
+  Tables 39–41 codebooks of sizes 8 / 16 / 32), and the optional
+  §4.2.7.6.3 Q14 LTP scaling factor (Table 42 → `{15565, 12288, 8192}`;
+  default `15565` ≈ 0.95 when not coded or for non-voiced frames).
+  Non-voiced frames consume no LTP bits. The §4.2.7.9 LTP synthesis
+  filter that consumes these parameters is deferred to a later round.
+
+  Nineteen new unit tests (229 lib tests total in the crate, up from
+  210 at round-12 close) cover the eleven PDF → iCDF transcriptions
+  (Tables 29 / 30 NB-MB-WB / 31 / 32 four PDFs / 37 / 38 three PDFs /
+  42), Table 30 scale + lag-range values, contour codebook
+  size-matches-PDF self-checks + index-0 all-zero rows + four
+  interior-row spot-checks against the spec, LTP filter codebook sizes
+  (8 / 16 / 32) + four boundary-row spot-checks against Tables 39–41,
+  the non-voiced no-bits-consumed property (both Inactive and Unvoiced),
+  rejection of non-2-non-4 `num_subframes` and SWB / FB bandwidths,
+  in-range absolute-coding lags + production / independent formula
+  agreement across {NB, MB, WB} × {2, 4} subframes, relative-coding
+  non-zero-delta + zero-delta-fallback paths, LTP-scaling-present output
+  ∈ `{15565, 12288, 8192}` and absent-uses-default-without-reading bit
+  positioning, and a sweep over {NB, MB, WB} × {2, 4} × {absent,
+  present} × {Absolute, Relative} × three buffers asserting no panics,
+  the `[lag_min, lag_max]` post-condition, and periodicity ≤ 2.
+
 * **Clean-room round 12 (2026-05-24):** RFC 6716 §4.2.7.5.8 SILK LPC
   prediction-gain limiting behind a new `LpcQ17::prediction_gain_limited`
   method returning a new `LpcQ12` type (`silk_lsf_to_lpc` module).

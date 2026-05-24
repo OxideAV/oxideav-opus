@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-24 (clean-room round 12)
+## Status — 2026-05-24 (clean-room round 13)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
@@ -10,8 +10,9 @@ gains + §4.2.7.5.2 LSF Stage-2 residual + §4.2.7.5.3 NLSF
 reconstruction + §4.2.7.5.4 NLSF stabilization + §4.2.7.5.5 NLSF
 interpolation + §4.2.7.5.6 NLSF→LPC core conversion (`silk_NLSF2A`) +
 §4.2.7.5.7 LPC range-limiting bandwidth expansion + §4.2.7.5.8 LPC
-prediction-gain stability limiting (`silk_LPC_inverse_pred_gain_QA`); no
-LTP / LCG seed / excitation, no CELT band machinery yet.**
+prediction-gain stability limiting (`silk_LPC_inverse_pred_gain_QA`) +
+§4.2.7.6 LTP parameters (pitch lags + LTP filter coefficients +
+LTP scaling); no LCG seed / excitation, no CELT band machinery yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -447,18 +448,87 @@ within ≤ 16 rounds, the forced round-15 zeroing, the signed-16-bit Q12
 fit, a real §4.2.7.5.2 → … → §4.2.7.5.8 pipeline sweep across all 32 `I1`
 × {NB, MB, WB} on three buffers, and the `ilog64` §1.1.10 boundaries.
 
-Total crate test count: 210 (5 TOC + 27 frame-packing + 19 range
+Round 13 (2026-05-24) lands the SILK Long-Term Prediction parameters
+for RFC 6716 §4.2.7.6 behind a new `LtpParameters` / `LtpConfig` API.
+The caller passes the SILK-layer bandwidth (NB / MB / WB), the signal
+type from §4.2.7.3, the subframe count (2 for 10 ms; 4 for 20 ms /
+Hybrid), a `LagCoding` enum selecting absolute vs relative primary-lag
+coding (with the prior frame's unclamped primary lag for the latter),
+and a boolean for whether the §4.2.7.6.3 LTP scaling field is present.
+`decode` returns:
+
+* **§4.2.7.6.1 pitch lags.** Non-voiced frames consume no bits.
+  Voiced frames decode the primary lag either as
+  `lag = lag_high * lag_scale + lag_low + lag_min` (absolute path:
+  Table 29 32-entry high-part PDF + Table 30 bandwidth-conditioned
+  low-part PDF + scale `{4, 6, 8}` for `{NB, MB, WB}` + `lag_min`
+  `{16, 24, 32}` + `lag_max` `{144, 216, 288}`), or as
+  `lag = previous_lag + (delta_lag_index - 9)` (relative path:
+  Table 31 21-entry delta PDF, with a decoded delta of 0 falling back
+  to the absolute-coding sub-path that reads the high + low parts).
+  The pitch-contour VQ index follows from one of the four Table 32
+  PDFs picked by `(bandwidth, num_subframes)`, then the per-subframe
+  lag is `pitch_lags[k] = clamp(lag_min, lag + lag_cb[contour_index][k],
+  lag_max)` with the offsets from Tables 33 (NB 10 ms, 3 entries × 2),
+  34 (NB 20 ms, 11 × 4), 35 (MB/WB 10 ms, 12 × 2) and 36 (MB/WB
+  20 ms, 34 × 4). The primary lag itself is held unclamped per the
+  §4.2.7.6.1 note so the next frame's relative coding remains
+  consistent.
+* **§4.2.7.6.2 LTP filter coefficients.** A 3-entry periodicity
+  index (Table 37 PDF `{77, 80, 99}/256`) gates one of three filter
+  codebooks; each subframe then decodes a filter index from the
+  periodicity-conditioned PDF in Table 38 (codebook sizes 8 / 16 /
+  32) into a 5-tap signed Q7 filter from Tables 39 (periodicity 0),
+  40 (periodicity 1) or 41 (periodicity 2).
+* **§4.2.7.6.3 LTP scaling.** When `ltp_scaling_present` is true, a
+  3-entry index from the Table 42 PDF `{128, 64, 64}/256` selects a
+  Q14 scale factor from `{15565, 12288, 8192}` (≈ 0.95 / 0.75 / 0.5).
+  When absent the default `15565` is used and no bits are consumed.
+  Non-voiced frames also use the default.
+
+The §4.2.7.9 LTP synthesis filter that consumes these parameters is
+intentionally left to a later round — this module only produces the
+decoded parameter set.
+
+Nineteen new unit tests (229 lib tests total in the crate, up from 210
+at round-12 close) cover the PDF → iCDF transcriptions for Tables 29 /
+30 (per-bandwidth) / 31 / 32 (all four PDFs) / 37 / 38 (all three
+codebooks) / 42 (each sums to 256, strictly monotone-decreasing iCDF,
+terminator 0), Table 30 scale + min-lag + max-lag values, the
+contour-codebook size-matches-PDF self-checks plus index-0 (all-zero
+offset) and several interior-row spot-checks against the spec
+(`CONTOUR_NB_20MS[1] == [2,1,0,-1]`, `CONTOUR_MBWB_20MS[33] == [-9,-3,
+3,9]`, `CONTOUR_MBWB_10MS[11] == [-3,3]`), the LTP-filter-codebook
+sizes (8 / 16 / 32) and four boundary-row spot-checks against Tables
+39–41 (`P0[0]=[4,6,24,7,5]`, `P0[7]=[16,14,38,-3,33]`,
+`P1[15]=[3,-1,21,16,41]`, `P2[31]=[2,0,9,10,88]`), the no-bits-consumed
+property for non-voiced frames (both Inactive and Unvoiced signal
+types), the malformed-config rejections (non-2-non-4 subframe count;
+SWB / FB bandwidth), the in-range + formula-match property for absolute
+coding across {NB, MB, WB} × {2, 4} subframes (independent re-derivation
+of the production decode), the relative-coding non-zero-delta path
+(`primary = previous_lag + (delta - 9)`), the relative-coding zero-delta
+fallback into the absolute sub-path, the LTP-scaling-present path's
+output landing in `{15565, 12288, 8192}`, the LTP-scaling-absent path
+consuming strictly fewer bits than the present path, and a sweep
+across {NB, MB, WB} × {2, 4} subframes × {absent, present} scaling ×
+{Absolute, Relative} coding × three buffers that asserts no panics, the
+`[lag_min, lag_max]` clamp post-condition, and the periodicity ≤ 2
+invariant.
+
+Total crate test count: 229 (5 TOC + 27 frame-packing + 19 range
 decoder + 17 SILK header + 20 subframe gains + 30 LSF stage-2 +
 26 LSF reconstruction + 19 LSF stabilization + 10 LSF interpolation
 + 22 LSF → LPC core + 6 LPC range-limiting + 9 LPC prediction-gain
-limiting).
+limiting + 19 LTP parameters).
 
-Round 12 stops after the §4.2.7.5.8 prediction-gain limiting — the SILK
-short-term LPC analysis filter coefficients are now fully decoded. LTP
-(§4.2.7.6), the LCG seed (§4.2.7.7), and excitation decoding (§4.2.7.8)
-are the next SILK stages; the full CELT band machinery and the §5 encoder
-pipeline remain out of scope; the higher-level encode / decode entry
-points still return `Error::NotImplemented`.
+Round 13 stops after the §4.2.7.6 LTP parameters — the SILK frame
+header, the gains, the full LSF → LPC pipeline, and now the
+long-term-prediction parameters are all decoded. The LCG seed
+(§4.2.7.7), excitation decoding (§4.2.7.8), the §4.2.7.9 synthesis
+filters (LTP + LPC), the full CELT band machinery and the §5 encoder
+pipeline remain to come; the higher-level encode / decode entry points
+still return `Error::NotImplemented`.
 
 ## Planned clean-room sources
 

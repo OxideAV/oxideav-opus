@@ -120,9 +120,21 @@
 //!   The result is the final stable Q12 filter `a_Q12[k]` consumed by the
 //!   §4.2.7.9.2 LPC synthesis.
 //!
-//! Subsequent SILK stages (LTP §4.2.7.6, LCG seed §4.2.7.7, excitation
-//! §4.2.7.8) and the CELT layer are not yet wired up; the [`Decoder`] /
-//! [`Encoder`] entry points still return [`Error::NotImplemented`].
+//! * Round 13 lands the §4.2.7.6 Long-Term Prediction parameters
+//!   ([`LtpParameters`]) — the primary pitch lag (§4.2.7.6.1; absolute via
+//!   Table 29 high part + Table 30 bandwidth-conditioned low part, or
+//!   relative via the Table 31 delta with a zero-delta fallback to
+//!   absolute), the pitch-contour VQ index (Table 32 PDF; Tables 33–36
+//!   codebooks) that refines the primary lag into per-subframe pitch lags
+//!   clamped to `[lag_min, lag_max]`, the §4.2.7.6.2 periodicity index
+//!   (Table 37) and per-subframe 5-tap Q7 LTP filter taps (Table 38 PDFs;
+//!   Tables 39–41 codebooks), and the §4.2.7.6.3 optional Q14 LTP scaling
+//!   factor (Table 42 → `{15565, 12288, 8192}`; default `15565` when not
+//!   coded). Non-voiced frames consume no LTP bits.
+//!
+//! Subsequent SILK stages (LCG seed §4.2.7.7, excitation §4.2.7.8) and
+//! the CELT layer are not yet wired up; the [`Decoder`] / [`Encoder`]
+//! entry points still return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -177,6 +189,7 @@ pub mod silk_lsf_recon;
 pub mod silk_lsf_stabilize;
 pub mod silk_lsf_stage2;
 pub mod silk_lsf_to_lpc;
+pub mod silk_ltp;
 pub mod toc;
 
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
@@ -193,6 +206,10 @@ pub use silk_lsf_stage2::{
     LsfStage2, D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB, QSTEP_NB_MB_Q16, QSTEP_WB_Q16,
 };
 pub use silk_lsf_to_lpc::{nlsf_to_c_q17, ordering, LpcQ12, LpcQ17};
+pub use silk_ltp::{
+    LagCoding, LtpConfig, LtpParameters, LTP_FILTER_TAPS, LTP_MAX_SUBFRAMES,
+    LTP_SCALING_DEFAULT_Q14,
+};
 pub use toc::{Bandwidth, ChannelMapping, FrameCountCode, Mode, OpusTocByte};
 
 /// No-op codec registration — the orphan-rebuild scaffold registers
