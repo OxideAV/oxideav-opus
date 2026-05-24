@@ -132,9 +132,25 @@
 //!   factor (Table 42 → `{15565, 12288, 8192}`; default `15565` when not
 //!   coded). Non-voiced frames consume no LTP bits.
 //!
-//! Subsequent SILK stages (LCG seed §4.2.7.7, excitation §4.2.7.8) and
-//! the CELT layer are not yet wired up; the [`Decoder`] / [`Encoder`]
-//! entry points still return [`Error::NotImplemented`].
+//! * Round 14 lands the §4.2.7.7 LCG seed ([`decode_lcg_seed`]) and the
+//!   §4.2.7.8 SILK excitation decoder ([`Excitation`] / [`ExcitationConfig`]).
+//!   The excitation is decoded in six substeps: §4.2.7.8.1 rate level
+//!   (Table 45 PDFs, one symbol per SILK frame), §4.2.7.8.2 per-shell-block
+//!   pulse count (Table 46 PDFs at one of 11 rate levels; the "extra LSB"
+//!   value 17 chains into rate level 9, then 10), §4.2.7.8.3 recursive
+//!   pulse-location partition (16 → 8 → 4 → 2 → 1; Tables 47–50 select
+//!   the split PDF by partition size + remaining pulse count),
+//!   §4.2.7.8.4 per-coefficient LSB decoding (Table 51), §4.2.7.8.5
+//!   sign decoding (Table 52, picked by signal type × quantization
+//!   offset type × pulse count bin with 6+ saturating), and §4.2.7.8.6
+//!   reconstruction with the LCG `seed' = 196314165*seed + 907633515
+//!   mod 2^32` plus the Table 53 Q23 quantization offset. The result is
+//!   the final Q23 excitation `e_Q23[]` consumed by the §4.2.7.9 LTP
+//!   and LPC synthesis filters.
+//!
+//! The CELT layer and the §4.2.7.9 synthesis filters are not yet wired
+//! up; the [`Decoder`] / [`Encoder`] entry points still return
+//! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -182,8 +198,10 @@ impl std::error::Error for Error {}
 
 pub mod frames;
 pub mod range_decoder;
+pub mod silk_excitation;
 pub mod silk_frame;
 pub mod silk_gains;
+pub mod silk_lcg_seed;
 pub mod silk_lsf_interp;
 pub mod silk_lsf_recon;
 pub mod silk_lsf_stabilize;
@@ -194,11 +212,16 @@ pub mod toc;
 
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
 pub use range_decoder::RangeDecoder;
+pub use silk_excitation::{
+    quantization_offset_q23, shell_block_count, Excitation, ExcitationConfig, SilkFrameSize,
+    MAX_EXCITATION_SAMPLES, MAX_SHELL_BLOCKS, SHELL_BLOCK_SAMPLES,
+};
 pub use silk_frame::{
     FrameKind, QuantizationOffsetType, SignalType, SilkFrameHeader, SilkFrameHeaderConfig,
     StereoPredictionWeights,
 };
 pub use silk_gains::{SubframeGain, SubframeGains, SubframeGainsConfig, SILK_MAX_SUBFRAMES};
+pub use silk_lcg_seed::decode_lcg_seed;
 pub use silk_lsf_interp::{LsfInterpContext, LsfInterpolated};
 pub use silk_lsf_recon::{cb1_q8, NlsfReconstructed};
 pub use silk_lsf_stabilize::NlsfStabilized;

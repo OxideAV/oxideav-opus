@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-24 (clean-room round 13)
+## Status — 2026-05-25 (clean-room round 14)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
@@ -12,7 +12,10 @@ interpolation + §4.2.7.5.6 NLSF→LPC core conversion (`silk_NLSF2A`) +
 §4.2.7.5.7 LPC range-limiting bandwidth expansion + §4.2.7.5.8 LPC
 prediction-gain stability limiting (`silk_LPC_inverse_pred_gain_QA`) +
 §4.2.7.6 LTP parameters (pitch lags + LTP filter coefficients +
-LTP scaling); no LCG seed / excitation, no CELT band machinery yet.**
+LTP scaling) + §4.2.7.7 LCG seed + §4.2.7.8 excitation (rate level +
+pulses per shell block + recursive pulse-location split + LSBs + signs
++ §4.2.7.8.6 LCG-driven reconstruction); no §4.2.7.9 LTP / LPC
+synthesis filters, no CELT band machinery yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -516,19 +519,88 @@ across {NB, MB, WB} × {2, 4} subframes × {absent, present} scaling ×
 `[lag_min, lag_max]` clamp post-condition, and the periodicity ≤ 2
 invariant.
 
-Total crate test count: 229 (5 TOC + 27 frame-packing + 19 range
+Round 14 (2026-05-25) lands the SILK Linear Congruential Generator
+seed for RFC 6716 §4.2.7.7 behind a new `decode_lcg_seed` helper, plus
+the full SILK excitation decoder for §4.2.7.8 behind a new
+`Excitation` / `ExcitationConfig` API. The LCG seed reads a single
+symbol from the uniform 4-entry Table 43 PDF (`{64, 64, 64, 64}/256`),
+yielding a value in `0..=3` that initialises the pseudorandom sign
+generator used by §4.2.7.8.6 reconstruction.
+
+The §4.2.7.8 excitation decodes in six substeps:
+
+* **§4.2.7.8.1 Rate level.** A single symbol per SILK frame drawn from
+  one of two Table 45 PDFs selected by `(signal_type)` —
+  `{15, 51, 12, 46, 45, 13, 33, 27, 14}/256` for Inactive/Unvoiced and
+  `{33, 30, 36, 17, 34, 49, 18, 21, 18}/256` for Voiced. The decoded
+  value `0..=8` indexes the per-block pulse-count PDF table.
+* **§4.2.7.8.2 Pulses per shell block.** Table 44 routes
+  `(bandwidth, frame_size)` to the shell-block count (5, 8, 10, 10,
+  15, 20 for the six (NB/MB/WB × 10ms/20ms) cells). For each block,
+  read from the rate-level-`r` PDF in Table 46. The special value 17
+  flags "extra LSB present" — re-read from rate level 9; if the result
+  is 17 again, re-read from level 9; on the tenth consecutive 17,
+  switch to rate level 10, whose cell-17 probability is exactly zero
+  (capping extra LSBs at 10 per block per the §4.2.7.8.2 note).
+* **§4.2.7.8.3 Pulse locations.** A recursive-partition decoder runs
+  per block with pulse count > 0: at each level the partition halves
+  (16 → 8 → 4 → 2 → 1) and the left-half pulse count is decoded from
+  the Table 47 / 48 / 49 / 50 split PDF (one PDF per `(partition_size,
+  pulse_count)` cell). When the partition collapses to a single
+  sample, the remaining pulse count is the sample's magnitude.
+* **§4.2.7.8.4 LSB decoding.** For each block with `lsbs > 0`, read
+  one binary symbol from the Table 51 PDF (`{136, 120}/256`) for every
+  coefficient (even those with zero pulses) for `lsbs` iterations
+  MSB-first, doubling the running magnitude and adding each bit.
+* **§4.2.7.8.5 Sign decoding.** For every coefficient with magnitude
+  > 0, read one binary symbol from the Table 52 PDF chosen by
+  `(signal_type, qoff_type, min(pulses_in_block, 6))`. A 0 means
+  negate; a 1 means keep positive. The pulse count for sign-PDF
+  selection is the initial pre-LSB count.
+* **§4.2.7.8.6 Reconstruction.** For each sample:
+  `e_Q23[i] = (e_raw[i] << 8) - sign(e_raw[i])*20 + offset_Q23` with
+  `offset_Q23` per Table 53 (`{Inactive,Unvoiced}/Low=25,
+  /High=60; Voiced/Low=8, /High=25`), then a 32-bit LCG step
+  `seed = (196314165*seed + 907633515) & 0xFFFFFFFF`. If the LCG MSB
+  (`seed & 0x80000000`) is set, `e_Q23[i]` is negated. Finally
+  `seed = (seed + e_raw[i]) & 0xFFFFFFFF` feeds the next sample.
+
+Thirty new unit tests (259 lib tests total in the crate, up from 229
+at round-13 close) cover the Table 43 LCG-seed iCDF transcription and
+the 0..=3 + bits-consumed properties; Table 44 (all six valid
+(bandwidth × frame_size) cells plus SWB/FB rejection); the two Table
+45 rate-level PDFs; all eleven Table 46 pulse-count PDFs (sums to 256,
+iCDF transcription, plus the L10 cell-17 = 0 boundary that caps the
+LSB-chain depth); one spot-check per Table 47/48/49/50 (1- and ≥7-
+pulse cells); Table 51 LSB PDF; six Table 52 sign PDFs across each
+`(signal_type, qoff_type)` quadrant plus the "6 or more" saturation;
+all six Table 53 quantization offsets; the LCG recurrence first few
+steps pinned algebraically; `Excitation::decode` rejections (invalid
+LCG seed, SWB/FB bandwidth); correct sample count per (bandwidth ×
+frame_size); the §4.2.7.8 "fits in 24 bits including sign" invariant
+across three buffers × all (NB/MB/WB × 10/20ms) cells with high
+quantization offset; per-block pulse-count ≤ 16 and LSB-count ≤ 10
+invariants; a hand-pinned reconstruction of an isolated mag=5, sign=-1
+sample producing ±1235 (depending on LCG flip); the zero-magnitude
+sample identity `|e_Q23[i]| == offset_Q23` after the LCG step; bit-
+exact reproducibility across two decoder passes of the same buffer +
+config; LCG-seed divergence (different seed = different output); and a
+sweep across three buffers × {NB, MB, WB} × {10, 20 ms} × 3 signal
+types × 2 qoff types × 4 seeds asserting no panics.
+
+Total crate test count: 259 (5 TOC + 27 frame-packing + 19 range
 decoder + 17 SILK header + 20 subframe gains + 30 LSF stage-2 +
 26 LSF reconstruction + 19 LSF stabilization + 10 LSF interpolation
 + 22 LSF → LPC core + 6 LPC range-limiting + 9 LPC prediction-gain
-limiting + 19 LTP parameters).
+limiting + 19 LTP parameters + 4 LCG seed + 26 excitation).
 
-Round 13 stops after the §4.2.7.6 LTP parameters — the SILK frame
-header, the gains, the full LSF → LPC pipeline, and now the
-long-term-prediction parameters are all decoded. The LCG seed
-(§4.2.7.7), excitation decoding (§4.2.7.8), the §4.2.7.9 synthesis
-filters (LTP + LPC), the full CELT band machinery and the §5 encoder
-pipeline remain to come; the higher-level encode / decode entry points
-still return `Error::NotImplemented`.
+Round 14 stops after the §4.2.7.8 excitation — the SILK frame header,
+the gains, the full LSF → LPC pipeline, the long-term-prediction
+parameters, the LCG seed and the full excitation reconstruction are
+all decoded. The §4.2.7.9 synthesis filters (LTP + LPC), the full
+CELT band machinery, and the §5 encoder pipeline remain to come; the
+higher-level encode / decode entry points still return
+`Error::NotImplemented`.
 
 ## Planned clean-room sources
 

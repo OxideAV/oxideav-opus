@@ -6,6 +6,59 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 14 (2026-05-25):** RFC 6716 §4.2.7.7 SILK LCG seed
+  (`silk_lcg_seed` module) and §4.2.7.8 SILK excitation decoder behind a
+  new `Excitation` / `ExcitationConfig` API (`silk_excitation` module).
+
+  The §4.2.7.7 LCG seed is a single uniform 4-entry symbol from Table
+  43 (`{64, 64, 64, 64}/256`) producing a value in `0..=3` that
+  initialises the LCG used by §4.2.7.8.6 reconstruction.
+
+  The §4.2.7.8 excitation runs in six substeps: §4.2.7.8.1 rate level
+  (one symbol per SILK frame from one of two Table 45 PDFs chosen by
+  signal type, producing `0..=8`); §4.2.7.8.2 per-shell-block pulse
+  count (Table 46 PDFs at the chosen rate level, with the special
+  value 17 chaining into rate level 9, then to rate level 10 on the
+  10th occurrence — capping extra LSBs at 10 per block per the
+  §4.2.7.8.2 spec note); §4.2.7.8.3 recursive pulse-location decoding
+  (partition halves 16 → 8 → 4 → 2 → 1 with Tables 47/48/49/50 split
+  PDFs selected by partition size + remaining pulse count); §4.2.7.8.4
+  per-coefficient LSB decoding (Table 51 `{136, 120}/256`, doubling
+  the magnitude and adding each bit MSB-first); §4.2.7.8.5 sign
+  decoding (Table 52, picked by `(signal_type, qoff_type,
+  min(pulses_in_block, 6))` — 42 PDFs in all); and §4.2.7.8.6
+  reconstruction with `e_Q23[i] = (e_raw << 8) - sign(e_raw)*20 +
+  offset_Q23` (Table 53 offsets `{25, 60, 25, 60, 8, 25}`) plus the
+  32-bit LCG step `seed = (196314165*seed + 907633515) & 0xFFFFFFFF`
+  whose MSB drives a per-sample sign flip, followed by
+  `seed = (seed + e_raw[i]) & 0xFFFFFFFF` for the next iteration.
+
+  Table 44 routes `(bandwidth, frame_size)` to the shell-block count
+  (5/8/10/10/15/20 for the six NB/MB/WB × 10ms/20ms cells; SWB/FB
+  rejected as not paired with the SILK layer). The 10 ms MB special
+  case decodes 8 shell blocks (128 samples) of which the trailing 8
+  are discarded by the caller per the §4.2.7.8 preamble.
+
+  Thirty new unit tests (259 lib tests total, up from 229 at round-13
+  close) cover the Table 43 transcription + the 0..=3 + 2-bits-per-
+  symbol invariants; Table 44 (all six cells + SWB/FB rejection); both
+  Table 45 PDFs; all eleven Table 46 PDFs including the L10 cell-17 =
+  0 boundary; spot-checks on Tables 47/48/49/50 (1- and ≥7-pulse
+  cells); Table 51; six Table 52 spot-checks across each
+  `(signal_type, qoff_type)` quadrant + the "6 or more" saturation;
+  all six Table 53 offsets; the LCG recurrence pinned algebraically
+  for the first two steps from seed=0; `Excitation::decode` rejections
+  (invalid LCG seed, SWB/FB bandwidth); per-cell sample count; the
+  §4.2.7.8 "fits in 24 bits including sign" invariant across three
+  buffers × all (NB/MB/WB × 10/20 ms) cells; per-block pulse-count ≤
+  16 and LSB-count ≤ 10 invariants; a hand-pinned reconstruction of
+  an isolated mag=5 sign=-1 sample producing ±1235; the
+  zero-magnitude `|e_Q23[i]| == offset_Q23` identity; cross-pass
+  reproducibility; LCG-seed divergence; and a no-panic sweep over
+  three buffers × {NB, MB, WB} × {10, 20 ms} × 3 signal types × 2
+  qoff types × 4 seeds. The §4.2.7.9 LTP / LPC synthesis filters that
+  consume `e_Q23[]` are deferred to a later round.
+
 * **Clean-room round 13 (2026-05-24):** RFC 6716 §4.2.7.6 SILK Long-Term
   Prediction parameters behind a new `LtpParameters` / `LtpConfig` API
   (`silk_ltp` module). Decodes the §4.2.7.6.1 primary pitch lag (either
