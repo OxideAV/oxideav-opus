@@ -148,8 +148,21 @@
 //!   the final Q23 excitation `e_Q23[]` consumed by the §4.2.7.9 LTP
 //!   and LPC synthesis filters.
 //!
-//! The CELT layer and the §4.2.7.9 synthesis filters are not yet wired
-//! up; the [`Decoder`] / [`Encoder`] entry points still return
+//! * Round 15 lands the §4.2.7.9.2 SILK LPC synthesis filter
+//!   ([`lpc_synthesis_subframe`] / [`lpc_synthesis_frame`] /
+//!   [`LpcSynthState`]). The short-term predictor combines the §4.2.7.4
+//!   Q16 gain, the §4.2.7.9.1 residual `res[i]`, and the §4.2.7.5.8 Q12
+//!   stabilised filter `a_Q12[k]` into the unclamped `lpc[i]` and its
+//!   clamped output `out[i] = clamp(-1.0, lpc[i], 1.0)`; the per-subframe
+//!   `d_LPC` unclamped history is carried across subframes via the
+//!   stateful [`LpcSynthState`] (cleared to zero on a decoder reset).
+//!   The §4.2.7.9.1 LTP synthesis filter that produces `res[i]` for
+//!   voiced frames remains to come — for now this stage can be driven
+//!   directly off `e_Q23[i] / 2^23` for unvoiced subframes per the
+//!   §4.2.7.9.1 wording.
+//!
+//! The CELT layer and the §4.2.7.9.1 LTP synthesis filter are not yet
+//! wired up; the [`Decoder`] / [`Encoder`] entry points still return
 //! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
@@ -202,6 +215,7 @@ pub mod silk_excitation;
 pub mod silk_frame;
 pub mod silk_gains;
 pub mod silk_lcg_seed;
+pub mod silk_lpc_synth;
 pub mod silk_lsf_interp;
 pub mod silk_lsf_recon;
 pub mod silk_lsf_stabilize;
@@ -222,6 +236,10 @@ pub use silk_frame::{
 };
 pub use silk_gains::{SubframeGain, SubframeGains, SubframeGainsConfig, SILK_MAX_SUBFRAMES};
 pub use silk_lcg_seed::decode_lcg_seed;
+pub use silk_lpc_synth::{
+    lpc_synthesis_frame, lpc_synthesis_subframe, subframe_samples, LpcSynthState,
+    LPC_SYNTH_MAX_ORDER, LPC_SYNTH_MAX_SUBFRAME_SAMPLES,
+};
 pub use silk_lsf_interp::{LsfInterpContext, LsfInterpolated};
 pub use silk_lsf_recon::{cb1_q8, NlsfReconstructed};
 pub use silk_lsf_stabilize::NlsfStabilized;

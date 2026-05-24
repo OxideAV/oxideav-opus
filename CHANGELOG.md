@@ -6,6 +6,65 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 15 (2026-05-25):** RFC 6716 §4.2.7.9.2 SILK LPC
+  synthesis filter behind a new `lpc_synthesis_subframe` /
+  `lpc_synthesis_frame` / `LpcSynthState` API (`silk_lpc_synth` module).
+  Given the §4.2.7.9.1 LPC residual `res[]` for the current subframe, the
+  §4.2.7.4 Q16 quantization gain `gain_Q16[s]`, and the §4.2.7.5.8
+  stabilised Q12 short-term predictor `a_Q12[k]`, the filter runs:
+
+  ```
+                                  d_LPC-1
+                 gain_Q16[s]         __              a_Q12[k]
+        lpc[i] = ----------- * res[i] + \  lpc[i-k-1] * --------
+                   65536.0              /_               4096.0
+                                        k=0
+
+        out[i] = clamp(-1.0, lpc[i], 1.0)
+  ```
+
+  Each subframe carries d_LPC unclamped `lpc[i]` history samples forward
+  into the next subframe through `LpcSynthState`, which is cleared to
+  zero on a decoder reset (RFC 6716 §4.5.2) or after an uncoded regular
+  SILK frame for the channel. The §4.2.7.9 preamble explicitly licenses
+  a floating-point implementation here ("the remainder of the
+  reconstruction process for the frame does not need to be bit-exact"),
+  so the filter accumulates in `f32` with the spec's left-to-right
+  formula. The §4.2.7.9.2 wording that "the decoder saves the unclamped
+  values lpc[i] to feed into the LPC filter for the next subframe, but
+  saves the clamped values out[i] for rewhitening in voiced frames" is
+  implemented exactly: state holds unclamped values; the rendered output
+  is the clamped vector. d_LPC routing follows §4.2.7.5: 10 for NB / MB
+  and 16 for WB; SWB / FB rejected at the SILK layer.
+
+  Eighteen new unit tests (277 lib tests total, up from 259 at round-14
+  close) cover `subframe_samples` (40 / 60 / 80 for NB / MB / WB + SWB /
+  FB rejection); `LpcSynthState` d_LPC routing + zero initialisation +
+  reset; the three input-validation rejections (mismatched `res` /
+  `out_clamped` / `a_q12` lengths); the algebraic identities (a_Q12 = 0
+  gives `lpc = gain_Q16/65536 * res`; res = 0 with zero history gives
+  identically zero output regardless of a_Q12 / gain); a hand-pinned
+  single-tap unity-gain NB filter (impulse response is the constant
+  `1.0`); a hand-pinned single-tap half-gain WB filter (impulse response
+  is the geometric series `0.5^(i+1)` and the history holds the final 16
+  unclamped samples to 1e-9 precision); a hand-traced two-tap NB filter
+  with non-trivial `res[]` `[1, 2, 3, 0, ...]` yielding the exact
+  sequence `[1.0, 2.5, 4.5, 2.875, 2.5625, ...]` plus the per-sample
+  clamp; the cross-subframe history carry-over (an impulse decays into a
+  unit-feedback subframe and the next subframe of zero residual still
+  emits `1.0` everywhere); the decoder-reset path zeroes history; the
+  `out[]` ∈ `[-1.0, 1.0]` clamp post-condition under deliberately
+  over-driven input; the spec wording that `state.history` stores the
+  unclamped `lpc[i]` and not the saturated `out[i]`; the
+  `lpc_synthesis_frame` wrapper matches an explicit per-subframe loop
+  bit-for-bit (state included) and rejects bad input lengths; and a
+  sweep over {NB, MB, WB} × {10, 20 ms} that asserts no panics, the
+  correct output length, the clamp post-condition, and the correct
+  history length. The §4.2.7.9.1 LTP synthesis filter that produces the
+  voiced-frame `res[]` is deferred to a later round; this stage can
+  already be driven directly off `e_Q23[i] / 2^23` for unvoiced
+  subframes per the §4.2.7.9.1 wording.
+
 * **Clean-room round 14 (2026-05-25):** RFC 6716 §4.2.7.7 SILK LCG seed
   (`silk_lcg_seed` module) and §4.2.7.8 SILK excitation decoder behind a
   new `Excitation` / `ExcitationConfig` API (`silk_excitation` module).

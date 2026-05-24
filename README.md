@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-25 (clean-room round 14)
+## Status — 2026-05-25 (clean-room round 15)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
@@ -14,8 +14,10 @@ prediction-gain stability limiting (`silk_LPC_inverse_pred_gain_QA`) +
 §4.2.7.6 LTP parameters (pitch lags + LTP filter coefficients +
 LTP scaling) + §4.2.7.7 LCG seed + §4.2.7.8 excitation (rate level +
 pulses per shell block + recursive pulse-location split + LSBs + signs
-+ §4.2.7.8.6 LCG-driven reconstruction); no §4.2.7.9 LTP / LPC
-synthesis filters, no CELT band machinery yet.**
++ §4.2.7.8.6 LCG-driven reconstruction) + §4.2.7.9.2 LPC synthesis
+filter (per-subframe short-term predictor with `d_LPC` history carry-
+over and `out[i] = clamp(-1, lpc[i], 1)`); no §4.2.7.9.1 LTP synthesis
+filter, no CELT band machinery yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -588,18 +590,71 @@ config; LCG-seed divergence (different seed = different output); and a
 sweep across three buffers × {NB, MB, WB} × {10, 20 ms} × 3 signal
 types × 2 qoff types × 4 seeds asserting no panics.
 
-Total crate test count: 259 (5 TOC + 27 frame-packing + 19 range
+Total crate test count: 277 (5 TOC + 27 frame-packing + 19 range
 decoder + 17 SILK header + 20 subframe gains + 30 LSF stage-2 +
 26 LSF reconstruction + 19 LSF stabilization + 10 LSF interpolation
 + 22 LSF → LPC core + 6 LPC range-limiting + 9 LPC prediction-gain
-limiting + 19 LTP parameters + 4 LCG seed + 26 excitation).
+limiting + 19 LTP parameters + 4 LCG seed + 26 excitation + 18 LPC
+synthesis).
 
 Round 14 stops after the §4.2.7.8 excitation — the SILK frame header,
 the gains, the full LSF → LPC pipeline, the long-term-prediction
 parameters, the LCG seed and the full excitation reconstruction are
-all decoded. The §4.2.7.9 synthesis filters (LTP + LPC), the full
-CELT band machinery, and the §5 encoder pipeline remain to come; the
-higher-level encode / decode entry points still return
+all decoded.
+
+Round 15 (2026-05-25) lands the §4.2.7.9.2 SILK LPC synthesis filter
+behind a new `lpc_synthesis_subframe` / `lpc_synthesis_frame` /
+`LpcSynthState` API. The per-subframe short-term predictor combines
+the §4.2.7.4 Q16 gain, the §4.2.7.9.1 residual `res[i]`, and the
+§4.2.7.5.8 stabilised Q12 filter `a_Q12[k]` into
+
+```
+                                  d_LPC-1
+                 gain_Q16[s]         __              a_Q12[k]
+        lpc[i] = ----------- * res[i] + \  lpc[i-k-1] * --------
+                   65536.0              /_               4096.0
+                                        k=0
+        out[i] = clamp(-1.0, lpc[i], 1.0)
+```
+
+The `d_LPC` unclamped `lpc[i]` history is carried across subframes via
+the stateful `LpcSynthState` (cleared to zero on a decoder reset per
+RFC 6716 §4.5.2 or after an uncoded regular SILK frame). The
+§4.2.7.9.2 wording "the decoder saves the unclamped values lpc[i] to
+feed into the LPC filter for the next subframe, but saves the clamped
+values out[i] for rewhitening in voiced frames" is honoured exactly:
+state holds the unclamped values; the rendered output is the clamped
+vector. d_LPC routing follows §4.2.7.5 — 10 for NB / MB, 16 for WB
+(SWB / FB rejected at the SILK layer). The §4.2.7.9 preamble licenses
+a floating-point implementation here ("the remainder of the
+reconstruction process for the frame does not need to be bit-exact"),
+so the accumulator runs in `f32`.
+
+Eighteen new unit tests (277 lib tests total in the crate, up from 259
+at round-14 close) cover `subframe_samples` routing including SWB / FB
+rejection; `LpcSynthState` d_LPC routing + zero initialisation + reset
+to zero; the three input-validation rejections (`res` / `out_clamped`
+length mismatch + `a_q12` length mismatch); the algebraic identities
+(`a_Q12 = 0 → lpc = gain * res`; zero residual with zero history → zero
+output regardless of a_Q12 / gain); a hand-pinned NB unity-gain
+single-tap impulse response (constant 1.0); a hand-pinned WB half-gain
+single-tap impulse response (geometric series `0.5^(i+1)` matched to
+1e-9 precision); a hand-traced two-tap NB filter with non-trivial
+`res[]` producing the exact sequence `[1.0, 2.5, 4.5, 2.875, 2.5625]`
+plus the per-sample clamp; the cross-subframe history carry-over (an
+impulse in subframe 0 keeps the unit-feedback filter emitting 1.0 in
+subframe 1); decoder-reset path zeroes history; out ∈ `[-1.0, 1.0]`
+under deliberately over-driven inputs; the unclamped-history-vs-clamped-
+output distinction; `lpc_synthesis_frame` agreement with an explicit
+per-subframe loop including state, plus its length-mismatch rejection;
+and a no-panic sweep over {NB, MB, WB} × {10 ms, 20 ms} asserting the
+clamp post-condition and the d_LPC history length.
+
+The §4.2.7.9.1 LTP synthesis filter that produces `res[i]` for voiced
+frames remains to come — for unvoiced subframes this stage can already
+be driven directly off `e_Q23[i] / 2^23` per the §4.2.7.9.1 wording.
+The CELT band machinery and the §5 encoder pipeline are also still
+ahead; the higher-level encode / decode entry points still return
 `Error::NotImplemented`.
 
 ## Planned clean-room sources
