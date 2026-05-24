@@ -2,16 +2,16 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-24 (clean-room round 11)
+## Status — 2026-05-24 (clean-room round 12)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
 gains + §4.2.7.5.2 LSF Stage-2 residual + §4.2.7.5.3 NLSF
 reconstruction + §4.2.7.5.4 NLSF stabilization + §4.2.7.5.5 NLSF
 interpolation + §4.2.7.5.6 NLSF→LPC core conversion (`silk_NLSF2A`) +
-§4.2.7.5.7 LPC range-limiting bandwidth expansion; no §4.2.7.5.8
-prediction-gain stability check yet, no LTP / excitation, no CELT band
-machinery yet.**
+§4.2.7.5.7 LPC range-limiting bandwidth expansion + §4.2.7.5.8 LPC
+prediction-gain stability limiting (`silk_LPC_inverse_pred_gain_QA`); no
+LTP / LCG seed / excitation, no CELT band machinery yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -409,17 +409,56 @@ no-panic edge, the post-loop saturation formula pinned in isolation, and
 a real §4.2.7.5.2 → §4.2.7.5.7 pipeline sweep across all 32 `I1` values
 × {NB, MB, WB}.
 
-Total crate test count: 201 (5 TOC + 27 frame-packing + 19 range
+Round 12 (2026-05-24) lands the SILK LPC prediction-gain limiting for
+RFC 6716 §4.2.7.5.8 behind a new `LpcQ17::prediction_gain_limited` method
+returning a new `LpcQ12` type. Even after the §4.2.7.5.7 range-limiting,
+the filter may have so much prediction gain that it is unstable; this
+stage drives up to 16 rounds of bandwidth expansion off the
+`silk_LPC_inverse_pred_gain_QA` stability test rather than the coefficient
+magnitude:
+
+* **`silk_LPC_inverse_pred_gain_QA` stability test (`is_lpc_stable`).**
+  Each round converts to the real Q12 coefficients `a32_Q12[n] =
+  (a32_Q17[n] + 16) >> 5` and runs the DC-response check (`DC_resp =
+  Σ a32_Q12[n] > 4096` ⇒ unstable) followed by a fixed-point Levinson
+  recurrence on the Q24-widened coefficients (`inv_gain_Q30[d_LPC] =
+  1<<30`, `a32_Q24[d_LPC-1][n] = a32_Q12[n] << 12`). For `k` from
+  `d_LPC-1` down to `0` it rejects on `abs(a32_Q24[k][k]) > 16773022`
+  (≈ 0.99975 in Q24) or `inv_gain_Q30[k] < 107374` (≈ 1/10000 in Q30),
+  and otherwise (for `k > 0`) computes row `k-1` via the spec's
+  `b1 = ilog(div_Q30)` / `inv_Qb2` / `err_Q29` / `gain_Qb1` / `num_Q24` /
+  `a32_Q24[k-1][n]` formulas. Every spec-flagged ">32-bit" multiply runs
+  in i64.
+* **Stability-driven chirp loop.** If stable, the Q12 coefficients are
+  returned; otherwise a chirp round with `sc_Q16[0] = 65536 - (2<<i)` is
+  applied via the same `silk_bwexpander_32` as §4.2.7.5.7. On round 15
+  `sc_Q16[0]` is `0`, zeroing every coefficient so an all-zero (trivially
+  stable) filter is the worst-case outcome.
+
+`LpcQ12` exposes `a_q12()`, `len()`, `is_empty()`, and `rounds()` (chirp
+rounds run before stability).
+
+Nine new unit tests (210 lib tests total in the crate, up from 201 at
+round-11 close) cover `is_lpc_stable` agreement with an independent
+2D-matrix spec oracle on hand-built filters, the all-zero stable case,
+DC-response rejection, a round-0 pass-through on a typical decoded NLSF
+vector, deliberately-unstable inputs always converging to a stable filter
+within ≤ 16 rounds, the forced round-15 zeroing, the signed-16-bit Q12
+fit, a real §4.2.7.5.2 → … → §4.2.7.5.8 pipeline sweep across all 32 `I1`
+× {NB, MB, WB} on three buffers, and the `ilog64` §1.1.10 boundaries.
+
+Total crate test count: 210 (5 TOC + 27 frame-packing + 19 range
 decoder + 17 SILK header + 20 subframe gains + 30 LSF stage-2 +
 26 LSF reconstruction + 19 LSF stabilization + 10 LSF interpolation
-+ 22 LSF → LPC core + 6 LPC range-limiting).
++ 22 LSF → LPC core + 6 LPC range-limiting + 9 LPC prediction-gain
+limiting).
 
-Round 11 stops after the §4.2.7.5.7 range-limiting; the §4.2.7.5.8
-prediction-gain stability check (Levinson reflection-coefficient
-recurrence + chirp loop) is deferred to a later round. LTP / excitation
-decoding, the full CELT band machinery, and the §5 encoder pipeline
-remain out of scope; the higher-level encode / decode entry points still
-return `Error::NotImplemented`.
+Round 12 stops after the §4.2.7.5.8 prediction-gain limiting — the SILK
+short-term LPC analysis filter coefficients are now fully decoded. LTP
+(§4.2.7.6), the LCG seed (§4.2.7.7), and excitation decoding (§4.2.7.8)
+are the next SILK stages; the full CELT band machinery and the §5 encoder
+pipeline remain out of scope; the higher-level encode / decode entry
+points still return `Error::NotImplemented`.
 
 ## Planned clean-room sources
 

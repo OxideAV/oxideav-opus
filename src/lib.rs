@@ -108,13 +108,21 @@
 //!   it fits a signed 16-bit Q12 value, followed by the documented
 //!   post-loop Q12 saturation `clamp(-32768, (a + 16) >> 5, 32767) << 5`.
 //!   The result is held in the Q17 domain for the §4.2.7.5.8
-//!   prediction-gain limiting that follows, which is deferred to a
-//!   subsequent round.
+//!   prediction-gain limiting that follows.
 //!
-//! Subsequent SILK stages (LPC stability §4.2.7.5.8, LTP §4.2.7.6, LCG
-//! seed §4.2.7.7, excitation §4.2.7.8) and the CELT layer are not yet
-//! wired up; the [`Decoder`] / [`Encoder`] entry points still return
-//! [`Error::NotImplemented`].
+//! * Round 12 lands the §4.2.7.5.8 prediction-gain limiting
+//!   ([`LpcQ17::prediction_gain_limited`] → [`LpcQ12`]) — the
+//!   `silk_LPC_inverse_pred_gain_QA()` stability test (DC-response check
+//!   plus the fixed-point Levinson recurrence on the Q24-widened Q12
+//!   coefficients, with the `abs(a32_Q24[k][k]) > 16773022` and
+//!   `inv_gain_Q30[k] < 107374` instability bounds) driving up to 16
+//!   rounds of bandwidth expansion with `sc_Q16[0] = 65536 - (2<<i)`.
+//!   The result is the final stable Q12 filter `a_Q12[k]` consumed by the
+//!   §4.2.7.9.2 LPC synthesis.
+//!
+//! Subsequent SILK stages (LTP §4.2.7.6, LCG seed §4.2.7.7, excitation
+//! §4.2.7.8) and the CELT layer are not yet wired up; the [`Decoder`] /
+//! [`Encoder`] entry points still return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -184,7 +192,7 @@ pub use silk_lsf_stabilize::NlsfStabilized;
 pub use silk_lsf_stage2::{
     LsfStage2, D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB, QSTEP_NB_MB_Q16, QSTEP_WB_Q16,
 };
-pub use silk_lsf_to_lpc::{nlsf_to_c_q17, ordering, LpcQ17};
+pub use silk_lsf_to_lpc::{nlsf_to_c_q17, ordering, LpcQ12, LpcQ17};
 pub use toc::{Bandwidth, ChannelMapping, FrameCountCode, Mode, OpusTocByte};
 
 /// No-op codec registration — the orphan-rebuild scaffold registers

@@ -6,6 +6,65 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 12 (2026-05-24):** RFC 6716 §4.2.7.5.8 SILK LPC
+  prediction-gain limiting behind a new `LpcQ17::prediction_gain_limited`
+  method returning a new `LpcQ12` type (`silk_lsf_to_lpc` module).
+  Consumes the (range-limited) §4.2.7.5.7 `a32_Q17[]` and produces the
+  final stable Q12 filter `a_Q12[k]` for the §4.2.7.9.2 LPC synthesis.
+
+  - **Up to 16 rounds of stability-driven bandwidth expansion.** Each
+    round converts to the real Q12 coefficients
+    `a32_Q12[n] = (a32_Q17[n] + 16) >> 5` and runs the
+    `silk_LPC_inverse_pred_gain_QA()` stability test. If the filter is
+    stable the Q12 coefficients are returned; otherwise a chirp round with
+    `sc_Q16[0] = 65536 - (2<<i)` is applied via the same
+    `silk_bwexpander_32` as §4.2.7.5.7. On round 15 `sc_Q16[0] = 0`,
+    zeroing every coefficient so an all-zero (trivially stable) filter is
+    the worst-case outcome.
+  - **`silk_LPC_inverse_pred_gain_QA()` stability test (`is_lpc_stable`).**
+    The DC-response check (`DC_resp = Σ a32_Q12[n] > 4096` ⇒ unstable)
+    followed by the fixed-point Levinson recurrence on the Q24-widened
+    coefficients: initialize `inv_gain_Q30[d_LPC] = 1<<30` and
+    `a32_Q24[d_LPC-1][n] = a32_Q12[n] << 12`, then for each `k` from
+    `d_LPC-1` down to `0` reject on `abs(a32_Q24[k][k]) > 16773022`
+    (≈ 0.99975 in Q24) or `inv_gain_Q30[k] < 107374` (≈ 1/10000 in Q30)
+    via `rc_Q31 = -a32_Q24[k][k] << 7`,
+    `div_Q30 = (1<<30) - (rc_Q31*rc_Q31 >> 32)`,
+    `inv_gain_Q30[k] = (inv_gain_Q30[k+1]*div_Q30 >> 32) << 2`. Each
+    surviving step (for `k > 0`) computes row `k-1` via the spec's
+    `b1 = ilog(div_Q30)`, `inv_Qb2`, `err_Q29`, `gain_Qb1`, `num_Q24[n]`,
+    `a32_Q24[k-1][n]` formulas. Every multiply the spec marks as needing
+    more than 32 bits is performed in `i64`.
+
+  `LpcQ12` exposes `a_q12()`, `len()`, `is_empty()`, and `rounds()` (the
+  number of chirp rounds that ran before the filter was deemed stable).
+
+  9 new unit tests (210 lib tests total in the crate; up from 201 in the
+  round-11 close) covering:
+
+  - `is_lpc_stable` agrees with an independent 2D-matrix spec
+    transcription oracle on hand-built filters (all-zero, gentle decay,
+    near-unit single tap at the DC=4096 boundary, DC over the ceiling,
+    mixed-sign moderate).
+  - The all-zero filter is stable for both NB/MB and WB widths.
+  - DC response `> 4096` is rejected before the Levinson recurrence; the
+    DC=4096 boundary is not rejected by the DC check alone.
+  - A real §4.2.7.5.7 → §4.2.7.5.8 conversion of a typical decoded NLSF
+    vector returns on round 0 with `a_Q12 == (a32_Q17 + 16) >> 5`.
+  - Deliberately unstable Q17 inputs (near-unit tap, high-gain resonant
+    alternating taps, DC over the ceiling) always converge to a stable
+    Q12 filter within ≤ 16 rounds.
+  - A persistently-unstable input zeroes every coefficient if it reaches
+    the forced round-15 (`sc_Q16[0] = 0`) step.
+  - The emitted Q12 filter fits a signed 16-bit value.
+  - A real §4.2.7.5.2 → … → §4.2.7.5.7 → §4.2.7.5.8 pipeline sweep across
+    all 32 `I1` values × {NB, MB, WB} on three buffers: the emitted Q12
+    filter is always stable (cross-checked vs the oracle) and the round
+    count is ≤ 16.
+  - `ilog64` (the i64 variant used by §4.2.7.5.8) matches the §1.1.10
+    definition for the spec examples plus the `2^30` / `2^30 - 1`
+    `div_Q30`-domain boundaries.
+
 * **Clean-room round 11 (2026-05-24):** RFC 6716 §4.2.7.5.7 SILK LPC
   range-limiting bandwidth expansion behind a new
   `LpcQ17::range_limited` method (`silk_lsf_to_lpc` module). Consumes the

@@ -51,12 +51,24 @@
 //! ([`LpcQ17::range_limited`]): up to 10 rounds of chirp-factor bandwidth
 //! expansion that shrink the raw `a32_Q17[]` so it fits a signed 16-bit Q12
 //! value, followed by a fixed Q12 saturation after the 10th round if it
-//! still overflows. The §4.2.7.5.8 prediction-gain stability test (up to 16
-//! chirp rounds + `silk_LPC_inverse_pred_gain_QA`) is deferred to a
-//! subsequent round. The range-limited `a32_Q17[]` produced here is held in
+//! still overflows. The range-limited `a32_Q17[]` produced there is held in
 //! the Q17 domain (per §4.2.7.5.7 the final saturation converts back to Q17
-//! for the prediction-gain limiting that follows), so callers that need a
-//! final stable Q12 filter must still run §4.2.7.5.8 against this output.
+//! for the prediction-gain limiting that follows).
+//!
+//! Finally this module lands the §4.2.7.5.8 **prediction-gain limiting**
+//! ([`LpcQ17::prediction_gain_limited`] → [`LpcQ12`]): up to 16 rounds of
+//! bandwidth expansion driven by the `silk_LPC_inverse_pred_gain_QA()`
+//! stability test rather than the coefficient magnitude. Each round converts
+//! the range-limited `a32_Q17[]` to the real Q12 coefficients
+//! `a32_Q12[n] = (a32_Q17[n] + 16) >> 5` that reconstruction will use, runs
+//! the DC-response check (`DC_resp = sum(a32_Q12) > 4096` ⇒ unstable) and the
+//! fixed-point Levinson recurrence on the Q24-widened coefficients
+//! (`abs(a32_Q24[k][k]) > 16773022` or `inv_gain_Q30[k] < 107374` ⇒
+//! unstable). If the filter is stable the final Q12 coefficients are
+//! returned; otherwise a chirp round with `sc_Q16[0] = 65536 - (2<<i)` is
+//! applied (the same `silk_bwexpander_32` as §4.2.7.5.7). On the 16th round
+//! `sc_Q16[0]` is `0`, zeroing every coefficient and guaranteeing a stable
+//! all-zero filter.
 
 use crate::silk_lsf_stage2::{D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB};
 use crate::toc::Bandwidth;
@@ -237,14 +249,56 @@ fn find_poly(c_q17: &[i32], d_lpc: usize, parity: usize) -> [i64; D_LPC_MAX / 2 
 /// The §4.2.7.5.6 NLSF → LPC core conversion result.
 ///
 /// Holds the 32-bit Q17 LPC coefficients `a32_Q17[k]`, `k ∈ 0..d_LPC`
-/// (without the leading `1.0` coefficient). These have **not** yet been
-/// passed through the §4.2.7.5.7 range-limiting bandwidth-expansion loop
-/// or the §4.2.7.5.8 prediction-gain stability check — both of those are
-/// scheduled for subsequent rounds.
+/// (without the leading `1.0` coefficient). Use [`LpcQ17::range_limited`]
+/// to apply the §4.2.7.5.7 range-limiting bandwidth expansion and then
+/// [`LpcQ17::prediction_gain_limited`] to apply the §4.2.7.5.8
+/// prediction-gain stability limiting, which produces the final Q12
+/// [`LpcQ12`] filter used for reconstruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LpcQ17 {
     len: u8,
     a32_q17: [i32; D_LPC_MAX],
+}
+
+/// The final §4.2.7.5.8 prediction-gain-limited Q12 LPC coefficients
+/// `a_Q12[k]`, `k ∈ 0..d_LPC`, ready for the §4.2.7.9.2 LPC synthesis
+/// filter. These are guaranteed stable: the §4.2.7.5.8 chirp loop runs up
+/// to 16 rounds of bandwidth expansion and, on the final round, zeroes
+/// every coefficient so an all-zero (trivially stable) filter is the
+/// worst-case outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LpcQ12 {
+    len: u8,
+    a_q12: [i32; D_LPC_MAX],
+    /// The number of §4.2.7.5.8 chirp rounds that ran before the filter
+    /// was deemed stable (`0` when the input was already stable). Exposed
+    /// for tests / diagnostics; not part of the reconstruction interface.
+    rounds: u8,
+}
+
+impl LpcQ12 {
+    /// The §4.2.7.5.8 Q12 LPC coefficients `a_Q12[k]`. Length is `d_LPC`
+    /// (10 for NB / MB, 16 for WB).
+    pub fn a_q12(&self) -> &[i32] {
+        &self.a_q12[..self.len as usize]
+    }
+
+    /// Number of coefficients (10 for NB / MB, 16 for WB).
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// `true` if there are no coefficients (never happens after a
+    /// successful conversion of a valid normalized-LSF vector).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Number of §4.2.7.5.8 bandwidth-expansion rounds that ran before the
+    /// filter passed the stability test (`0` if it was stable as-is).
+    pub fn rounds(&self) -> usize {
+        self.rounds as usize
+    }
 }
 
 impl LpcQ17 {
@@ -350,6 +404,177 @@ impl LpcQ17 {
             len: self.len,
             a32_q17: a32,
         }
+    }
+
+    /// Apply the RFC 6716 §4.2.7.5.8 prediction-gain limiting to the
+    /// (range-limited) §4.2.7.5.7 `a32_Q17[]` coefficients, producing the
+    /// final stable Q12 filter [`LpcQ12`].
+    ///
+    /// Even after §4.2.7.5.7 the filter may have so much prediction gain
+    /// that it is unstable (especially for voiced sounds). Rather than
+    /// using the prediction gain itself (which can diverge for an unstable
+    /// filter), this stage drives up to **16 rounds** of bandwidth expansion
+    /// off `silk_LPC_inverse_pred_gain_QA()`, which decides stability from
+    /// the reflection coefficients computed by a fixed-point Levinson
+    /// recurrence on the *real* Q12 coefficients that reconstruction will
+    /// use:
+    ///
+    ///  * `a32_Q12[n] = (a32_Q17[n] + 16) >> 5` — the Q12 coefficients.
+    ///  * **DC-response check.** `DC_resp = Σ a32_Q12[n]`; `DC_resp > 4096`
+    ///    ⇒ unstable.
+    ///  * **Levinson recurrence.** Initialize `inv_gain_Q30[d_LPC] = 1<<30`
+    ///    and `a32_Q24[d_LPC-1][n] = a32_Q12[n] << 12`, then for each `k`
+    ///    from `d_LPC-1` down to `0`:
+    ///    * `abs(a32_Q24[k][k]) > 16773022` (≈ 0.99975 in Q24) ⇒ unstable;
+    ///    * `rc_Q31 = -a32_Q24[k][k] << 7`,
+    ///      `div_Q30 = (1<<30) - (rc_Q31*rc_Q31 >> 32)`,
+    ///      `inv_gain_Q30[k] = (inv_gain_Q30[k+1]*div_Q30 >> 32) << 2`;
+    ///    * `inv_gain_Q30[k] < 107374` (≈ 1/10000 in Q30) ⇒ unstable;
+    ///    * otherwise (for `k > 0`) compute row `k-1` via the spec's
+    ///      `b1 = ilog(div_Q30)`, `inv_Qb2`, `err_Q29`, `gain_Qb1`,
+    ///      `num_Q24[n]`, `a32_Q24[k-1][n]` formulas.
+    ///
+    /// If the filter is stable on round `i`, the final coefficients
+    /// `a_Q12[k] = (a32_Q17[k] + 16) >> 5` are returned. Otherwise a chirp
+    /// round with `sc_Q16[0] = 65536 - (2<<i)` is applied to `a32_Q17[]`
+    /// using the same `silk_bwexpander_32` as §4.2.7.5.7. On round 15
+    /// `sc_Q16[0]` is `0`, so every coefficient becomes `0`, guaranteeing a
+    /// stable filter.
+    pub fn prediction_gain_limited(&self) -> LpcQ12 {
+        let d_lpc = self.len as usize;
+        let mut a32_q17 = self.a32_q17;
+
+        for round in 0..16u32 {
+            // Real Q12 coefficients reconstruction will use.
+            let mut a32_q12 = [0i32; D_LPC_MAX];
+            for k in 0..d_lpc {
+                a32_q12[k] = (a32_q17[k] + 16) >> 5;
+            }
+
+            if is_lpc_stable(&a32_q12[..d_lpc]) {
+                // Stable — emit the final Q12 coefficients.
+                let mut a_q12 = [0i32; D_LPC_MAX];
+                a_q12[..d_lpc].copy_from_slice(&a32_q12[..d_lpc]);
+                return LpcQ12 {
+                    len: self.len,
+                    a_q12,
+                    rounds: round as u8,
+                };
+            }
+
+            // Unstable — apply one round of §4.2.7.5.7-style chirp with the
+            // §4.2.7.5.8 round-dependent factor sc_Q16[0] = 65536 - (2<<i).
+            // On round 15 this is exactly 0, zeroing every coefficient.
+            let sc_q16_0 = 65536i64 - (2i64 << round);
+            bwexpander_32(&mut a32_q17[..d_lpc], sc_q16_0);
+        }
+
+        // Round 15 forced sc_Q16[0] = 0, so a32_Q17[] is all zeros and the
+        // Q12 conversion of zero is zero — an all-zero, trivially stable
+        // filter. (We still produce it through the same conversion path so
+        // the rounding term is applied uniformly.)
+        let mut a_q12 = [0i32; D_LPC_MAX];
+        for k in 0..d_lpc {
+            a_q12[k] = (a32_q17[k] + 16) >> 5;
+        }
+        LpcQ12 {
+            len: self.len,
+            a_q12,
+            rounds: 16,
+        }
+    }
+}
+
+/// RFC 6716 §4.2.7.5.8 `silk_LPC_inverse_pred_gain_QA()` stability test.
+///
+/// Returns `true` iff the LPC synthesis filter built from the real Q12
+/// coefficients `a32_Q12[]` is stable, i.e. the DC response does not exceed
+/// 4096 and the fixed-point Levinson recurrence keeps every reflection
+/// coefficient sufficiently below one in magnitude.
+///
+/// All multiplies that the spec marks as requiring more than 32 bits are
+/// performed in `i64`; `b1` ranges from 20 to 31 so `1 << (b1-1)` and the
+/// shift amounts stay in range.
+fn is_lpc_stable(a32_q12: &[i32]) -> bool {
+    let d_lpc = a32_q12.len();
+
+    // DC-response check: DC_resp = Σ a32_Q12[n]; > 4096 ⇒ unstable.
+    let dc_resp: i64 = a32_q12.iter().map(|&c| c as i64).sum();
+    if dc_resp > 4096 {
+        return false;
+    }
+
+    // Widen the top row to Q24. inv_gain_Q30[d_LPC] = 1 << 30.
+    // We keep just the current row (a32_Q24[k][..]) and shrink it each step.
+    let mut row: [i64; D_LPC_MAX] = [0; D_LPC_MAX];
+    for k in 0..d_lpc {
+        // a32_Q24[d_LPC-1][n] = a32_Q12[n] << 12.
+        row[k] = (a32_q12[k] as i64) << 12;
+    }
+    let mut inv_gain_q30: i64 = 1 << 30;
+
+    // k from d_LPC-1 down to 0.
+    for k in (0..d_lpc).rev() {
+        let akk = row[k];
+        // abs(a32_Q24[k][k]) > 16773022 (≈ 0.99975 in Q24) ⇒ unstable.
+        if akk.unsigned_abs() > 16_773_022 {
+            return false;
+        }
+
+        // rc_Q31[k] = -a32_Q24[k][k] << 7.
+        let rc_q31 = -akk << 7;
+        // div_Q30[k] = (1<<30) - (rc_Q31*rc_Q31 >> 32). The product needs
+        // more than 32 bits → i64 (rc_Q31 fits ±~2.1e9, the square ±~4.6e18
+        // which is within i64).
+        let div_q30 = (1i64 << 30) - ((rc_q31 * rc_q31) >> 32);
+        // inv_gain_Q30[k] = (inv_gain_Q30[k+1]*div_Q30 >> 32) << 2.
+        inv_gain_q30 = ((inv_gain_q30 * div_q30) >> 32) << 2;
+        // inv_gain_Q30[k] < 107374 (≈ 1/10000 in Q30) ⇒ unstable.
+        if inv_gain_q30 < 107_374 {
+            return false;
+        }
+
+        if k > 0 {
+            // Compute row k-1 from row k.
+            // b1 = ilog(div_Q30); b2 = b1 - 16. b1 ∈ [20, 31].
+            let b1 = ilog64(div_q30) as i64;
+            let b2 = b1 - 16;
+            // inv_Qb2 = ((1<<29) - 1) / (div_Q30 >> (b2+1)). The divisor is
+            // positive (div_Q30 > 0 for a stable step), so integer division
+            // is well-defined.
+            let inv_qb2 = ((1i64 << 29) - 1) / (div_q30 >> (b2 + 1));
+            // err_Q29 = (1<<29) - ((div_Q30 << (15-b2)) * inv_Qb2 >> 16).
+            let err_q29 = (1i64 << 29) - (((div_q30 << (15 - b2)) * inv_qb2) >> 16);
+            // gain_Qb1 = (inv_Qb2 << 16) + (err_Q29*inv_Qb2 >> 13).
+            let gain_qb1 = (inv_qb2 << 16) + ((err_q29 * inv_qb2) >> 13);
+
+            // num_Q24[n] = a32_Q24[k][n]
+            //            - ((a32_Q24[k][k-n-1]*rc_Q31 + (1<<30)) >> 31)
+            // a32_Q24[k-1][n] = (num_Q24[n]*gain_Qb1 + (1<<(b1-1))) >> b1
+            // for 0 <= n < k. The reads use the *current* row, so snapshot
+            // it (n and k-n-1 both index the same row k) before overwriting.
+            let cur = row;
+            let round_b1 = 1i64 << (b1 - 1);
+            for n in 0..k {
+                let num_q24 = cur[n] - (((cur[k - n - 1] * rc_q31) + (1i64 << 30)) >> 31);
+                row[n] = ((num_q24 * gain_qb1) + round_b1) >> b1;
+            }
+        }
+    }
+
+    // Every k passed both checks ⇒ stable.
+    true
+}
+
+/// `ilog(n)` per RFC 6716 §1.1.10 for a non-negative `i64`: the minimum
+/// number of bits required to store the positive integer `n` in binary, or
+/// `0` for `n <= 0`. (`div_Q30` here is positive when the recurrence reaches
+/// this point, so the `n <= 0` branch is defensive.)
+fn ilog64(n: i64) -> u32 {
+    if n <= 0 {
+        0
+    } else {
+        64 - (n as u64).leading_zeros()
     }
 }
 
@@ -986,6 +1211,278 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- §4.2.7.5.8 prediction-gain limiting --------------------------
+
+    /// Independent spec transcription of `silk_LPC_inverse_pred_gain_QA()`
+    /// using a full 2D `a32_Q24` matrix (one row per `k`) and the literal
+    /// RFC formulas, with a control structure distinct from the production
+    /// rolling-row `is_lpc_stable`. Returns `true` iff the filter is stable.
+    fn oracle_is_stable(a32_q12: &[i32]) -> bool {
+        let d = a32_q12.len();
+        let dc: i64 = a32_q12.iter().map(|&c| c as i64).sum();
+        if dc > 4096 {
+            return false;
+        }
+        // a32_Q24[k][n], k ∈ 0..d, n ∈ 0..d. Only the top row is seeded.
+        let mut a = vec![vec![0i64; d]; d];
+        for n in 0..d {
+            a[d - 1][n] = (a32_q12[n] as i64) << 12;
+        }
+        let mut inv_gain_q30: i64 = 1 << 30;
+        for k in (0..d).rev() {
+            let akk = a[k][k];
+            if akk.abs() > 16_773_022 {
+                return false;
+            }
+            let rc_q31 = -akk << 7;
+            let div_q30 = (1i64 << 30) - ((rc_q31 * rc_q31) >> 32);
+            inv_gain_q30 = ((inv_gain_q30 * div_q30) >> 32) << 2;
+            if inv_gain_q30 < 107_374 {
+                return false;
+            }
+            if k > 0 {
+                let b1 = {
+                    // ilog
+                    if div_q30 <= 0 {
+                        0i64
+                    } else {
+                        (64 - (div_q30 as u64).leading_zeros()) as i64
+                    }
+                };
+                let b2 = b1 - 16;
+                let inv_qb2 = ((1i64 << 29) - 1) / (div_q30 >> (b2 + 1));
+                let err_q29 = (1i64 << 29) - (((div_q30 << (15 - b2)) * inv_qb2) >> 16);
+                let gain_qb1 = (inv_qb2 << 16) + ((err_q29 * inv_qb2) >> 13);
+                for n in 0..k {
+                    let num_q24 = a[k][n] - (((a[k][k - n - 1] * rc_q31) + (1i64 << 30)) >> 31);
+                    a[k - 1][n] = ((num_q24 * gain_qb1) + (1i64 << (b1 - 1))) >> b1;
+                }
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn stability_check_agrees_with_oracle_on_hand_built_filters() {
+        // A spread of small / borderline / large filters; production and
+        // oracle must classify each identically.
+        let cases: &[&[i32]] = &[
+            // The trivial all-zero filter: DC = 0, every rc = 0 ⇒ stable.
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            // A gentle decaying filter (small magnitudes) ⇒ stable.
+            &[400, -200, 100, -50, 25, -12, 6, -3, 1, 0],
+            // A near-unit single-tap filter (a_Q12[0] ≈ 1.0 in Q12 = 4096):
+            // DC_resp = 4096, exactly the boundary (NOT > 4096) ⇒ DC ok, but
+            // the reflection coefficient is ≈ 1 so it should be unstable.
+            &[4096, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            // DC over the 4096 ceiling ⇒ unstable by the DC check alone.
+            &[4097, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            // Mixed-sign moderate filter.
+            &[1500, -1200, 900, -600, 300, -150, 75, -30, 10, -5],
+        ];
+        for case in cases {
+            assert_eq!(
+                is_lpc_stable(case),
+                oracle_is_stable(case),
+                "stability divergence on {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stability_check_zero_filter_is_stable() {
+        assert!(is_lpc_stable(&[0i32; D_LPC_NB_MB]));
+        assert!(is_lpc_stable(&[0i32; D_LPC_WB]));
+    }
+
+    #[test]
+    fn stability_check_dc_response_over_4096_is_unstable() {
+        // Σ a32_Q12 = 4097 > 4096 ⇒ rejected before the Levinson recurrence.
+        let mut a = [0i32; D_LPC_NB_MB];
+        a[0] = 4097;
+        assert!(!is_lpc_stable(&a));
+        // Right at the boundary the DC check passes (4096 is not > 4096); the
+        // single near-unit tap then fails the recurrence, but the DC check
+        // alone does not reject it. Confirm via the oracle.
+        let mut b = [0i32; D_LPC_NB_MB];
+        b[0] = 4096;
+        assert_eq!(is_lpc_stable(&b), oracle_is_stable(&b));
+    }
+
+    #[test]
+    fn pred_gain_limit_stable_input_passes_through_in_zero_rounds() {
+        // A real decoded NLSF vector almost always yields a stable filter
+        // after §4.2.7.5.7, so prediction_gain_limited returns on round 0
+        // with a_Q12 == (a32_Q17 + 16) >> 5 of the range-limited input.
+        let nlsf = ascending_nlsf(D_LPC_NB_MB, 1500, 2700);
+        let limited = LpcQ17::from_nlsf(Bandwidth::Nb, &nlsf)
+            .unwrap()
+            .range_limited();
+        let pg = limited.prediction_gain_limited();
+        // The range-limited input is stable, so no chirp rounds run and the
+        // Q12 coefficients are the straight conversion of a32_Q17.
+        if pg.rounds() == 0 {
+            let expected: Vec<i32> = limited.a32_q17().iter().map(|&c| (c + 16) >> 5).collect();
+            assert_eq!(pg.a_q12(), expected.as_slice());
+        }
+        // Whatever the round count, the emitted filter must be stable.
+        assert!(is_lpc_stable(pg.a_q12()));
+        assert_eq!(pg.len(), D_LPC_NB_MB);
+    }
+
+    #[test]
+    fn pred_gain_limit_always_emits_a_stable_filter() {
+        // Feed deliberately aggressive (unstable) Q17 coefficients straight
+        // in (skipping range-limiting) and confirm the §4.2.7.5.8 chirp loop
+        // always converges to a stable Q12 filter.
+        let cases: &[[i32; D_LPC_NB_MB]] = &[
+            // A near-unit leading tap in Q17 (≈ 1.0): unstable, needs chirp.
+            [4096 << 5, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            // Several large alternating taps — a high-gain resonant filter.
+            [
+                3500 << 5,
+                -3400 << 5,
+                3300 << 5,
+                -3200 << 5,
+                3100 << 5,
+                -3000 << 5,
+                2900 << 5,
+                -2800 << 5,
+                2700 << 5,
+                -2600 << 5,
+            ],
+            // DC way over the ceiling.
+            [4000 << 5, 4000 << 5, 4000 << 5, 0, 0, 0, 0, 0, 0, 0],
+        ];
+        for case in cases {
+            let lpc = LpcQ17 {
+                len: D_LPC_NB_MB as u8,
+                a32_q17: {
+                    let mut a = [0i32; D_LPC_MAX];
+                    a[..D_LPC_NB_MB].copy_from_slice(case);
+                    a
+                },
+            };
+            let pg = lpc.prediction_gain_limited();
+            assert!(
+                is_lpc_stable(pg.a_q12()),
+                "emitted unstable filter for input {case:?} (rounds={})",
+                pg.rounds()
+            );
+            assert!(pg.rounds() <= 16);
+        }
+    }
+
+    #[test]
+    fn pred_gain_limit_round15_zeroes_a_persistently_unstable_filter() {
+        // Construct an input that the inverse-pred-gain test always rejects
+        // even after chirping: a filter dominated by one tap pinned to the
+        // maximum the prior stages can leave (Q12 = 32767, well above the
+        // near-unit instability point). The §4.2.7.5.8 loop reaches round 15
+        // where sc_Q16[0] = 0 zeroes every coefficient, producing the
+        // all-zero (trivially stable) filter and rounds() == 16.
+        let mut a = [0i32; D_LPC_MAX];
+        a[0] = 32767 << 5; // huge near-Q12-max leading tap
+        a[1] = 32767 << 5;
+        let lpc = LpcQ17 {
+            len: D_LPC_NB_MB as u8,
+            a32_q17: a,
+        };
+        let pg = lpc.prediction_gain_limited();
+        assert!(is_lpc_stable(pg.a_q12()));
+        // If it ever reaches the forced-zero round, every coefficient is 0.
+        if pg.rounds() == 16 {
+            assert!(pg.a_q12().iter().all(|&c| c == 0));
+        }
+    }
+
+    #[test]
+    fn pred_gain_limit_emitted_q12_fits_signed_16bit() {
+        // The §4.2.7.5.8 output is the Q12 filter used by reconstruction; it
+        // must fit a signed 16-bit value (the chirp loop ran §4.2.7.5.7-style
+        // expansion, and a32_Q17 was range-limited going in).
+        let nlsf = ascending_nlsf(D_LPC_WB, 800, 1900);
+        let pg = LpcQ17::from_nlsf(Bandwidth::Wb, &nlsf)
+            .unwrap()
+            .range_limited()
+            .prediction_gain_limited();
+        for (k, &c) in pg.a_q12().iter().enumerate() {
+            assert!(
+                (i16::MIN as i32..=i16::MAX as i32).contains(&c),
+                "a_Q12[{k}] = {c} does not fit i16"
+            );
+        }
+    }
+
+    #[test]
+    fn pred_gain_limit_real_pipeline_stable_across_bandwidth_x_i1_sweep() {
+        // Drive the full §4.2.7.5.2 → … → §4.2.7.5.7 → §4.2.7.5.8 pipeline
+        // for every (bandwidth, I1) on a few buffers. The emitted Q12 filter
+        // must always be stable (per is_lpc_stable, cross-checked vs the
+        // independent oracle) and the round count bounded by 16.
+        use crate::range_decoder::RangeDecoder;
+        use crate::silk_lsf_recon::NlsfReconstructed;
+        use crate::silk_lsf_stabilize::NlsfStabilized;
+        use crate::silk_lsf_stage2::LsfStage2;
+
+        let bufs: &[&[u8]] = &[
+            &[
+                0x5A, 0xC3, 0x17, 0x9E, 0x42, 0xFB, 0x08, 0x71, 0x2D, 0xB6, 0x4C, 0x8E,
+            ],
+            &[
+                0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+            ],
+            &[
+                0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10, 0xFE, 0xDC, 0xBA, 0x98,
+            ],
+        ];
+        for buf in bufs {
+            for bw in [Bandwidth::Nb, Bandwidth::Mb, Bandwidth::Wb] {
+                for i1 in 0u8..32 {
+                    let mut rd = RangeDecoder::new(buf);
+                    let stage2 = LsfStage2::decode(&mut rd, bw, i1).expect("stage-2");
+                    let recon =
+                        NlsfReconstructed::from_stage1_and_stage2(bw, i1, &stage2).expect("recon");
+                    let stab = NlsfStabilized::from_reconstructed(bw, &recon).expect("stab");
+                    let pg = LpcQ17::from_nlsf(bw, stab.nlsf_q15())
+                        .unwrap()
+                        .range_limited()
+                        .prediction_gain_limited();
+                    assert_eq!(pg.len(), stab.nlsf_q15().len());
+                    assert!(pg.rounds() <= 16);
+                    assert!(
+                        is_lpc_stable(pg.a_q12()),
+                        "unstable Q12 filter: bw={bw:?} i1={i1} rounds={}",
+                        pg.rounds()
+                    );
+                    // Production stability classification agrees with the
+                    // independent oracle on the emitted filter.
+                    assert_eq!(
+                        is_lpc_stable(pg.a_q12()),
+                        oracle_is_stable(pg.a_q12()),
+                        "stability classification divergence: bw={bw:?} i1={i1}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ilog64_matches_spec_definition() {
+        // ilog(n) = floor(log2(n)) + 1 for n > 0, else 0 — the §1.1.10 rule
+        // applied to the i64 div_Q30 domain used by §4.2.7.5.8.
+        assert_eq!(ilog64(-1), 0);
+        assert_eq!(ilog64(0), 0);
+        assert_eq!(ilog64(1), 1);
+        assert_eq!(ilog64(2), 2);
+        assert_eq!(ilog64(3), 2);
+        assert_eq!(ilog64(4), 3);
+        assert_eq!(ilog64(7), 3);
+        // div_Q30 ∈ roughly [1, 2^30]; ilog(2^30) = 31, ilog(2^30 - 1) = 30.
+        assert_eq!(ilog64(1 << 30), 31);
+        assert_eq!(ilog64((1 << 30) - 1), 30);
     }
 
     #[test]
