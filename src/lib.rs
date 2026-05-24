@@ -98,14 +98,23 @@
 //!   `silk_NLSF2A_find_poly` P/Q recurrence runs in i64 to absorb the
 //!   "up to 48 bits of intermediate precision" the spec calls out, and
 //!   the last-row sum/difference assembly produces the 32-bit
-//!   `a32_Q17[]`. The §4.2.7.5.7 bandwidth-expansion range-limiting
-//!   loop and the §4.2.7.5.8 prediction-gain stability check are
-//!   deferred to subsequent rounds.
+//!   `a32_Q17[]`.
 //!
-//! Subsequent SILK stages (LPC range-limiting §4.2.7.5.7, LPC stability
-//! §4.2.7.5.8, LTP §4.2.7.6, LCG seed §4.2.7.7, excitation §4.2.7.8) and
-//! the CELT layer are not yet wired up; the [`Decoder`] / [`Encoder`]
-//! entry points still return [`Error::NotImplemented`].
+//! * Round 11 lands the §4.2.7.5.7 range-limiting bandwidth expansion
+//!   ([`LpcQ17::range_limited`]) — up to 10 rounds of `silk_bwexpander_32`
+//!   chirping (`maxabs_Q12 = min((maxabs_Q17 + 16) >> 5, 163838)`, chirp
+//!   factor `sc_Q16[0] = 65470 - ((maxabs_Q12 - 32767) << 14) /
+//!   ((maxabs_Q12 * (k+1)) >> 2)`) that shrink the raw `a32_Q17[]` until
+//!   it fits a signed 16-bit Q12 value, followed by the documented
+//!   post-loop Q12 saturation `clamp(-32768, (a + 16) >> 5, 32767) << 5`.
+//!   The result is held in the Q17 domain for the §4.2.7.5.8
+//!   prediction-gain limiting that follows, which is deferred to a
+//!   subsequent round.
+//!
+//! Subsequent SILK stages (LPC stability §4.2.7.5.8, LTP §4.2.7.6, LCG
+//! seed §4.2.7.7, excitation §4.2.7.8) and the CELT layer are not yet
+//! wired up; the [`Decoder`] / [`Encoder`] entry points still return
+//! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 

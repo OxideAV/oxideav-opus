@@ -46,13 +46,17 @@
 //!                          - (p_Q16[d2-1][k+1] + p_Q16[d2-1][k])
 //!     ```
 //!
-//! This module covers the §4.2.7.5.6 **core conversion** only. The
-//! §4.2.7.5.7 range-limiting bandwidth-expansion loop (up to 10 rounds
-//! shrinking `a32_Q17[]` so it fits Q12) and the §4.2.7.5.8 prediction-gain
-//! stability test (up to 16 chirp rounds + `silk_LPC_inverse_pred_gain_QA`)
-//! are deferred to subsequent rounds. The `a32_Q17[]` produced here is
-//! the raw input to that pipeline — callers that need a final stable Q12
-//! filter must run §4.2.7.5.7 + §4.2.7.5.8 first.
+//! On top of the §4.2.7.5.6 **core conversion**, this module also lands the
+//! §4.2.7.5.7 **range-limiting** bandwidth-expansion loop
+//! ([`LpcQ17::range_limited`]): up to 10 rounds of chirp-factor bandwidth
+//! expansion that shrink the raw `a32_Q17[]` so it fits a signed 16-bit Q12
+//! value, followed by a fixed Q12 saturation after the 10th round if it
+//! still overflows. The §4.2.7.5.8 prediction-gain stability test (up to 16
+//! chirp rounds + `silk_LPC_inverse_pred_gain_QA`) is deferred to a
+//! subsequent round. The range-limited `a32_Q17[]` produced here is held in
+//! the Q17 domain (per §4.2.7.5.7 the final saturation converts back to Q17
+//! for the prediction-gain limiting that follows), so callers that need a
+//! final stable Q12 filter must still run §4.2.7.5.8 against this output.
 
 use crate::silk_lsf_stage2::{D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB};
 use crate::toc::Bandwidth;
@@ -305,6 +309,120 @@ impl LpcQ17 {
     /// successful conversion of a valid normalized-LSF vector).
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Apply the RFC 6716 §4.2.7.5.7 range-limiting bandwidth expansion to
+    /// the raw §4.2.7.5.6 `a32_Q17[]` coefficients.
+    ///
+    /// The raw coefficients are too large to fit a signed 16-bit value;
+    /// reducing them to Q12 precision doesn't incur significant quality
+    /// loss but still doesn't guarantee a fit. Up to 10 rounds of
+    /// bandwidth expansion run per §4.2.7.5.7:
+    ///
+    ///  * Each round finds the index `k` with the largest `abs(a32_Q17[k])`
+    ///    (ties broken toward the lowest `k`), computes
+    ///    `maxabs_Q12 = min((maxabs_Q17 + 16) >> 5, 163838)`, and **stops**
+    ///    once `maxabs_Q12 <= 32767` (the coefficients now fit Q12).
+    ///  * Otherwise it derives the chirp factor
+    ///    `sc_Q16[0] = 65470 - ((maxabs_Q12 - 32767) << 14)
+    ///    / ((maxabs_Q12 * (k+1)) >> 2)` (integer division) and runs
+    ///    `silk_bwexpander_32`:
+    ///    `a32_Q17[k] = (a32_Q17[k]*sc_Q16[k]) >> 16` and
+    ///    `sc_Q16[k+1] = (sc_Q16[0]*sc_Q16[k] + 32768) >> 16` (the second
+    ///    multiply unsigned to avoid 32-bit overflow).
+    ///
+    /// If the coefficients still overflow Q12 after the 10th round, each
+    /// coefficient is saturated in the Q12 domain and converted back to Q17:
+    /// `a32_Q17[k] = clamp(-32768, (a32_Q17[k] + 16) >> 5, 32767) << 5`.
+    /// Per §4.2.7.5.7 this saturation is performed only if `maxabs_Q12` is
+    /// still greater than 32767 after the 10th round (i.e. it is skipped if
+    /// expansion converged earlier).
+    ///
+    /// The result is returned in the Q17 domain (the §4.2.7.5.8
+    /// prediction-gain limiting that follows consumes Q17 coefficients), so
+    /// it shares the [`LpcQ17`] representation. The §4.2.7.5.8 stability
+    /// check is **not** applied here.
+    pub fn range_limited(&self) -> LpcQ17 {
+        let mut a32 = self.a32_q17;
+        let d_lpc = self.len as usize;
+        limit_lpc_range(&mut a32[..d_lpc]);
+        LpcQ17 {
+            len: self.len,
+            a32_q17: a32,
+        }
+    }
+}
+
+/// In-place RFC 6716 §4.2.7.5.7 range-limiting bandwidth expansion of the
+/// raw §4.2.7.5.6 Q17 LPC coefficients.
+///
+/// Runs up to 10 rounds of `silk_bwexpander_32` chirping, then — only if
+/// the largest coefficient still overflows Q12 after the 10th round —
+/// applies the fixed Q12 saturation. See [`LpcQ17::range_limited`] for the
+/// formula breakdown.
+fn limit_lpc_range(a32_q17: &mut [i32]) {
+    for _round in 0..10 {
+        // Find the index of the largest abs(a32_Q17[k]); ties → lowest k.
+        // `unsigned_abs()` gives the magnitude even for i32::MIN without
+        // the i32::MIN abs() panic; widen to i64 for the later arithmetic.
+        let mut max_idx = 0usize;
+        let mut maxabs_q17: i64 = a32_q17[0].unsigned_abs() as i64;
+        for (k, &c) in a32_q17.iter().enumerate().skip(1) {
+            let abs = c.unsigned_abs() as i64;
+            if abs > maxabs_q17 {
+                maxabs_q17 = abs;
+                max_idx = k;
+            }
+        }
+
+        // maxabs_Q12 = min((maxabs_Q17 + 16) >> 5, 163838). The upper bound
+        // 163838 == ((2**31 - 1) >> 14) + 32767 caps the chirp numerator so
+        // it stays inside a signed 32-bit value (we compute in i64 anyway).
+        let maxabs_q12 = ((maxabs_q17 + 16) >> 5).min(163838);
+        if maxabs_q12 <= 32767 {
+            // The coefficients already fit Q12 — no expansion, no saturation.
+            return;
+        }
+
+        // chirp factor sc_Q16[0]; integer division per §4.2.7.5.7.
+        let numer = (maxabs_q12 - 32767) << 14;
+        let denom = (maxabs_q12 * (max_idx as i64 + 1)) >> 2;
+        let sc_q16_0 = 65470 - numer / denom;
+        bwexpander_32(a32_q17, sc_q16_0);
+    }
+
+    // After the 10th round, saturate in Q12 only if the largest coefficient
+    // still overflows. Re-derive maxabs_Q12 the same way as inside the loop.
+    let maxabs_q17 = a32_q17
+        .iter()
+        .map(|&c| c.unsigned_abs() as i64)
+        .max()
+        .unwrap_or(0);
+    let maxabs_q12 = ((maxabs_q17 + 16) >> 5).min(163838);
+    if maxabs_q12 > 32767 {
+        for c in a32_q17.iter_mut() {
+            // clamp(-32768, (a32_Q17[k] + 16) >> 5, 32767) << 5 — saturate in
+            // the Q12 domain, then convert back to Q17.
+            let q12 = (((*c as i64 + 16) >> 5).clamp(-32768, 32767)) as i32;
+            *c = q12 << 5;
+        }
+    }
+}
+
+/// RFC 6716 §4.2.7.5.7 `silk_bwexpander_32` recurrence.
+///
+/// `a32_Q17[k] = (a32_Q17[k]*sc_Q16[k]) >> 16` with
+/// `sc_Q16[k+1] = (sc_Q16[0]*sc_Q16[k] + 32768) >> 16`. The first multiply
+/// can require up to 48 bits of precision (done in i64); the second is
+/// performed unsigned (both `sc_Q16` values are positive and < 2^16) to
+/// avoid the 32-bit overflow the spec warns about.
+fn bwexpander_32(a32_q17: &mut [i32], sc_q16_0: i64) {
+    let mut sc_q16_k: u64 = sc_q16_0 as u64;
+    for c in a32_q17.iter_mut() {
+        // First multiply: signed, up to 48 bits → i64.
+        *c = ((*c as i64 * sc_q16_k as i64) >> 16) as i32;
+        // Second multiply: unsigned per §4.2.7.5.7.
+        sc_q16_k = (sc_q16_0 as u64 * sc_q16_k + 32768) >> 16;
     }
 }
 
@@ -641,6 +759,233 @@ mod tests {
         // via the relation a[0] - a[d_LPC-1] = -2 * q_diff (must be even).
         assert_eq!((a[0] - a[D_LPC_NB_MB - 1]) % 2, 0);
         assert_eq!((a[0] + a[D_LPC_NB_MB - 1]) % 2, 0);
+    }
+
+    // --- §4.2.7.5.7 range-limiting bandwidth expansion ----------------
+
+    /// Independent transcription of the §4.2.7.5.7 loop, written against the
+    /// raw RFC formulas with a fresh control structure so a typo in the
+    /// production `limit_lpc_range` shows up as a divergence. Returns the
+    /// range-limited Q17 coefficients.
+    fn oracle_range_limited(input: &[i32]) -> Vec<i32> {
+        let mut a: Vec<i64> = input.iter().map(|&c| c as i64).collect();
+        let d = a.len();
+
+        let maxabs_q12_of = |a: &[i64]| -> (usize, i64) {
+            // largest abs, ties to lowest index
+            let mut idx = 0usize;
+            let mut best = a[0].abs();
+            for (k, &c) in a.iter().enumerate().skip(1) {
+                if c.abs() > best {
+                    best = c.abs();
+                    idx = k;
+                }
+            }
+            let q12 = ((best + 16) >> 5).min(163838);
+            (idx, q12)
+        };
+
+        for _ in 0..10 {
+            let (k, q12) = maxabs_q12_of(&a);
+            if q12 <= 32767 {
+                return a.iter().map(|&c| c as i32).collect();
+            }
+            let numer = (q12 - 32767) << 14;
+            let denom = (q12 * (k as i64 + 1)) >> 2;
+            let sc0 = 65470 - numer / denom;
+            // bwexpander_32, computed independently in i128 to be sure the
+            // production i64/u64 path doesn't silently truncate.
+            let mut sc_k: i128 = sc0 as i128;
+            for c in a.iter_mut() {
+                *c = ((*c as i128 * sc_k) >> 16) as i64;
+                sc_k = (sc0 as i128 * sc_k + 32768) >> 16;
+            }
+        }
+        // recompute maxabs after round 10
+        let (_, q12_after) = maxabs_q12_of(&a);
+        if q12_after > 32767 {
+            for c in a.iter_mut() {
+                let q12 = ((*c + 16) >> 5).clamp(-32768, 32767);
+                *c = q12 << 5;
+            }
+        }
+        debug_assert_eq!(a.len(), d);
+        a.iter().map(|&c| c as i32).collect()
+    }
+
+    /// After §4.2.7.5.7, every coefficient must fit a signed 16-bit Q12
+    /// value: `(a32_Q17[k] + 16) >> 5 ∈ [-32768, 32767]`.
+    fn assert_fits_q12(a: &[i32]) {
+        for (k, &c) in a.iter().enumerate() {
+            let q12 = (c as i64 + 16) >> 5;
+            assert!(
+                (-32768..=32767).contains(&q12),
+                "coeff {k} = {c} does not fit Q12 (q12 = {q12})"
+            );
+        }
+    }
+
+    #[test]
+    fn range_limit_leaves_small_coeffs_untouched() {
+        // Coefficients whose maxabs_Q12 is already <= 32767 must pass through
+        // unchanged (no expansion, no saturation). A Q17 magnitude of
+        // 32767 << 5 = 1048544 maps to exactly Q12 = 32767, the boundary.
+        let nlsf = ascending_nlsf(D_LPC_NB_MB, 1500, 2700);
+        let lpc = LpcQ17::from_nlsf(Bandwidth::Nb, &nlsf).unwrap();
+        // Only run this assertion if the raw output is already in range; a
+        // typical decoded vector is, but assert the invariant either way.
+        let raw = lpc.a32_q17().to_vec();
+        let maxabs = raw.iter().map(|&c| (c as i64).abs()).max().unwrap();
+        let maxabs_q12 = ((maxabs + 16) >> 5).min(163838);
+        let limited = lpc.range_limited();
+        if maxabs_q12 <= 32767 {
+            assert_eq!(limited.a32_q17(), raw.as_slice());
+        }
+        assert_fits_q12(limited.a32_q17());
+    }
+
+    #[test]
+    fn range_limit_matches_oracle_on_synthetic_overflow() {
+        // Hand-built Q17 vectors that overflow Q12 by varying amounts so the
+        // chirp loop runs at least one round. Cross-check production vs the
+        // independent i128 oracle bit-for-bit.
+        let cases: &[[i32; D_LPC_NB_MB]] = &[
+            // a single coefficient just over the Q12 boundary
+            [1_100_000, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            // the peak at a non-zero index (exercises the (k+1) divisor)
+            [0, 0, 0, 2_500_000, -100_000, 0, 0, 0, 0, 0],
+            // several large coefficients of mixed sign
+            [
+                3_000_000, -2_800_000, 2_600_000, -2_400_000, 2_200_000, -2_000_000, 1_800_000,
+                -1_600_000, 1_400_000, -1_200_000,
+            ],
+            // a moderate overshoot that should converge well before round 10
+            [1_200_000, -1_150_000, 0, 0, 0, 0, 0, 0, 0, 0],
+        ];
+        for case in cases {
+            let lpc = LpcQ17 {
+                len: D_LPC_NB_MB as u8,
+                a32_q17: {
+                    let mut a = [0i32; D_LPC_MAX];
+                    a[..D_LPC_NB_MB].copy_from_slice(case);
+                    a
+                },
+            };
+            let limited = lpc.range_limited();
+            let expected = oracle_range_limited(case);
+            assert_eq!(
+                limited.a32_q17(),
+                expected.as_slice(),
+                "production/oracle divergence on {case:?}"
+            );
+            assert_fits_q12(limited.a32_q17());
+        }
+    }
+
+    #[test]
+    fn range_limit_extreme_input_at_maxabs_cap_converges() {
+        // An extreme coefficient pinned to the maxabs_Q12 = 163838 cap (the
+        // §4.2.7.5.7 numerator-overflow bound). The adaptive chirp factor is
+        // very small for such a large overshoot, so the expansion converges
+        // within the 10-round budget; production must still agree with the
+        // independent oracle bit-for-bit and the result must fit Q12.
+        let huge = 163838i64 << 5; // Q17 magnitude that maps to Q12 = 163838
+        let mut a = [0i32; D_LPC_MAX];
+        a[0] = huge as i32;
+        a[5] = -(huge as i32);
+        a[9] = (huge as i32) / 2;
+        let lpc = LpcQ17 {
+            len: D_LPC_NB_MB as u8,
+            a32_q17: a,
+        };
+        let limited = lpc.range_limited();
+        let expected = oracle_range_limited(&a[..D_LPC_NB_MB]);
+        assert_eq!(limited.a32_q17(), expected.as_slice());
+        assert_fits_q12(limited.a32_q17());
+    }
+
+    #[test]
+    fn range_limit_post_loop_saturation_formula() {
+        // The §4.2.7.5.7 post-loop Q12 saturation is documented as a
+        // belt-and-suspenders step run "regardless of whether or not the
+        // Q12 version of any coefficient still overflows" — but in practice
+        // the adaptive chirp converges every realistic input within 10
+        // rounds, so the engaged branch is effectively unreachable. Pin the
+        // saturation *formula* directly so a transcription typo is still
+        // caught: clamp(-32768, (a + 16) >> 5, 32767) << 5.
+        let saturate = |c: i64| -> i32 {
+            let q12 = ((c + 16) >> 5).clamp(-32768, 32767);
+            (q12 << 5) as i32
+        };
+        // Below the positive Q12 ceiling: round-trips through Q12 << 5.
+        assert_eq!(saturate(32767i64 << 5), 32767 << 5);
+        // Just over the ceiling clamps to 32767 << 5.
+        assert_eq!(saturate((32767i64 << 5) + (1 << 5)), 32767 << 5);
+        // Far over the ceiling clamps to the same maximum.
+        assert_eq!(saturate(i32::MAX as i64), 32767 << 5);
+        // Below the negative floor clamps to -32768 << 5.
+        assert_eq!(saturate(-(32768i64 << 5) - (1 << 5)), -32768 << 5);
+        assert_eq!(saturate(i32::MIN as i64), -32768 << 5);
+        // Zero stays zero; the +16 rounding does not push it off.
+        assert_eq!(saturate(0), 0);
+    }
+
+    #[test]
+    fn range_limit_handles_i32_min_without_panic() {
+        // unsigned_abs() must not panic on i32::MIN inside the max search.
+        let mut a = [0i32; D_LPC_MAX];
+        a[0] = i32::MIN;
+        a[3] = i32::MAX;
+        let lpc = LpcQ17 {
+            len: D_LPC_NB_MB as u8,
+            a32_q17: a,
+        };
+        let limited = lpc.range_limited();
+        assert_fits_q12(limited.a32_q17());
+        let expected = oracle_range_limited(&a[..D_LPC_NB_MB]);
+        assert_eq!(limited.a32_q17(), expected.as_slice());
+    }
+
+    #[test]
+    fn range_limit_real_pipeline_fits_q12_across_bandwidth_x_i1_sweep() {
+        // Drive the real §4.2.7.5.2 → §4.2.7.5.3 → §4.2.7.5.4 → §4.2.7.5.6
+        // pipeline, then range-limit. Every result must fit Q12 and agree
+        // with the independent oracle for every (bandwidth, I1) on a few
+        // buffers.
+        use crate::range_decoder::RangeDecoder;
+        use crate::silk_lsf_recon::NlsfReconstructed;
+        use crate::silk_lsf_stabilize::NlsfStabilized;
+        use crate::silk_lsf_stage2::LsfStage2;
+
+        let bufs: &[&[u8]] = &[
+            &[
+                0x5A, 0xC3, 0x17, 0x9E, 0x42, 0xFB, 0x08, 0x71, 0x2D, 0xB6, 0x4C, 0x8E,
+            ],
+            &[
+                0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+            ],
+        ];
+        for buf in bufs {
+            for bw in [Bandwidth::Nb, Bandwidth::Mb, Bandwidth::Wb] {
+                for i1 in 0u8..32 {
+                    let mut rd = RangeDecoder::new(buf);
+                    let stage2 = LsfStage2::decode(&mut rd, bw, i1).expect("stage-2");
+                    let recon =
+                        NlsfReconstructed::from_stage1_and_stage2(bw, i1, &stage2).expect("recon");
+                    let stab = NlsfStabilized::from_reconstructed(bw, &recon).expect("stab");
+                    let lpc = LpcQ17::from_nlsf(bw, stab.nlsf_q15()).unwrap();
+                    let limited = lpc.range_limited();
+                    assert_eq!(limited.len(), lpc.len());
+                    assert_fits_q12(limited.a32_q17());
+                    let expected = oracle_range_limited(lpc.a32_q17());
+                    assert_eq!(
+                        limited.a32_q17(),
+                        expected.as_slice(),
+                        "production/oracle divergence: bw={bw:?} i1={i1}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

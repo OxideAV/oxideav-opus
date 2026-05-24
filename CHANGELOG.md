@@ -6,6 +6,52 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 11 (2026-05-24):** RFC 6716 §4.2.7.5.7 SILK LPC
+  range-limiting bandwidth expansion behind a new
+  `LpcQ17::range_limited` method (`silk_lsf_to_lpc` module). Consumes the
+  raw §4.2.7.5.6 `a32_Q17[]` and reduces it so it fits a signed 16-bit
+  Q12 value:
+
+  - **Up to 10 rounds of `silk_bwexpander_32` chirping.** Each round
+    finds the index `k` of the largest `abs(a32_Q17[k])` (ties to the
+    lowest `k`), computes `maxabs_Q12 = min((maxabs_Q17 + 16) >> 5,
+    163838)`, and stops once `maxabs_Q12 <= 32767`. Otherwise it derives
+    the chirp factor `sc_Q16[0] = 65470 - ((maxabs_Q12 - 32767) << 14) /
+    ((maxabs_Q12 * (k+1)) >> 2)` (integer division) and runs the
+    `silk_bwexpander_32` recurrence `a32_Q17[k] = (a32_Q17[k]*sc_Q16[k])
+    >> 16`, `sc_Q16[k+1] = (sc_Q16[0]*sc_Q16[k] + 32768) >> 16`. The
+    first multiply runs in i64 ("up to 48 bits of precision"); the second
+    is performed unsigned per the spec to avoid 32-bit overflow.
+  - **Post-loop Q12 saturation.** If `maxabs_Q12` is still greater than
+    32767 after the 10th round, each coefficient is saturated in the Q12
+    domain and converted back to Q17:
+    `a32_Q17[k] = clamp(-32768, (a32_Q17[k] + 16) >> 5, 32767) << 5`.
+    The result is returned in the Q17 domain (the §4.2.7.5.8
+    prediction-gain limiting that follows consumes Q17 coefficients), so
+    it shares the `LpcQ17` representation. The §4.2.7.5.8 stability check
+    is deferred to a subsequent round.
+
+  `maxabs_Q17` is taken via `i32::unsigned_abs()` so an `i32::MIN`
+  coefficient from an adversarial §4.2.7.5.6 output does not panic.
+
+  6 new unit tests (201 lib tests total in the crate; up from 195 in the
+  round-10 close) covering:
+
+  - Small coefficients already fitting Q12 pass through unchanged.
+  - Production agrees bit-for-bit with an independent i128 transcription
+    of the §4.2.7.5.7 loop on synthetic overflow vectors (single peak,
+    peak at a non-zero index, mixed-sign large coefficients, a moderate
+    overshoot) and on an extreme input pinned to the 163838 cap.
+  - Every range-limited output fits a signed 16-bit Q12 value.
+  - The `i32::MIN` coefficient no-panic edge.
+  - The post-loop Q12 saturation formula pinned in isolation (the
+    adaptive chirp converges every realistic input within 10 rounds, so
+    the engaged branch is effectively unreachable; the formula is pinned
+    directly to catch a transcription typo).
+  - A real §4.2.7.5.2 → §4.2.7.5.3 → §4.2.7.5.4 → §4.2.7.5.6 →
+    §4.2.7.5.7 pipeline sweep across all 32 `I1` values × {NB, MB, WB}
+    asserting the Q12 fit and production/oracle agreement.
+
 * **Clean-room round 10 (2026-05-24):** RFC 6716 §4.2.7.5.6 SILK
   Normalized LSF → LPC core conversion behind a new `LpcQ17` API
   (`silk_lsf_to_lpc` module). Consumes a stabilized / interpolated

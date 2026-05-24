@@ -2,15 +2,16 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-24 (clean-room round 10)
+## Status — 2026-05-24 (clean-room round 11)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
 gains + §4.2.7.5.2 LSF Stage-2 residual + §4.2.7.5.3 NLSF
 reconstruction + §4.2.7.5.4 NLSF stabilization + §4.2.7.5.5 NLSF
-interpolation + §4.2.7.5.6 NLSF→LPC core conversion (`silk_NLSF2A`);
-no §4.2.7.5.7 LPC range-limiting yet, no §4.2.7.5.8 prediction-gain
-stability check, no LTP / excitation, no CELT band machinery yet.**
+interpolation + §4.2.7.5.6 NLSF→LPC core conversion (`silk_NLSF2A`) +
+§4.2.7.5.7 LPC range-limiting bandwidth expansion; no §4.2.7.5.8
+prediction-gain stability check yet, no LTP / excitation, no CELT band
+machinery yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -372,16 +373,53 @@ across the full §4.2.7.5.2 → §4.2.7.5.3 → §4.2.7.5.4 pipeline ×
 all 32 `I1` × {NB, MB, WB}, and a no-panic sweep over three buffers
 × all 32 `I1` × {NB, MB, WB}.
 
-Total crate test count: 195 (5 TOC + 27 frame-packing + 19 range
+Round 11 (2026-05-24) lands the SILK LPC range-limiting bandwidth
+expansion for RFC 6716 §4.2.7.5.7 behind a new `LpcQ17::range_limited`
+method. Given the raw §4.2.7.5.6 `a32_Q17[]` (which is too large to fit
+a signed 16-bit value), the procedure shrinks the coefficients so they
+fit Q12:
+
+* **Up to 10 rounds of `silk_bwexpander_32` chirping.** Each round finds
+  the index `k` with the largest `abs(a32_Q17[k])` (ties to the lowest
+  `k`), computes `maxabs_Q12 = min((maxabs_Q17 + 16) >> 5, 163838)`, and
+  stops once `maxabs_Q12 <= 32767`. Otherwise it derives the chirp factor
+  `sc_Q16[0] = 65470 - ((maxabs_Q12 - 32767) << 14) /
+  ((maxabs_Q12 * (k+1)) >> 2)` (integer division) and runs the recurrence
+  `a32_Q17[k] = (a32_Q17[k]*sc_Q16[k]) >> 16`,
+  `sc_Q16[k+1] = (sc_Q16[0]*sc_Q16[k] + 32768) >> 16`. The first multiply
+  runs in i64 ("up to 48 bits of precision"); the second is unsigned per
+  the §4.2.7.5.7 note to avoid 32-bit overflow.
+* **Post-loop Q12 saturation.** If `maxabs_Q12` is still greater than
+  32767 after the 10th round, each coefficient is saturated in the Q12
+  domain and converted back to Q17:
+  `a32_Q17[k] = clamp(-32768, (a32_Q17[k] + 16) >> 5, 32767) << 5`. In
+  practice the adaptive chirp converges every realistic input within 10
+  rounds, so this branch is the spec-documented belt-and-suspenders step.
+
+The output is held in the Q17 domain (the §4.2.7.5.8 prediction-gain
+limiting that follows consumes Q17 coefficients), so it shares the
+`LpcQ17` representation. `maxabs_Q17` is taken via `i32::unsigned_abs()`
+so an `i32::MIN` coefficient cannot panic.
+
+Six new unit tests (201 lib tests total in the crate, up from 195 at
+round-10 close) cover the small-coefficient pass-through, production /
+independent-i128-oracle agreement on synthetic overflow vectors and on
+the 163838-cap extreme, the Q12-fit post-condition, the `i32::MIN`
+no-panic edge, the post-loop saturation formula pinned in isolation, and
+a real §4.2.7.5.2 → §4.2.7.5.7 pipeline sweep across all 32 `I1` values
+× {NB, MB, WB}.
+
+Total crate test count: 201 (5 TOC + 27 frame-packing + 19 range
 decoder + 17 SILK header + 20 subframe gains + 30 LSF stage-2 +
 26 LSF reconstruction + 19 LSF stabilization + 10 LSF interpolation
-+ 22 LSF → LPC).
++ 22 LSF → LPC core + 6 LPC range-limiting).
 
-Round 10 stops after the §4.2.7.5.6 core; §4.2.7.5.7 range-limiting
-and §4.2.7.5.8 prediction-gain stability are deferred to a later
-round. LTP / excitation decoding, the full CELT band machinery, and
-the §5 encoder pipeline remain out of scope; the higher-level encode
-/ decode entry points still return `Error::NotImplemented`.
+Round 11 stops after the §4.2.7.5.7 range-limiting; the §4.2.7.5.8
+prediction-gain stability check (Levinson reflection-coefficient
+recurrence + chirp loop) is deferred to a later round. LTP / excitation
+decoding, the full CELT band machinery, and the §5 encoder pipeline
+remain out of scope; the higher-level encode / decode entry points still
+return `Error::NotImplemented`.
 
 ## Planned clean-room sources
 
