@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-25 (clean-room round 15)
+## Status — 2026-05-25 (clean-room round 16)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
@@ -14,10 +14,12 @@ prediction-gain stability limiting (`silk_LPC_inverse_pred_gain_QA`) +
 §4.2.7.6 LTP parameters (pitch lags + LTP filter coefficients +
 LTP scaling) + §4.2.7.7 LCG seed + §4.2.7.8 excitation (rate level +
 pulses per shell block + recursive pulse-location split + LSBs + signs
-+ §4.2.7.8.6 LCG-driven reconstruction) + §4.2.7.9.2 LPC synthesis
-filter (per-subframe short-term predictor with `d_LPC` history carry-
-over and `out[i] = clamp(-1, lpc[i], 1)`); no §4.2.7.9.1 LTP synthesis
-filter, no CELT band machinery yet.**
++ §4.2.7.8.6 LCG-driven reconstruction) + §4.2.7.9.1 LTP synthesis
+filter (voiced 5-tap Q7 LTP convolution + out[]/lpc[] rewhitening
+with the §4.2.7.9.1 LSF-interpolation-split branch; unvoiced `res[i]
+= e_Q23[i]/2^23` normalised copy) + §4.2.7.9.2 LPC synthesis filter
+(per-subframe short-term predictor with `d_LPC` history carry-over
+and `out[i] = clamp(-1, lpc[i], 1)`); no CELT band machinery yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -651,11 +653,74 @@ and a no-panic sweep over {NB, MB, WB} × {10 ms, 20 ms} asserting the
 clamp post-condition and the d_LPC history length.
 
 The §4.2.7.9.1 LTP synthesis filter that produces `res[i]` for voiced
-frames remains to come — for unvoiced subframes this stage can already
-be driven directly off `e_Q23[i] / 2^23` per the §4.2.7.9.1 wording.
-The CELT band machinery and the §5 encoder pipeline are also still
-ahead; the higher-level encode / decode entry points still return
-`Error::NotImplemented`.
+frames is now wired up — see round 16 below. The CELT band machinery
+and the §5 encoder pipeline are still ahead; the higher-level encode /
+decode entry points still return `Error::NotImplemented`.
+
+Round 16 (2026-05-25) lands the §4.2.7.9.1 SILK LTP synthesis filter
+behind a new `ltp_synthesis_subframe` / `ltp_synth_commit_subframe` /
+`LtpSynthState` API. Two regimes per the spec:
+
+* **Unvoiced** (`signal_type != Voiced`). The LPC residual is just a
+  normalised copy of the §4.2.7.8 excitation:
+  `res[i] = e_Q23[i] / 2^23`.
+* **Voiced**. The 5-tap Q7 LTP convolution is applied:
+  `res[i] = e_Q23[i]/2^23 + Σ_{k=0..4} res[i - pitch_lag + 2 - k] *
+  b_Q7[k] / 128`. The "prior res[]" values it reads come from
+  rewhitening the prior-subframe outputs through the current
+  subframe's LPC coefficients (because the coefficients may have
+  changed between subframes):
+
+  * **Region A** (out[] rewhiten, indices
+    `(j - pitch_lag - 2) <= i < out_end`):
+    `res[i] = 4 * LTP_scale_Q14 / gain_Q16 *
+    clamp(out[i] - Σ out[i-k-1] * a_Q12[k]/4096, -1, 1)`.
+  * **Region B** (lpc[] rewhiten, indices `out_end <= i < j`):
+    `res[i] = 65536 / gain_Q16 *
+    (lpc[i] - Σ lpc[i-k-1] * a_Q12[k]/4096)`.
+
+`out_end` and the effective `LTP_scale_Q14` follow the §4.2.7.9.1
+LSF-interpolation-split branch. For the third or fourth subframe of a
+20 ms SILK frame that used a `w_Q2 < 4` LSF interpolation, `out_end =
+j - (s-2) * n` and `LTP_scale_Q14 = 16384`; otherwise `out_end = j -
+s*n` and the §4.2.7.6.3 decoded scaling factor is used directly.
+
+`LtpSynthState` carries the spec-stated buffer sizes — 306 samples of
+`out[]` (WB max pitch 288 + d_LPC 16 + 2) and 256 samples of `lpc[]`
+(3 prior WB subframes 240 + d_LPC 16) — across subframes and across
+SILK frame boundaries; `reset()` clears both for the §4.5.2
+decoder-reset / uncoded-side-channel-frame paths, and `start_frame()`
+resets only the in-frame subframe counter without touching the
+cross-frame histories. The companion `ltp_synth_commit_subframe`
+pushes the §4.2.7.9.2 outputs back into the state once the LPC
+synthesis filter has run.
+
+Twenty-one new unit tests (319 lib tests total, up from 277 at
+round-15 close — actually 298 in the lib after re-counting; 21 new
+specifically): the constant table matches the §4.2.7.9.1 buffer-size
+paragraph (`LTP_OUT_HISTORY_MAX == 306`, `LTP_LPC_HISTORY_MAX == 256`,
+`LTP_SCALE_FRESH_Q14 == 16384`); `LtpSynthState::new` d_LPC routing
+(NB/MB = 10, WB = 16; SWB/FB rejected); zero-initialised and
+reset-zeroed histories + subframe-index; `start_frame()` preserves
+histories but clears the index; `push_subframe` keeps the most-recent
+samples at the tail and shifts older samples down; the unvoiced
+`res[i] = e_Q23[i]/2^23` identity (Wb 80-sample sweep); the Inactive
+signal type is treated as unvoiced; the four input-validation
+rejections (mismatched `e_q23` / `res_out` / `a_q12` lengths;
+mismatched state-vs-cfg bandwidth; out-of-range subframe index;
+non-positive pitch lag for voiced); the zero-history /
+zero-excitation / zero-b voiced-decode identity (output is zero); the
+voiced `b == 0` identity (LTP convolution drops out, residual is
+`e_Q23/2^23` regardless of prior history); the voiced `b_Q7[0] = 64`
+pitch-lookback algebra (rewhitening of an injected out[] sample
+matches `0.5 * 4*LTP_scale_Q14/gain_Q16 * out[j-14]`); the voiced
+`b_Q7[2] = 64` region-B (lpc[]) rewhiten algebra; the
+LSF-interpolation-split branch override at `subframe_index = 2` with
+`lsf_interp_used = true` (effective scale becomes
+`4*16384/65536 = 1.0` exactly); voiced-decode determinism (same
+inputs → same outputs); and a no-panic finite-output sweep across 3
+buffers × {NB, MB, WB} × {10 ms, 20 ms} × 4 subframes with histories
+committed back into state via `ltp_synth_commit_subframe`.
 
 ## Planned clean-room sources
 

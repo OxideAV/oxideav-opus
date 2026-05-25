@@ -6,6 +6,55 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 16 (2026-05-25):** RFC 6716 §4.2.7.9.1 SILK LTP
+  synthesis filter behind a new `ltp_synthesis_subframe` /
+  `ltp_synth_commit_subframe` / `LtpSynthState` / `LtpSynthSubframe`
+  API (`silk_ltp_synth` module). Two regimes:
+
+  * **Unvoiced** (`signal_type != Voiced`): `res[i] = e_Q23[i] / 2^23`
+    (a normalised copy of the §4.2.7.8 excitation).
+  * **Voiced**: 5-tap Q7 LTP convolution
+    `res[i] = e_Q23[i]/2^23 + Σ_{k=0..4} res[i - pitch_lag + 2 - k] *
+    b_Q7[k]/128`, where the "prior res[]" values come from rewhitening
+    the previous subframes' outputs through the current subframe's LPC
+    coefficients. Two rewhitening regions:
+    * Region A (out[] rewhiten, `(j - pitch_lag - 2) <= i < out_end`):
+      `res[i] = 4*LTP_scale_Q14/gain_Q16 * clamp(out[i] - Σ
+      out[i-k-1] * a_Q12[k]/4096, -1, 1)`.
+    * Region B (lpc[] rewhiten, `out_end <= i < j`):
+      `res[i] = 65536/gain_Q16 * (lpc[i] - Σ lpc[i-k-1] *
+      a_Q12[k]/4096)`.
+
+  `out_end` and the effective `LTP_scale_Q14` follow the §4.2.7.9.1
+  LSF-interpolation-split branch: third/fourth subframe of a 20 ms
+  SILK frame with `w_Q2 < 4` ⇒ `out_end = j - (s-2)*n` and
+  `LTP_scale_Q14 = 16384`; otherwise `out_end = j - s*n` and the
+  §4.2.7.6.3 decoded scaling factor is used.
+
+  `LtpSynthState` carries 306 samples of `out[]` history (`lag_max
+  288 + d_LPC 16 + 2`) and 256 samples of `lpc[]` history (`3 prior
+  WB subframes 240 + d_LPC 16`) — the buffer sizes called out in the
+  §4.2.7.9.1 paragraphs. `reset()` clears both for the §4.5.2
+  decoder-reset / uncoded-side-channel-frame paths;
+  `ltp_synth_commit_subframe` pushes the §4.2.7.9.2 outputs back into
+  the state for the next subframe's rewhitening.
+
+  Twenty-one new unit tests (298 lib tests total) cover the
+  spec-stated buffer-size constants, `LtpSynthState` d_LPC routing +
+  zero-init + reset + start_frame + push_subframe ordering, the
+  unvoiced normalised-excitation identity (NB / Wb sweeps with
+  Inactive and Unvoiced both routed to the unvoiced path), four
+  input-validation rejections (mismatched lengths, bandwidth, subframe
+  index, non-positive pitch lag), the voiced zero-history /
+  zero-excitation / zero-b identity, the voiced `b == 0` pass-through
+  identity, the voiced `b_Q7[0]` region-A pitch-lookback algebra
+  (`0.5 * 4*LTP_scale_Q14/gain_Q16 * out[j-14]`), the voiced `b_Q7[2]`
+  region-B (lpc[]) rewhiten algebra, the LSF-interpolation-split
+  override (effective scale becomes `4*16384/65536 = 1.0` exactly),
+  voiced-decode determinism, and a no-panic finite-output sweep across
+  3 buffers × {NB, MB, WB} × {10 ms, 20 ms} × 4 subframes with state
+  carried via `ltp_synth_commit_subframe`.
+
 * **Clean-room round 15 (2026-05-25):** RFC 6716 §4.2.7.9.2 SILK LPC
   synthesis filter behind a new `lpc_synthesis_subframe` /
   `lpc_synthesis_frame` / `LpcSynthState` API (`silk_lpc_synth` module).

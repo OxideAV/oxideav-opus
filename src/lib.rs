@@ -156,14 +156,26 @@
 //!   clamped output `out[i] = clamp(-1.0, lpc[i], 1.0)`; the per-subframe
 //!   `d_LPC` unclamped history is carried across subframes via the
 //!   stateful [`LpcSynthState`] (cleared to zero on a decoder reset).
-//!   The §4.2.7.9.1 LTP synthesis filter that produces `res[i]` for
-//!   voiced frames remains to come — for now this stage can be driven
-//!   directly off `e_Q23[i] / 2^23` for unvoiced subframes per the
-//!   §4.2.7.9.1 wording.
 //!
-//! The CELT layer and the §4.2.7.9.1 LTP synthesis filter are not yet
-//! wired up; the [`Decoder`] / [`Encoder`] entry points still return
-//! [`Error::NotImplemented`].
+//! * Round 16 lands the §4.2.7.9.1 SILK LTP synthesis filter
+//!   ([`ltp_synthesis_subframe`] / [`ltp_synth_commit_subframe`] /
+//!   [`LtpSynthState`]). Unvoiced subframes produce `res[i] = e_Q23[i] /
+//!   2^23` (a normalised excitation copy). Voiced subframes go through the
+//!   §4.2.7.6 5-tap Q7 LTP convolution `res[i] = e_Q23[i]/2^23 + Σ
+//!   res[i - pitch_lag + 2 - k] * b_Q7[k]/128`, with the prior-subframe
+//!   `out[]` history rewhitened via `4*LTP_scale_Q14/gain_Q16 *
+//!   clamp(out[i] - Σ out[i-k-1] * a_Q12[k]/4096, -1, 1)` (region A) and
+//!   the prior-subframe unclamped `lpc[]` rewhitened via `65536/gain_Q16 *
+//!   (lpc[i] - Σ lpc[i-k-1] * a_Q12[k]/4096)` (region B). `out_end` and
+//!   the effective `LTP_scale_Q14` (= 16384 fresh-LPC override) follow the
+//!   §4.2.7.9.1 third/fourth-subframe LSF-interpolation-split branch. The
+//!   stateful [`LtpSynthState`] carries 306 samples of out[] and 256
+//!   samples of lpc[] history (the spec-stated WB worst cases) across
+//!   subframes and across SILK frame boundaries, cleared to zero on a
+//!   decoder reset per §4.5.2.
+//!
+//! The CELT layer is not yet wired up; the [`Decoder`] / [`Encoder`]
+//! entry points still return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -222,6 +234,7 @@ pub mod silk_lsf_stabilize;
 pub mod silk_lsf_stage2;
 pub mod silk_lsf_to_lpc;
 pub mod silk_ltp;
+pub mod silk_ltp_synth;
 pub mod toc;
 
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
@@ -250,6 +263,10 @@ pub use silk_lsf_to_lpc::{nlsf_to_c_q17, ordering, LpcQ12, LpcQ17};
 pub use silk_ltp::{
     LagCoding, LtpConfig, LtpParameters, LTP_FILTER_TAPS, LTP_MAX_SUBFRAMES,
     LTP_SCALING_DEFAULT_Q14,
+};
+pub use silk_ltp_synth::{
+    ltp_synth_commit_subframe, ltp_synthesis_subframe, LtpSynthState, LtpSynthSubframe,
+    LTP_LPC_HISTORY_MAX, LTP_MAX_PITCH_LAG, LTP_OUT_HISTORY_MAX, LTP_SCALE_FRESH_Q14,
 };
 pub use toc::{Bandwidth, ChannelMapping, FrameCountCode, Mode, OpusTocByte};
 
