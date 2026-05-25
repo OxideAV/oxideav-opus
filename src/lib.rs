@@ -191,6 +191,22 @@
 //!   carry across the frame boundary via [`StereoUnmixState`], cleared
 //!   to zero on a decoder reset per §4.2.8.
 //!
+//! * Round 18 lands the §4.2.3 SILK packet-level header bits and the
+//!   §4.2.4 per-frame LBRR flags ([`SilkHeaderBits`] / [`silk_frame_count`]).
+//!   For each channel (mono: 1; stereo: 2), the decoder reads N uniform
+//!   `dec_bit_logp(1)` VAD bits (N = SILK-frame count from §4.2.2: 1 for
+//!   10/20 ms Opus frames, 2 for 40 ms, 3 for 60 ms) followed by a single
+//!   global LBRR flag. For Opus frames longer than 20 ms, each channel
+//!   whose global LBRR flag is set then contributes one Table 4 symbol
+//!   (`{0, 53, 53, 150}/256` for 40 ms / `{0, 41, 20, 29, 41, 15, 28,
+//!   82}/256` for 60 ms) carrying a per-SILK-frame LBRR bitmap, packed
+//!   LSB-to-MSB. For 10/20 ms Opus frames the global LBRR flag itself
+//!   implies a single LBRR frame. Output is a [`SilkHeaderBits`]
+//!   carrying the per-channel VAD bitmap, global LBRR flag, and the
+//!   fully expanded per-channel × per-SILK-frame [`PerFrameLbrr`]
+//!   bitmap consumed by the downstream §4.2.5 LBRR / §4.2.6 regular
+//!   SILK frame loop.
+//!
 //! The CELT layer is not yet wired up; the [`Decoder`] / [`Encoder`]
 //! entry points still return [`Error::NotImplemented`].
 
@@ -243,6 +259,7 @@ pub mod range_decoder;
 pub mod silk_excitation;
 pub mod silk_frame;
 pub mod silk_gains;
+pub mod silk_header;
 pub mod silk_lcg_seed;
 pub mod silk_lpc_synth;
 pub mod silk_lsf_interp;
@@ -266,6 +283,10 @@ pub use silk_frame::{
     StereoPredictionWeights,
 };
 pub use silk_gains::{SubframeGain, SubframeGains, SubframeGainsConfig, SILK_MAX_SUBFRAMES};
+pub use silk_header::{
+    per_frame_lbrr_pdf, silk_frame_count, PerFrameLbrr, SilkChannelHeader, SilkHeaderBits,
+    SILK_MAX_FRAMES_PER_CHANNEL,
+};
 pub use silk_lcg_seed::decode_lcg_seed;
 pub use silk_lpc_synth::{
     lpc_synthesis_frame, lpc_synthesis_subframe, subframe_samples, LpcSynthState,

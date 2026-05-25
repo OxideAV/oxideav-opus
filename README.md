@@ -2,9 +2,11 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-25 (clean-room round 17)
+## Status — 2026-05-26 (clean-room round 18)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
+§4.2.3 SILK header bits (VAD + LBRR flag per channel) + §4.2.4
+per-frame LBRR flags (Table 4 PDFs at 40/60 ms) +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
 gains + §4.2.7.5.2 LSF Stage-2 residual + §4.2.7.5.3 NLSF
 reconstruction + §4.2.7.5.4 NLSF stabilization + §4.2.7.5.5 NLSF
@@ -758,6 +760,49 @@ reconstruction (coded side, fresh history); phase-1 ramp endpoints
 (effective `w1` at samples 1, `n1`, and the steady region); mid-history
 carry across two frames; side-history carry across two frames; and
 output clamping under oversized weights.
+
+Round 18 (2026-05-26) lands the RFC 6716 §4.2.3 SILK packet-level
+header bits and the §4.2.4 per-frame LBRR flags behind a new
+`SilkHeaderBits` / `SilkChannelHeader` / `PerFrameLbrr` API
+(`silk_header` module). The decoder reads, in §4.2.2 Figures 15/16
+order:
+
+* For each channel (mono: 1; stereo: 2), `N` uniform-binary VAD bits
+  followed by a single global LBRR flag — all via
+  `RangeDecoder::dec_bit_logp(1)`. `N = silk_frame_count(frame_size)`
+  per §4.2.2 (1 for 10/20 ms Opus frames, 2 for 40 ms, 3 for 60 ms).
+* For Opus frames longer than 20 ms (`N >= 2`), one §4.2.4 per-frame
+  LBRR symbol per channel whose global LBRR flag is set. The Table 4
+  PDFs are `{0, 53, 53, 150}/256` (40 ms) and
+  `{0, 41, 20, 29, 41, 15, 28, 82}/256` (60 ms). Both have a leading
+  zero entry: per §4.1.3.3 the iCDF drops that entry
+  (`PER_FRAME_LBRR_{40MS,60MS}_ICDF`) and the helper adds an offset of
+  1, producing a 2- or 3-bit bitmap with at least one bit set, packed
+  LSB-to-MSB so bit `i` is the LBRR flag for SILK frame `i`.
+
+For 10/20 ms Opus frames the per-frame LBRR bitmap mirrors the global
+LBRR flag without consuming any extra bits — per §4.2.4 "the global
+LBRR flag in the header bits is already sufficient to indicate the
+presence of that single LBRR frame".
+
+The output records each channel's VAD bitmap, the global LBRR flag,
+and a fully-expanded `PerFrameLbrr { mid, side }` bitmap consumed by
+the (forthcoming) §4.2.5 LBRR / §4.2.6 regular SILK loop.
+
+Fourteen new unit tests (321 lib tests total, up from 307 at round-17
+close): the Table 4 PDF/iCDF transcription self-checks (40 ms and
+60 ms, including strictly-decreasing + terminator-zero invariants);
+the `per_frame_lbrr_pdf` dispatch fallback; the `silk_frame_count`
+§4.2.2 dispatch including the CELT-only 2.5/5 ms `None` arm; a 10 ms
+mono decode that consumes exactly 2 bits; a 60 ms stereo decode that
+populates all 3-bit VAD + LBRR bitmaps within range; rejection of
+`num_silk_frames ∉ {1, 2, 3}`; the §4.2.3-implied per-frame LBRR
+mirror on 10 ms with the global flag set (verifying no extra symbol
+is consumed); the §4.2.4 skip path on 60 ms when both global LBRR
+flags are unset (verifying exactly 8 bits are consumed); the VAD /
+LBRR bitmap accessors for present-side and missing-side cases; and
+exhaustive 40 ms / 60 ms `decode_per_frame_lbrr` symbol-range sweeps
+plus a 60 ms full-coverage sweep over `{1..=7}`.
 
 ## Planned clean-room sources
 

@@ -6,6 +6,45 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 18 (2026-05-26):** RFC 6716 §4.2.3 SILK
+  packet-level header bits and §4.2.4 per-frame LBRR flags behind a
+  new `SilkHeaderBits` / `SilkChannelHeader` / `PerFrameLbrr` /
+  `silk_frame_count` API (`silk_header` module). The decoder reads
+  the §4.2.2 Figures 15/16 prefix:
+
+  * Per channel (mono: 1; stereo: 2): `N` uniform-binary VAD bits
+    plus one global LBRR flag via `RangeDecoder::dec_bit_logp(1)`,
+    where `N` is the SILK-frame count from §4.2.2 (1 for 10/20 ms
+    Opus frames, 2 for 40 ms, 3 for 60 ms).
+  * For Opus frames > 20 ms with the channel's global LBRR flag set,
+    one §4.2.4 per-frame LBRR symbol from Table 4
+    (`{0, 53, 53, 150}/256` for 40 ms or
+    `{0, 41, 20, 29, 41, 15, 28, 82}/256` for 60 ms). Both PDFs have
+    a leading zero entry per §4.1.3.3, so the iCDF tables
+    (`PER_FRAME_LBRR_{40MS,60MS}_ICDF`) drop the leading zero and the
+    helper adds offset 1, producing a 2- or 3-bit LBRR bitmap packed
+    LSB-to-MSB (bit `i` ↔ SILK frame `i`).
+  * For Opus frames ≤ 20 ms the per-frame LBRR bitmap mirrors the
+    global LBRR flag without consuming any extra bits, per §4.2.4.
+
+  Output is a `SilkHeaderBits` with per-channel VAD bitmaps, global
+  LBRR flags, and a fully-expanded `PerFrameLbrr` bitmap for the
+  downstream §4.2.5 / §4.2.6 LBRR + regular SILK loop.
+
+  14 new module tests (321 lib tests total, up from 307): Table 4
+  PDF/iCDF transcription self-checks (40 ms + 60 ms, with
+  strictly-decreasing + terminator-zero invariants); `per_frame_lbrr_pdf`
+  dispatch fallback; `silk_frame_count` §4.2.2 dispatch including the
+  2.5/5 ms CELT-only `None` arm; mono 10 ms decode consumes exactly
+  2 bits; stereo 60 ms decode populates 3-bit bitmaps within range;
+  rejection of `num_silk_frames ∉ {1, 2, 3}`; the §4.2.3-implied
+  per-frame mirror on 10 ms with the global flag set (verifying no
+  extra symbol consumed); the §4.2.4 skip path on 60 ms with both
+  global flags unset (verifying exactly 8 bits consumed); VAD / LBRR
+  accessors for present-side and missing-side cases; exhaustive 40 ms
+  and 60 ms `decode_per_frame_lbrr` symbol-range sweeps plus a 60 ms
+  full-coverage sweep over `{1..=7}`.
+
 * **Clean-room round 17 (2026-05-25):** RFC 6716 §4.2.8 SILK stereo
   unmixing (`silk_stereo_MS_to_LR`) behind a new `stereo_ms_to_lr` /
   `StereoUnmixState` / `StereoWeightsQ13` / `StereoFrame` API
