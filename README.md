@@ -695,9 +695,8 @@ cross-frame histories. The companion `ltp_synth_commit_subframe`
 pushes the §4.2.7.9.2 outputs back into the state once the LPC
 synthesis filter has run.
 
-Twenty-one new unit tests (319 lib tests total, up from 277 at
-round-15 close — actually 298 in the lib after re-counting; 21 new
-specifically): the constant table matches the §4.2.7.9.1 buffer-size
+Twenty-one new unit tests (298 lib tests total, up from 277 at
+round-15 close): the constant table matches the §4.2.7.9.1 buffer-size
 paragraph (`LTP_OUT_HISTORY_MAX == 306`, `LTP_LPC_HISTORY_MAX == 256`,
 `LTP_SCALE_FRESH_Q14 == 16384`); `LtpSynthState::new` d_LPC routing
 (NB/MB = 10, WB = 16; SWB/FB rejected); zero-initialised and
