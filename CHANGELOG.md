@@ -6,6 +6,33 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 17 (2026-05-25):** RFC 6716 §4.2.8 SILK stereo
+  unmixing (`silk_stereo_MS_to_LR`) behind a new `stereo_ms_to_lr` /
+  `StereoUnmixState` / `StereoWeightsQ13` / `StereoFrame` API
+  (`silk_stereo` module). Converts the decoded mid/side `out[]` signals
+  into left/right:
+
+  * `p0 = (mid[i-2] + 2*mid[i-1] + mid[i]) / 4.0` is the low-passed,
+    one-sample-delayed mid term; the unfiltered mid is also delayed one
+    sample (`mid[i-1]`).
+  * `left[i] = clamp(-1.0, (1+w1)*mid[i-1] + side[i-1] + w0*p0, 1.0)`,
+    `right[i] = clamp(-1.0, (1-w1)*mid[i-1] - side[i-1] - w0*p0, 1.0)`.
+  * Phase 1 (first `n1` = 64 NB / 96 MB / 128 WB samples) interpolates
+    the §4.2.7.1 Q13 weights from the previous frame's
+    `(prev_w0_Q13, prev_w1_Q13)` to the current frame's; phase 2 uses
+    the current weights.
+  * An uncoded side channel (§4.2.7.2 mid-only flag) is treated as
+    all-zero.
+  * `StereoUnmixState` carries the two trailing mid samples, one
+    trailing side sample, and the previous-frame weights across the
+    frame boundary, cleared to zero on a decoder reset per §4.2.8.
+
+  9 module tests: the `interp_phase_samples` table, fresh/reset state,
+  empty/length validation, zero-weight delayed-mono collapse, a
+  hand-computed constant-weight mid/side reconstruction, phase-1 ramp
+  endpoints, mid- and side-history carry across frame boundaries, and
+  output clamping.
+
 * **Clean-room round 16 (2026-05-25):** RFC 6716 §4.2.7.9.1 SILK LTP
   synthesis filter behind a new `ltp_synthesis_subframe` /
   `ltp_synth_commit_subframe` / `LtpSynthState` / `LtpSynthSubframe`

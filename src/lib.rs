@@ -174,6 +174,23 @@
 //!   subframes and across SILK frame boundaries, cleared to zero on a
 //!   decoder reset per §4.5.2.
 //!
+//! * Round 17 lands the §4.2.8 SILK stereo unmixing
+//!   ([`stereo_ms_to_lr`] / [`StereoUnmixState`] / [`StereoWeightsQ13`] /
+//!   [`StereoFrame`]) — the `silk_stereo_MS_to_LR` conversion that turns
+//!   the decoded mid/side `out[]` signals into left/right. The side
+//!   channel is predicted from a low-passed mid term
+//!   (`p0 = (mid[i-2] + 2*mid[i-1] + mid[i]) / 4`) and the unfiltered
+//!   one-sample-delayed mid (`mid[i-1]`) via the §4.2.7.1 Q13 weights:
+//!   `left[i] = clamp(-1, (1+w1)*mid[i-1] + side[i-1] + w0*p0, 1)` and
+//!   `right[i] = clamp(-1, (1-w1)*mid[i-1] - side[i-1] - w0*p0, 1)`. The
+//!   first `n1` samples (64 NB / 96 MB / 128 WB) interpolate the weights
+//!   from the previous frame's `(prev_w0_Q13, prev_w1_Q13)` to the
+//!   current frame's; the remainder use the current weights. An uncoded
+//!   side channel (§4.2.7.2) is treated as all-zero. The two trailing
+//!   mid samples, one trailing side sample, and previous-frame weights
+//!   carry across the frame boundary via [`StereoUnmixState`], cleared
+//!   to zero on a decoder reset per §4.2.8.
+//!
 //! The CELT layer is not yet wired up; the [`Decoder`] / [`Encoder`]
 //! entry points still return [`Error::NotImplemented`].
 
@@ -235,6 +252,7 @@ pub mod silk_lsf_stage2;
 pub mod silk_lsf_to_lpc;
 pub mod silk_ltp;
 pub mod silk_ltp_synth;
+pub mod silk_stereo;
 pub mod toc;
 
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
@@ -267,6 +285,9 @@ pub use silk_ltp::{
 pub use silk_ltp_synth::{
     ltp_synth_commit_subframe, ltp_synthesis_subframe, LtpSynthState, LtpSynthSubframe,
     LTP_LPC_HISTORY_MAX, LTP_MAX_PITCH_LAG, LTP_OUT_HISTORY_MAX, LTP_SCALE_FRESH_Q14,
+};
+pub use silk_stereo::{
+    interp_phase_samples, stereo_ms_to_lr, StereoFrame, StereoUnmixState, StereoWeightsQ13,
 };
 pub use toc::{Bandwidth, ChannelMapping, FrameCountCode, Mode, OpusTocByte};
 

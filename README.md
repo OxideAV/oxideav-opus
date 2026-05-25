@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-25 (clean-room round 16)
+## Status — 2026-05-25 (clean-room round 17)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
@@ -19,7 +19,10 @@ filter (voiced 5-tap Q7 LTP convolution + out[]/lpc[] rewhitening
 with the §4.2.7.9.1 LSF-interpolation-split branch; unvoiced `res[i]
 = e_Q23[i]/2^23` normalised copy) + §4.2.7.9.2 LPC synthesis filter
 (per-subframe short-term predictor with `d_LPC` history carry-over
-and `out[i] = clamp(-1, lpc[i], 1)`); no CELT band machinery yet.**
+and `out[i] = clamp(-1, lpc[i], 1)`) + §4.2.8 stereo unmixing
+(`silk_stereo_MS_to_LR`: low-passed `p0` + delayed mid + §4.2.7.1 Q13
+weights → clamped L/R, with 8 ms weight interpolation across frames);
+no CELT band machinery yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -720,6 +723,41 @@ LSF-interpolation-split branch override at `subframe_index = 2` with
 inputs → same outputs); and a no-panic finite-output sweep across 3
 buffers × {NB, MB, WB} × {10 ms, 20 ms} × 4 subframes with histories
 committed back into state via `ltp_synth_commit_subframe`.
+
+Round 17 (2026-05-25) lands the §4.2.8 SILK stereo unmixing
+(`silk_stereo_MS_to_LR`) behind a new `stereo_ms_to_lr` /
+`StereoUnmixState` / `StereoWeightsQ13` / `StereoFrame` API
+(`silk_stereo` module). After both stereo channels finish §4.2.7.9
+reconstruction, the mid/side `out[]` signals are converted to
+left/right. The side channel is predicted from a low-passed mid term
+`p0 = (mid[i-2] + 2*mid[i-1] + mid[i]) / 4` and the unfiltered,
+one-sample-delayed mid (`mid[i-1]`), using the §4.2.7.1 Q13 weights:
+
+```text
+ left[i] = clamp(-1.0, (1 + w1)*mid[i-1] + side[i-1] + w0*p0, 1.0)
+right[i] = clamp(-1.0, (1 - w1)*mid[i-1] - side[i-1] - w0*p0, 1.0)
+```
+
+The first `n1` samples (64 NB / 96 MB / 128 WB ≈ 8 ms) interpolate the
+weights linearly from the previous frame's `(prev_w0_Q13, prev_w1_Q13)`
+to the current frame's `(w0_Q13, w1_Q13)`; the rest of the frame uses
+the current weights (`min(i, n1)` clamps the ramp). An uncoded side
+channel (§4.2.7.2) is treated as all-zero. The two trailing mid
+samples, one trailing side sample, and the previous-frame weights are
+carried across the frame boundary by `StereoUnmixState`, cleared to
+zero on a decoder reset (`StereoUnmixState::reset`) per the §4.2.8
+closing paragraph. Per the §4.2.7.9 "does not need to be bit-exact"
+preamble, the stage runs in `f32`.
+
+Nine new unit tests (307 lib tests total, up from 298 at round-16
+close): the `interp_phase_samples` table (64/96/128; SWB/FB rejected);
+fresh/reset state zeroing; empty-mid and mismatched-side-length
+rejection; the zero-weight no-side collapse to delayed mono
+(`L = R = mid[i-1]`); a hand-computed constant-weight mid/side
+reconstruction (coded side, fresh history); phase-1 ramp endpoints
+(effective `w1` at samples 1, `n1`, and the steady region); mid-history
+carry across two frames; side-history carry across two frames; and
+output clamping under oversized weights.
 
 ## Planned clean-room sources
 
