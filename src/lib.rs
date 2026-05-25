@@ -191,6 +191,21 @@
 //!   carry across the frame boundary via [`StereoUnmixState`], cleared
 //!   to zero on a decoder reset per §4.2.8.
 //!
+//! * Round 19 lands the §4.2.9 SILK resampler delay budget and the
+//!   internal-vs-output sample-rate accounting ([`silk_resampler_delay_ms`] /
+//!   [`silk_resampler_delay_samples_at`] / [`silk_internal_rate_hz`] /
+//!   [`silk_frame_samples_internal`] / [`silk_frame_samples_at_output`] /
+//!   [`is_supported_output_rate`] / [`SUPPORTED_OUTPUT_RATES_HZ`]).
+//!   The §4.2.9 resampler itself is non-normative ("a decoder can use
+//!   any method it wants"); what IS normative is the Table 54 maximum
+//!   delay allocation (NB = 0.538 ms, MB = 0.692 ms, WB = 0.706 ms) so
+//!   the encoder can apply a matching pre-delay to keep SILK and CELT
+//!   aligned across a §4.5 mode switch. This module owns Table 54 plus
+//!   the implied SILK internal rates (NB = 8000 Hz, MB = 12000 Hz,
+//!   WB = 16000 Hz) and the §4.2.9 supported output rates (8 / 12 / 16 /
+//!   24 / 48 kHz). SWB and FB never reach the §4.2.9 SILK stage and are
+//!   rejected with `None`.
+//!
 //! * Round 18 lands the §4.2.3 SILK packet-level header bits and the
 //!   §4.2.4 per-frame LBRR flags ([`SilkHeaderBits`] / [`silk_frame_count`]).
 //!   For each channel (mono: 1; stereo: 2), the decoder reads N uniform
@@ -269,6 +284,7 @@ pub mod silk_lsf_stage2;
 pub mod silk_lsf_to_lpc;
 pub mod silk_ltp;
 pub mod silk_ltp_synth;
+pub mod silk_resampler;
 pub mod silk_stereo;
 pub mod toc;
 
@@ -306,6 +322,12 @@ pub use silk_ltp::{
 pub use silk_ltp_synth::{
     ltp_synth_commit_subframe, ltp_synthesis_subframe, LtpSynthState, LtpSynthSubframe,
     LTP_LPC_HISTORY_MAX, LTP_MAX_PITCH_LAG, LTP_OUT_HISTORY_MAX, LTP_SCALE_FRESH_Q14,
+};
+pub use silk_resampler::{
+    is_supported_output_rate, silk_frame_samples_at_output, silk_frame_samples_internal,
+    silk_internal_rate_hz, silk_resampler_delay_ms, silk_resampler_delay_samples_at,
+    REFERENCE_RATE_HZ, SILK_RESAMPLER_DELAY_MS_MB, SILK_RESAMPLER_DELAY_MS_NB,
+    SILK_RESAMPLER_DELAY_MS_WB, SUPPORTED_OUTPUT_RATES_HZ,
 };
 pub use silk_stereo::{
     interp_phase_samples, stereo_ms_to_lr, StereoFrame, StereoUnmixState, StereoWeightsQ13,

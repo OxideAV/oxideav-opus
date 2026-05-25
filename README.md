@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-26 (clean-room round 18)
+## Status — 2026-05-26 (clean-room round 19)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
 §4.2.3 SILK header bits (VAD + LBRR flag per channel) + §4.2.4
@@ -23,8 +23,10 @@ with the §4.2.7.9.1 LSF-interpolation-split branch; unvoiced `res[i]
 (per-subframe short-term predictor with `d_LPC` history carry-over
 and `out[i] = clamp(-1, lpc[i], 1)`) + §4.2.8 stereo unmixing
 (`silk_stereo_MS_to_LR`: low-passed `p0` + delayed mid + §4.2.7.1 Q13
-weights → clamped L/R, with 8 ms weight interpolation across frames);
-no CELT band machinery yet.**
+weights → clamped L/R, with 8 ms weight interpolation across frames) +
+§4.2.9 resampler delay budget (Table 54: NB = 0.538 ms, MB = 0.692 ms,
+WB = 0.706 ms; internal SILK rates 8/12/16 kHz; supported output rates
+8/12/16/24/48 kHz); no CELT band machinery yet.**
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
@@ -803,6 +805,53 @@ flags are unset (verifying exactly 8 bits are consumed); the VAD /
 LBRR bitmap accessors for present-side and missing-side cases; and
 exhaustive 40 ms / 60 ms `decode_per_frame_lbrr` symbol-range sweeps
 plus a 60 ms full-coverage sweep over `{1..=7}`.
+
+Round 19 (2026-05-26) lands the RFC 6716 §4.2.9 SILK resampler delay
+budget and the internal-vs-output sample-rate accounting behind a new
+`silk_resampler` module:
+
+* **Table 54 — normative delay allocation per SILK audio bandwidth.**
+  NB = 0.538 ms, MB = 0.692 ms, WB = 0.706 ms. The §4.2.9 resampler
+  itself is explicitly non-normative ("a decoder can use any method it
+  wants to perform the resampling"), but the delay budget is normative
+  so the encoder can apply a matching pre-delay to the MDCT layer and
+  keep SILK and CELT aligned across a §4.5 mode switch. `silk_resampler_delay_ms`
+  returns the bandwidth's delay in milliseconds; `silk_resampler_delay_samples_at`
+  scales it to a sample count at any output rate (round half away from
+  zero — §4.2.9 itself notes "it may not be possible to achieve exactly
+  these delays while using a whole number of input or output samples").
+  SWB and FB return `None`: they never reach the §4.2.9 SILK resampler.
+* **Internal SILK sample rate per bandwidth.** NB = 8 kHz, MB = 12 kHz,
+  WB = 16 kHz (implied by the §4.2.1 / §4.2.7.x decode pipeline; the
+  resampler bridges this to the application's chosen output rate).
+  `silk_internal_rate_hz` and `silk_frame_samples_internal` cover the
+  pre-resampler sample-count accounting (NB 20 ms = 160; MB 20 ms =
+  240; WB 20 ms = 320).
+* **§4.2.9 supported output rates.** 8 / 12 / 16 / 24 / 48 kHz, the
+  five rates "the reference implementation is able to resample to …
+  within or near this delay constraint". Exposed as
+  `SUPPORTED_OUTPUT_RATES_HZ` + `is_supported_output_rate`;
+  `REFERENCE_RATE_HZ` (= 48 kHz) marks the rate Table 54 anchors
+  against and the rate CELT operates at.
+* **Per-frame output sample count.** `silk_frame_samples_at_output`
+  returns the post-resampler sample count for one SILK frame at any
+  output rate (e.g. 480 samples at 48 kHz for any bandwidth × 10 ms;
+  960 for 20 ms). Sized so a caller can allocate the output buffer
+  without knowing the resampler kernel.
+
+Eighteen new unit tests (339 lib tests total, up from 321 at round-18
+close): Table 54 transcription self-checks and the SWB/FB exclusion;
+the strict NB < MB < WB monotonicity §4.2.9 explicitly motivates; the
+Table 54 expansion to 48 kHz samples (NB = 26, MB = 33, WB = 34) plus
+internal-rate samples and 24 kHz intermediate-rate samples; SWB / FB /
+zero-rate rejections on the delay-samples helper; the five §4.2.9
+supported output rates plus a sweep of unsupported rates (11.025 /
+22.05 / 32 / 44.1 / 96 kHz); the SILK internal rate per bandwidth and
+its membership in the §4.2.9 supported-output set; canonical
+per-frame sample counts at internal + output rates plus rejection of
+non-SILK durations (25 / 50 / 400 / 600 / 1234 tenths-ms); and a
+cross-check that the Table 54 delay is strictly less than one 10 ms
+SILK frame at every supported output rate × every SILK bandwidth.
 
 ## Planned clean-room sources
 

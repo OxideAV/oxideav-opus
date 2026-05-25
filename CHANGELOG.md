@@ -6,6 +6,46 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 19 (2026-05-26):** RFC 6716 §4.2.9 SILK resampler
+  delay budget and the internal-vs-output sample-rate accounting
+  behind a new `silk_resampler` module
+  (`silk_resampler_delay_ms` / `silk_resampler_delay_samples_at` /
+  `silk_internal_rate_hz` / `silk_frame_samples_internal` /
+  `silk_frame_samples_at_output` / `is_supported_output_rate` /
+  `SUPPORTED_OUTPUT_RATES_HZ` / `REFERENCE_RATE_HZ` plus the
+  `SILK_RESAMPLER_DELAY_MS_{NB,MB,WB}` constants).
+
+  * Table 54 normative delay allocation: NB = 0.538 ms, MB = 0.692 ms,
+    WB = 0.706 ms. The §4.2.9 resampler itself is non-normative ("a
+    decoder can use any method it wants to perform the resampling"),
+    but the delay budget is normative so the encoder can apply a
+    matching pre-delay and keep SILK/CELT aligned across a §4.5 mode
+    switch. SWB and FB never reach the §4.2.9 SILK stage and return
+    `None`.
+  * Internal SILK sample rates per bandwidth (NB = 8 kHz, MB = 12 kHz,
+    WB = 16 kHz) and per-frame sample-count accounting at both the
+    internal rate and any output rate. NB 20 ms = 160 internal samples
+    or 960 output samples at 48 kHz; MB 20 ms = 240 / 960; WB 20 ms =
+    320 / 960.
+  * The five §4.2.9 supported output rates (8 / 12 / 16 / 24 / 48 kHz),
+    the rates "the reference implementation is able to resample to …
+    within or near this delay constraint".
+  * Delay-samples helper rounds half away from zero per the §4.2.9
+    caveat that exact whole-sample delays may be unachievable at
+    arbitrary output rates.
+
+  18 new module tests (339 lib tests total, up from 321): Table 54
+  transcription + SWB/FB exclusion + strict NB < MB < WB monotonicity;
+  Table 54 expansion to 48 kHz samples (26 / 33 / 34) and the
+  internal-rate / 24 kHz intermediate-rate expansions; SWB / FB /
+  zero-rate rejections; the §4.2.9 supported-output-rate set plus a
+  sweep of unsupported rates; the SILK internal rate per bandwidth
+  and its membership in the supported-output set; canonical per-frame
+  sample counts at internal + output rates plus rejection of
+  non-SILK durations; and a cross-check that the Table 54 delay is
+  strictly less than one 10 ms SILK frame at every supported output
+  rate × every SILK bandwidth.
+
 * **Clean-room round 18 (2026-05-26):** RFC 6716 §4.2.3 SILK
   packet-level header bits and §4.2.4 per-frame LBRR flags behind a
   new `SilkHeaderBits` / `SilkChannelHeader` / `PerFrameLbrr` /
