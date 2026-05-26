@@ -2,9 +2,13 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-26 (clean-room round 20)
+## Status — 2026-05-27 (clean-room round 21)
 
-**Packet header + §3.2 frame-packing parser + §4.1 range decoder +
+**Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
+dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
+SILK internal bandwidth pinned to WB for Hybrid + §4.2.2 SILK-frame
+count + §4.2.4 per-frame LBRR-flag presence gate + channel-count
+multiplier) + §4.1 range decoder +
 §4.2.3 SILK header bits (VAD + LBRR flag per channel) + §4.2.4
 per-frame LBRR flags (Table 4 PDFs at 40/60 ms) +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
@@ -34,6 +38,50 @@ post-filter parameter group: logp=1 enable + `octave` uniform[0,6)
 `tapset` `{2,1,1}/4`, §4.3.1 `transient` `{7,1}/8`, §4.3.2.1 `intra`
 `{7,1}/8`); coarse energy / bit allocation / band loop still
 deferred.**
+
+## Round 21 — §3.1 / §4.2 framing dispatch (2026-05-27)
+
+Round 21 lands the framing dispatch (`framing` module:
+`OpusFrameRouting` / `OperatingMode` / `SilkBandwidth`) — the single
+pure-function lookup that turns an `OpusTocByte` into the
+per-Opus-frame routing decision a §4 decoder needs *before* it
+touches the range coder. This codifies the SILK / Hybrid / CELT-only
+dispatch logic, the §4.2 "Hybrid → SILK runs in WB regardless of TOC
+bandwidth" pin, the §4.2.2 SILK-frame count per channel (1 for
+10/20 ms, 2 for 40 ms, 3 for 60 ms), the §4.2.4 per-frame LBRR-flag
+presence gate (duration > 20 ms), and the channel-count multiplier
+for stereo — fields that were previously open-coded by every caller
+that constructed a SILK or CELT context.
+
+Concretely, `OpusFrameRouting::from_toc` is the dispatch entry point.
+For a 60 ms stereo SILK-only WB frame (config 11, s=1) it produces:
+`operating_mode = SilkOnly`, `silk_bandwidth = Some(Wb)`,
+`silk_frames_per_channel = Some(3)`, `channel_count() = 2`,
+`total_silk_frames() = 6`, `has_per_frame_lbrr_bits() = true`. For a
+20 ms stereo Hybrid SWB frame (config 13, s=1) it produces:
+`operating_mode = Hybrid`, `silk_bandwidth = Some(Wb)` (the §4.2 pin
+even though the TOC bandwidth is `Swb`), `silk_frames_per_channel =
+Some(1)`, `total_silk_frames() = 2`, `has_per_frame_lbrr_bits() =
+false`. For a 5 ms mono CELT-only NB frame (config 17, s=0):
+`operating_mode = CeltOnly`, `silk_bandwidth = None`,
+`silk_frames_per_channel = None`, `total_silk_frames() = 0`,
+`has_per_frame_lbrr_bits() = false`.
+
+Thirteen new unit tests cover the SILK-only Table 2 row-by-row
+expectations (12 cells × `(toc_bandwidth, frame_size, silk_bandwidth,
+silk_frames_per_channel)`), the Hybrid WB-pin (4 Hybrid configs × the
+SWB→WB / FB→WB downgrade), CELT-only frames sweep across mono / stereo
+(16 × 2 configs), the §4.2.4 per-frame LBRR gate against every Table 2
+cell (32 configs), the `total_silk_frames` formula across all 32 ×
+{mono, stereo}, a 60 ms stereo SILK-only worked example, the `c`-bit
+independence of the routing (the §3.2 frame-count code never affects
+the §4 dispatch), the channel-mapping pass-through for CELT-only, the
+`OperatingMode::from(Mode)` bijection, the `SilkBandwidth::to_bandwidth`
+lift, and the `silk_layer ⇔ silk_bandwidth.is_some() ⇔
+silk_frames_per_channel.is_some()` invariants across the entire Table 2
+grid.
+
+Total test count: 362 lib tests (was 349 after round 20).
 
 ## Round 20 — first CELT-layer fragment (2026-05-26)
 

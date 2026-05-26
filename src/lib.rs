@@ -238,6 +238,20 @@
 //!   table) / §4.3.3 bit allocation (#943, blocked on `cache_caps50`
 //!   + `LOG2_FRAC_TABLE`) sub-pieces.
 //!
+//! * Round 21 lands the §3.1 / §4.2 framing dispatch ([`OpusFrameRouting`]
+//!   / [`OperatingMode`] / [`SilkBandwidth`]) — the single
+//!   pure-function lookup that turns an [`OpusTocByte`] into the
+//!   per-Opus-frame routing decision a §4 decoder needs *before* it
+//!   touches the range coder: which layer(s) are present (SILK-only /
+//!   Hybrid / CELT-only), the SILK internal bandwidth (pinned to WB
+//!   for Hybrid per §4.2 even when the TOC bandwidth is SWB / FB), the
+//!   §4.2.2 SILK-frame count per channel (1 for 10/20 ms, 2 for 40 ms,
+//!   3 for 60 ms), the §4.2.4 per-frame LBRR-flag presence gate
+//!   (duration > 20 ms), and the channel-count multiplier for stereo.
+//!   Codifies the dispatch decision so downstream decoders consume one
+//!   `OpusFrameRouting` instead of open-coding the
+//!   `(mode, bandwidth, frame_size)` switch each time.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -287,6 +301,7 @@ impl std::error::Error for Error {}
 
 pub mod celt_header;
 pub mod frames;
+pub mod framing;
 pub mod range_decoder;
 pub mod silk_excitation;
 pub mod silk_frame;
@@ -307,6 +322,7 @@ pub mod toc;
 
 pub use celt_header::{CeltHeaderPrefix, CeltPostFilter};
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
+pub use framing::{OperatingMode, OpusFrameRouting, SilkBandwidth};
 pub use range_decoder::RangeDecoder;
 pub use silk_excitation::{
     quantization_offset_q23, shell_block_count, Excitation, ExcitationConfig, SilkFrameSize,

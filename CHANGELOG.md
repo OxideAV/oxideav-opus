@@ -6,6 +6,35 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 21 (2026-05-27):** §3.1 / §4.2 framing dispatch —
+  a new `framing` module exposing `OpusFrameRouting`, `OperatingMode`,
+  and `SilkBandwidth`. `OpusFrameRouting::from_toc` turns the parsed
+  `OpusTocByte` into the per-Opus-frame dispatch decision a §4 decoder
+  needs *before* it touches the range coder:
+
+  * `operating_mode` — SilkOnly / Hybrid / CeltOnly from §3.1 Table 2.
+  * `silk_layer` / `celt_layer` — which layers are present.
+  * `silk_bandwidth` — internal SILK bandwidth (NB / MB / WB), pinned
+    to WB for every Hybrid frame regardless of the TOC's SWB / FB per
+    RFC 6716 §4.2 first paragraph ("the LP layer itself still only runs
+    in WB").
+  * `silk_frames_per_channel` — §4.2.2 LP-layer organisation (1 for
+    10 / 20 ms Opus frames, 2 for 40 ms, 3 for 60 ms; `None` for
+    CELT-only).
+  * `total_silk_frames` — channel-count × per-channel SILK frames.
+  * `has_per_frame_lbrr_bits` — §4.2.4 duration gate (true for SILK-
+    bearing frames longer than 20 ms).
+
+  Thirteen new unit tests cover the SILK-only Table 2 row-by-row
+  expectations (12 cells), the Hybrid WB-pin, the CELT-only frames
+  sweep across mono/stereo, the §4.2.4 per-frame LBRR gate against
+  every Table 2 cell, the `total_silk_frames` formula across all 32
+  configs × {mono, stereo}, a 60 ms stereo SILK-only worked example,
+  the `c`-bit independence of the routing, the channel-mapping
+  pass-through, and the `silk_layer ⇔ silk_bandwidth.is_some() ⇔
+  silk_frames_per_channel.is_some()` invariants across the entire
+  Table 2 grid.
+
 * **Clean-room round 20 (2026-05-26):** first CELT-layer fragment —
   the RFC 6716 §4.3 / Table 56 pre-band header symbols behind a new
   `celt_header` module (`CeltHeaderPrefix` / `CeltPostFilter`).
