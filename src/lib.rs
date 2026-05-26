@@ -222,8 +222,24 @@
 //!   bitmap consumed by the downstream §4.2.5 LBRR / §4.2.6 regular
 //!   SILK frame loop.
 //!
-//! The CELT layer is not yet wired up; the [`Decoder`] / [`Encoder`]
-//! entry points still return [`Error::NotImplemented`].
+//! * Round 20 lands the first CELT-layer fragment ([`CeltHeaderPrefix`] /
+//!   [`CeltPostFilter`]) — the §4.3, Table 56 pre-band header symbols
+//!   that every CELT-bearing Opus frame opens with: `silence`
+//!   (`{32767, 1}/32768`), the §4.3.7.1 pitch post-filter parameter
+//!   group (logp=1 enable bit, then `octave` uniform[0,6), `period =
+//!   (16<<octave) + fine_pitch - 1` from `4+octave` raw bits bounded
+//!   to `15..=1022`, `gain` 3 raw bits ⇒ `G = 3*(gain_index+1)/32`,
+//!   `tapset` `{2,1,1}/4`), the §4.3.1 `transient` (`{7,1}/8`), and
+//!   the §4.3.2.1 `intra` (`{7,1}/8`) flag. When `silence` is set,
+//!   the rest of the prefix is force-defaulted per the §4.3
+//!   shortcut. This is the only Table-56 segment that fits between
+//!   the SILK pipeline already wired up and the §4.3.2.1 coarse
+//!   energy (#936, blocked on the Laplace decoder + `e_prob_model`
+//!   table) / §4.3.3 bit allocation (#943, blocked on `cache_caps50`
+//!   + `LOG2_FRAC_TABLE`) sub-pieces.
+//!
+//! The rest of the CELT layer is not yet wired up; the [`Decoder`]
+//! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -269,6 +285,7 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+pub mod celt_header;
 pub mod frames;
 pub mod range_decoder;
 pub mod silk_excitation;
@@ -288,6 +305,7 @@ pub mod silk_resampler;
 pub mod silk_stereo;
 pub mod toc;
 
+pub use celt_header::{CeltHeaderPrefix, CeltPostFilter};
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
 pub use range_decoder::RangeDecoder;
 pub use silk_excitation::{

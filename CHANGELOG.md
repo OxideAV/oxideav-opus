@@ -6,6 +6,41 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 20 (2026-05-26):** first CELT-layer fragment —
+  the RFC 6716 §4.3 / Table 56 pre-band header symbols behind a new
+  `celt_header` module (`CeltHeaderPrefix` / `CeltPostFilter`).
+
+  * `silence` — `dec_icdf` against the 2-entry `{32767, 1}/32768`
+    iCDF `[1, 0]` at ftb=15. When the flag fires the rest of the
+    CELT prefix is force-defaulted per the §4.3 shortcut (no
+    post-filter, no transient, no intra).
+  * §4.3.7.1 pitch post-filter parameter group: one `dec_bit_logp(1)`
+    enable bit, then on the enabled branch `octave` via
+    `dec_uint(6)` (uniform on `0..=5`), the `4 + octave` raw-bit
+    `fine_pitch` field through `dec_bits`, the §4.3.7.1 pitch-period
+    reconstruction `T = (16 << octave) + fine_pitch - 1` (bounded
+    `15..=1022`), the 3-bit `gain_index` raw field whose downstream
+    gain is `G = 3 * (gain_index + 1) / 32`, and the §4.3.7.1
+    `tapset` `{2, 1, 1}/4` iCDF `[2, 1, 0]` at ftb=2.
+  * §4.3.1 `transient` and §4.3.2.1 `intra` flags via
+    `dec_bit_logp(3)` (PDF `{7, 1}/8`).
+  * This is the only Table-56 segment that fits between the SILK
+    pipeline already wired up and the §4.3.2.1 coarse-energy
+    (Laplace decoder + `e_prob_model` table, gated on a docs gap)
+    / §4.3.3 bit allocation (`cache_caps50` + `LOG2_FRAC_TABLE`,
+    also gated on a docs gap) sub-pieces; the per-band `tf_change`
+    symbols (§4.3.1) live in the band loop and are decoded after
+    `coarse energy` per Table 56, so they're deferred as well.
+  * Ten new unit tests cover the iCDF transcription self-checks
+    (silence PDF sums to 32768, tapset PDF sums to 4), the pitch
+    period formula at the global minimum (15), maximum (1022), and
+    per-octave boundaries, an all-zero buffer (most-likely symbol
+    on every branch ⇒ no silence / no post-filter / no transient /
+    no intra), an all-ones buffer (every produced field stays in
+    its declared range), a `tell()`-advance proof, a 256-buffer
+    fuzz-style range sweep over the post-filter fields, and the
+    silence-shortcut post-condition.
+
 * **Clean-room round 19 (2026-05-26):** RFC 6716 §4.2.9 SILK resampler
   delay budget and the internal-vs-output sample-rate accounting
   behind a new `silk_resampler` module

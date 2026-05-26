@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-26 (clean-room round 19)
+## Status — 2026-05-26 (clean-room round 20)
 
 **Packet header + §3.2 frame-packing parser + §4.1 range decoder +
 §4.2.3 SILK header bits (VAD + LBRR flag per channel) + §4.2.4
@@ -26,7 +26,64 @@ and `out[i] = clamp(-1, lpc[i], 1)`) + §4.2.8 stereo unmixing
 weights → clamped L/R, with 8 ms weight interpolation across frames) +
 §4.2.9 resampler delay budget (Table 54: NB = 0.538 ms, MB = 0.692 ms,
 WB = 0.706 ms; internal SILK rates 8/12/16 kHz; supported output rates
-8/12/16/24/48 kHz); no CELT band machinery yet.**
+8/12/16/24/48 kHz) + first CELT-layer fragment: §4.3 Table 56
+pre-band header symbols (`silence` `{32767, 1}/32768`, §4.3.7.1
+post-filter parameter group: logp=1 enable + `octave` uniform[0,6)
++ `period = (16<<octave) + fine_pitch - 1` from `4+octave` raw bits
+∈ `15..=1022` + `gain` 3 raw bits → `G = 3*(gain_index+1)/32` +
+`tapset` `{2,1,1}/4`, §4.3.1 `transient` `{7,1}/8`, §4.3.2.1 `intra`
+`{7,1}/8`); coarse energy / bit allocation / band loop still
+deferred.**
+
+## Round 20 — first CELT-layer fragment (2026-05-26)
+
+Round 20 lands the §4.3 / Table 56 pre-band header symbols every
+CELT-bearing Opus frame opens with, behind a new `celt_header`
+module exposing `CeltHeaderPrefix` / `CeltPostFilter`. These are
+the only Table-56 entries that fit between the SILK pipeline now
+wired up and the two known-blocked CELT sub-pieces (§4.3.2.1
+coarse energy, gated on the Laplace decoder + `e_prob_model`
+table; §4.3.3 bit allocation, gated on `cache_caps50` +
+`LOG2_FRAC_TABLE`). The per-band `tf_change` flags (§4.3.1) live
+in the band loop after coarse energy per Table 56, so they're
+deferred as well.
+
+The decode order encoded by `CeltHeaderPrefix::decode` mirrors
+Table 56: `silence` via the 2-entry `{32767, 1}/32768` iCDF
+(short-circuits the rest of the prefix when set); `post-filter`
+via `dec_bit_logp(1)` (logp=1, PDF `{1, 1}/2`); if post-filter is
+enabled, the §4.3.7.1 four-parameter group — `octave` via
+`dec_uint(6)` (uniform on `0..=5`), `fine_pitch` via
+`dec_bits(4 + octave)` (at most 9 raw bits), the §4.3.7.1 pitch
+period reconstruction `T = (16 << octave) + fine_pitch - 1`
+(global bounds `15..=1022`; per-octave lower bounds
+`{15, 31, 63, 127, 255, 511}` and per-octave upper bounds
+`{30, 62, 126, 254, 510, 1022}`), `gain_index` via `dec_bits(3)`
+(downstream gain `G = 3 * (gain_index + 1) / 32`), and `tapset`
+via the §4.3.7.1 `{2, 1, 1}/4` iCDF — and finally `transient`
+(§4.3.1) and `intra` (§4.3.2.1), both as `dec_bit_logp(3)` (PDF
+`{7, 1}/8`).
+
+Ten new unit tests cover the iCDF transcription self-checks
+(silence PDF sums to 32768, tapset PDF sums to 4, both iCDF
+arrays terminate at zero and decrease monotonically), the pitch
+period formula at the global minimum (15), the global maximum
+(1022), the lower bound of each octave (`fine_pitch = 0`), and
+the upper bound of each octave (`fine_pitch = (1 << (4+k)) - 1`),
+an all-zero buffer where every most-likely-symbol branch fires
+(no silence / no post-filter / no transient / no intra), an
+all-ones buffer where every produced field still stays in its
+declared range, a `tell()`-advance proof, a 256-buffer
+fuzz-style range sweep over the post-filter fields, and the
+silence-shortcut post-condition.
+
+Total test count: 349 lib tests across SILK + CELT-header (was
+339 after round 19).
+
+The §4.3.4 PVQ shape decoder, §4.3.5 anti-collapse, §4.3.6
+denormalization, and the §4.3.7 inverse MDCT plus its
+post-filter application all remain ahead, sitting behind the
+two §4.3.2.1 / §4.3.3 blockers above.
 
 The prior implementation was retired under the workspace clean-room
 policy: provenance for several core modules could not be defended
