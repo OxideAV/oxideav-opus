@@ -6,6 +6,26 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 22 (2026-05-27):** §3.4 R1..R7 malformed-input
+  rejection audit — a dedicated integration-level test file
+  (`tests/malformed_input.rs`, 20 tests) that pins every concrete
+  failure mode RFC 6716 §3.4 enumerates for a malformed packet, plus
+  property-style sweeps proving the §4.2.3 / §4.2.4 SILK header
+  decoder is panic-free on any truncation of a previously-valid
+  bitstream (§4.1.4 zero-extension contract). Covers R1 (empty
+  packet), R2 (frame > 1275 B for codes 0 and 1, plus the §3.2.1
+  boundary at 1275 B), R3 (code-1 odd body length), R4 (code-2
+  length-byte truncations + length > remaining + DTX boundary), R5
+  (`M = 0` + `M > 48` rejection), R6 (CBR `R % M != 0`), R7 (VBR
+  declared length overrun), §3.2.5 padding-chain pathologies, TOC
+  total-function self-consistency, §4.2.3 / §4.2.4 truncation
+  panic-freeness across `(num_silk_frames, stereo)` × prefix-length
+  1..=32, §4.2.4 LBRR-bitmap-never-zero invariant for 40 / 60 ms,
+  mono channel never emits side state, parsed-frame slice
+  lifetimes, and a code × body-len short-packet panic sweep. Test
+  totals: 362 lib + 20 integration = 382 (was 362 lib + 0
+  integration after round 21).
+
 * **Clean-room round 21 (2026-05-27):** §3.1 / §4.2 framing dispatch —
   a new `framing` module exposing `OpusFrameRouting`, `OperatingMode`,
   and `SilkBandwidth`. `OpusFrameRouting::from_toc` turns the parsed

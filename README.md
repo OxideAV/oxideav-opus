@@ -2,13 +2,17 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-27 (clean-room round 21)
+## Status — 2026-05-27 (clean-room round 22)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
 SILK internal bandwidth pinned to WB for Hybrid + §4.2.2 SILK-frame
 count + §4.2.4 per-frame LBRR-flag presence gate + channel-count
-multiplier) + §4.1 range decoder +
+multiplier) + §3.4 R1..R7 malformed-input rejection audit
+(`tests/malformed_input.rs`: 20 integration tests sweeping every
+R1..R7 violation shape + TOC-byte total-function determinism +
+§4.2.3 / §4.2.4 SILK-header truncation safety property) + §4.1
+range decoder +
 §4.2.3 SILK header bits (VAD + LBRR flag per channel) + §4.2.4
 per-frame LBRR flags (Table 4 PDFs at 40/60 ms) +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
@@ -38,6 +42,73 @@ post-filter parameter group: logp=1 enable + `octave` uniform[0,6)
 `tapset` `{2,1,1}/4`, §4.3.1 `transient` `{7,1}/8`, §4.3.2.1 `intra`
 `{7,1}/8`); coarse energy / bit allocation / band loop still
 deferred.**
+
+## Round 22 — §3.4 R1..R7 malformed-input rejection audit (2026-05-27)
+
+Round 22 lands a dedicated integration-level malformed-input audit
+(`tests/malformed_input.rs`, 20 tests) that pins the §3.4
+requirements R1..R7 rejection behaviour to a per-requirement set of
+property-style sweeps. This is the audit-grade evidence — for both
+fuzz tooling and a future Auditor pass — that the §3.2 frame-packing
+parser rejects every concrete malformed shape RFC 6716 §3.4
+enumerates, and that the §4.2.3 / §4.2.4 SILK header decoder is
+panic-free on any truncation of a previously-valid bitstream.
+
+Coverage:
+
+* **R1** — empty-packet rejection (`OpusPacket::parse(&[]) =>
+  EmptyPacket`).
+* **R2** — implicit frame length capped at `MAX_FRAME_BYTES = 1275`:
+  code 0 with 1276 B body rejects; 1275 B accepts (boundary); code 1
+  with 2552 B body (two 1276 B halves) rejects; 2550 B accepts; code
+  3 VBR boundary at 1275 B accepts.
+* **R3** — code-1 packets with odd body length (i.e. even `N`)
+  rejected, sweeping body_len ∈ 0..=8.
+* **R4** — code-2 packets across three failure shapes: missing
+  length byte, missing second length byte for first ∈ 252..=255, and
+  declared length > remaining; plus the §3.2.1 DTX boundary where
+  declared length equals remaining (second frame is zero-length).
+* **R5** — code-3 `M=0` rejected; `M ∈ 1..=48` with zero R/M
+  accepted; `M > 48` rejected by the high-bit constraint
+  (`MAX_FRAMES_PER_PACKET = 48`).
+* **R6** — code-3 CBR where R is not a multiple of M (R=7, M=3)
+  rejected; R=6, M=3 (R/M=2) accepted (boundary).
+* **R7** — code-3 VBR declared lengths overrunning remaining
+  rejected; declared=5, M=2 with 15 body bytes accepted (boundary,
+  final frame = 10 B).
+* **§3.2.5 padding chain** — missing padding-length byte rejected;
+  padding > remaining rejected; unterminated 255-chain rejected.
+* **TOC determinism** — every `u8` parses to a self-consistent TOC
+  byte; `frame_size_tenths_ms` is always in `{25, 50, 100, 200, 400,
+  600}` (Table 2).
+* **§4.2.3 / §4.2.4 truncation safety** — for every
+  `(num_silk_frames, stereo) ∈ {1, 2, 3} × {false, true}`,
+  truncating a 32-byte buffer to every prefix length 1..=32 never
+  panics; the returned `SilkHeaderBits` always has zero high-order
+  bits beyond `num_silk_frames`. The §4.1.4 RangeDecoder
+  zero-extension rule makes this provably safe — the test pins the
+  contract.
+* **§4.2.4 PDF bounds** — `decode_per_frame_lbrr` always returns a
+  value in `{1..=2^N - 1}` for any input, never `0`, by way of the
+  §4.1.3.3 leading-zero offset.
+* **Mono-only safety** — `SilkHeaderBits::decode(..., stereo=false)`
+  never emits `Some(side)` or a non-zero `side` LBRR bitmap (swept
+  across all 256 byte-0 starts × 3 frame counts).
+* **Slice lifetimes** — frames returned by a successful parse all
+  point inside the input buffer's bounds.
+* **Pathological short-packet sweep** — every `(c, body_len)` shape
+  from 0..=12 bytes × five different filler patterns runs without
+  panicking.
+
+Total test count: 362 lib tests + 20 integration tests = 382 tests
+(was 362 lib + 0 integration after round 21).
+
+The audit caught one real shape that would otherwise have been
+unspecified in the test suite: `M ∈ 49..=63` (reachable from the
+6-bit `M` field but disallowed by R5's "120 ms / 2.5 ms = 48" cap)
+must be rejected — the existing parser already does so via
+`MAX_FRAMES_PER_PACKET`, but the test now pins the behaviour
+explicitly.
 
 ## Round 21 — §3.1 / §4.2 framing dispatch (2026-05-27)
 
