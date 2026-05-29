@@ -6,6 +6,55 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 24 (2026-05-29):** §4.3 CELT MDCT-band layout —
+  a new `celt_band_layout` module owning RFC 6716 Table 55 (the
+  21-band partition with per-band MDCT bin counts at 2.5 / 5 / 10 /
+  20 ms and the `0..=20000 Hz` band-edge frequencies) and the §4.3
+  "first 17 bands (up to 8 kHz) are not coded in Hybrid mode" rule.
+  Exposes `CeltFrameSize` (the four CELT frame-size variants whose
+  `repr(u8)` discriminants double as Table 55 column index `0..=3`,
+  plus `from_frame_tenths_ms` / `to_frame_tenths_ms`),
+  `celt_band_bins_per_channel(band, fs) -> Option<u16>`,
+  `celt_band_start_hz(b)` / `celt_band_stop_hz(b)` band edges,
+  `celt_band_at_hz(hz) -> Option<usize>` reverse lookup,
+  `celt_first_coded_band(is_hybrid)` / `celt_end_coded_band()`
+  iterator bounds, `celt_total_bins_per_channel(fs, is_hybrid)`
+  column-sum helper, and named constants `CELT_NUM_BANDS = 21`,
+  `HYBRID_FIRST_CODED_BAND = 17`, `CELT_MAX_BINS_PER_BAND = 176`.
+  The "Custom" mode of §6.2 is explicitly out of scope.
+
+  This is the layout the deferred §4.3.2 coarse-energy decoder,
+  §4.3.3 bit allocator, §4.3.4 PVQ shape decoder, §4.3.6
+  denormalisation, and §4.3.7 inverse MDCT all need before any band
+  loop can iterate.
+
+  Twenty new module tests (401 lib tests total, up from 381 at
+  round-23 close; 20 integration tests unchanged) cover: full-band
+  start / stop pin (band 0 starts at 0 Hz, band 20 stops at 20 kHz);
+  adjacent bands tile without gaps (`stop(b) == start(b + 1)` for
+  every `b ∈ 0..=19`); positive band widths everywhere; the
+  power-of-two column-scaling invariant (`column(c) == 1 << c *
+  column(0)` per band); every cell `∈ [1, 176]` per the §4.3 prose;
+  hand-pinned Table 55 cells at bands 0 / 8 / 12 / 15 / 17 / 20;
+  band-edge spot pins at start, the §4.3 Hybrid boundary
+  (`stop(16) = 8000` = `start(17)`), and tail (`stop(20) = 20000`);
+  out-of-range band index returns `None`;
+  `CeltFrameSize::from_frame_tenths_ms` round-trip with explicit
+  SILK-only rejection (400 / 600 ms); discriminant-vs-column-index
+  agreement; the Hybrid-vs-CELT-only first-coded-band split with the
+  8 kHz boundary pin; `celt_total_bins_per_channel` column-sum
+  agreement against an independent iterator sum for each mode; strict
+  `hybrid_total < celt_only_total` invariant; pinned CELT-only column
+  sums (100 / 200 / 400 / 800) and Hybrid column sums (60 / 120 /
+  240 / 480); `celt_band_at_hz` round-trip against the band-edge
+  triple (start, midpoint, `stop - 1` all land on the same band);
+  `>= 20 kHz` rejection of `celt_band_at_hz`;
+  `celt_band_at_hz(8000) == 17` lining up with
+  `HYBRID_FIRST_CODED_BAND`; multiple-of-200-Hz band-width
+  invariant with three pinned widths (200 Hz for band 0, 400 Hz for
+  band 8, 4400 Hz for band 20); `CELT_MAX_BINS_PER_BAND == max(every
+  cell)`.
+
 * **Clean-room round 23 (2026-05-29):** §4.2.7.4 SILK gain
   dequantization tail — a new `silk_log2lin` module exposing
   `silk_log2lin` (the spec's piecewise-linear approximation of

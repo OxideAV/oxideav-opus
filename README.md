@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-29 (clean-room round 23)
+## Status — 2026-05-29 (clean-room round 24)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
@@ -42,8 +42,88 @@ post-filter parameter group: logp=1 enable + `octave` uniform[0,6)
 + `period = (16<<octave) + fine_pitch - 1` from `4+octave` raw bits
 ∈ `15..=1022` + `gain` 3 raw bits → `G = 3*(gain_index+1)/32` +
 `tapset` `{2,1,1}/4`, §4.3.1 `transient` `{7,1}/8`, §4.3.2.1 `intra`
-`{7,1}/8`); coarse energy / bit allocation / band loop still
-deferred.**
+`{7,1}/8`) + §4.3 Table 55 CELT MDCT-band layout
+(`celt_band_layout`: 21-band partition with `bins_per_channel` at
+2.5 / 5 / 10 / 20 ms, band-edge frequencies `0..=20000 Hz`,
+`celt_band_at_hz` reverse lookup, the §4.3 "first 17 bands not
+coded in Hybrid mode" rule baked into `celt_first_coded_band` /
+`HYBRID_FIRST_CODED_BAND = 17`, column-sum helper
+`celt_total_bins_per_channel`); coarse energy / bit allocation /
+PVQ shape / band loop still deferred.**
+
+## Round 24 — §4.3 Table 55 CELT MDCT-band layout (2026-05-29)
+
+Round 24 lands the §4.3 CELT MDCT-band layout (RFC 6716 §4.3 p. 103
+prose + Table 55 p. 104) behind a new `celt_band_layout` module.
+This is the second CELT-layer fragment, after round 20's Table 56
+pre-band header, and it sits below every CELT sub-decoder still ahead
+(§4.3.2 coarse energy, §4.3.3 bit allocator, §4.3.4 PVQ shape, §4.3.6
+denormalisation, §4.3.7 inverse MDCT) — they all iterate band-by-band
+and ask "how many MDCT bins in band `b` at this frame size?". The
+module owns:
+
+* `CeltFrameSize` — the four CELT frame sizes (2.5 / 5 / 10 / 20 ms)
+  as a `repr(u8)` enum whose discriminants double as the Table 55
+  "Bins:" column index (`0..=3`), with
+  `from_frame_tenths_ms(u32) -> Option<Self>` mapping the §3.1 TOC
+  byte's `frame_size_tenths_ms` for CELT-bearing Opus frames and
+  returning `None` for 40 / 60 ms SILK-only frames.
+* `celt_band_bins_per_channel(band, fs)` — the per-(band, frame-size)
+  Table 55 lookup (`1..=176` bins per channel, doubling across the
+  four columns), with `band >= CELT_NUM_BANDS` returning `None`.
+* `celt_band_start_hz(b)` / `celt_band_stop_hz(b)` — the band-boundary
+  frequencies from Table 55 (`0..=20000 Hz` in 200 Hz multiples), with
+  `stop(b) == start(b + 1)` and the convention `stop(20) == 20000`.
+* `celt_band_at_hz(hz)` — the reverse lookup that turns a frequency
+  in Hz into a `Some(band)` (lowest band whose `[start, stop)`
+  interval contains `hz`) or `None` at / above 20 kHz, matching the
+  CELT-only / Hybrid dispatch convention.
+* `celt_first_coded_band(is_hybrid)` / `HYBRID_FIRST_CODED_BAND = 17`
+  — the §4.3 "first 17 bands (up to 8 kHz) are not coded" rule for
+  Hybrid frames, with CELT-only frames starting at band 0.
+* `celt_total_bins_per_channel(fs, is_hybrid)` — the column-sum helper
+  that the §4.3.3 bit allocator and §4.3.4 PVQ shape decoder will both
+  want before the band loop starts. Pinned: 100 / 200 / 400 / 800 for
+  CELT-only at 2.5 / 5 / 10 / 20 ms; 60 / 120 / 240 / 480 for the
+  corresponding Hybrid column sums.
+* `CELT_NUM_BANDS = 21`, `HYBRID_FIRST_CODED_BAND = 17`,
+  `CELT_MAX_BINS_PER_BAND = 176` named constants.
+
+The "Custom" mode of §6.2 (which can use a different number of bands
+or different band edges) is explicitly out of scope and is documented
+as such in the module preamble; every constructor rejects the
+non-standard layouts.
+
+Twenty new module tests (401 lib tests total, up from 381 at round-23
+close; 20 integration tests unchanged) cover: the start / stop
+boundary of the table (`band 0` starts at 0 Hz, `band 20` stops at
+20 000 Hz), gap-free adjacent-band tiling (`stop(b) == start(b + 1)`
+for every `b ∈ 0..=19`), positive band widths everywhere, the
+power-of-two column-scaling invariant (`column(c) == 1 << c * column(0)`
+per band), every cell `∈ [1, 176]` per the §4.3 prose, hand-pinned
+spot cells (band 0, 8, 12, 15, 17, 20 across every column) and
+hand-pinned band edges (`start(0) = 0`, `stop(16) = 8000` =
+`start(17)`, `stop(20) = 20000`), out-of-range index returning `None`,
+the `CeltFrameSize::from_frame_tenths_ms` round-trip with explicit
+SILK-only rejection (`400` / `600` ms), discriminant-vs-column-index
+agreement, the Hybrid-vs-CELT-only first-coded-band split with the
+8 kHz boundary pin, the `celt_total_bins_per_channel` column-sum
+agreement against an independent `(0..21).sum()` for each mode, the
+strict `hybrid_total < celt_only_total` invariant, the four pinned
+CELT-only column sums (100 / 200 / 400 / 800) and four pinned Hybrid
+column sums (60 / 120 / 240 / 480), the `celt_band_at_hz` round-trip
+against the band-edge pair (start, midpoint, and `stop - 1` all land
+on the same band), the `>= 20 kHz` rejection of `celt_band_at_hz`,
+the `celt_band_at_hz(8000) == 17` pin matching
+`HYBRID_FIRST_CODED_BAND`, the multiple-of-200-Hz band-width
+invariant with three pinned widths (`200` Hz for band 0, `400` Hz
+for band 8, `4400` Hz for band 20), and the
+`CELT_MAX_BINS_PER_BAND == max(every cell)` pin.
+
+No external library source was consulted; every cell, every
+band-edge frequency, every constant, and the "first 17 bands not
+coded in Hybrid mode" rule comes directly from RFC 6716 §4.3 (p. 103
+prose + Table 55 p. 104).
 
 ## Round 23 — §4.2.7.4 SILK gain dequantization tail (2026-05-29)
 

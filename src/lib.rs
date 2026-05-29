@@ -263,6 +263,21 @@
 //!   25 728× linear) are pinned to the RFC text. The §4.2.7.5 NLSF
 //!   stages had been deferred since round 5; this round closes that gap.
 //!
+//! * Round 24 lands the §4.3 CELT MDCT-band layout
+//!   ([`celt_band_layout`]: [`CeltFrameSize`] + Table 55
+//!   `bins_per_channel` lookups via [`celt_band_bins_per_channel`] +
+//!   [`celt_band_start_hz`] / [`celt_band_stop_hz`] band-edge
+//!   accessors + [`celt_band_at_hz`] reverse lookup + the §4.3
+//!   "first 17 bands not coded in Hybrid mode" rule baked into
+//!   [`celt_first_coded_band`] / [`HYBRID_FIRST_CODED_BAND`] + the
+//!   [`celt_total_bins_per_channel`] column-sum helper). The standard
+//!   non-Custom CELT layer's [`CELT_NUM_BANDS`] = 21 bands and the
+//!   per-band MDCT bin counts at the four CELT frame sizes (2.5 / 5
+//!   / 10 / 20 ms) are the lookup every §4.3.2 coarse-energy decoder,
+//!   §4.3.3 bit allocator, §4.3.4 PVQ shape decoder, §4.3.6
+//!   denormaliser, and §4.3.7 inverse-MDCT pass needs before any
+//!   band-loop iteration can start.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -310,6 +325,7 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+pub mod celt_band_layout;
 pub mod celt_header;
 pub mod frames;
 pub mod framing;
@@ -332,6 +348,11 @@ pub mod silk_resampler;
 pub mod silk_stereo;
 pub mod toc;
 
+pub use celt_band_layout::{
+    celt_band_at_hz, celt_band_bins_per_channel, celt_band_start_hz, celt_band_stop_hz,
+    celt_end_coded_band, celt_first_coded_band, celt_total_bins_per_channel, CeltFrameSize,
+    CELT_MAX_BINS_PER_BAND, CELT_NUM_BANDS, HYBRID_FIRST_CODED_BAND,
+};
 pub use celt_header::{CeltHeaderPrefix, CeltPostFilter};
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
 pub use framing::{OperatingMode, OpusFrameRouting, SilkBandwidth};
