@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-27 (clean-room round 22)
+## Status — 2026-05-29 (clean-room round 23)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
@@ -16,7 +16,9 @@ range decoder +
 §4.2.3 SILK header bits (VAD + LBRR flag per channel) + §4.2.4
 per-frame LBRR flags (Table 4 PDFs at 40/60 ms) +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe
-gains + §4.2.7.5.2 LSF Stage-2 residual + §4.2.7.5.3 NLSF
+gains (log_gain decode + the §4.2.7.4 tail-end
+`gain_Q16 = silk_log2lin((0x1D1C71*log_gain >> 16) + 2090)` dequant
+mapping `0..=63 → [81920, 1_686_110_208]`) + §4.2.7.5.2 LSF Stage-2 residual + §4.2.7.5.3 NLSF
 reconstruction + §4.2.7.5.4 NLSF stabilization + §4.2.7.5.5 NLSF
 interpolation + §4.2.7.5.6 NLSF→LPC core conversion (`silk_NLSF2A`) +
 §4.2.7.5.7 LPC range-limiting bandwidth expansion + §4.2.7.5.8 LPC
@@ -42,6 +44,45 @@ post-filter parameter group: logp=1 enable + `octave` uniform[0,6)
 `tapset` `{2,1,1}/4`, §4.3.1 `transient` `{7,1}/8`, §4.3.2.1 `intra`
 `{7,1}/8`); coarse energy / bit allocation / band loop still
 deferred.**
+
+## Round 23 — §4.2.7.4 SILK gain dequantization tail (2026-05-29)
+
+Round 23 lands the §4.2.7.4 tail-end mapping from the integer
+`log_gain ∈ 0..=63` (decoded since round 5) to the linear Q16
+gain `gain_Q16 ∈ [81_920, 1_686_110_208]` consumed by the
+§4.2.7.9.1 LTP and §4.2.7.9.2 LPC synthesis filters. A new
+`silk_log2lin` module owns:
+
+* `silk_log2lin(in_log_q7)` — the §4.2.7.4 piecewise-linear
+  approximation of `2^(inLog_Q7/128)`:
+  `(1 << i) + ((-174*f*(128-f) >> 16) + f) * ((1 << i) >> 7)`
+  with `i = inLog_Q7 >> 7` and `f = inLog_Q7 & 127`.
+* `silk_gains_dequant(log_gain)` — the composed
+  `silk_log2lin((0x1D1C71*log_gain >> 16) + 2090)` mapping. Both
+  documented endpoints (`81920` at `log_gain = 0` representing
+  linear gain 1.25, and `1_686_110_208` at `log_gain = 63`
+  representing linear gain ≈ 25 728) are pinned exactly.
+* Named constants `SILK_LOG_GAIN_MULTIPLIER = 0x1D1C71`,
+  `SILK_LOG_GAIN_BIAS = 2090`, `SILK_GAIN_Q16_MIN = 81_920`,
+  `SILK_GAIN_Q16_MAX = 1_686_110_208`.
+* `SubframeGains::dequant_q16()` convenience that maps an entire
+  decoded frame's `log_gain[]` into a fixed-size `[u32;
+  SILK_MAX_SUBFRAMES]` array (trailing unused slots stay zero for
+  two-subframe frames).
+
+19 new module tests (381 lib tests total, up from 362; 20
+integration tests unchanged): the two §4.2.7.4 endpoints pinned to
+the RFC text; strict-monotone-in-`log_gain` property across the
+full domain; spec-range invariant across the full sweep;
+pure-power-of-two collapse `silk_log2lin(128*i) == 1 << i` for
+`i ∈ 0..=30`; an independent i64 oracle of the §4.2.7.4 formula
+matched bit-for-bit by the production i32 implementation across
+the entire `i ∈ 0..=30 × f ∈ 0..=127` Q7 domain plus the
+log-gain dequant sub-domain; pinned endpoint algebra
+(`log_gain = 63 → in_log_q7 = 30*128 + 83 = 3923`); the halfway
+pin `silk_log2lin(7*128 | 64) = 181` matching the true `2^7.5 ≈
+181.019`; the `SubframeGains::dequant_q16` trailing-slot zeroing
+and per-subframe agreement properties.
 
 ## Round 22 — §3.4 R1..R7 malformed-input rejection audit (2026-05-27)
 

@@ -252,6 +252,17 @@
 //!   `OpusFrameRouting` instead of open-coding the
 //!   `(mode, bandwidth, frame_size)` switch each time.
 //!
+//! * Round 23 lands the §4.2.7.4 SILK gain dequantization tail
+//!   ([`silk_log2lin`] / [`silk_gains_dequant`] /
+//!   [`SubframeGains::dequant_q16`](crate::silk_gains::SubframeGains::dequant_q16))
+//!   — the piecewise-linear approximation of `2^(inLog_Q7/128)` and the
+//!   composed `log_gain ∈ 0..=63 → gain_Q16 ∈ [81920, 1_686_110_208]`
+//!   mapping that the §4.2.7.9.1 LTP and §4.2.7.9.2 LPC synthesis
+//!   filters consume. The two §4.2.7.4 endpoints (`log_gain = 0`
+//!   ⇒ `81920` = 1.25× linear; `log_gain = 63` ⇒ `1_686_110_208` ≈
+//!   25 728× linear) are pinned to the RFC text. The §4.2.7.5 NLSF
+//!   stages had been deferred since round 5; this round closes that gap.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -308,6 +319,7 @@ pub mod silk_frame;
 pub mod silk_gains;
 pub mod silk_header;
 pub mod silk_lcg_seed;
+pub mod silk_log2lin;
 pub mod silk_lpc_synth;
 pub mod silk_lsf_interp;
 pub mod silk_lsf_recon;
@@ -338,6 +350,10 @@ pub use silk_header::{
     SILK_MAX_FRAMES_PER_CHANNEL,
 };
 pub use silk_lcg_seed::decode_lcg_seed;
+pub use silk_log2lin::{
+    silk_gains_dequant, silk_log2lin, SILK_GAIN_Q16_MAX, SILK_GAIN_Q16_MIN, SILK_LOG_GAIN_BIAS,
+    SILK_LOG_GAIN_MULTIPLIER,
+};
 pub use silk_lpc_synth::{
     lpc_synthesis_frame, lpc_synthesis_subframe, subframe_samples, LpcSynthState,
     LPC_SYNTH_MAX_ORDER, LPC_SYNTH_MAX_SUBFRAME_SAMPLES,

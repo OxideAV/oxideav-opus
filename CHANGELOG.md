@@ -6,6 +6,55 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 23 (2026-05-29):** §4.2.7.4 SILK gain
+  dequantization tail — a new `silk_log2lin` module exposing
+  `silk_log2lin` (the spec's piecewise-linear approximation of
+  `2^(inLog_Q7/128)`) and `silk_gains_dequant` (the composed
+  `log_gain ∈ 0..=63 → gain_Q16` pipeline
+  `silk_log2lin((0x1D1C71*log_gain >> 16) + 2090)`), plus the named
+  constants `SILK_LOG_GAIN_MULTIPLIER`, `SILK_LOG_GAIN_BIAS`,
+  `SILK_GAIN_Q16_MIN = 81_920`, `SILK_GAIN_Q16_MAX = 1_686_110_208`.
+  Also adds a `SubframeGains::dequant_q16` convenience that maps an
+  entire decoded frame's `log_gain[]` into the fixed-size `[u32;
+  SILK_MAX_SUBFRAMES]` array consumed by the §4.2.7.9.1 LTP and
+  §4.2.7.9.2 LPC synthesis filters (with trailing unused slots left
+  at zero for two-subframe frames).
+
+  This closes the §4.2.7.4 tail-end conversion that was previously
+  noted as deferred since round 5; the §4.2.7.9 synthesis filters
+  already accept a `gain_q16` input but were missing the official
+  RFC-spec mapping from the decoded `log_gain` integer to the linear
+  Q16 gain.
+
+  Nineteen new module tests (381 lib tests total, up from 362 at
+  round-22 close, plus the 20 integration tests unchanged) cover:
+
+  * The §4.2.7.4 documented endpoints — `log_gain = 0` returns
+    `81920` (= 1.25 in linear scale) and `log_gain = 63` returns
+    `1_686_110_208` (≈ 25 728 in linear).
+  * Strict monotonicity: `silk_gains_dequant(g+1) > silk_gains_dequant(g)`
+    for every `g ∈ 0..=62`.
+  * Spec-range invariant across the full `0..=63` sweep.
+  * Pure-power-of-two collapse: `silk_log2lin(128*i) == 1<<i` for
+    `i ∈ 0..=30`.
+  * `silk_log2lin(0) == 1` and `silk_log2lin(1) == 1` (the
+    approximation can't resolve sub-128 Q7 below `i = 7`).
+  * Pinned `silk_log2lin(7*128 | 64) = 181` — exact match of the
+    §4.2.7.4 approximation against the true `2^7.5 ≈ 181.019…`
+    halfway between `2^7` and `2^8`, exercising both the `bowed`
+    correction and the linear term.
+  * Independent i64 oracle of the §4.2.7.4 formula matched bit-for-bit
+    by the production i32 implementation across (a) every reachable
+    `inLog_Q7` from the `log_gain` dequant pipeline and (b) the full
+    `i ∈ 0..=30 × f ∈ 0..=127` Q7 domain.
+  * Endpoint algebra pinned independently of `silk_gains_dequant`:
+    `log_gain = 0 → in_log_q7 = 2090`; `log_gain = 63 → in_log_q7 =
+    3923` (= `30*128 + 83`), `silk_log2lin(2090) = 81_920`,
+    `silk_log2lin(3923) = 1_686_110_208`.
+  * `SubframeGains::dequant_q16` leaves trailing slots at zero for a
+    two-subframe frame and matches per-subframe `silk_gains_dequant`
+    calls across the four-subframe frame.
+
 * **Clean-room round 22 (2026-05-27):** §3.4 R1..R7 malformed-input
   rejection audit — a dedicated integration-level test file
   (`tests/malformed_input.rs`, 20 tests) that pins every concrete

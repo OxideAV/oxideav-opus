@@ -233,6 +233,23 @@ impl SubframeGains {
         self.gains[self.len() - 1].log_gain
     }
 
+    /// Dequantise every populated subframe's `log_gain` to a Q16 linear
+    /// gain via RFC 6716 §4.2.7.4
+    /// `gain_Q16[k] = silk_log2lin((0x1D1C71 * log_gain[k] >> 16) + 2090)`.
+    ///
+    /// Returns a fixed-size array; only the first [`Self::len`] entries
+    /// are populated, the rest are zero. The resulting `gain_Q16[k]`
+    /// values lie in the spec-documented `[81920, 1_686_110_208]` range
+    /// and are the input to the §4.2.7.9.1 LTP and §4.2.7.9.2 LPC
+    /// synthesis filters.
+    pub fn dequant_q16(&self) -> [u32; SILK_MAX_SUBFRAMES] {
+        let mut out = [0u32; SILK_MAX_SUBFRAMES];
+        for (slot, gain) in out.iter_mut().zip(self.gains.iter()).take(self.len()) {
+            *slot = crate::silk_log2lin::silk_gains_dequant(gain.log_gain);
+        }
+        out
+    }
+
     fn icdf_for_signal_type(signal_type: SignalType) -> &'static [u8] {
         match signal_type {
             SignalType::Inactive => GAIN_MSB_ICDF_INACTIVE,
@@ -625,6 +642,60 @@ mod tests {
                 gains.as_slice()[k].log_gain,
                 *expected
             );
+        }
+    }
+
+    // ----- §4.2.7.4 dequant_q16 -----------------------------------
+
+    #[test]
+    fn dequant_q16_zeroes_trailing_slots_for_two_subframe_frame() {
+        // Drive the decoder with two subframes; assert the trailing
+        // unused slots in the fixed-size dequant array stay zero.
+        let mut bytes = vec![0u8; 16];
+        bytes[0] = 0x40;
+        let mut rd = RangeDecoder::new(&bytes);
+        let cfg = SubframeGainsConfig {
+            signal_type: SignalType::Inactive,
+            num_subframes: 2,
+            first_subframe_is_independent: true,
+            previous_log_gain: None,
+        };
+        let gains = SubframeGains::decode(&mut rd, cfg).expect("decode must succeed");
+        let q16 = gains.dequant_q16();
+        // First two slots populated; bounded by the spec range.
+        for (k, val) in q16.iter().enumerate().take(gains.len()) {
+            assert!(
+                (81_920..=1_686_110_208).contains(val),
+                "subframe {} gain_Q16 {} outside spec range",
+                k,
+                val
+            );
+        }
+        // Slots beyond `len` left at zero.
+        for (k, val) in q16.iter().enumerate().skip(gains.len()) {
+            assert_eq!(*val, 0, "slot {} expected zero, got {}", k, val);
+        }
+    }
+
+    #[test]
+    fn dequant_q16_matches_per_subframe_call() {
+        // Drive the decoder with four subframes; assert the array
+        // dequant matches a per-subframe `silk_gains_dequant` recomputation.
+        let mut bytes = vec![0u8; 16];
+        bytes[0] = 0xFF;
+        let mut rd = RangeDecoder::new(&bytes);
+        let cfg = SubframeGainsConfig {
+            signal_type: SignalType::Voiced,
+            num_subframes: 4,
+            first_subframe_is_independent: true,
+            previous_log_gain: None,
+        };
+        let gains = SubframeGains::decode(&mut rd, cfg).expect("decode must succeed");
+        let array = gains.dequant_q16();
+        for (k, val) in array.iter().enumerate().take(gains.len()) {
+            let log_gain = gains.as_slice()[k].log_gain;
+            let expected = crate::silk_log2lin::silk_gains_dequant(log_gain);
+            assert_eq!(*val, expected, "subframe {} mismatch", k);
         }
     }
 
