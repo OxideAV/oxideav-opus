@@ -4,6 +4,38 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-opus/compare/v0.0.9...v0.0.10) - 2026-05-29
+
+### Other
+
+- §4.3 Table 55 CELT MDCT-band layout (round 24)
+- §4.2.7.4 SILK gain dequant tail (silk_log2lin) — round 23
+- §3.4 R1..R7 malformed-input rejection audit (round 22)
+- §3.1 / §4.2 framing dispatch (round 21)
+- land §4.3 Table 56 CELT pre-band header symbols
+- Round 19: §4.2.9 SILK resampler delay budget + sample-rate accounting
+- round 18: §4.2.3 SILK header bits + §4.2.4 per-frame LBRR flags
+- §4.2.8 stereo unmixing — silk_stereo_MS_to_LR (round 17)
+- fix the round-16 test count phrasing
+- §4.2.7.9.1 LTP synthesis filter (round 16)
+- round 15 — RFC 6716 §4.2.7.9.2 LPC synthesis filter
+- §4.2.7.7 LCG seed + §4.2.7.8 excitation reconstruction
+- §4.2.7.6 LTP parameters (pitch lags + LTP filter + LTP scaling)
+- §4.2.7.5.8 LPC prediction-gain stability limiting
+- §4.2.7.5.7 LPC range-limiting bandwidth expansion
+- round 10: RFC 6716 §4.2.7.5.6 SILK NLSF→LPC core conversion
+- clean-room round 9 — SILK §4.2.7.5.5 NLSF interpolation
+- round 8: RFC 6716 §4.2.7.5.4 SILK NLSF stabilization
+- round 7: RFC 6716 §4.2.7.5.3 SILK NLSF reconstruction
+- round 6: RFC 6716 §4.2.7.5.2 SILK LSF Stage-2
+- round 5 fix: compare iCDF slices by value, not pointer identity
+- round 5: RFC 6716 §4.2.7.4 SILK subframe gains
+- round 4: RFC 6716 §4.2.7.1–§4.2.7.5.1 SILK frame header
+- round 3: RFC 6716 §4.1 range decoder
+- round 2: RFC 6716 §3.2 frame-packing parser
+- round 1: RFC 6716 §3.1 packet TOC byte parser
+- orphan rebuild: clean-room scaffold post 2026-05-20 audit
+
 ### Added
 
 * **Clean-room round 24 (2026-05-29):** §4.3 CELT MDCT-band layout —
