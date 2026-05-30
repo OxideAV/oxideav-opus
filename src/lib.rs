@@ -295,6 +295,26 @@
 //!   deferred — turns each per-band `tf_change[b]` bit into one of
 //!   these adjustments before the §4.3.4.2 PVQ shape decoder runs.
 //!
+//! * Round 26 lands the §4.5.1 CELT redundancy / mode-transition side
+//!   information ([`decode_redundancy`] / [`RedundancyDecision`] /
+//!   [`RedundancyPosition`]) — the three-step procedure that decides
+//!   whether an Opus frame embeds an extra 5 ms redundant CELT frame
+//!   for a clean mode transition. §4.5.1.1 implicit signalling for
+//!   SILK-only Opus frames (the 17-bit remaining-budget gate),
+//!   §4.5.1.1 explicit signalling for Hybrid Opus frames (the 37-bit
+//!   gate + Table 64 `{4095, 1}/4096` flag), §4.5.1.2 redundancy
+//!   position (Table 65 `{1, 1}/2` uniform symbol: 0 = end-of-frame
+//!   / first-frame-in-transition, 1 = start-of-frame / second-frame-
+//!   in-transition), and §4.5.1.3 redundancy size (SILK-only =
+//!   remaining whole bytes; Hybrid = `2 + dec_uint(256)` with the
+//!   "claimed > remaining" branch routed to [`RedundancyDecision::Invalid`]
+//!   per the §4.5.1.3 "stop decoding and discard" recommendation).
+//!   CELT-only Opus frames bypass the §4.5.1 path entirely. This
+//!   round does NOT decode the redundant CELT frame itself — that
+//!   requires the §4.3.2.1 / §4.3.3 blockers (#936 / #943) — only
+//!   the boundary metadata that tells the caller WHERE the redundant
+//!   CELT bytes start and HOW MANY of them there are.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -344,6 +364,7 @@ impl std::error::Error for Error {}
 
 pub mod celt_band_layout;
 pub mod celt_header;
+pub mod celt_redundancy;
 pub mod celt_tf_adjust;
 pub mod frames;
 pub mod framing;
@@ -372,6 +393,14 @@ pub use celt_band_layout::{
     CELT_MAX_BINS_PER_BAND, CELT_NUM_BANDS, HYBRID_FIRST_CODED_BAND,
 };
 pub use celt_header::{CeltHeaderPrefix, CeltPostFilter};
+pub use celt_redundancy::{
+    decode_redundancy, remaining_bits, whole_bytes_remaining, RedundancyDecision,
+    RedundancyPosition, HYBRID_REDUNDANCY_MIN_REMAINING_BITS,
+    HYBRID_REDUNDANCY_SIZE_BASELINE_BYTES, HYBRID_REDUNDANCY_SIZE_DEC_UINT_FT,
+    REDUNDANCY_FLAG_ICDF, REDUNDANCY_FLAG_ICDF_FTB, REDUNDANCY_MIN_SIZE_BYTES,
+    REDUNDANCY_POSITION_ICDF, REDUNDANCY_POSITION_ICDF_FTB,
+    SILK_ONLY_REDUNDANCY_MIN_REMAINING_BITS,
+};
 pub use celt_tf_adjust::{
     celt_tf_adjustment, celt_tf_select_can_affect, TfAdjustment, TfDirection,
     TF_ADJUSTMENT_ABS_MAX, TF_ADJUSTMENT_MAX, TF_ADJ_NONTRANSIENT_SELECT0,

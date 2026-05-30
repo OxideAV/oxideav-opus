@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-30 (clean-room round 25)
+## Status — 2026-05-30 (clean-room round 26)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
@@ -53,8 +53,91 @@ lookup (`celt_tf_adjust`: Tables 60–63 keyed by `(frame_size,
 transient, tf_select, tf_change[b])` → `i8 ∈ [-3, 3]` + §4.3.1
 `tf_select` "only decoded if it can affect at least one band" gate +
 `TfDirection::{Unchanged, IncreaseTime(N), IncreaseFrequency(N)}`
-classification for the §4.3.4.5 Hadamard-transform step); coarse
-energy / bit allocation / PVQ shape / band loop still deferred.**
+classification for the §4.3.4.5 Hadamard-transform step) + §4.5.1
+CELT redundancy / mode-transition side information
+(`celt_redundancy::decode_redundancy`: §4.5.1.1 implicit signalling
+for SILK-only Opus frames at the 17-bit remaining gate + §4.5.1.1
+explicit signalling for Hybrid Opus frames at the 37-bit gate
+with the Table 64 `{4095, 1}/4096` flag + §4.5.1.2 Table 65
+`{1, 1}/2` position flag → `End` / `Beginning` placement +
+§4.5.1.3 redundancy size: SILK-only = remaining whole bytes,
+Hybrid = `2 + dec_uint(256)` with the §4.5.1.3 "claimed > whole
+bytes remaining" overflow routed to `RedundancyDecision::Invalid`);
+coarse energy / bit allocation / PVQ shape / band loop still
+deferred.**
+
+## Round 26 — §4.5.1 CELT redundancy / mode-transition side information (2026-05-30)
+
+Round 26 lands the §4.5.1 redundancy-flag pipeline (RFC 6716 §4.5.1
+pp. 124–126, Tables 64 and 65) behind a new `celt_redundancy`
+module. This is the first §4.5 (mode-switching) fragment, sitting
+at the tail of every SILK-only or Hybrid Opus frame to decide
+whether an extra 5 ms redundant CELT frame is embedded in the
+remaining bytes.
+
+The §4.5.1 procedure is a three-step decision tree:
+
+1. §4.5.1.1 — *redundancy flag*. SILK-only frames signal implicitly
+   ("on" iff `remaining_bits >= 17`). Hybrid frames signal explicitly
+   via a Table 64 `{4095, 1}/4096` symbol, but only after a stricter
+   `remaining_bits >= 37` gate (room for the symbol + a minimum
+   2-byte redundant frame).
+2. §4.5.1.2 — *redundancy position*. Decoded only when the flag is
+   on, using the Table 65 `{1, 1}/2` uniform symbol. Symbol 0 places
+   the redundant frame at the END of the Opus frame; symbol 1 at the
+   BEGINNING.
+3. §4.5.1.3 — *redundancy size*. SILK-only: the remaining whole
+   bytes after the §4.5.1.2 read. Hybrid: `2 + dec_uint(256)`. If
+   the Hybrid claim exceeds the whole bytes that actually remain
+   in the Opus frame, §4.5.1.3 RECOMMENDS the decoder "stop
+   decoding and discard the rest of the current Opus frame" — we
+   surface that as `RedundancyDecision::Invalid` and let the caller
+   pick whether to keep the already-decoded audio (per the §4.5.1.3
+   "may keep any audio decoded so far" allowance) or trash it.
+
+The module owns:
+
+* `SILK_ONLY_REDUNDANCY_MIN_REMAINING_BITS = 17` —
+  §4.5.1.1 SILK-only implicit-signal gate.
+* `HYBRID_REDUNDANCY_MIN_REMAINING_BITS = 37` —
+  §4.5.1.1 Hybrid explicit-signal gate.
+* `REDUNDANCY_FLAG_ICDF = [1, 0]` / `_FTB = 12` — Table 64.
+* `REDUNDANCY_POSITION_ICDF = [1, 0]` / `_FTB = 1` — Table 65.
+* `HYBRID_REDUNDANCY_SIZE_BASELINE_BYTES = 2` /
+  `HYBRID_REDUNDANCY_SIZE_DEC_UINT_FT = 256` — the §4.5.1.3
+  Hybrid `size = 2 + dec_uint(256)` formula constants.
+* `REDUNDANCY_MIN_SIZE_BYTES = 2` — the §4.5.1.3 invariant lower
+  bound on a well-formed redundant CELT frame.
+* `RedundancyPosition::{End, Beginning}` — Table 65 symbol →
+  placement.
+* `RedundancyDecision::{NotPresent, Present { position, size_bytes }, Invalid}`
+  — the three legal outcomes per §4.5.1.
+* `decode_redundancy(rd, mode, opus_frame_bytes)` — driver entry
+  point; CELT-only frames bypass §4.5.1 entirely and return
+  `NotPresent` without touching the range decoder.
+* `remaining_bits` / `whole_bytes_remaining` — helper accounting
+  per §4.1.6 + §4.5.1.3.
+
+The round does NOT decode the redundant CELT frame itself — that
+needs the §4.3.2.1 coarse energy (gated on the Laplace decoder +
+`e_prob_model`, #936) and the §4.3.3 bit allocator (gated on
+`cache_caps50` + `LOG2_FRAC_TABLE`, #943). Round 26 stops at the
+boundary metadata — WHERE the redundant CELT bytes start and HOW
+MANY of them there are — so the §4.3 decoder, once unblocked, can
+slot in directly.
+
+Twelve unit tests cover both the SILK-only implicit-flag boundary
+(below 17 bits → not present; full buffer → present), the Hybrid
+explicit-flag gate (below 37 bits → not present; full buffer →
+flag is read and `tell` advances), the CELT-only bypass invariant,
+the Table 64 / Table 65 ICDF derivations, the
+`RedundancyPosition::from_symbol` Table 65 mapping, and the
+`RedundancyDecision` accessor helpers.
+
+Provenance: every PDF, every byte / bit threshold, every
+conditional branch is transcribed from RFC 6716 §4.5.1 in
+`docs/audio/opus/rfc6716-opus.txt`. No external library source was
+consulted.
 
 ## Round 25 — §4.3.4.5 CELT TF-resolution adjustment lookup (2026-05-30)
 

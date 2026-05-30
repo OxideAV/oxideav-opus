@@ -12,6 +12,53 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 26 (2026-05-30):** §4.5.1 CELT redundancy /
+  mode-transition side-information decoder — a new
+  `celt_redundancy` module owning RFC 6716 §4.5.1.1–§4.5.1.3
+  (Tables 64 and 65). Exposes
+  `decode_redundancy(rd, mode, opus_frame_bytes) -> RedundancyDecision`
+  routing CELT-only Opus frames to a no-op bypass, SILK-only Opus
+  frames through the §4.5.1.1 implicit 17-bit remaining-budget
+  gate + §4.5.1.2 Table 65 `{1,1}/2` position symbol + §4.5.1.3
+  "remaining whole bytes" size, and Hybrid Opus frames through
+  the §4.5.1.1 explicit 37-bit gate + Table 64 `{4095,1}/4096`
+  flag + Table 65 position symbol + §4.5.1.3 `2 + dec_uint(256)`
+  size with the "claimed > whole bytes remaining" overflow
+  routed to `RedundancyDecision::Invalid`. Also lands
+  `RedundancyPosition::{End, Beginning}` for the §4.5.1.2 placement
+  decision, `RedundancyDecision::{NotPresent, Present {position,
+  size_bytes}, Invalid}` for the three legal outcomes, named
+  constants `SILK_ONLY_REDUNDANCY_MIN_REMAINING_BITS = 17` /
+  `HYBRID_REDUNDANCY_MIN_REMAINING_BITS = 37` /
+  `REDUNDANCY_FLAG_ICDF = [1, 0]` / `REDUNDANCY_FLAG_ICDF_FTB = 12`
+  / `REDUNDANCY_POSITION_ICDF = [1, 0]` /
+  `REDUNDANCY_POSITION_ICDF_FTB = 1` /
+  `HYBRID_REDUNDANCY_SIZE_BASELINE_BYTES = 2` /
+  `HYBRID_REDUNDANCY_SIZE_DEC_UINT_FT = 256` /
+  `REDUNDANCY_MIN_SIZE_BYTES = 2`, and helper accounting
+  functions `remaining_bits(rd, opus_frame_bytes)` /
+  `whole_bytes_remaining(rd, opus_frame_bytes)` per §4.1.6 +
+  §4.5.1.3.
+
+  Round 26 stops at the §4.5.1 boundary metadata (where the
+  redundant CELT bytes start, how many of them there are); the
+  decode of the redundant CELT frame itself needs §4.3.2.1
+  coarse energy (#936, Laplace decoder + `e_prob_model`) and
+  §4.3.3 bit allocation (#943, `cache_caps50` + `LOG2_FRAC_TABLE`).
+
+  Twelve new unit tests cover the SILK-only implicit-flag boundary
+  (below 17 bits → not present; full buffer → present with
+  remaining-whole-bytes size; size-equals-whole-bytes-remaining
+  invariant), the Hybrid 37-bit gate (below → not present; full
+  buffer → Table 64 read advances `tell()`), the CELT-only bypass
+  invariant, the Table 64 / Table 65 ICDF derivations from the
+  RFC PDFs, the `RedundancyPosition::from_symbol` Table 65 mapping
+  (including the defensive non-binary fall-through), the
+  `RedundancyDecision` accessor helpers, the §4.1.6 + §4.5.1.3
+  `remaining_bits` / `whole_bytes_remaining` helper accounting,
+  and a sanity check on every named constant against the RFC text.
+  Decoder runs to 440 unit tests + 20 integration tests, all passing.
+
 * **Clean-room round 25 (2026-05-30):** §4.3.4.5 CELT TF-resolution
   adjustment lookup — a new `celt_tf_adjust` module owning RFC 6716
   Tables 60–63 (the four `(frame_size, choice) -> i8` adjustment
