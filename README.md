@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-29 (clean-room round 24)
+## Status — 2026-05-30 (clean-room round 25)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
@@ -48,8 +48,87 @@ post-filter parameter group: logp=1 enable + `octave` uniform[0,6)
 `celt_band_at_hz` reverse lookup, the §4.3 "first 17 bands not
 coded in Hybrid mode" rule baked into `celt_first_coded_band` /
 `HYBRID_FIRST_CODED_BAND = 17`, column-sum helper
-`celt_total_bins_per_channel`); coarse energy / bit allocation /
-PVQ shape / band loop still deferred.**
+`celt_total_bins_per_channel`) + §4.3.4.5 TF-resolution adjustment
+lookup (`celt_tf_adjust`: Tables 60–63 keyed by `(frame_size,
+transient, tf_select, tf_change[b])` → `i8 ∈ [-3, 3]` + §4.3.1
+`tf_select` "only decoded if it can affect at least one band" gate +
+`TfDirection::{Unchanged, IncreaseTime(N), IncreaseFrequency(N)}`
+classification for the §4.3.4.5 Hadamard-transform step); coarse
+energy / bit allocation / PVQ shape / band loop still deferred.**
+
+## Round 25 — §4.3.4.5 CELT TF-resolution adjustment lookup (2026-05-30)
+
+Round 25 lands the §4.3.4.5 TF (time-frequency) resolution adjustment
+machinery (RFC 6716 §4.3.4.5 p. 119–120, Tables 60–63) behind a new
+`celt_tf_adjust` module. This is the third CELT-layer fragment after
+round 20's Table 56 pre-band header and round 24's Table 55 band
+layout, and it sits in the §4.3.4 band loop right after coarse energy
+(§4.3.2.1) and bit allocation (§4.3.3) — both still deferred — but
+before the §4.3.4.2 PVQ shape decoder reads the band.
+
+Tables 60–63 are the four lookups that turn the `(frame_size,
+transient, tf_select, tf_change[b])` tuple into a per-band integer
+adjustment `∈ [-3, 3]`. Negative values mean the decoder applies
+`|adj|` levels of the Hadamard transform per-vector to increase
+temporal resolution; positive values (only reachable on transient
+frames per the §4.3.4.5 prose) apply `adj` levels across the
+interleaved MDCT vector to increase frequency resolution; zero means
+the band's MDCT vector is consumed unchanged.
+
+The module owns:
+
+* `TF_ADJ_NONTRANSIENT_SELECT0` — Table 60 (`[[0,-1],[0,-1],[0,-2],[0,-2]]`).
+* `TF_ADJ_NONTRANSIENT_SELECT1` — Table 61 (`[[0,-1],[0,-2],[0,-3],[0,-3]]`).
+* `TF_ADJ_TRANSIENT_SELECT0` — Table 62 (`[[0,-1],[1,0],[2,0],[3,0]]`).
+* `TF_ADJ_TRANSIENT_SELECT1` — Table 63 (`[[0,-1],[1,-1],[1,-1],[1,-1]]`).
+* `celt_tf_adjustment(frame_size, transient, tf_select, tf_change) -> i8`
+  — the routed lookup.
+* `celt_tf_select_can_affect(frame_size, transient, tf_change_slice)
+  -> bool` — the §4.3.1 "tf_select uses a 1/2 probability, but is only
+  decoded if it can have an impact on the result knowing the value of
+  all per-band tf_change flags" gate. The §4.3.4.5 band loop calls
+  this AFTER decoding every per-band `tf_change[b]` to decide whether
+  to consume the `tf_select` bit at all. Empty band sets (no coded
+  bands) and the universally-redundant 2.5 ms rows ([0, -1] in all
+  four tables) return `false`.
+* `TfDirection::{Unchanged, IncreaseTime(N), IncreaseFrequency(N)}`
+  carrying the Hadamard-transform branch + level count.
+* `TfAdjustment` (= `i8`), `TF_ADJUSTMENT_MAX = 3`,
+  `TF_ADJUSTMENT_ABS_MAX = 3` named constants pinned to the
+  observed max across every documented cell.
+
+27 new module tests (428 lib tests total, up from 401 at round-24
+close; 20 integration tests unchanged, grand total 448) cover: the
+four-row × two-column shape of every table; every cell within the
+documented `[-3, 3]` range; every Table 60 / 61 / 62 / 63 cell
+hand-pinned to the RFC; the "non-transient `choice = 0` is always 0"
+structural invariant on Tables 60 + 61; the "non-transient `choice =
+1` is always ≤ 0" pin (stationary content never gains frequency
+resolution); the "positive adjustments only on transient frames"
+asymmetry, both at the table layer and at `TfDirection`; the
+Table 62 `choice = 0` monotone `0, 1, 2, 3` scale across frame
+sizes; the universal 2.5 ms row `[0, -1]` across all four tables;
+the `TF_ADJUSTMENT_MAX` / `TF_ADJUSTMENT_ABS_MAX` constants matching
+the observed max over every cell; the `celt_tf_adjustment` entry
+routing each `(transient, tf_select)` corner to the matching table;
+`celt_tf_select_can_affect` returning `false` on empty band sets and
+on the redundant 2.5 ms rows (both transient and non-transient);
+returning `false` on 10 ms non-transient when every band picks
+`choice = 0` (Tables 60 and 61 agree on column 0) and `true` as soon
+as any band picks `choice = 1`; returning `true` on 20 ms transient
+for any non-empty band set (Tables 62 vs 63 disagree on both
+columns); `TfDirection::from_adjustment` classifying every cell
+correctly with the `levels()` value matching `adj.unsigned_abs()`
+over the full `[-3, 3]` range; `IncreaseFrequency` never reachable
+on non-transient frames; `IncreaseTime` always reached for
+non-transient `choice = 1`.
+
+No external library source was consulted; every cell of every
+table, every routing decision, the §4.3.1 `tf_select`
+non-redundancy rule, and the §4.3.4.5 "negative = temporal
+resolution increased, positive = frequency resolution increased"
+classification come directly from RFC 6716 §4.3.1 (p. 109) and
+§4.3.4.5 (p. 119–120).
 
 ## Round 24 — §4.3 Table 55 CELT MDCT-band layout (2026-05-29)
 

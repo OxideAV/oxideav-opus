@@ -278,6 +278,23 @@
 //!   denormaliser, and §4.3.7 inverse-MDCT pass needs before any
 //!   band-loop iteration can start.
 //!
+//! * Round 25 lands the §4.3.4.5 CELT TF-resolution adjustment lookup
+//!   ([`celt_tf_adjust`]: Tables 60–63 [`TF_ADJ_NONTRANSIENT_SELECT0`]
+//!   / [`TF_ADJ_NONTRANSIENT_SELECT1`] / [`TF_ADJ_TRANSIENT_SELECT0`]
+//!   / [`TF_ADJ_TRANSIENT_SELECT1`] +
+//!   [`celt_tf_adjustment`](crate::celt_tf_adjust::celt_tf_adjustment)
+//!   `(frame_size, transient, tf_select, tf_change) -> i8` entry +
+//!   the §4.3.1
+//!   [`celt_tf_select_can_affect`](crate::celt_tf_adjust::celt_tf_select_can_affect)
+//!   "tf_select is only decoded if it can have an impact on the
+//!   result knowing the value of all per-band tf_change flags" gate +
+//!   [`TfDirection`] classification (`Unchanged` / `IncreaseTime(N)` /
+//!   `IncreaseFrequency(N)`) carrying the §4.3.4.5 Hadamard-transform
+//!   level count). The §4.3.4.5 band loop downstream — gated on
+//!   §4.3.2.1 coarse energy + §4.3.3 bit allocation, both still
+//!   deferred — turns each per-band `tf_change[b]` bit into one of
+//!   these adjustments before the §4.3.4.2 PVQ shape decoder runs.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -327,6 +344,7 @@ impl std::error::Error for Error {}
 
 pub mod celt_band_layout;
 pub mod celt_header;
+pub mod celt_tf_adjust;
 pub mod frames;
 pub mod framing;
 pub mod range_decoder;
@@ -354,6 +372,11 @@ pub use celt_band_layout::{
     CELT_MAX_BINS_PER_BAND, CELT_NUM_BANDS, HYBRID_FIRST_CODED_BAND,
 };
 pub use celt_header::{CeltHeaderPrefix, CeltPostFilter};
+pub use celt_tf_adjust::{
+    celt_tf_adjustment, celt_tf_select_can_affect, TfAdjustment, TfDirection,
+    TF_ADJUSTMENT_ABS_MAX, TF_ADJUSTMENT_MAX, TF_ADJ_NONTRANSIENT_SELECT0,
+    TF_ADJ_NONTRANSIENT_SELECT1, TF_ADJ_TRANSIENT_SELECT0, TF_ADJ_TRANSIENT_SELECT1,
+};
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
 pub use framing::{OperatingMode, OpusFrameRouting, SilkBandwidth};
 pub use range_decoder::RangeDecoder;

@@ -4,6 +4,54 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Clean-room round 25 (2026-05-30):** §4.3.4.5 CELT TF-resolution
+  adjustment lookup — a new `celt_tf_adjust` module owning RFC 6716
+  Tables 60–63 (the four `(frame_size, choice) -> i8` adjustment
+  tables keyed by `(transient, tf_select)`). Exposes
+  `celt_tf_adjustment(frame_size, transient, tf_select, tf_change)
+  -> i8` (the routed lookup, return value `∈ [-3, 3]`),
+  `celt_tf_select_can_affect(frame_size, transient, &[bool]) -> bool`
+  (the §4.3.1 "tf_select is only decoded if it can have an impact on
+  the result knowing the value of all per-band tf_change flags"
+  redundancy gate that the §4.3.4.5 band loop calls AFTER decoding
+  every per-band `tf_change[b]`), `TfDirection::{Unchanged,
+  IncreaseTime(N), IncreaseFrequency(N)}` carrying the §4.3.4.5
+  Hadamard-transform branch and level count, `TfAdjustment` (= `i8`)
+  storage type, and named constants `TF_ADJUSTMENT_MAX = 3`,
+  `TF_ADJUSTMENT_ABS_MAX = 3`, plus the four tables themselves
+  (`TF_ADJ_NONTRANSIENT_SELECT0`, `TF_ADJ_NONTRANSIENT_SELECT1`,
+  `TF_ADJ_TRANSIENT_SELECT0`, `TF_ADJ_TRANSIENT_SELECT1`) for direct
+  inspection.
+
+  This is the lookup the §4.3.4.5 band loop downstream consumes once
+  it's wired up (gated on §4.3.2.1 coarse energy and §4.3.3 bit
+  allocation, both still deferred); it sits between Table 55's
+  per-band MDCT-bin count and the §4.3.4.2 PVQ shape decoder.
+
+  Twenty-seven new module tests (428 lib tests total, up from 401 at
+  round-24 close; 20 integration tests unchanged, grand total 448).
+  Coverage: every table's `4 × 2` shape; every cell `∈ [-3, 3]`; all
+  32 cells across Tables 60 / 61 / 62 / 63 hand-pinned to RFC 6716
+  §4.3.4.5; the "non-transient `choice = 0` is always 0" invariant;
+  the "non-transient `choice = 1` is always ≤ 0" invariant; the
+  "positive adjustments only on transient frames" §4.3.4.5
+  asymmetry pinned at both the table and `TfDirection` layer; the
+  Table 62 `choice = 0` monotone `0, 1, 2, 3` scale across frame
+  sizes; the universal 2.5 ms `[0, -1]` row across all four tables;
+  `TF_ADJUSTMENT_MAX` and `TF_ADJUSTMENT_ABS_MAX` matching the
+  observed max over every cell; `celt_tf_adjustment` entry-point
+  routing each `(transient, tf_select)` corner; `celt_tf_select_can_affect`
+  returning `false` on empty band sets and on the redundant 2.5 ms
+  rows; returning `false` on 10 ms non-transient with all-`choice 0`
+  bands and `true` as soon as any band picks `choice = 1`;
+  returning `true` on 20 ms transient for any non-empty band set;
+  `TfDirection::from_adjustment` classification + `levels()` value
+  matching `adj.unsigned_abs()` over `[-3, 3]`;
+  `IncreaseFrequency` never reachable on non-transient frames;
+  `IncreaseTime` always reached for non-transient `choice = 1`.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-opus/compare/v0.0.9...v0.0.10) - 2026-05-29
 
 ### Other
