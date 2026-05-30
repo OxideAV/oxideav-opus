@@ -4,6 +4,12 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-opus/compare/v0.0.10...v0.0.11) - 2026-05-30
+
+### Other
+
+- §4.3.4.5 CELT TF-resolution adjustment lookup (round 25)
+
 ### Added
 
 * **Clean-room round 25 (2026-05-30):** §4.3.4.5 CELT TF-resolution
