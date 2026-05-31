@@ -315,6 +315,34 @@
 //!   the boundary metadata that tells the caller WHERE the redundant
 //!   CELT bytes start and HOW MANY of them there are.
 //!
+//! * Round 28 lands the §4.5.1.4 redundant-CELT-frame decode
+//!   parameters and the §4.5.1.4 cross-lap placement
+//!   ([`redundant_frame_params`] / [`RedundantFrameParams`] /
+//!   [`CrossLapPlacement`] / [`apply_mb_to_wb_override`] /
+//!   [`REDUNDANT_FRAME_TENTHS_MS`] / [`REDUNDANT_CROSS_LAP_TENTHS_MS`])
+//!   — the pure-function lookup that turns an [`OpusFrameRouting`]
+//!   plus a [`RedundancyDecision`] into the four normative
+//!   §4.5.1.4 facts a §4.3 CELT decoder needs to actually decode
+//!   the redundant frame: "no TOC byte" (just feed the redundant
+//!   bytes into the CELT decoder), 5 ms fixed duration
+//!   ([`REDUNDANT_FRAME_TENTHS_MS`] = 50 tenths-ms), channel count
+//!   inherited from the carrier Opus frame, and audio bandwidth
+//!   inherited from the carrier with the §4.5.1.4 "MB SILK frames
+//!   → WB" exception ([`apply_mb_to_wb_override`]). Also lands the
+//!   §4.5.1.4 cross-lap placement decision
+//!   ([`CrossLapPlacement::FirstHalfAsIs`] for [`RedundancyPosition::Beginning`]
+//!   — CELT→SILK/Hybrid transitions, where the redundant CELT
+//!   frame's first 2.5 ms replace the SILK/Hybrid leading 2.5 ms
+//!   and the second 2.5 ms cross-lap; [`CrossLapPlacement::SecondHalfAsIs`]
+//!   for [`RedundancyPosition::End`] — SILK/Hybrid→CELT
+//!   transitions, where only the redundant frame's second 2.5 ms
+//!   is used and that half cross-laps with the SILK/Hybrid
+//!   trailing edge). The §4.3.7 power-complementary MDCT window
+//!   that actually performs the cross-lap mix is gated on the
+//!   undelivered §4.3.2 / §4.3.3 / §4.3.4 chain; this round owns
+//!   only the placement metadata (which 2.5 ms region cross-laps,
+//!   where in the carrier's sample buffer it sits).
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -370,6 +398,7 @@ pub mod frames;
 pub mod framing;
 pub mod mode_transition_reset;
 pub mod range_decoder;
+pub mod redundancy_decode_params;
 pub mod silk_excitation;
 pub mod silk_frame;
 pub mod silk_gains;
@@ -411,6 +440,10 @@ pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
 pub use framing::{OperatingMode, OpusFrameRouting, SilkBandwidth};
 pub use mode_transition_reset::{decide_state_resets, CeltResetPlacement, StateReset};
 pub use range_decoder::RangeDecoder;
+pub use redundancy_decode_params::{
+    apply_mb_to_wb_override, redundant_frame_params, CrossLapPlacement, RedundantFrameParams,
+    REDUNDANT_CROSS_LAP_TENTHS_MS, REDUNDANT_FRAME_TENTHS_MS,
+};
 pub use silk_excitation::{
     quantization_offset_q23, shell_block_count, Excitation, ExcitationConfig, SilkFrameSize,
     MAX_EXCITATION_SAMPLES, MAX_SHELL_BLOCKS, SHELL_BLOCK_SAMPLES,

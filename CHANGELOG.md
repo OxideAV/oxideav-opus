@@ -6,6 +6,31 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 28 (2026-06-01):** §4.5.1.4 redundant-CELT-frame
+  decode parameters and cross-lap placement — a new
+  `redundancy_decode_params` module encoding the two normative halves
+  of RFC 6716 §4.5.1.4 (pp. 126–127). Half 1: the parameter-derivation
+  rule (no TOC byte, 5 ms fixed duration via
+  `REDUNDANT_FRAME_TENTHS_MS = 50`, inherited channel count,
+  inherited bandwidth with the §4.5.1.4 "MB SILK → WB" exception via
+  `apply_mb_to_wb_override`) bundled into
+  `RedundantFrameParams { duration_tenths_ms, channels, bandwidth,
+  position, size_bytes, cross_lap }`. Half 2: the cross-lap placement
+  rule (`CrossLapPlacement::FirstHalfAsIs` for
+  `RedundancyPosition::Beginning` — CELT → SILK/Hybrid carriers,
+  where the redundant CELT frame's first 2.5 ms replace the carrier's
+  leading 2.5 ms and the second 2.5 ms cross-lap;
+  `CrossLapPlacement::SecondHalfAsIs` for `RedundancyPosition::End`
+  — SILK/Hybrid → CELT carriers, where only the second 2.5 ms is
+  used and it cross-laps with the SILK/Hybrid trailing edge).
+  `redundant_frame_params(routing, decision)` is the pure-function
+  driver entry; `RedundancyDecision::Invalid` (the §4.5.1.3 overflow
+  outcome) and `RedundancyDecision::NotPresent` both route to `None`.
+  Twenty-five new unit tests (492 lib tests total, up from 467 at
+  round-27 close) pin every rule, cross-check four §4.5.3 Figure 18
+  transition rows, and sweep the total-function output for the
+  MB-bandwidth invariant.
+
 * **Clean-room round 27 (2026-05-31):** §4.5.2 SILK + CELT decoder
   state-reset policy across mode transitions — a new
   `mode_transition_reset` module encoding the four normative rules

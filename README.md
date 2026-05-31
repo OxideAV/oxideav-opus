@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-31 (clean-room round 27)
+## Status — 2026-06-01 (clean-room round 28)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
@@ -73,9 +73,146 @@ reset on CELT-only → SILK/Hybrid with redundancy; `StateReset {
 silk, celt: CeltResetPlacement::{None, BeforeFrame,
 BeforeRedundantOnly} }` driving the full 3×3-mode × redundancy
 matrix and cross-checked against the non-normative §4.5.3 Figure
-18 reset markers);
-coarse energy / bit allocation / PVQ shape / band loop still
-deferred.**
+18 reset markers) + §4.5.1.4 redundant-CELT-frame decode parameters
+and cross-lap placement (`redundancy_decode_params`:
+`RedundantFrameParams { duration_tenths_ms: 50 (fixed 5 ms),
+channels, bandwidth (with §4.5.1.4 "MB SILK → WB" override),
+position, size_bytes, cross_lap }` derived from
+`OpusFrameRouting` + `RedundancyDecision`; `CrossLapPlacement::
+{FirstHalfAsIs, SecondHalfAsIs}` mapping `Beginning` →
+"first 2.5 ms of redundant as-is + second 2.5 ms cross-lap" (CELT
+→ SILK/Hybrid) and `End` → "discard first 2.5 ms + second 2.5 ms
+cross-lap" (SILK/Hybrid → CELT); `Invalid` overflow + `NotPresent`
+both route to `None` per §4.5.1.3);
+coarse energy / bit allocation / PVQ shape / band loop / §4.3.7
+inverse-MDCT window for the actual cross-lap still deferred.**
+
+## Round 28 — §4.5.1.4 redundant-CELT-frame decode parameters + cross-lap placement (2026-06-01)
+
+Round 28 lands the §4.5.1.4 *Decoding the Redundancy* fragment
+(RFC 6716 §4.5.1.4, pp. 126–127) behind a new
+`redundancy_decode_params` module. This is the third §4.5
+(mode-switching) fragment after round 26's §4.5.1.1–§4.5.1.3
+boundary metadata and round 27's §4.5.2 state-reset decision tree.
+Round 26 said *whether* a redundant CELT frame was present and
+*where* its bytes sat; round 27 said *which* sub-decoders to reset
+across the transition; this round turns the boundary metadata into
+the concrete *decode parameters* the §4.3 CELT decoder needs (no
+TOC byte; fixed 5 ms duration; inherited channel count; inherited
+bandwidth with the MB → WB exception) plus the §4.5.1.4
+*cross-lap placement* metadata that tells the caller which 2.5 ms
+half of the redundant CELT output feeds the splice with the
+SILK/Hybrid signal.
+
+The §4.5.1.4 prose has two normative halves.
+
+**Half 1 — redundant-frame parameters.** *"The redundant frame is
+decoded like any other CELT-only frame, with the exception that it
+does not contain a TOC byte. The frame size is fixed at 5 ms, the
+channel count is set to that of the current frame, and the audio
+bandwidth is also set to that of the current frame, with the
+exception that for MB SILK frames, it is set to WB."* Four facts:
+
+1. **No TOC byte.** The §3.1 TOC parse is skipped; the §4.3 CELT
+   decoder is started directly on the redundant bytes.
+2. **Frame size fixed at 5 ms.** Encoded as
+   `REDUNDANT_FRAME_TENTHS_MS = 50` in the crate's
+   tenths-of-a-millisecond convention.
+3. **Channel count inherited** from the carrier Opus frame.
+4. **Bandwidth inherited with the MB SILK → WB override** —
+   Hybrid carriers (SWB / FB) and SILK-only NB / WB carriers pass
+   through; SILK-only MB carriers bump to WB (the §4.3 CELT layer
+   does not support MB).
+
+**Half 2 — cross-lap placement.** *"If the redundancy belongs at
+the beginning (in a CELT-only to SILK-only or Hybrid transition),
+the final reconstructed output uses the first 2.5 ms of audio
+output by the decoder for the redundant frame as is, discarding
+the corresponding output from the SILK-only or Hybrid portion of
+the frame. The remaining 2.5 ms is cross-lapped with the decoded
+SILK/Hybrid signal using the CELT's power-complementary MDCT
+window …"* + *"If the redundancy belongs at the end (in a SILK-
+only or Hybrid to CELT-only transition), only the second half
+(2.5 ms) of the audio output by the decoder for the redundant
+frame is used. In that case, the second half of the redundant
+frame is cross-lapped with the end of the SILK/Hybrid signal …"*
+Two cases:
+
+* `RedundancyPosition::Beginning` →
+  `CrossLapPlacement::FirstHalfAsIs`. Carrier is the post-
+  transition SILK/Hybrid frame. The redundant CELT frame's first
+  2.5 ms replace the carrier's leading 2.5 ms; the second 2.5 ms
+  cross-lap with the SILK/Hybrid signal across the 2.5–5.0 ms
+  region of the Opus frame.
+* `RedundancyPosition::End` →
+  `CrossLapPlacement::SecondHalfAsIs`. Carrier is the pre-
+  transition SILK/Hybrid frame. Only the redundant CELT frame's
+  second 2.5 ms are used; that half cross-laps with the trailing
+  edge of the SILK/Hybrid signal. The first 2.5 ms are discarded.
+
+The §4.3.7 power-complementary MDCT window that actually performs
+the cross-lap mix is part of the §4.3.7 inverse-MDCT stage, which
+is gated on the §4.3.2 / §4.3.3 / §4.3.4 chain (all still
+deferred). What this round owns is the placement metadata —
+WHERE in the carrier's sample buffer the 2.5 ms cross-lap region
+sits, and WHICH 2.5 ms half of the redundant CELT output feeds it
+— so the §4.3.7 stage, once unblocked, can splice the two streams
+directly.
+
+The module owns:
+
+* `REDUNDANT_FRAME_TENTHS_MS = 50` — §4.5.1.4 "fixed at 5 ms"
+  duration.
+* `REDUNDANT_CROSS_LAP_TENTHS_MS = 25` — half-duration of the
+  redundant frame, the cross-lap region size in both cases.
+* `RedundantFrameParams { duration_tenths_ms, channels,
+  bandwidth, position, size_bytes, cross_lap }` — the §4.5.1.4
+  outcome bundled into a single struct.
+* `CrossLapPlacement::{FirstHalfAsIs, SecondHalfAsIs}` — half-2
+  placement decision, with `from_position` + `uses_first_half` +
+  `second_half_is_used_as_is` accessors.
+* `apply_mb_to_wb_override(carrier_bandwidth, is_silk_only)` —
+  half-1 bandwidth-override helper exposed for cross-checking.
+* `redundant_frame_params(routing, decision) -> Option<...>` —
+  driver entry. Returns `None` for `NotPresent` and `Invalid`
+  (the §4.5.1.3 overflow case is "stop and discard" per the RFC
+  RECOMMENDATION), otherwise the populated parameters.
+
+Twenty-five new unit tests (492 lib tests total, up from 467 at
+round-27 close; 20 integration tests unchanged, grand total 512)
+cover: the `REDUNDANT_FRAME_TENTHS_MS = 50` and
+`REDUNDANT_CROSS_LAP_TENTHS_MS = 25` constants and their
+half-of-frame invariant; `CrossLapPlacement::from_position`
+totality; `uses_first_half` accessor truth table; the
+"second half is never used as-is" invariant for both placements;
+`apply_mb_to_wb_override` firing for SILK-only MB; the override
+NOT firing for Hybrid MB (pathological), SILK-only NB / WB / SWB
+/ FB pass-through under any carrier mode; `redundant_frame_params`
+returning `None` for `NotPresent` and `Invalid`; SILK-only NB +
+Beginning ⇒ FirstHalfAsIs with NB pass-through; SILK-only MB +
+End ⇒ SecondHalfAsIs with bandwidth bumped to WB; SILK-only WB
+pass-through; Hybrid SWB and Hybrid FB pass-through; channel-
+count inheritance under five (mode, bandwidth) carriers × both
+channel modes; duration always 50 tenths regardless of the
+carrier's frame size (4 carrier sizes); `size_bytes` faithful
+forwarding under seven sizes; four §4.5.3 Figure 18 cross-checks
+("CELT → SILK with Redundancy" / "CELT → Hybrid with Redundancy"
+/ "SILK → CELT with Redundancy" / "Hybrid → CELT with Redundancy"
++ a "SILK → SILK with Redundancy MB-carrier" case verifying the
+MB → WB bump for both position symbols); a `frame_count_code` /
+`Mode` "carrier-only field irrelevance" invariant; and a total-
+function sweep over (mode × bandwidth × channels × position) that
+verifies the output `bandwidth` is never MB.
+
+Provenance: every constant, every conditional, the "fixed at
+5 ms" duration, the channel-count inheritance, the MB → WB
+override, the `Beginning` / `End` placement distinction, and the
+2.5 ms cross-lap region size is transcribed from RFC 6716
+§4.5.1.4 in `docs/audio/opus/rfc6716-opus.txt` (pp. 126–127). The
+non-normative §4.5.3 Figure 18 (p. 129) was used solely as a
+cross-check that the four redundancy-bearing transition rows
+reproduce the figure's `R` placement; no rule was seeded from
+the figure. No external library source was consulted.
 
 ## Round 27 — §4.5.2 SILK + CELT state-reset policy across mode transitions (2026-05-31)
 
