@@ -368,6 +368,7 @@ pub mod celt_redundancy;
 pub mod celt_tf_adjust;
 pub mod frames;
 pub mod framing;
+pub mod mode_transition_reset;
 pub mod range_decoder;
 pub mod silk_excitation;
 pub mod silk_frame;
@@ -408,6 +409,7 @@ pub use celt_tf_adjust::{
 };
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
 pub use framing::{OperatingMode, OpusFrameRouting, SilkBandwidth};
+pub use mode_transition_reset::{decide_state_resets, CeltResetPlacement, StateReset};
 pub use range_decoder::RangeDecoder;
 pub use silk_excitation::{
     quantization_offset_q23, shell_block_count, Excitation, ExcitationConfig, SilkFrameSize,

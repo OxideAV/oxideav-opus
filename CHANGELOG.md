@@ -4,6 +4,29 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Clean-room round 27 (2026-05-31):** §4.5.2 SILK + CELT decoder
+  state-reset policy across mode transitions — a new
+  `mode_transition_reset` module encoding the four normative rules
+  of RFC 6716 §4.5.2 (p. 127) as a pure decision function
+  `decide_state_resets(prev_mode, next_mode, redundancy) ->
+  StateReset { silk, celt: CeltResetPlacement }`. Rule 1 resets
+  SILK on every CELT-only → SILK-only/Hybrid transition; rule 2
+  resets CELT on every mode change into Hybrid or CELT-only except
+  when redundancy is used; rule 3 places the CELT reset *before
+  the redundant CELT frame* on SILK/Hybrid → CELT-only with
+  redundancy and skips it before the following CELT-only frame;
+  rule 4 suppresses the CELT reset on CELT-only → SILK/Hybrid
+  with redundancy. `RedundancyDecision::Invalid` (the §4.5.1.3
+  overflow outcome) is treated as no usable redundancy.
+  `CeltResetPlacement::{None, BeforeFrame, BeforeRedundantOnly}`
+  plus `StateReset::{celt_resets, is_noop}` accessors round out
+  the public surface. Twenty-seven new unit tests (467 lib tests
+  total) pin every cell of the 3×3 mode-pair × redundancy
+  cross-product and cross-check four §4.5.3 Figure 18 transition
+  rows.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-opus/compare/v0.0.10...v0.0.11) - 2026-05-30
 
 ### Other

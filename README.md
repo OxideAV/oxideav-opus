@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-05-30 (clean-room round 26)
+## Status — 2026-05-31 (clean-room round 27)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
@@ -62,9 +62,99 @@ with the Table 64 `{4095, 1}/4096` flag + §4.5.1.2 Table 65
 `{1, 1}/2` position flag → `End` / `Beginning` placement +
 §4.5.1.3 redundancy size: SILK-only = remaining whole bytes,
 Hybrid = `2 + dec_uint(256)` with the §4.5.1.3 "claimed > whole
-bytes remaining" overflow routed to `RedundancyDecision::Invalid`);
+bytes remaining" overflow routed to `RedundancyDecision::Invalid`) +
+§4.5.2 SILK + CELT decoder state-reset policy
+(`mode_transition_reset::decide_state_resets`: rule 1 SILK reset on
+CELT-only → SILK/Hybrid transitions + rule 2 CELT reset on every
+mode change into Hybrid or CELT-only + rule 3 carve-out placing the
+CELT reset *before the redundant CELT frame* on SILK/Hybrid →
+CELT-only with redundancy + rule 4 carve-out suppressing the CELT
+reset on CELT-only → SILK/Hybrid with redundancy; `StateReset {
+silk, celt: CeltResetPlacement::{None, BeforeFrame,
+BeforeRedundantOnly} }` driving the full 3×3-mode × redundancy
+matrix and cross-checked against the non-normative §4.5.3 Figure
+18 reset markers);
 coarse energy / bit allocation / PVQ shape / band loop still
 deferred.**
+
+## Round 27 — §4.5.2 SILK + CELT state-reset policy across mode transitions (2026-05-31)
+
+Round 27 lands the §4.5.2 *State Reset* decision procedure (RFC 6716
+§4.5.2, p. 127) behind a new `mode_transition_reset` module. This is
+the second §4.5 (mode-switching) fragment after round 26's §4.5.1
+redundancy-flag pipeline, picking up exactly where that round
+stopped: §4.5.1 decided *whether* a transition carried a 5 ms
+redundant CELT frame; §4.5.2 decides *which sub-decoder needs to be
+reset* across the transition and *where* the CELT reset is placed
+relative to the redundant frame.
+
+The §4.5.2 prose is four sentences (the only normative content of
+the section). The module encodes them as four orthogonal rules:
+
+1. **Rule 1 — SILK reset.** The SILK state is reset before every
+   SILK-only or Hybrid frame whose predecessor was CELT-only. The
+   bit is independent of redundancy.
+2. **Rule 2 — CELT reset (default).** The CELT state is reset
+   every time the operating mode changes AND the new mode is Hybrid
+   or CELT-only, EXCEPT when the transition uses redundancy.
+3. **Rule 3 — SILK/Hybrid → CELT-only with redundancy.** The CELT
+   reset moves from "before the new-mode frame" to "before the
+   redundant CELT frame embedded in the previous frame's tail" and
+   is NOT applied before the following CELT-only frame.
+4. **Rule 4 — CELT-only → SILK-only/Hybrid with redundancy.** The
+   CELT decoder is NOT reset for decoding the redundant CELT frame.
+   Combined with rule 2's "except when … redundancy" exception,
+   the CELT decoder is not reset by §4.5.2 policy at all for this
+   transition; SILK still resets per rule 1.
+
+The module owns:
+
+* `StateReset { silk: bool, celt: CeltResetPlacement }` — the
+  outcome of one transition decision.
+* `CeltResetPlacement::{None, BeforeFrame, BeforeRedundantOnly}`
+  — three placement outcomes covering the rule-2 default,
+  the rule-3 carve-out, and the no-reset cases (same-mode +
+  rule 4 + Hybrid → SILK-only).
+* `decide_state_resets(prev_mode, next_mode, redundancy)` —
+  entry point. Treats `RedundancyDecision::Invalid` as "no
+  usable redundancy" per the §4.5.1.3 RECOMMENDATION to stop
+  decoding on overflow.
+* `StateReset::{celt_resets, is_noop}` — accessors.
+
+Twenty-seven new unit tests (467 lib tests total, up from 440 at
+round-26 close; 20 integration tests unchanged, grand total 487)
+cover: the `StateReset::{celt_resets, is_noop}` accessors; rule 1
+firing for CELT-only → SILK-only and CELT-only → Hybrid;
+rule 1 NOT firing for same-mode and Hybrid → SILK-only; rule 1 NOT
+firing whenever `next == CeltOnly`; rule 1's independence from
+redundancy state (NotPresent / Present / Invalid all reset SILK
+identically); rule 2 firing on every mode-changing transition into
+Hybrid or CELT-only without redundancy; rule 2 NOT firing on
+Hybrid → SILK-only; rule 2 NOT firing on any same-mode pair under
+any redundancy state; the rule-3 carve-out routing SILK-only →
+CELT-only and Hybrid → CELT-only with redundancy to
+`BeforeRedundantOnly`; rule 3 falling back to the rule-2
+`BeforeFrame` default when redundancy is `Invalid`; the rule-4
+carve-out suppressing the CELT reset on CELT-only → SILK-only / →
+Hybrid with redundancy while leaving the SILK reset (rule 1)
+intact; CELT-only → Hybrid WITHOUT redundancy still resetting CELT
+under the rule-2 default; the full 3×3 mode-pair × {present,
+not_present} cross-product pinned cell by cell; four §4.5.3 Figure
+18 cross-checks (SILK → CELT with redundancy / CELT → SILK with
+redundancy / CELT → Hybrid with redundancy / Hybrid → WB SILK)
+matching the figure's `;` (SILK-only reset) and absent-reset
+markers; and a small unit-test on the `redundancy_is_present`
+helper that treats `Invalid` as absent.
+
+Provenance: every rule, every cell of the 3×3 × 2-redundancy
+transition matrix, the "operating mode changes" predicate, and the
+"before the redundant frame vs. before the new-mode frame"
+distinction is transcribed from RFC 6716 §4.5.2 in
+`docs/audio/opus/rfc6716-opus.txt` (p. 127). The non-normative
+§4.5.3 Figure 18 was used solely as a cross-check that the
+transcribed rules reproduce the figure's reset markers; no rule
+was seeded from the figure. No external library source was
+consulted.
 
 ## Round 26 — §4.5.1 CELT redundancy / mode-transition side information (2026-05-30)
 
