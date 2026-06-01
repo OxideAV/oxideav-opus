@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-01 (clean-room round 28)
+## Status — 2026-06-01 (clean-room round 29)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
@@ -83,9 +83,112 @@ position, size_bytes, cross_lap }` derived from
 "first 2.5 ms of redundant as-is + second 2.5 ms cross-lap" (CELT
 → SILK/Hybrid) and `End` → "discard first 2.5 ms + second 2.5 ms
 cross-lap" (SILK/Hybrid → CELT); `Invalid` overflow + `NotPresent`
-both route to `None` per §4.5.1.3);
-coarse energy / bit allocation / PVQ shape / band loop / §4.3.7
-inverse-MDCT window for the actual cross-lap still deferred.**
+both route to `None` per §4.5.1.3) + §4.3.2.1 CELT coarse-energy
+Laplace-model parameter surface (`celt_e_prob_model`: `E_PROB_MODEL`
+— the 336-byte `[LM ∈ 0..4][mode ∈ {inter, intra}][band × 2]` Q8
+`{prob, decay}` table feeding `ec_laplace_decode` +
+`EnergyPredictionMode::{Inter, Intra}` selector driven by the §4.3.2.1
+CELT-header `intra` flag + `e_prob_pair(lm, mode, band) -> EProbPair`
+/ `e_prob_row(lm, mode) -> &[u8; 42]` accessors + intra-mode
+prediction-coefficient constants `INTRA_PRED_ALPHA_Q15 = 0` /
+`INTRA_PRED_BETA_Q15 = 4915` against `Q15_ONE = 32768` per RFC 6716
+§4.3.2.1 p. 108);
+the §4.3.2.1 Laplace decoder itself + 2-D `(time, frequency)` predictor
++ §4.3.3 bit allocation + §4.3.4 PVQ shape + band loop + §4.3.7
+inverse-MDCT window for the cross-lap still deferred. The per-LM
+*inter*-mode `(alpha, beta)` pair is a §4.3.2.1 docs gap.**
+
+## Round 29 — §4.3.2.1 CELT coarse-energy Laplace-model parameter surface (2026-06-01)
+
+Round 29 lands the first §4.3.2.1 *Coarse Energy Decoding* fragment
+(RFC 6716 §4.3.2.1, pp. 108–109) behind a new `celt_e_prob_model`
+module. This is the parameter-surface piece — the table lookup that
+hands the §4.3.2.1 `ec_laplace_decode` routine its per-band Q8
+`{probability, decay}` pair — not the Laplace decoder itself nor the
+2-D `(time, frequency)` predictor that consumes its output. Round 20
+landed the CELT pre-band header up to the `intra` flag and noted the
+coarse-energy decode as blocked on `e_prob_model`; this round
+delivers that table plus the surrounding selector / accessor surface
+so the Laplace decoder + predictor can be wired up against it next.
+
+The §4.3.2.1 narrative names three pieces of data the coarse-energy
+decoder needs:
+
+1. **`(alpha, beta)` prediction coefficients.** RFC 6716 §4.3.2.1
+   p. 108 fixes the intra case at `alpha = 0` and
+   `beta = 4915 / 32768` (Q15). The inter case "depend[s] on the
+   frame size in use"; numeric values are not in the RFC body.
+2. **The `e_prob_model` table** — per
+   `(LM, intra, band)` Q8 `{prob, decay}` pair, where
+   `LM = log2(frame_size / 120) ∈ {0,1,2,3}` selects the
+   120 / 240 / 480 / 960-sample CELT frame sizes,
+   `intra ∈ {0,1}` selects inter vs. intra, and `band ∈ 0..21`
+   indexes the §4.3 Table 55 MDCT bands. 336 bytes total
+   (4 × 2 × 21 × 2).
+3. **The `ec_laplace_decode` routine** itself. Out of scope for
+   this round.
+
+The module owns:
+
+* `E_PROB_MODEL: [[[u8; 42]; 2]; 4]` — the 336-byte Q8 table,
+  laid out exactly as `docs/audio/celt/tables/e_prob_model.csv`
+  (one CSV row = one `(LM, mode)` cell with 21 `{prob, decay}`
+  pairs).
+* `E_PROB_MODEL_LM_COUNT = 4`, `E_PROB_MODEL_MODE_COUNT = 2`,
+  `E_PROB_MODEL_BYTES_PER_BAND = 2`,
+  `E_PROB_MODEL_BYTES_PER_ROW = 42`,
+  `E_PROB_MODEL_TOTAL_BYTES = 336` — shape constants for
+  downstream callers.
+* `E_PROB_MODEL_MODE_INTER = 0`, `E_PROB_MODEL_MODE_INTRA = 1` —
+  the §4.3.2.1 inner-axis index constants.
+* `EnergyPredictionMode::{Inter, Intra}` — typed selector with
+  `from_intra_flag(bool)` decode helper and a `table_index()`
+  accessor.
+* `EProbPair { prob, decay }` — Q8 pair the §4.3.2.1
+  `ec_laplace_decode` consumes.
+* `e_prob_pair(lm, mode, band) -> Result<EProbPair, EProbModelError>`
+  — typed lookup with bounds checks on `lm` and `band`.
+* `e_prob_row(lm, mode) -> Result<&'static [u8; 42], EProbModelError>`
+  — borrows the full 42-byte row so the band loop can iterate
+  without re-indexing.
+* `INTRA_PRED_ALPHA_Q15 = 0` / `INTRA_PRED_BETA_Q15 = 4915` /
+  `Q15_ONE = 32768` — the §4.3.2.1 intra-case prediction
+  coefficients (`4915 / 32768 ≈ 0.15`).
+
+Twenty-two new unit tests (514 lib tests total, up from 492 at
+round-28 close) cover: the five shape constants matching the
+struct's actual array dimensions; the inner-row length invariant
+(42 bytes = 21 bands × 2 bytes) for every `(LM, mode)` cell; the
+total-byte invariant summed across all 8 rows; the
+`INTRA_PRED_ALPHA_Q15 = 0` / `INTRA_PRED_BETA_Q15 = 4915` /
+`Q15_ONE = 32768` constants per RFC 6716 §4.3.2.1 p. 108;
+`EnergyPredictionMode::from_intra_flag` truth-table; the
+`Inter → 0` / `Intra → 1` `table_index` mapping matching the CSV
+layout; seven CSV row spot-checks (CSV rows 0, 1, 3, 4, 6, 7
+covering both modes at LM = 0, 1, 2, 3, and bands 0, 5, 10, 20);
+the `LmOutOfRange` and `BandOutOfRange` error paths for both
+accessors; the full 42-byte row returned by `e_prob_row` (first +
+last band positions spot-checked); a total-function sweep over
+every `(LM, mode, band)` triple (4 × 2 × 21 = 168 cells); a
+`pair_lookup_matches_row_lookup` cross-check that the typed pair
+accessor agrees with the raw-row accessor on every cell; and a
+sanity property (intra band-0 `prob` < inter band-0 `prob` for
+every LM) reflecting the §4.3.2.1 narrative on prediction
+effectiveness at band 0.
+
+Provenance: the §4.3.2.1 narrative, the `alpha = 0` /
+`beta = 4915 / 32768` intra-case coefficients, the per-`(LM,
+intra, band)` table layout, and the Q8 `{prob, decay}` pair
+semantics are transcribed from RFC 6716 §4.3.2.1 in
+`docs/audio/opus/rfc6716-opus.txt` (pp. 108–109). The 336 Q8 bytes
+are reproduced from `docs/audio/celt/tables/e_prob_model.csv` (one
+CSV row per `(LM, mode)` cell, 42 bytes each — see the
+`e_prob_model.meta` sidecar for the canonical layout). The narrative
+`docs/audio/celt/spec/celt-coarse-energy-and-allocation.md` §1.2
+cross-references both. The per-LM *inter*-mode `(alpha, beta)` pair
+is a §4.3.2.1 docs gap (the RFC says "depend on the frame size in
+use" without giving numeric values); deferred until the docs side
+delivers the gap fill.
 
 ## Round 28 — §4.5.1.4 redundant-CELT-frame decode parameters + cross-lap placement (2026-06-01)
 

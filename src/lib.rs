@@ -343,6 +343,21 @@
 //!   only the placement metadata (which 2.5 ms region cross-laps,
 //!   where in the carrier's sample buffer it sits).
 //!
+//! * Round 29 lands the §4.3.2.1 CELT coarse-energy Laplace-model
+//!   parameter surface ([`celt_e_prob_model`]: [`E_PROB_MODEL`] —
+//!   the 336-byte `[LM ∈ 0..4][mode ∈ {inter, intra}][band × 2]` Q8
+//!   `{prob, decay}` table feeding `ec_laplace_decode` +
+//!   [`EnergyPredictionMode::{Inter, Intra}`] selector driven by the
+//!   §4.3.2.1 CELT header `intra` flag + [`e_prob_pair`] / [`e_prob_row`]
+//!   accessors returning [`EProbPair`] / `&[u8; 42]` + the
+//!   [`INTRA_PRED_ALPHA_Q15`] / [`INTRA_PRED_BETA_Q15`] / [`Q15_ONE`]
+//!   intra-mode prediction-coefficient constants (`alpha = 0`,
+//!   `beta = 4915 / 32768` per RFC 6716 §4.3.2.1 p. 108)). This is the
+//!   parameter-surface fragment needed before the §4.3.2.1
+//!   Laplace decoder + 2-D `(time, frequency)` predictor can run;
+//!   the decoder itself and the per-LM inter-mode `(alpha, beta)`
+//!   pair are deferred (inter coefficients are a §4.3.2.1 docs gap).
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -391,6 +406,7 @@ impl core::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub mod celt_band_layout;
+pub mod celt_e_prob_model;
 pub mod celt_header;
 pub mod celt_redundancy;
 pub mod celt_tf_adjust;
@@ -421,6 +437,12 @@ pub use celt_band_layout::{
     celt_band_at_hz, celt_band_bins_per_channel, celt_band_start_hz, celt_band_stop_hz,
     celt_end_coded_band, celt_first_coded_band, celt_total_bins_per_channel, CeltFrameSize,
     CELT_MAX_BINS_PER_BAND, CELT_NUM_BANDS, HYBRID_FIRST_CODED_BAND,
+};
+pub use celt_e_prob_model::{
+    e_prob_pair, e_prob_row, EProbModelError, EProbPair, EnergyPredictionMode, E_PROB_MODEL,
+    E_PROB_MODEL_BYTES_PER_BAND, E_PROB_MODEL_BYTES_PER_ROW, E_PROB_MODEL_LM_COUNT,
+    E_PROB_MODEL_MODE_COUNT, E_PROB_MODEL_MODE_INTER, E_PROB_MODEL_MODE_INTRA,
+    E_PROB_MODEL_TOTAL_BYTES, INTRA_PRED_ALPHA_Q15, INTRA_PRED_BETA_Q15, Q15_ONE,
 };
 pub use celt_header::{CeltHeaderPrefix, CeltPostFilter};
 pub use celt_redundancy::{

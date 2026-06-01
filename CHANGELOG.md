@@ -6,6 +6,46 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 29 (2026-06-01):** §4.3.2.1 CELT coarse-energy
+  Laplace-model parameter surface — a new `celt_e_prob_model` module
+  delivering the parameter-surface piece of RFC 6716 §4.3.2.1
+  (pp. 108–109): the per-`(LM, mode, band)` Q8 `{prob, decay}` table
+  the §4.3.2.1 `ec_laplace_decode` routine consumes. Round 20's CELT
+  pre-band header noted the §4.3.2.1 coarse energy as blocked on this
+  table; this round delivers it plus the surrounding selector /
+  accessor surface so the Laplace decoder and 2-D `(time, frequency)`
+  predictor can be wired up against it next. New public surface:
+  `E_PROB_MODEL: [[[u8; 42]; 2]; 4]` (336 Q8 bytes; layout
+  `[LM ∈ 0..4][mode ∈ {inter, intra}][band × 2 + {prob, decay}]`,
+  matching `docs/audio/celt/tables/e_prob_model.csv` row-for-row);
+  shape constants `E_PROB_MODEL_LM_COUNT = 4`,
+  `E_PROB_MODEL_MODE_COUNT = 2`, `E_PROB_MODEL_BYTES_PER_BAND = 2`,
+  `E_PROB_MODEL_BYTES_PER_ROW = 42`,
+  `E_PROB_MODEL_TOTAL_BYTES = 336`; inner-axis index constants
+  `E_PROB_MODEL_MODE_INTER = 0`, `E_PROB_MODEL_MODE_INTRA = 1`;
+  typed selector `EnergyPredictionMode::{Inter, Intra}` with
+  `from_intra_flag(bool)` decode helper and a `table_index()`
+  accessor; `EProbPair { prob: u8, decay: u8 }`; typed accessors
+  `e_prob_pair(lm, mode, band) -> Result<EProbPair, EProbModelError>`
+  and `e_prob_row(lm, mode) -> Result<&'static [u8; 42],
+  EProbModelError>`; intra-case prediction-coefficient constants
+  `INTRA_PRED_ALPHA_Q15 = 0` and `INTRA_PRED_BETA_Q15 = 4915` against
+  `Q15_ONE = 32768` per RFC 6716 §4.3.2.1 p. 108
+  (`4915 / 32768 ≈ 0.15`). Twenty-two new unit tests (514 lib tests
+  total, up from 492 at round-28 close) pin the table shape, the Q8
+  byte values at seven CSV-row spot-checks, the `EnergyPredictionMode`
+  mapping, the `LmOutOfRange` / `BandOutOfRange` error paths, a
+  total-function sweep over every `(LM, mode, band)` triple
+  (4 × 2 × 21 = 168 cells), a pair-vs-row cross-check on every cell,
+  and the §4.3.2.1 prediction-effectiveness sanity property
+  (`intra_band0_prob < inter_band0_prob` for every LM). The
+  §4.3.2.1 Laplace decoder itself, the 2-D `(time, frequency)`
+  predictor application, and the §4.3.2.2 fine-energy follow-up are
+  out of scope for this module. The per-LM *inter*-mode
+  `(alpha, beta)` pair is a §4.3.2.1 docs gap (the RFC names them as
+  "depend on the frame size in use" without giving numeric values);
+  deferred until the docs side delivers the gap fill.
+
 * **Clean-room round 28 (2026-06-01):** §4.5.1.4 redundant-CELT-frame
   decode parameters and cross-lap placement — a new
   `redundancy_decode_params` module encoding the two normative halves
