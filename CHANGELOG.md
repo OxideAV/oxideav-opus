@@ -6,6 +6,42 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 29 (2026-06-01):** §4.3.2.1 CELT coarse-energy
+  Laplace probability model — a new `celt_e_prob_model` module owning
+  the `e_prob_model` table (RFC 6716 §4.3.2.1, pp. 108–109). The
+  336-byte `E_PROB_MODEL: [[[u8; 42]; 2]; 4]` table is indexed
+  `[LM ∈ 0..=3][intra ∈ 0..=1][band ∈ 0..=20] → (prob_zero, decay)`
+  Q8 pair, transcribed cell-for-cell from
+  `docs/audio/celt/tables/e_prob_model.csv` (the Feist-facts CSV
+  under the OxideAV CELT clean-room workspace).
+  `EnergyPrediction::{Inter, Intra}` dispatches the §4.3.2.1 `intra`
+  Table-56 flag onto the table's middle axis; the §4.3.2.1
+  intra-case `(alpha = 0, beta = 4915/32768)` prediction coefficients
+  are exposed as named constants `INTRA_ALPHA_NUMERATOR`,
+  `INTRA_BETA_NUMERATOR`, `INTRA_BETA_DENOMINATOR`.
+  `lm_from_celt_frame_size` / `celt_frame_size_from_lm` /
+  `frame_size_samples_from_lm` round-trip the §4.3.2.1
+  `LM = log2(frame_size / 120)` axis against the round-24
+  `CeltFrameSize`. `e_prob_model_pair` /
+  `e_prob_model_prob_zero` / `e_prob_model_decay` /
+  `e_prob_model_row` are the cell-, byte-, and row-level accessors
+  the §4.3.2.1 `ec_laplace_decode` primitive will consume.
+  Thirty-four new unit tests (526 lib tests total, up from 492 at
+  round-28 close) pin every axis constant, full 42-byte pins for
+  the `(LM=0, inter)` and `(LM=0, intra)` rows, three corner/middle
+  pins per remaining row, the global minimum-`prob_zero`
+  (21, at `(LM=2, intra, band=0)`) and global maximum-`prob_zero`
+  (192, at `(LM=2, inter, band=18)`) cells, the §4.3.2.1
+  directional invariant `prob_zero_intra < prob_zero_inter` /
+  `decay_intra > decay_inter` on low-frequency bands, the
+  every-cell-non-zero invariant, the `INTRA_BETA ≈ 0.15001`
+  sanity bracket, accessor agreement, and the
+  `LM ↔ CeltFrameSize ↔ samples` round-trip. The §4.3.2.1
+  `ec_laplace_decode` primitive (which consumes the
+  `(prob_zero, decay)` pair plus a `RangeDecoder`) and the
+  §4.3.2.1 `unquant_coarse_energy` driver remain deferred to a
+  follow-up round.
+
 * **Clean-room round 28 (2026-06-01):** §4.5.1.4 redundant-CELT-frame
   decode parameters and cross-lap placement — a new
   `redundancy_decode_params` module encoding the two normative halves

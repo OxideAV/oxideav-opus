@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-01 (clean-room round 28)
+## Status — 2026-06-01 (clean-room round 29)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
@@ -83,9 +83,153 @@ position, size_bytes, cross_lap }` derived from
 "first 2.5 ms of redundant as-is + second 2.5 ms cross-lap" (CELT
 → SILK/Hybrid) and `End` → "discard first 2.5 ms + second 2.5 ms
 cross-lap" (SILK/Hybrid → CELT); `Invalid` overflow + `NotPresent`
-both route to `None` per §4.5.1.3);
-coarse energy / bit allocation / PVQ shape / band loop / §4.3.7
-inverse-MDCT window for the actual cross-lap still deferred.**
+both route to `None` per §4.5.1.3) + §4.3.2.1 CELT coarse-energy
+Laplace probability model (`celt_e_prob_model`: the 336-byte
+`E_PROB_MODEL` table indexed `[LM ∈ 0..=3][intra ∈ 0..=1][band ∈
+0..=20] → (prob_zero, decay)` Q8 pair from
+`docs/audio/celt/tables/e_prob_model.csv`; `EnergyPrediction::
+{Inter, Intra}` mapping the §4.3.2.1 `intra` Table-56 flag; the
+intra-case prediction coefficients `INTRA_ALPHA_NUMERATOR = 0` +
+`INTRA_BETA_NUMERATOR = 4915` / `INTRA_BETA_DENOMINATOR = 32768`
+per §4.3.2.1; `lm_from_celt_frame_size` +
+`celt_frame_size_from_lm` + `frame_size_samples_from_lm` for the
+`LM = log2(frame_size/120)` mapping; `e_prob_model_pair` /
+`e_prob_model_prob_zero` / `e_prob_model_decay` /
+`e_prob_model_row` cell accessors);
+the §4.3.2.1 `ec_laplace_decode` primitive that consumes these
+parameters, the §4.3.2.1 `unquant_coarse_energy` driver / 2-D
+prediction filter, §4.3.3 bit allocation, §4.3.4 PVQ shape, band
+loop, and §4.3.7 inverse-MDCT window for the actual cross-lap
+still deferred.**
+
+## Round 29 — §4.3.2.1 CELT coarse-energy Laplace probability model (2026-06-01)
+
+Round 29 lands the §4.3.2.1 `e_prob_model` Laplace probability
+model (RFC 6716 §4.3.2.1, pp. 108–109) behind a new
+`celt_e_prob_model` module. This is the first §4.3.2 (energy
+envelope) fragment after the round-20 §4.3 / Table 56 header
+prefix landed the `intra` flag decoder. Round 20 said *whether*
+time prediction was in use; this round lands the *probability
+parameters* the §4.3.2.1 `ec_laplace_decode()` primitive will
+read out of for each band's coarse-energy prediction error.
+
+The §4.3.2.1 prose nails down three facts.
+
+**Fact 1 — the Laplace model parameters live in a 4 × 2 × 21 ×
+2 = 336-byte table.** *"We approximate the ideal probability
+distribution of the prediction error using a Laplace
+distribution with separate parameters for each frame size in
+intra- and inter-frame modes. These parameters are held in the
+e_prob_model table in quant_bands.c."* (RFC 6716 §4.3.2.1) The
+table is indexed by `(LM, intra, band)`; each cell is a
+`{prob_zero, decay}` Q8 pair the §4.3.2.1 Laplace decoder
+combines with the running range-coder state to decode the next
+symbol.
+
+**Fact 2 — `LM = log2(frame_size / 120)`.** RFC 6716 §4.3.2.1's
+frame-size axis uses `LM ∈ {0, 1, 2, 3}` for 120 / 240 / 480 /
+960 samples at the §4.3 CELT internal rate of 48 kHz. Those map
+to 2.5 / 5 / 10 / 20 ms — the same column ordering already used
+by the round-24 `CeltFrameSize` enum and `celt_band_layout`'s
+Table 55. The module exposes `lm_from_celt_frame_size` /
+`celt_frame_size_from_lm` / `frame_size_samples_from_lm` so the
+§4.3.2.1 driver downstream can move between both
+representations without open-coding the bit-shift.
+
+**Fact 3 — intra prediction has the fixed coefficients
+`alpha = 0`, `beta = 4915/32768`.** *"The prediction
+coefficients applied depend on the frame size in use when not
+using intra energy and are alpha=0, beta=4915/32768 when using
+intra energy."* (RFC 6716 §4.3.2.1) Exposed as named constants
+`INTRA_ALPHA_NUMERATOR = 0`, `INTRA_BETA_NUMERATOR = 4915`,
+`INTRA_BETA_DENOMINATOR = 32768` so the upcoming 2-D prediction
+filter driver doesn't have to rediscover the fraction at the
+call site. The inter-case `(alpha, beta)` coefficients depend
+on the frame size and land in the same follow-up round that
+wires up the prediction filter itself.
+
+The module owns:
+
+* `E_PROB_MODEL: [[[u8; 42]; 2]; 4]` — the §4.3.2.1
+  probability table, transcribed cell-for-cell from
+  `docs/audio/celt/tables/e_prob_model.csv` (Feist-facts
+  extraction; RFC 6716's canonical identifier).
+* `E_PROB_MODEL_{FRAME_SIZE,PREDICTION,BAND,PAIRS}_AXIS` +
+  `E_PROB_MODEL_BYTE_COUNT = 336` + `E_PROB_MODEL_ROW_BYTES =
+  42` + `E_PROB_MODEL_LM_MAX = 3` — every axis size pinned to
+  the spec so a future-LM extension or a band-partition change
+  forces a recompile.
+* `EnergyPrediction::{Inter, Intra}` with
+  `intra_axis_index` (the table's middle-axis index) and
+  `from_intra_flag(bool)` (decoder-side dispatch from the
+  §4.3 Table-56 `intra` flag).
+* `lm_from_celt_frame_size` / `celt_frame_size_from_lm` /
+  `frame_size_samples_from_lm` — the `LM = log2(frame_size /
+  120)` round-trip between the §4.3.2.1 axis and the round-24
+  `CeltFrameSize` enum.
+* `e_prob_model_pair(lm, prediction, band) -> Option<(u8, u8)>` —
+  the primary lookup the Laplace decoder consumes.
+* `e_prob_model_prob_zero` / `e_prob_model_decay` /
+  `e_prob_model_row` — the three individual-axis accessors.
+* `INTRA_ALPHA_NUMERATOR` / `INTRA_BETA_NUMERATOR` /
+  `INTRA_BETA_DENOMINATOR` — the §4.3.2.1 intra-case fixed
+  coefficients.
+
+Thirty-four new unit tests (526 lib tests total, up from 492 at
+round-28 close; 20 integration tests unchanged, grand total
+546) cover: every axis constant (`FRAME_SIZE = 4`,
+`PREDICTION = 2`, `BAND = 21`, `PAIRS = 2`, byte count = 336,
+row bytes = 42, `LM_MAX = 3`); the `BAND` axis tracking
+`CELT_NUM_BANDS`; the table's total byte count under iteration
+matching the constant; the `INTRA_BETA_NUMERATOR /
+INTRA_BETA_DENOMINATOR ≈ 0.15001` sanity bracket; full
+42-byte pins for the two most-used rows (`(LM=0, inter)` and
+`(LM=0, intra)`); three corner-and-middle cell pins for each of
+the remaining six rows so every CSV row touches at least three
+test points; out-of-range `LM` and `band` axes returning `None`
+on all four accessors; `prob_zero` / `decay` /
+`row` helper agreement against `pair`; the
+`EnergyPrediction::from_intra_flag` truth table;
+`LM ↔ CeltFrameSize` round-trip across all four sizes;
+`frame_size_samples_from_lm` matching the spec's `120 << LM`
+sequence; the §4.3.2.1 directional invariant that intra-case
+`prob_zero` is strictly *less* than inter-case for low-frequency
+bands (the time-predictor's absence widens the prediction-error
+distribution) plus the complementary `decay` directional
+invariant; every Q8 cell in the table being non-zero (a typo
+producing 0 would be a degenerate Laplace) for both halves of
+each pair; and named pins on the table's global minimum
+prob-of-zero cell (21, `(LM=2, intra, band=0)`) and global
+maximum (192, `(LM=2, inter, band=18)`) so a future CSV
+regeneration can't silently shift either extreme.
+
+**Why this is the right next step.** The §4.5 mode-switching
+rounds (26–28) closed the cross-frame boundary metadata; the
+remaining §4.3 CELT decoder progression has two roughly parallel
+sub-blockers — §4.3.2.1 coarse energy (the Laplace primitive +
+its parameter table + the 2-D prediction filter) and §4.3.3 bit
+allocation (`cache_caps50` + `LOG2_FRAC_TABLE` + the eight-step
+allocator). The Laplace probability table is the most-cited
+sub-dependency of the coarse-energy stage and is also the only
+piece small enough to fit in one well-isolated round with full
+RFC-text pins. Landing it now unblocks the §4.3.2.1
+`ec_laplace_decode` primitive in the next round, which in turn
+unblocks the §4.3.2.1 `unquant_coarse_energy` driver — and the
+driver is what closes the cross-lap MDCT window the round-28
+`CrossLapPlacement` metadata is waiting on.
+
+**Followups.**
+
+* §4.3.2.1 `ec_laplace_decode` primitive (consumes
+  `e_prob_model_pair` + a `RangeDecoder`).
+* §4.3.2.1 `unquant_coarse_energy` driver (consumes the
+  Laplace primitive + the 2-D prediction filter + the
+  inter-case `(alpha, beta)` frame-size-dependent
+  coefficients).
+* §4.3.3 bit allocation (`cache_caps50` + `LOG2_FRAC_TABLE`,
+  CSVs already present at
+  `docs/audio/celt/tables/cache_caps50.csv` /
+  `docs/audio/celt/tables/log2_frac_table.csv`).
 
 ## Round 28 — §4.5.1.4 redundant-CELT-frame decode parameters + cross-lap placement (2026-06-01)
 

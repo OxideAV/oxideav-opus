@@ -343,6 +343,24 @@
 //!   only the placement metadata (which 2.5 ms region cross-laps,
 //!   where in the carrier's sample buffer it sits).
 //!
+//! * Round 29 lands the §4.3.2.1 CELT coarse-energy Laplace
+//!   probability model ([`E_PROB_MODEL`] / [`e_prob_model_pair`] /
+//!   [`e_prob_model_prob_zero`] / [`e_prob_model_decay`] /
+//!   [`e_prob_model_row`] / [`EnergyPrediction`] /
+//!   [`lm_from_celt_frame_size`] / [`celt_frame_size_from_lm`] /
+//!   [`frame_size_samples_from_lm`] / [`INTRA_ALPHA_NUMERATOR`] /
+//!   [`INTRA_BETA_NUMERATOR`] / [`INTRA_BETA_DENOMINATOR`]) — the
+//!   336-byte `e_prob_model` table (RFC 6716 §4.3.2.1, pp. 108–109)
+//!   transcribed from `docs/audio/celt/tables/e_prob_model.csv`,
+//!   indexed `[LM ∈ 0..=3][intra ∈ 0..=1][band ∈ 0..=20] →
+//!   (prob_zero, decay)` Q8 pair, plus the `LM = log2(frame_size /
+//!   120)` axis round-trip against the round-24 [`CeltFrameSize`]
+//!   and the §4.3.2.1 intra-case prediction coefficients (`alpha =
+//!   0`, `beta = 4915/32768`). This is the per-band probability
+//!   model the §4.3.2.1 `ec_laplace_decode` primitive will consume;
+//!   the primitive itself and the §4.3.2.1 `unquant_coarse_energy`
+//!   driver land in a follow-up round.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -391,6 +409,7 @@ impl core::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub mod celt_band_layout;
+pub mod celt_e_prob_model;
 pub mod celt_header;
 pub mod celt_redundancy;
 pub mod celt_tf_adjust;
@@ -421,6 +440,13 @@ pub use celt_band_layout::{
     celt_band_at_hz, celt_band_bins_per_channel, celt_band_start_hz, celt_band_stop_hz,
     celt_end_coded_band, celt_first_coded_band, celt_total_bins_per_channel, CeltFrameSize,
     CELT_MAX_BINS_PER_BAND, CELT_NUM_BANDS, HYBRID_FIRST_CODED_BAND,
+};
+pub use celt_e_prob_model::{
+    celt_frame_size_from_lm, e_prob_model_decay, e_prob_model_pair, e_prob_model_prob_zero,
+    e_prob_model_row, frame_size_samples_from_lm, lm_from_celt_frame_size, EnergyPrediction,
+    E_PROB_MODEL, E_PROB_MODEL_BAND_AXIS, E_PROB_MODEL_BYTE_COUNT, E_PROB_MODEL_FRAME_SIZE_AXIS,
+    E_PROB_MODEL_LM_MAX, E_PROB_MODEL_PAIRS_AXIS, E_PROB_MODEL_PREDICTION_AXIS,
+    E_PROB_MODEL_ROW_BYTES, INTRA_ALPHA_NUMERATOR, INTRA_BETA_DENOMINATOR, INTRA_BETA_NUMERATOR,
 };
 pub use celt_header::{CeltHeaderPrefix, CeltPostFilter};
 pub use celt_redundancy::{
