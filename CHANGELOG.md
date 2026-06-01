@@ -4,6 +4,15 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-opus/compare/v0.0.11...v0.0.12) - 2026-06-01
+
+### Other
+
+- §4.3.2.1 CELT coarse-energy Laplace probability model (round 29)
+- §4.5.1.4 redundant-CELT-frame decode parameters + cross-lap placement (round 28)
+- §4.5.2 SILK + CELT state-reset policy across mode transitions (round 27)
+- §4.5.1 CELT redundancy / mode-transition side information (round 26)
+
 ### Added
 
 * **Clean-room round 29 (2026-06-01):** §4.3.2.1 CELT coarse-energy
