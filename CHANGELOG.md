@@ -6,6 +6,42 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 30 (2026-06-02):** §4.3.3 intensity-stereo
+  reservation parameter surface — a new `celt_log2_frac_table` module
+  delivering the `LOG2_FRAC_TABLE` lookup piece of RFC 6716 §4.3.3
+  (p. 113): the 24-byte conservative `log2` table (in Q3 / 1/8-bit
+  units) the §4.3.3 `intensity_rsv = LOG2_FRAC_TABLE[end − start]`
+  reservation consumes. Round 24 noted the §4.3.3 allocator as blocked
+  on `cache_caps50` + `LOG2_FRAC_TABLE`; this round delivers the
+  smaller of the two table dependencies. New public surface:
+  `LOG2_FRAC_TABLE: [u8; 24]` (24 Q3 bytes; layout
+  `LOG2_FRAC_TABLE[coded_bands] = conservative_log2(coded_bands)` in
+  1/8-bit units, matching `docs/audio/celt/tables/log2_frac_table.csv`
+  row-for-row); shape constant `LOG2_FRAC_TABLE_LEN = 24`;
+  unit-denominator constant `Q3_BITS_PER_WHOLE_BIT = 8`; typed
+  accessor `log2_frac(coded_bands) -> Result<u8, Log2FracError>`
+  with the §4.3.3 `coded_bands = end − start` indexing rule and a
+  bounds check covering the `coded_bands ≥ 24` case; full-row
+  borrow `log2_frac_row() -> &'static [u8; 24]`; error variant
+  `Log2FracError::CodedBandsOutOfRange { coded_bands }`. Seventeen
+  new unit tests (531 lib tests total, up from 514 at round-29
+  close) pin the table shape, the `Q3_BITS_PER_WHOLE_BIT = 8` unit
+  constant, seven CSV-row spot-checks at indices 0 / 1 / 2 / 4 / 14
+  / 15 / 21 / 23 (covering the §4.3.3 base case, the 1-bit floor,
+  the upward-rounded conservative entry, the Hybrid reachable
+  index, the 32-byte plateau pair, the CELT-only reachable index,
+  and the final entry), a monotone-non-decreasing property across
+  every adjacent pair, a conservative-bound property
+  `LOG2_FRAC_TABLE[n] ≥ 8 × floor(log2(n))` for every `n ∈ 1..24`
+  (leading-zero-count formulation, no floats), a total-function
+  sweep over every in-range index, the `CodedBandsOutOfRange` error
+  paths, a row-vs-pair cross-check, and two §4.3.3-reachable-index
+  sanity pins (CELT-only `end − start = 21` → `36` Q3; Hybrid
+  `end − start = 4` → `19` Q3). The rest of the §4.3.3 allocation
+  algorithm (anti-collapse / skip / dual-stereo reservations, the
+  Table 57 static-allocation search, boost / trim decoding, and the
+  `cache_caps50` per-band maximum vector) is out of scope.
+
 * **Clean-room round 29 (2026-06-01):** §4.3.2.1 CELT coarse-energy
   Laplace-model parameter surface — a new `celt_e_prob_model` module
   delivering the parameter-surface piece of RFC 6716 §4.3.2.1

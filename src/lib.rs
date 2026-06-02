@@ -358,6 +358,19 @@
 //!   the decoder itself and the per-LM inter-mode `(alpha, beta)`
 //!   pair are deferred (inter coefficients are a §4.3.2.1 docs gap).
 //!
+//! * Round 30 lands the §4.3.3 *intensity-stereo reservation*
+//!   parameter surface ([`celt_log2_frac_table`]:
+//!   [`LOG2_FRAC_TABLE`] — the 24-byte Q3 (1/8-bit) conservative
+//!   `log2` table feeding the §4.3.3 `intensity_rsv =
+//!   LOG2_FRAC_TABLE[end − start]` reservation + [`log2_frac`] typed
+//!   accessor + [`log2_frac_row`] full-row borrow + the
+//!   [`Q3_BITS_PER_WHOLE_BIT`] = 8 unit-denominator constant). This
+//!   is a parameter-surface piece of the §4.3.3 bit-allocation
+//!   procedure; the boost / trim / anti-collapse / skip / dual-stereo
+//!   reservations, the Table 57 static allocation search, the
+//!   `cache_caps50` per-band maximum, and the rest of the §4.3.3
+//!   allocation loop are all out of scope for this round.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -408,6 +421,7 @@ impl std::error::Error for Error {}
 pub mod celt_band_layout;
 pub mod celt_e_prob_model;
 pub mod celt_header;
+pub mod celt_log2_frac_table;
 pub mod celt_redundancy;
 pub mod celt_tf_adjust;
 pub mod frames;
@@ -445,6 +459,10 @@ pub use celt_e_prob_model::{
     E_PROB_MODEL_TOTAL_BYTES, INTRA_PRED_ALPHA_Q15, INTRA_PRED_BETA_Q15, Q15_ONE,
 };
 pub use celt_header::{CeltHeaderPrefix, CeltPostFilter};
+pub use celt_log2_frac_table::{
+    log2_frac, log2_frac_row, Log2FracError, LOG2_FRAC_TABLE, LOG2_FRAC_TABLE_LEN,
+    Q3_BITS_PER_WHOLE_BIT,
+};
 pub use celt_redundancy::{
     decode_redundancy, remaining_bits, whole_bytes_remaining, RedundancyDecision,
     RedundancyPosition, HYBRID_REDUNDANCY_MIN_REMAINING_BITS,

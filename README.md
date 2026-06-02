@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-01 (clean-room round 29)
+## Status — 2026-06-02 (clean-room round 30)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
@@ -92,11 +92,109 @@ CELT-header `intra` flag + `e_prob_pair(lm, mode, band) -> EProbPair`
 / `e_prob_row(lm, mode) -> &[u8; 42]` accessors + intra-mode
 prediction-coefficient constants `INTRA_PRED_ALPHA_Q15 = 0` /
 `INTRA_PRED_BETA_Q15 = 4915` against `Q15_ONE = 32768` per RFC 6716
-§4.3.2.1 p. 108);
+§4.3.2.1 p. 108) + §4.3.3 intensity-stereo reservation parameter
+surface (`celt_log2_frac_table`: `LOG2_FRAC_TABLE` — the 24-byte Q3
+(1/8-bit) conservative `log2` table feeding the §4.3.3
+`intensity_rsv = LOG2_FRAC_TABLE[end − start]` reservation +
+`log2_frac(coded_bands) -> u8` accessor + `log2_frac_row() -> &[u8;
+24]` full-row borrow + `Q3_BITS_PER_WHOLE_BIT = 8` unit-denominator
+constant; covers the CELT-only `end − start = 21` and Hybrid `end −
+start = 4` reachable indices per RFC 6716 §4.3.3 p. 113);
 the §4.3.2.1 Laplace decoder itself + 2-D `(time, frequency)` predictor
-+ §4.3.3 bit allocation + §4.3.4 PVQ shape + band loop + §4.3.7
-inverse-MDCT window for the cross-lap still deferred. The per-LM
-*inter*-mode `(alpha, beta)` pair is a §4.3.2.1 docs gap.**
++ rest of §4.3.3 bit allocation (boost / trim / anti-collapse / skip /
+dual-stereo reservations + Table 57 static-allocation search +
+`cache_caps50` per-band maximum) + §4.3.4 PVQ shape + band loop +
+§4.3.7 inverse-MDCT window for the cross-lap still deferred. The
+per-LM *inter*-mode `(alpha, beta)` pair is a §4.3.2.1 docs gap.**
+
+## Round 30 — §4.3.3 intensity-stereo reservation parameter surface (2026-06-02)
+
+Round 30 lands the §4.3.3 *bit allocation* `LOG2_FRAC_TABLE` lookup
+(RFC 6716 §4.3.3, p. 113) behind a new `celt_log2_frac_table` module.
+This is a narrow parameter-surface piece — the 24-byte conservative
+`log2` table the §4.3.3 *intensity-stereo reservation* uses, plus a
+typed accessor pairing it with the §4.3.3 `coded_bands = end − start`
+indexing rule — not the rest of the §4.3.3 allocation algorithm
+(anti-collapse / skip / dual-stereo reservations, the Table 57
+static-allocation search, boost / trim decoding, or the `cache_caps50`
+per-band maximum vector). Round 24 noted the §4.3.3 allocator as
+blocked on `cache_caps50` + `LOG2_FRAC_TABLE`; this round delivers
+the smaller of the two table dependencies so subsequent rounds can
+build up the §4.3.3 reservation pre-amble against it.
+
+The §4.3.3 narrative (RFC 6716 §4.3.3 sub-step §2.5 "intensity
+stereo") reads:
+
+> For stereo, bits are reserved for intensity stereo and dual stereo.
+> Intensity stereo requires `ilog2(end − start)` bits, reserved if
+> there is room […]. The number of bits actually reserved is given
+> by the `LOG2_FRAC_TABLE` in `rate.c`.
+
+So the §4.3.3 caller indexes the table by the number of coded bands
+in the frame (`end − start` over the §4.3 Table 55 band loop) and
+reserves that many 1/8-bit units from `total` before the Table 57
+static allocation search runs. For CELT-only frames the band loop is
+`0..=20` so `end − start = 21`; for Hybrid frames the SILK layer
+covers the first 17 bands so `end − start = 4` (the §4.3 carve-out of
+bands `17..=20`). The table's 24-entry depth covers both with
+headroom.
+
+The module owns:
+
+* `LOG2_FRAC_TABLE: [u8; 24]` — the conservative `log2` table in Q3
+  (1/8-bit) units, laid out exactly as
+  `docs/audio/celt/tables/log2_frac_table.csv` (one CSV row per
+  `(index, log2_8thbits)` pair).
+* `LOG2_FRAC_TABLE_LEN = 24` — the shape constant for downstream
+  callers.
+* `Q3_BITS_PER_WHOLE_BIT = 8` — the §4.3.3 unit-denominator,
+  toggling between whole bits and 1/8-bit units.
+* `log2_frac(coded_bands) -> Result<u8, Log2FracError>` — the typed
+  accessor that does the §4.3.3 `LOG2_FRAC_TABLE[end − start]`
+  lookup with a bounds check that catches the `coded_bands ≥ 24`
+  case (which the §4.3.3 band loop cannot reach but a buggy caller
+  could).
+* `log2_frac_row() -> &'static [u8; 24]` — the full-row borrow when
+  a downstream sub-decoder wants to iterate the table without
+  per-call indexing.
+* `Log2FracError::CodedBandsOutOfRange { coded_bands }` — the one
+  error variant.
+
+Seventeen new unit tests (531 lib tests total, up from 514 at the
+round-29 close; 20 integration tests unchanged, grand total 551)
+cover: the `LOG2_FRAC_TABLE_LEN = 24` shape constant pinned against
+the array's actual length; the `Q3_BITS_PER_WHOLE_BIT = 8` unit
+constant; seven CSV-row spot-checks at indices 0 / 1 / 2 / 4 / 14 /
+15 / 21 / 23 (covering the §4.3.3 base case, the 1-bit floor, the
+upward-rounded conservative entry, the Hybrid reachable index, the
+32-byte plateau pair, the CELT-only reachable index, and the final
+entry); a monotone-non-decreasing property over every adjacent pair
+of entries (the §2.5 narrative's "conservative log2" implies
+monotonicity); a conservative-bound property `LOG2_FRAC_TABLE[n] ≥
+8 × floor(log2(n))` for every `n ∈ 1..24` (formulated as a leading-
+zero-count check to avoid floating-point); a total-function sweep
+over every in-range index (24 cells); `CodedBandsOutOfRange` error
+paths for `LOG2_FRAC_TABLE_LEN` and `u32::MAX`; a row-vs-pair
+cross-check on every cell that `log2_frac_row()` agrees with
+`log2_frac(n)`; and two §4.3.3-reachable-index sanity pins
+(CELT-only `end − start = 21` → `36` Q3; Hybrid `end − start = 4` →
+`19` Q3).
+
+Provenance: the §4.3.3 narrative (the conservative `log2`
+characterisation, the `intensity_rsv = LOG2_FRAC_TABLE[end − start]`
+formula, the §4.3.3 §2.5 sub-step the table participates in, and the
+Q3 / 1-8-bit unit) is transcribed from RFC 6716 §4.3.3 in
+`docs/audio/opus/rfc6716-opus.txt` (pp. 112–114). The 24 Q3 byte
+values are reproduced from `docs/audio/celt/tables/log2_frac_table.csv`
+(one CSV row per `(index, log2_8thbits)` pair — see the
+`log2_frac_table.meta` sidecar for the canonical layout). The
+narrative `docs/audio/celt/spec/celt-coarse-energy-and-allocation.md`
+§2.5 cross-references both. The rest of the §4.3.3 allocation
+algorithm (boost / trim / anti-collapse / skip / dual-stereo
+reservations, the Table 57 static-allocation search, the
+`cache_caps50` per-band maximum, the §4.3.3 reallocation /
+fine-vs-shape split / band-priority computation) is out of scope for
+this module.
 
 ## Round 29 — §4.3.2.1 CELT coarse-energy Laplace-model parameter surface (2026-06-01)
 
