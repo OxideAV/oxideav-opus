@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-02 (clean-room round 30)
+## Status — 2026-06-03 (clean-room round 31)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
@@ -106,6 +106,148 @@ dual-stereo reservations + Table 57 static-allocation search +
 `cache_caps50` per-band maximum) + §4.3.4 PVQ shape + band loop +
 §4.3.7 inverse-MDCT window for the cross-lap still deferred. The
 per-LM *inter*-mode `(alpha, beta)` pair is a §4.3.2.1 docs gap.**
+
+## Round 31 — §4.3.3 per-band maximum-allocation parameter surface (2026-06-03)
+
+Round 31 lands the §4.3.3 *bit allocation* `cache_caps50` lookup plus
+the §4.3.3 `init_caps()` convert rule (RFC 6716 §4.3.3, pp. 113–114)
+behind a new `celt_cache_caps50` module. This is the second of the
+two §4.3.3 table dependencies round 24 noted as blocking the
+allocator: round 30 landed `LOG2_FRAC_TABLE` (the §4.3.3
+intensity-stereo reservation log₂), and this round lands
+`CACHE_CAPS50` (the §4.3.3 per-band maximum allocation cap). With
+both tables in tree the §4.3.3 allocator's table-dependency wall is
+closed; what remains is the orchestration itself (boost / trim /
+anti-collapse / skip / dual-stereo reservations, the Table 57
+static-allocation search, and the reallocation / fine-vs-shape split
+/ band-priority computation).
+
+The §4.3.3 narrative reads (RFC 6716 §4.3.3, p. 113):
+
+> The maximum allocation vector is an approximation of the maximum
+> space that can be used by each band for a given mode. The value is
+> approximate because the shape encoding is variable rate […]. The
+> maximums specified by the codec reflect the average maximum. In
+> the reference implementation, the maximums in bits/sample are
+> precomputed in a static table […] for each band, for each value
+> of LM, and for both mono and stereo.
+
+The §4.3.3 indexing and convert rule (RFC 6716 §4.3.3 p. 113):
+
+> To convert the values in cache.caps into the actual maximums:
+> first, set `nbBands` to the maximum number of bands for this mode,
+> and `stereo` to zero if stereo is not in use and one otherwise.
+> For each band, set `N` to the number of MDCT bins covered by the
+> band (for one channel), set `LM` to the shift value for the frame
+> size. Then, set `i` to `nbBands*(2*LM+stereo)`. Next, set the
+> maximum for the band to the `i`-th index of `cache.caps + 64` and
+> multiply by the number of channels in the current frame (one or
+> two) and by `N`, then divide the result by 4 using integer
+> division. The resulting vector will be called `cap[]`. The
+> elements fit in signed 16-bit integers but do not fit in 8 bits.
+> This procedure is implemented in the reference in the function
+> `init_caps()` in `celt.c`.
+
+So the §4.3.3 allocator needs three things from this module: the
+flat `cache_caps50` byte for a `(LM, stereo, band)` triple, the
+`init_caps()` `(value + 64) * channels * N / 4` convert step, and
+the §4.3.3 `i = nbBands*(2*LM + stereo) + band` row-stride indexing
+rule. All three are owned here; the §4.3.3 band loop that walks
+across bands and produces the full `cap[]` vector is the
+allocator's responsibility and runs at the call site.
+
+The module owns:
+
+* `CACHE_CAPS50: [u8; 168]` — the per-band maximum-allocation table
+  in Q0 bits/sample units, laid out as eight 21-byte rows in the
+  §4.3.3 `(LM, stereo)` row-stride convention. Row `r` is
+  `(LM = r/2, stereo = r%2)`; the row matches CSV row `r` in
+  `docs/audio/celt/tables/cache_caps50.csv`.
+* `CACHE_CAPS50_LM_COUNT = 4`, `CACHE_CAPS50_STEREO_COUNT = 2`,
+  `CACHE_CAPS50_TOTAL_BYTES = 168` — shape constants for downstream
+  callers.
+* `CACHE_CAPS50_STEREO_MONO = 0`, `CACHE_CAPS50_STEREO_STEREO = 1` —
+  the §4.3.3 stereo-axis index constants.
+* `INIT_CAPS_BIAS = 64`, `INIT_CAPS_DIVISOR = 4`,
+  `INIT_CAPS_MAX_CHANNELS = 2` — `init_caps()` convert-rule constants.
+* `CacheCapsStereo::{Mono, Stereo}` — the typed stereo-axis
+  selector, with `axis_index() -> usize` (yielding `0` / `1` for the
+  row-stride rule), `channels() -> u32` (yielding `1` / `2` for the
+  `init_caps()` multiplier), and `from_is_stereo(bool) -> Self` for
+  decoding the TOC stereo-flag boolean.
+* `cache_caps_offset(lm, stereo, band) -> usize` — the §4.3.3
+  `nbBands * (2*LM + stereo) + band` flat-offset helper.
+* `cache_caps_value(lm, stereo, band) -> Result<u8, CacheCaps50Error>`
+  — the typed per-cell accessor with `LmOutOfRange` /
+  `BandOutOfRange` bounds checks.
+* `cache_caps_row(lm, stereo) -> Result<&'static [u8], CacheCaps50Error>`
+  — the typed per-row borrow for the §4.3 band loop.
+* `init_caps(caps_value, channels, n_bins) -> u32` — the §4.3.3
+  `((value + 64) * channels * N) / 4` convert step on a single byte
+  (named for the §4.3.3 reference function).
+* `cap_for_band_bits(lm, stereo, band, channels, n_bins) -> Result<u32,
+  CacheCaps50Error>` — composite lookup + convert, with the
+  `ChannelsOutOfRange` check on the §4.3.3 `channels ∈ {1,2}`
+  range.
+* `CacheCaps50Error::{LmOutOfRange, BandOutOfRange,
+  ChannelsOutOfRange}` — the three error variants.
+
+The §4.3.3 narrative invariant that the per-band cap "fits in signed
+16-bit integers but does not fit in 8 bits" is checked across the
+full §4.3 band loop at 20 ms stereo (the headline CELT-only frame
+size at the maximum channel count): every `cap_for_band_bits` call
+is `≤ i16::MAX`, and at least one cell exceeds `i8::MAX`.
+
+Twenty-nine new unit tests (560 lib tests total, up from 531 at the
+round-30 close; 20 integration tests unchanged, grand total 580)
+cover: the `CACHE_CAPS50_LM_COUNT = 4` / `CACHE_CAPS50_STEREO_COUNT
+= 2` / `CACHE_CAPS50_TOTAL_BYTES = 168` shape constants pinned
+against the array's actual length; the `INIT_CAPS_BIAS = 64` /
+`INIT_CAPS_DIVISOR = 4` / `INIT_CAPS_MAX_CHANNELS = 2` convert-rule
+constants; the `CACHE_CAPS50_STEREO_MONO = 0` /
+`CACHE_CAPS50_STEREO_STEREO = 1` axis-index constants plus the
+`CacheCapsStereo::axis_index()` / `channels()` /
+`from_is_stereo(bool)` round-trip; eight CSV-cell spot-checks at
+`(row 0, band 0)` / `(row 1, band 20)` / `(row 2, band 0)` /
+`(row 3, band 8)` / `(row 4, band 12)` / `(row 5, band 17)` /
+`(row 6, band 20)` / `(row 7, band 0)` (covering every CSV row plus
+the high-band tail of the 2.5 ms stereo / 20 ms mono rows, mid-band
+plateau of the 10 ms mono row, and the Hybrid-reachable band of the
+10 ms stereo row); the §4.3.3 `cache_caps_offset()` rule against
+every `(LM, stereo, band)` triple (168 cells) plus the two endpoints
+(`offset(0, Mono, 0) == 0` and
+`offset(3, Stereo, 20) == TOTAL_BYTES − 1`); the
+`cache_caps_value()` total-function sweep; the `cache_caps_row()`
+per-cell mirror; the `LmOutOfRange` / `BandOutOfRange` /
+`ChannelsOutOfRange` error paths on both accessors and the composite
+helper; four `init_caps()` formula pins including the
+`(caps=255, channels=2, N=192) → 30624` upper-bound cell and the
+floor-division corner at `caps ∈ {1,2,3}` (all yielding
+`(value + 64) / 4 = 16`); a `cap_for_band_bits()` composite
+cross-check against the manual lookup-plus-`init_caps()` sequence
+at `(LM=2, stereo=Stereo, band=17)` driven by the §4.3 Table 55 bin
+count for that band; the §4.3.3 narrative `cap fits in i16 but not
+i8` invariant (sweep at 20 ms stereo for the i16 bound + an explicit
+`at_least_one_cap_exceeds_i8` pin); and two §4.3.3-reachable-cell
+sanity pins (CELT-only 20 ms stereo band 0 → `caps = 204` →
+`cap = 134 * n_bins`; Hybrid 20 ms mono band 17 → `caps = 173` →
+`cap = (237 * n_bins) / 4`).
+
+Provenance: the §4.3.3 narrative (the convert rule, the §4.3.3
+`i = nbBands * (2*LM + stereo) + band` indexing, the bits/sample
+table description, the `cap` fits-in-`i16` invariant, and the
+`init_caps()` function name) is transcribed from RFC 6716 §4.3.3
+in `docs/audio/opus/rfc6716-opus.txt` (pp. 113–114). The 168 Q0
+byte values are reproduced from
+`docs/audio/celt/tables/cache_caps50.csv` (one CSV row per `(LM,
+stereo)` cell, 21 bytes per row — see the `cache_caps50.meta`
+sidecar for the canonical layout). The narrative
+`docs/audio/celt/spec/celt-coarse-energy-and-allocation.md` §2.2
+cross-references both. The rest of the §4.3.3 allocation algorithm
+(boost / trim / anti-collapse / skip / dual-stereo reservations,
+the Table 57 static-allocation search consuming the `cap[]` vector,
+the reallocation / fine-vs-shape split / band-priority computation)
+is out of scope for this module.
 
 ## Round 30 — §4.3.3 intensity-stereo reservation parameter surface (2026-06-02)
 

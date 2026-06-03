@@ -6,6 +6,71 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 31 (2026-06-03):** §4.3.3 per-band
+  maximum-allocation parameter surface — a new `celt_cache_caps50`
+  module delivering the `CACHE_CAPS50` lookup piece of RFC 6716 §4.3.3
+  (pp. 113–114): the 168-byte bits/sample table the §4.3.3 per-band
+  bit cap `cap[band] = ((cache_caps50[i] + 64) * channels * N) / 4`
+  consumes (named `init_caps()` in RFC 6716 §4.3.3 p. 114). Round 24
+  noted the §4.3.3 allocator as blocked on `cache_caps50` +
+  `LOG2_FRAC_TABLE`; round 30 landed `LOG2_FRAC_TABLE`, and this round
+  closes that pair by landing `CACHE_CAPS50` plus the `init_caps()`
+  convert-rule helpers. New public surface: `CACHE_CAPS50: [u8; 168]`
+  (168 Q0 bytes; layout `[LM ∈ 0..4][stereo ∈ {0,1}][band ∈ 0..21]`
+  flattened by the §4.3.3 `i = nbBands * (2*LM + stereo) + band` rule
+  with `nbBands = 21`, matching
+  `docs/audio/celt/tables/cache_caps50.csv` row-for-row); shape
+  constants `CACHE_CAPS50_LM_COUNT = 4`,
+  `CACHE_CAPS50_STEREO_COUNT = 2`, `CACHE_CAPS50_TOTAL_BYTES = 168`;
+  stereo-axis index constants `CACHE_CAPS50_STEREO_MONO = 0`,
+  `CACHE_CAPS50_STEREO_STEREO = 1`; convert-rule constants
+  `INIT_CAPS_BIAS = 64`, `INIT_CAPS_DIVISOR = 4`,
+  `INIT_CAPS_MAX_CHANNELS = 2`; typed stereo-axis selector
+  `CacheCapsStereo::{Mono, Stereo}` with `axis_index()` /
+  `channels()` / `from_is_stereo(bool)` helpers (the `channels()`
+  helper turns `Mono → 1` / `Stereo → 2` to feed the `init_caps()`
+  multiplier independently of the axis index); typed accessors
+  `cache_caps_value(lm, stereo, band) -> Result<u8, CacheCaps50Error>`
+  and `cache_caps_row(lm, stereo) -> Result<&'static [u8],
+  CacheCaps50Error>` over the lookup; flat-offset helper
+  `cache_caps_offset(lm, stereo, band) -> usize` covering the §4.3.3
+  row-stride rule; `init_caps(caps_value, channels, n_bins) -> u32`
+  computing the §4.3.3 `(value + 64) * channels * N / 4` convert
+  rule on a single byte; composite
+  `cap_for_band_bits(lm, stereo, band, channels, n_bins) ->
+  Result<u32, CacheCaps50Error>` performing lookup-plus-convert in
+  one typed call; error variants
+  `CacheCaps50Error::{LmOutOfRange, BandOutOfRange,
+  ChannelsOutOfRange}`. Twenty-nine new unit tests (560 lib tests
+  total, up from 531 at round-30 close; 20 integration tests
+  unchanged, grand total 580) pin the table shape, the
+  `INIT_CAPS_BIAS = 64` / `INIT_CAPS_DIVISOR = 4` /
+  `INIT_CAPS_MAX_CHANNELS = 2` convert-rule constants, the
+  `CACHE_CAPS50_STEREO_MONO = 0` / `CACHE_CAPS50_STEREO_STEREO = 1`
+  axis indices, the `CacheCapsStereo::channels()` `Mono → 1` /
+  `Stereo → 2` helper mapping, the `from_is_stereo(bool)` round-trip,
+  eight CSV-cell spot-checks at `(row 0, band 0)` / `(row 1, band 20)`
+  / `(row 2, band 0)` / `(row 3, band 8)` / `(row 4, band 12)` /
+  `(row 5, band 17)` / `(row 6, band 20)` / `(row 7, band 0)`, the
+  §4.3.3 `cache_caps_offset()` rule against every `(LM, stereo, band)`
+  triple (168 cells) plus its two endpoints, the `cache_caps_value()`
+  total-function sweep, the `cache_caps_row()` per-cell mirror, the
+  `LmOutOfRange` / `BandOutOfRange` / `ChannelsOutOfRange` error
+  paths on both accessors, four §4.3.3 `init_caps()` formula pins
+  (including the `(caps=255, channels=2, N=192) → 30624` upper-bound
+  cell and the floor-division corner at `caps ∈ {1,2,3}`), a
+  `cap_for_band_bits()` composite cross-check against the manual
+  lookup-plus-`init_caps()` sequence, the §4.3.3 narrative invariant
+  that 20 ms stereo caps fit in `i16` but at least one exceeds
+  `i8::MAX`, and two §4.3.3-reachable-cell pins (CELT-only 20 ms
+  stereo band 0 → `caps = 204` → `cap = 134 * n_bins`; Hybrid 20 ms
+  mono band 17 → `caps = 173` → `cap = (237 * n_bins) / 4`). The
+  §4.3.3 bit allocation orchestration that consumes the `cap[]`
+  vector (boost / trim / anti-collapse / skip / dual-stereo
+  reservations, the Table 57 static allocation search, the
+  reallocation / fine-vs-shape split / band-priority computation) is
+  out of scope for this round.
+
 * **Clean-room round 30 (2026-06-02):** §4.3.3 intensity-stereo
   reservation parameter surface — a new `celt_log2_frac_table` module
   delivering the `LOG2_FRAC_TABLE` lookup piece of RFC 6716 §4.3.3

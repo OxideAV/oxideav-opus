@@ -371,6 +371,23 @@
 //!   `cache_caps50` per-band maximum, and the rest of the §4.3.3
 //!   allocation loop are all out of scope for this round.
 //!
+//! * Round 31 lands the §4.3.3 *per-band maximum-allocation* parameter
+//!   surface ([`celt_cache_caps50`]: [`CACHE_CAPS50`] — the 168-byte
+//!   `[LM ∈ 0..4][stereo ∈ {mono, stereo}][band ∈ 0..21]` Q0
+//!   bits/sample table feeding the §4.3.3 per-band bit cap +
+//!   [`CacheCapsStereo::{Mono, Stereo}`] selector + [`cache_caps_value`]
+//!   / [`cache_caps_row`] accessors + [`init_caps`] /
+//!   [`cap_for_band_bits`] convert-to-bits rule
+//!   `cap[band] = ((cache_caps50[i] + 64) * channels * N) / 4` per
+//!   RFC 6716 §4.3.3 p. 113 + [`INIT_CAPS_BIAS`] / [`INIT_CAPS_DIVISOR`]
+//!   / [`INIT_CAPS_MAX_CHANNELS`] convert-rule constants). Closes the
+//!   second of the two table dependencies round 24 noted for the
+//!   §4.3.3 allocator (round 30 landed [`LOG2_FRAC_TABLE`]; this round
+//!   lands [`CACHE_CAPS50`]). The §4.3.3 bit allocation orchestration
+//!   that consumes `cap[]` (boost / trim / anti-collapse / skip /
+//!   dual-stereo reservations, the Table 57 static allocation search)
+//!   is still out of scope.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -419,6 +436,7 @@ impl core::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub mod celt_band_layout;
+pub mod celt_cache_caps50;
 pub mod celt_e_prob_model;
 pub mod celt_header;
 pub mod celt_log2_frac_table;
@@ -451,6 +469,12 @@ pub use celt_band_layout::{
     celt_band_at_hz, celt_band_bins_per_channel, celt_band_start_hz, celt_band_stop_hz,
     celt_end_coded_band, celt_first_coded_band, celt_total_bins_per_channel, CeltFrameSize,
     CELT_MAX_BINS_PER_BAND, CELT_NUM_BANDS, HYBRID_FIRST_CODED_BAND,
+};
+pub use celt_cache_caps50::{
+    cache_caps_offset, cache_caps_row, cache_caps_value, cap_for_band_bits, init_caps,
+    CacheCaps50Error, CacheCapsStereo, CACHE_CAPS50, CACHE_CAPS50_LM_COUNT,
+    CACHE_CAPS50_STEREO_COUNT, CACHE_CAPS50_STEREO_MONO, CACHE_CAPS50_STEREO_STEREO,
+    CACHE_CAPS50_TOTAL_BYTES, INIT_CAPS_BIAS, INIT_CAPS_DIVISOR, INIT_CAPS_MAX_CHANNELS,
 };
 pub use celt_e_prob_model::{
     e_prob_pair, e_prob_row, EProbModelError, EProbPair, EnergyPredictionMode, E_PROB_MODEL,
