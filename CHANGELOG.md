@@ -6,6 +6,83 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 33 (2026-06-04):** §4.3.3 *band-boost* decoder —
+  a new `celt_band_boost` module delivering the §4.3.3 band-boost
+  decode loop (RFC 6716 §4.3.3, pp. 113–114) — the third §4.3.3
+  fragment after rounds 30 and 31's `LOG2_FRAC_TABLE` /
+  `CACHE_CAPS50` parameter surfaces, and the structural bridge that
+  takes round 31's `cap[]` per-band upper bound and round 32's
+  `decode_alloc_trim` gate's `total_boost` input and ties them
+  together at the §4.3.3 control-flow site. The §4.3.3 narrative is:
+  *"To decode the band boosts: First, set 'dynalloc_logp' to 6 […]
+  'total_bits' to the size of the frame in 8th bits, 'total_boost'
+  to zero […]. For each band […] the boost quanta in units of 1/8
+  bit is calculated as `quanta = min(8*N, max(48, N))`. […] Set
+  'boost' to zero and 'dynalloc_loop_logp' to dynalloc_logp. While
+  dynalloc_loop_logp […] in 8th bits plus tell is less than
+  total_bits plus total_boost and boost is less than `cap[]` for
+  this band: Decode a bit […] update tell […] If the decoded value
+  is zero break the loop. Otherwise, add quanta to boost and
+  total_boost, subtract quanta from total_bits, and set
+  dynalloc_loop_log to 1. […] If boost is non-zero and dynalloc_logp
+  is greater than 2, decrease dynalloc_logp."* New public surface:
+  shape constants `DYNALLOC_LOGP_INIT = 6` (§4.3.3 initial
+  first-boost cost in whole bits), `DYNALLOC_LOGP_MIN = 2` (§4.3.3
+  first-boost floor), `DYNALLOC_LOOP_LOGP_AFTER_FIRST = 1` (§4.3.3
+  second-and-subsequent-bits cost within a single band's loop),
+  `BAND_BOOST_QUANTA_FLOOR_EIGHTH_BITS = 48` (§4.3.3 `max(48, N)`
+  floor), and `BAND_BOOST_QUANTA_CEIL_MULT = 8` (§4.3.3 `8*N`
+  1-bit/sample ceiling multiplier); the `band_boost_quanta(n)` pure
+  helper computing `min(8*n, max(48, n))` over `u32`; the
+  `decode_band_boosts(rd, start, end, caps, n_bins,
+  frame_size_bytes) -> Result<BandBoostOutcome, BandBoostError>`
+  driver walking the §4.3 `start..end` coding window (`0..end`
+  normally, `17..end` in Hybrid mode) and running the §4.3.3
+  per-band inner loop against caller-supplied `caps[band - start]`
+  and `n_bins[band - start]` slices; the
+  `BandBoost { boost_eighth_bits, bits_read }` per-band outcome
+  struct; the `BandBoostOutcome { per_band, total_boost_eighth_bits,
+  total_bits_remaining_eighth_bits, dynalloc_logp_final }` full
+  driver outcome bundling the §4.3.3 `total_boost` accumulator
+  consumed by `celt_alloc_trim::decode_alloc_trim` downstream; and
+  error variants `BandBoostError::{CapsLengthMismatch{expected,
+  provided}, NBinsLengthMismatch{expected, provided},
+  EmptyBandWindow{start, end}, InvertedBandWindow{start, end}}`
+  for caller-side bookkeeping bugs that don't belong to the range
+  coder's sticky error flag. Thirty-seven new unit tests (630 lib
+  tests total, up from 593 at round-32 close; 20 integration tests
+  unchanged, grand total 650) cover: the five §4.3.3 RFC constants
+  pinned to their narrative sources; the §4.3.3
+  `quanta = min(8*N, max(48, N))` rule sampled at `N = 48`
+  (boundary), `N > 48` (linear regime), `6 ≤ N < 48` (floor regime),
+  `N < 6` (ceiling regime), `N = 0` (degenerate), and as a total
+  function over every `u16`; the four `BandBoostError` paths with
+  the range coder's `tell_frac()` unchanged across error returns;
+  the no-room-for-any-boost path (`frame_size_bytes = 0`) returning
+  all-zero boosts and the §4.3.3 invariant
+  `total_bits + total_boost = frame_eighth_bits` holding at zero;
+  the stop-bit-biased payload (`[0x00; 64]` whose §4.1.1 init
+  `val = 127 - (b0 >> 1) = 127` biases `dec_bit_logp` toward the
+  §4.3.3 stop branch) decoding zero boosts with `bits_read = 1`
+  per band and the §4.3.3 `dynalloc_logp_final =
+  DYNALLOC_LOGP_INIT` no-decrement rule; the boost-bit-biased
+  payload (`[0xFF; 64]` ⇒ `val = 0`) actually boosting at least one
+  band and decrementing `dynalloc_logp` below its initial value;
+  the `per_band` vector alignment with the `start..end` window
+  (including the §4.3 Hybrid `17..21` four-band window); the §4.3.3
+  invariant `total_bits + total_boost = frame_size_bytes * 64`
+  conserved across both the stop and boost paths; the §4.3.3
+  `dynalloc_logp` cross-band floor at `DYNALLOC_LOGP_MIN`; the
+  `boost = 0` short-circuit on a `cap = 0` band (no range-coder
+  bits read); the `BandBoostOutcome` debug / equality / determinism
+  cross-check on identical runs; and the §3.4 R5 `1275 * 64`
+  max-frame headroom assertion. The §4.3.3 *use* of the per-band
+  `boost` values — the per-band shape-allocation adjustment that
+  feeds into the §4.3.3 Table 57 static-allocation search and the
+  §4.3.3 anti-collapse / skip / dual-stereo reservations — is the
+  responsibility of the §4.3.3 allocator and runs at the call site
+  of `decode_band_boosts`.
+
 * **Clean-room round 32 (2026-06-03):** §4.3.3 *allocation trim*
   parameter surface — a new `celt_alloc_trim` module delivering the
   Table-58 PDF of RFC 6716 §4.3.3 (p. 115) plus the §4.3.3

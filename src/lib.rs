@@ -403,6 +403,24 @@
 //!   static allocation search — is still out of scope and runs at the
 //!   call site of [`decode_alloc_trim`].
 //!
+//! * Round 33 lands the §4.3.3 *band-boost* decoder
+//!   ([`celt_band_boost`]: [`decode_band_boosts`] driver +
+//!   [`band_boost_quanta`] §4.3.3 `min(8*N, max(48, N))` helper +
+//!   [`BandBoost`] / [`BandBoostOutcome`] per-band and full-driver
+//!   outcomes carrying the §4.3.3 `total_boost` accumulator consumed
+//!   by [`decode_alloc_trim`] downstream + [`DYNALLOC_LOGP_INIT`] = 6
+//!   / [`DYNALLOC_LOGP_MIN`] = 2 / [`DYNALLOC_LOOP_LOGP_AFTER_FIRST`]
+//!   = 1 cost constants + [`BAND_BOOST_QUANTA_FLOOR_EIGHTH_BITS`] = 48
+//!   / [`BAND_BOOST_QUANTA_CEIL_MULT`] = 8 quanta-rule constants +
+//!   [`BandBoostError`] caller-side bookkeeping bugs). Bridges round
+//!   31's [`crate::celt_cache_caps50::cap_for_band_bits`] per-band
+//!   upper bound and round 32's [`decode_alloc_trim`] gate's
+//!   `total_boost` input. The §4.3.3 *use* of the per-band boost
+//!   values — the §4.3.3 Table 57 static-allocation search +
+//!   anti-collapse / skip / dual-stereo reservations — is the
+//!   responsibility of the §4.3.3 allocator and runs at the call
+//!   site of [`decode_band_boosts`].
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -451,6 +469,7 @@ impl core::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub mod celt_alloc_trim;
+pub mod celt_band_boost;
 pub mod celt_band_layout;
 pub mod celt_cache_caps50;
 pub mod celt_e_prob_model;
@@ -486,6 +505,11 @@ pub use celt_alloc_trim::{
     AllocTrimError, ALLOC_TRIM_DEFAULT, ALLOC_TRIM_FTB, ALLOC_TRIM_ICDF, ALLOC_TRIM_MAX,
     ALLOC_TRIM_MIN, ALLOC_TRIM_PDF, ALLOC_TRIM_PDF_DENOMINATOR, ALLOC_TRIM_PDF_LEN,
     ALLOC_TRIM_SIGNAL_COST_EIGHTH_BITS, EIGHTH_BITS_PER_BYTE,
+};
+pub use celt_band_boost::{
+    band_boost_quanta, decode_band_boosts, BandBoost, BandBoostError, BandBoostOutcome,
+    BAND_BOOST_QUANTA_CEIL_MULT, BAND_BOOST_QUANTA_FLOOR_EIGHTH_BITS, DYNALLOC_LOGP_INIT,
+    DYNALLOC_LOGP_MIN, DYNALLOC_LOOP_LOGP_AFTER_FIRST,
 };
 pub use celt_band_layout::{
     celt_band_at_hz, celt_band_bins_per_channel, celt_band_start_hz, celt_band_stop_hz,
