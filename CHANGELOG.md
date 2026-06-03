@@ -6,6 +6,64 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 32 (2026-06-03):** §4.3.3 *allocation trim*
+  parameter surface — a new `celt_alloc_trim` module delivering the
+  Table-58 PDF of RFC 6716 §4.3.3 (p. 115) plus the §4.3.3
+  signalling-gate predicate (RFC 6716 §4.3.3 p. 114) and the typed
+  decode wrapper that fuses the two. The §4.3.3 narrative reads:
+  *"To decode the trim, first set the trim value to 5, then if and
+  only if the count of decoded 8th bits so far (ec_tell_frac) plus
+  48 (6 bits) is less than or equal to the total frame size in 8th
+  bits minus total_boost […], decode the trim value using the PDF
+  in Table 58."* New public surface: `ALLOC_TRIM_PDF: [u8; 11]`
+  (the 11-cell Table-58 PDF `{2, 2, 5, 10, 22, 46, 22, 10, 5, 2,
+  2}/128`) and the derived `ALLOC_TRIM_ICDF: [u8; 11]` (`[126, 124,
+  119, 109, 87, 41, 19, 9, 4, 2, 0]`) for direct
+  `RangeDecoder::dec_icdf` consumption; shape constants
+  `ALLOC_TRIM_PDF_LEN = 11`, `ALLOC_TRIM_FTB = 7`,
+  `ALLOC_TRIM_PDF_DENOMINATOR = 128`; trim-integer range constants
+  `ALLOC_TRIM_DEFAULT = 5`, `ALLOC_TRIM_MIN = 0`,
+  `ALLOC_TRIM_MAX = 10` per the RFC's "an integer value from 0-10"
+  and "the default value of 5 indicates no trim" wording;
+  signalling-cost constants `ALLOC_TRIM_SIGNAL_COST_EIGHTH_BITS =
+  48` (6 whole bits at 1/8-bit precision) and
+  `EIGHTH_BITS_PER_BYTE = 64`; the §4.3.3 signalling-gate
+  predicate `alloc_trim_is_signalled(ec_tell_frac, frame_eighth_bits,
+  total_boost) -> bool` evaluating
+  `(ec_tell_frac + 48) ≤ (frame_eighth_bits − total_boost)` with
+  saturating arithmetic for the malformed-input edge cases; the
+  byte-to-1/8-bit conversion helper
+  `frame_eighth_bits(frame_size_bytes) -> Result<u32,
+  AllocTrimError>` with `u32` overflow rejection; the composite
+  decode wrapper `decode_alloc_trim(rd, ec_tell_frac,
+  frame_size_bytes, total_boost) -> Result<u8, AllocTrimError>`
+  fusing the gate evaluation, the gate-fail-returns-`5` rule, and
+  the `RangeDecoder::dec_icdf(&ALLOC_TRIM_ICDF, 7)` read into one
+  typed call; full-table borrows `alloc_trim_pdf()` and
+  `alloc_trim_icdf()`; error variants
+  `AllocTrimError::{FrameSizeOverflows, TotalBoostExceedsFrame {
+  frame_eighth_bits, total_boost }}` for caller-side bookkeeping
+  bugs. Thirty-three new unit tests (593 lib tests total, up from
+  560 at round-31 close; 20 integration tests unchanged, grand
+  total 613) pin the shape constants, the Table 58 PDF cells
+  against the RFC body, the PDF sum-to-denominator and
+  symmetric-around-default invariants, the heaviest-mass-at-default
+  cell pin, the iCDF strict-monotone-decreasing invariant, the
+  iCDF-from-PDF derivation, spot iCDF cells, the
+  `frame_eighth_bits` scaling and overflow rejection, the §4.3.3
+  signalling gate at the six-bit boundary (`ec_tell_frac + 48 =
+  budget` passes, one over fails) and across the total_boost / no
+  room / underflow / `u32` overflow edge cases, the
+  `decode_alloc_trim` gate-fail returns `5` and consumes no
+  range-coder bits, the gate-pass returns an in-range value and
+  advances `tell_frac`, the error paths leave the range coder
+  untouched, and the worst-case-symbol-cost-matches-gate-budget
+  math (`log2(128/2) = 6` whole bits = 48 1/8 bits). The §4.3.3
+  *use* of the trim — the per-band `trim_offsets[]` derivation
+  that biases the Table 57 static allocation search — runs at the
+  call site of `decode_alloc_trim` and is out of scope for this
+  parameter surface.
+
 * **Clean-room round 31 (2026-06-03):** §4.3.3 per-band
   maximum-allocation parameter surface — a new `celt_cache_caps50`
   module delivering the `CACHE_CAPS50` lookup piece of RFC 6716 §4.3.3

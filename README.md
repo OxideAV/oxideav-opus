@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-03 (clean-room round 31)
+## Status — 2026-06-03 (clean-room round 32)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
@@ -99,13 +99,129 @@ surface (`celt_log2_frac_table`: `LOG2_FRAC_TABLE` — the 24-byte Q3
 `log2_frac(coded_bands) -> u8` accessor + `log2_frac_row() -> &[u8;
 24]` full-row borrow + `Q3_BITS_PER_WHOLE_BIT = 8` unit-denominator
 constant; covers the CELT-only `end − start = 21` and Hybrid `end −
-start = 4` reachable indices per RFC 6716 §4.3.3 p. 113);
+start = 4` reachable indices per RFC 6716 §4.3.3 p. 113) + §4.3.3
+allocation-trim parameter surface (`celt_alloc_trim`: `ALLOC_TRIM_PDF`
+— the 11-cell Table-58 PDF `{2, 2, 5, 10, 22, 46, 22, 10, 5, 2,
+2}/128` + derived `ALLOC_TRIM_ICDF = [126, 124, 119, 109, 87, 41, 19,
+9, 4, 2, 0]` for `RangeDecoder::dec_icdf` consumption +
+`ALLOC_TRIM_DEFAULT = 5` / `ALLOC_TRIM_MIN = 0` / `ALLOC_TRIM_MAX =
+10` per the RFC's "an integer value from 0-10" and "the default value
+of 5 indicates no trim" wording + `ALLOC_TRIM_SIGNAL_COST_EIGHTH_BITS
+= 48` (6 whole bits in 1/8-bit precision) + the §4.3.3 signalling
+gate `alloc_trim_is_signalled(ec_tell_frac, frame_eighth_bits,
+total_boost) -> bool` evaluating `(ec_tell_frac + 48) ≤
+(frame_eighth_bits − total_boost)` with saturating arithmetic on the
+malformed-input edges + the typed wrapper `decode_alloc_trim(rd,
+ec_tell_frac, frame_size_bytes, total_boost) -> Result<u8,
+AllocTrimError>` fusing the gate, the gate-fail-returns-5 rule, and
+the `dec_icdf` read into one call + `AllocTrimError::{FrameSizeOverflows,
+TotalBoostExceedsFrame}`);
 the §4.3.2.1 Laplace decoder itself + 2-D `(time, frequency)` predictor
-+ rest of §4.3.3 bit allocation (boost / trim / anti-collapse / skip /
-dual-stereo reservations + Table 57 static-allocation search +
-`cache_caps50` per-band maximum) + §4.3.4 PVQ shape + band loop +
++ rest of §4.3.3 bit allocation (per-band `trim_offsets[]` derivation +
+boost / anti-collapse / skip / dual-stereo reservations + Table 57
+static-allocation search) + §4.3.4 PVQ shape + band loop +
 §4.3.7 inverse-MDCT window for the cross-lap still deferred. The
 per-LM *inter*-mode `(alpha, beta)` pair is a §4.3.2.1 docs gap.**
+
+## Round 32 — §4.3.3 allocation-trim parameter surface (2026-06-03)
+
+Round 32 lands the §4.3.3 *allocation trim* — the Table-58 PDF, the
+§4.3.3 signalling gate, and the typed decode wrapper that fuses the
+two — behind a new `celt_alloc_trim` module. The §4.3.3 narrative
+(RFC 6716 §4.3.3, pp. 114–115) reads:
+
+> The allocation trim is an integer value from 0-10. The default
+> value of 5 indicates no trim. The trim parameter is entropy coded
+> in order to lower the coding cost of less extreme adjustments.
+> Values lower than 5 bias the allocation towards lower frequencies
+> and values above 5 bias it towards higher frequencies. Like other
+> signaled parameters, signaling of the trim is gated so that it is
+> not included if there is insufficient space available in the
+> bitstream. To decode the trim, first set the trim value to 5,
+> then if and only if the count of decoded 8th bits so far
+> (ec_tell_frac) plus 48 (6 bits) is less than or equal to the
+> total frame size in 8th bits minus total_boost (a product of the
+> above band boost procedure), decode the trim value using the PDF
+> in Table 58.
+
+Table 58 is the 11-cell PDF `{2, 2, 5, 10, 22, 46, 22, 10, 5, 2,
+2}/128`. The symbol `k ∈ 0..=10` reads as the trim integer `k`; the
+PDF is symmetric around `k = 5` (the no-trim default), with the
+heaviest mass on that cell, and falls off as 22, 10, 5, 2, 2 either
+side — matching the §4.3.3 "less extreme adjustments cheapened" rule.
+
+The module owns:
+
+* `ALLOC_TRIM_PDF: [u8; 11]` — the Table-58 PDF reproduced inline.
+* `ALLOC_TRIM_ICDF: [u8; 11]` = `[126, 124, 119, 109, 87, 41, 19,
+  9, 4, 2, 0]` — the derived iCDF by the §4.1.3.3
+  `icdf[k] = (1<<ftb) − fh[k]` rule, ready for
+  `RangeDecoder::dec_icdf`.
+* `ALLOC_TRIM_PDF_LEN = 11`, `ALLOC_TRIM_FTB = 7`,
+  `ALLOC_TRIM_PDF_DENOMINATOR = 128` — shape constants.
+* `ALLOC_TRIM_DEFAULT = 5`, `ALLOC_TRIM_MIN = 0`, `ALLOC_TRIM_MAX
+  = 10` — trim-integer range, per the §4.3.3 wording.
+* `ALLOC_TRIM_SIGNAL_COST_EIGHTH_BITS = 48` (the §4.3.3 "plus 48
+  (6 bits)" budget) and `EIGHTH_BITS_PER_BYTE = 64` — gate
+  constants.
+* `alloc_trim_is_signalled(ec_tell_frac, frame_eighth_bits,
+  total_boost) -> bool` — the §4.3.3 signalling-gate predicate.
+* `frame_eighth_bits(frame_size_bytes) -> Result<u32,
+  AllocTrimError>` — byte-to-1/8-bit conversion with `u32`
+  overflow rejection.
+* `decode_alloc_trim(rd, ec_tell_frac, frame_size_bytes,
+  total_boost) -> Result<u8, AllocTrimError>` — the composite
+  wrapper: evaluate the gate, return `5` on gate failure
+  (consuming no bits), or `dec_icdf(&ALLOC_TRIM_ICDF, 7)` on gate
+  success.
+* `alloc_trim_pdf()` / `alloc_trim_icdf()` — full-table borrows.
+* `AllocTrimError::{FrameSizeOverflows, TotalBoostExceedsFrame{
+  frame_eighth_bits, total_boost }}` — error variants for
+  caller-side bookkeeping bugs.
+
+Thirty-three new unit tests (593 lib tests total, up from 560 at the
+round-31 close; 20 integration tests unchanged, grand total 613)
+cover: the `ALLOC_TRIM_PDF_LEN = 11` / `ALLOC_TRIM_FTB = 7` /
+`ALLOC_TRIM_PDF_DENOMINATOR = 128` / `ALLOC_TRIM_DEFAULT = 5` /
+`ALLOC_TRIM_MIN..=ALLOC_TRIM_MAX = 0..=10` /
+`ALLOC_TRIM_SIGNAL_COST_EIGHTH_BITS = 48` /
+`EIGHTH_BITS_PER_BYTE = 64` constants; the Table 58 PDF cells pinned
+against the RFC body verbatim; the PDF sums-to-128 invariant; the
+PDF symmetry around `k = 5`; the heaviest-mass-at-default cell
+(`PDF[5] = 46`); the iCDF strict-monotone-decreasing invariant; the
+iCDF-from-PDF derivation cross-check (every cell of the 11-cell
+table); four iCDF spot pins (`[0] = 126`, `[1] = 124`, `[5] = 41`,
+`[10] = 0`); the `frame_eighth_bits` scaling at `0`, `1`, `1275`
+(§3.4 R5 max) and `u32` overflow rejection on `boundary + 1` and
+`u32::MAX`; the §4.3.3 signalling gate at the six-bit boundary
+(`ec_tell_frac = frame − 48` passes, `frame − 47` fails); the gate
+under non-zero `total_boost`; the gate underflow / `u32` overflow
+safety paths; the `decode_alloc_trim` gate-fail returns
+`ALLOC_TRIM_DEFAULT` and consumes no range-coder bits (via
+`tell()` before/after); the gate-pass returns an in-range value and
+advances `tell_frac()`; both error paths leave the range coder
+untouched; and the worst-case-symbol-cost-matches-gate-budget
+math `log2(128 / 2) = 6` whole bits = 48 1/8 bits.
+
+Provenance: the §4.3.3 narrative (the §4.3.3 trim integer range, the
+"default value of 5 indicates no trim" wording, the signalling-gate
+predicate `(ec_tell_frac + 48) ≤ (frame_size_bytes * 8 −
+total_boost)`, and the §4.3.3 reference function names) is
+transcribed from RFC 6716 §4.3.3 in
+`docs/audio/opus/rfc6716-opus.txt` (pp. 114–115). The 11-cell Table
+58 PDF is inlined in the RFC body on p. 115; no separate CSV is
+required (the `docs/audio/celt/tables/` set holds only the §4.3.3
+tables the RFC does *not* inline). The
+`docs/audio/celt/spec/celt-coarse-energy-and-allocation.md` §2.4
+narrative cross-references both. The iCDF is derived from the
+inlined PDF by the §4.1.3.3 `icdf[k] = (1 << ftb) − fh[k]` rule.
+The §4.3.3 *use* of the trim — the per-band `trim_offsets[]`
+derivation (RFC 6716 §4.3.3 p. 115: `(alloc_trim − 5 − LM) *
+channels * MDCT_bin_count * remaining_bands * 2**LM * 8 / 64`, with
+the width-1-band carve-out subtracting `8 * channels`) that biases
+the Table 57 static allocation search — is the responsibility of
+the §4.3.3 allocator and runs at the call site of
+`decode_alloc_trim`; it is out of scope for this parameter surface.
 
 ## Round 31 — §4.3.3 per-band maximum-allocation parameter surface (2026-06-03)
 

@@ -388,6 +388,21 @@
 //!   dual-stereo reservations, the Table 57 static allocation search)
 //!   is still out of scope.
 //!
+//! * Round 32 lands the §4.3.3 *allocation trim* parameter surface
+//!   ([`celt_alloc_trim`]: [`ALLOC_TRIM_PDF`] — the Table-58 PDF
+//!   `{2, 2, 5, 10, 22, 46, 22, 10, 5, 2, 2}/128` and its derived
+//!   [`ALLOC_TRIM_ICDF`] for [`RangeDecoder::dec_icdf`] consumption +
+//!   [`ALLOC_TRIM_DEFAULT`] = 5 / [`ALLOC_TRIM_MIN`] = 0 /
+//!   [`ALLOC_TRIM_MAX`] = 10 trim-integer range + the §4.3.3
+//!   signalling gate `(ec_tell_frac + 48) ≤ (frame_bytes * 8 −
+//!   total_boost)` in [`alloc_trim_is_signalled`] + the
+//!   [`decode_alloc_trim`] wrapper that fuses the gate, the
+//!   gate-fail-returns-default rule, and the [`RangeDecoder::dec_icdf`]
+//!   read into one typed call). The §4.3.3 use of the trim — the
+//!   per-band `trim_offsets[]` derivation that shifts the Table 57
+//!   static allocation search — is still out of scope and runs at the
+//!   call site of [`decode_alloc_trim`].
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -435,6 +450,7 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+pub mod celt_alloc_trim;
 pub mod celt_band_layout;
 pub mod celt_cache_caps50;
 pub mod celt_e_prob_model;
@@ -465,6 +481,12 @@ pub mod silk_resampler;
 pub mod silk_stereo;
 pub mod toc;
 
+pub use celt_alloc_trim::{
+    alloc_trim_icdf, alloc_trim_is_signalled, alloc_trim_pdf, decode_alloc_trim, frame_eighth_bits,
+    AllocTrimError, ALLOC_TRIM_DEFAULT, ALLOC_TRIM_FTB, ALLOC_TRIM_ICDF, ALLOC_TRIM_MAX,
+    ALLOC_TRIM_MIN, ALLOC_TRIM_PDF, ALLOC_TRIM_PDF_DENOMINATOR, ALLOC_TRIM_PDF_LEN,
+    ALLOC_TRIM_SIGNAL_COST_EIGHTH_BITS, EIGHTH_BITS_PER_BYTE,
+};
 pub use celt_band_layout::{
     celt_band_at_hz, celt_band_bins_per_channel, celt_band_start_hz, celt_band_stop_hz,
     celt_end_coded_band, celt_first_coded_band, celt_total_bins_per_channel, CeltFrameSize,
