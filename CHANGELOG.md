@@ -6,6 +6,81 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 34 (2026-06-04):** §4.3.3 *reservation block* —
+  a new `celt_reservations` module delivering the §4.3.3 fixed-cost
+  preamble that runs after the §4.3.3 band-boost loop (round 33) and
+  the §4.3.3 allocation-trim decode (round 32) but before the §4.3.3
+  Table 57 static-allocation search. RFC 6716 §4.3.3 (p. 114)
+  specifies four reservations skimmed off the working `total`
+  budget: `anti_collapse_rsv` (8 1/8 bits iff transient && `LM > 1`
+  && `total ≥ (LM + 2) * 8`), `skip_rsv` (8 1/8 bits iff `total > 8`
+  after anti-collapse), `intensity_rsv` (stereo only; equal to
+  `LOG2_FRAC_TABLE[end − start]` from round 30 except reset to 0 if
+  greater than `total`), and `dual_stereo_rsv` (stereo only, 8 1/8
+  bits iff `total > 8` after the intensity-stereo deduction; only
+  considered when intensity_rsv was successfully reserved). The
+  §4.3.3 working `total` starts at `frame_size_bytes * 64 −
+  ec_tell_frac − 1` (the trailing `-1` is the §4.3.3 conservative
+  deduction). New public surface: `reserve_block(frame_size_bytes,
+  ec_tell_frac, total_boost, lm, is_transient, is_stereo,
+  coded_bands) -> Result<ReservationOutcome, ReservationError>`
+  pure-function evaluator (`lm` typed `CeltFrameSize`,
+  `coded_bands` = `end − start` for the §4.3 band-coding window);
+  `ReservationOutcome { anti_collapse_rsv, skip_rsv, intensity_rsv,
+  dual_stereo_rsv, total_remaining_eighth_bits }` typed outcome with
+  `reserved_total_eighth_bits()` summing helper; reservation-cost
+  constants `ONE_BIT_EIGHTH_BITS = 8` (anti-collapse / skip /
+  dual-stereo) and `CONSERVATIVE_DEDUCTION_EIGHTH_BITS = 1`;
+  anti-collapse gating constants `ANTI_COLLAPSE_LM_MIN_EXCLUSIVE =
+  1` (strict `LM > 1` floor) and
+  `ANTI_COLLAPSE_HEADROOM_MULT_EIGHTH_BITS = 8` /
+  `ANTI_COLLAPSE_HEADROOM_LM_OFFSET = 2` (the `(LM + 2) * 8`
+  1/8-bit headroom test); the module-local `EIGHTH_BITS_PER_BYTE =
+  64` mirror of `celt_alloc_trim::EIGHTH_BITS_PER_BYTE`; error
+  variants `ReservationError::{FrameSizeOverflows, TellExceedsFrame
+  { frame_eighth_bits, ec_tell_frac }, TotalBoostExceedsFrame {
+  frame_eighth_bits, ec_tell_frac, total_boost },
+  LogFracLookupFailed(Log2FracError) }` for caller-side bookkeeping
+  bugs (the range coder's sticky error flag is the right channel
+  for a corrupt bitstream signal); `From<Log2FracError>` round-trip
+  helper. Forty-one new unit tests (671 lib tests total, up from
+  630 at round-33 close; 20 integration tests unchanged, grand total
+  691) cover: the five RFC constants pinned to their narrative
+  sources; the `EIGHTH_BITS_PER_BYTE` agreement with
+  `celt_alloc_trim`; the `CeltFrameSize::column_index() → LM`
+  cross-check at every frame size; the four anti-collapse predicate
+  paths (non-transient ⇒ no rsv; LM ∈ {0, 1} ⇒ no rsv even with
+  transient; LM = 2 / LM = 3 with budget ⇒ rsv = 8); the §4.3.3
+  anti-collapse threshold inequality at exact match and one short;
+  the §4.3.3 skip gate at `total = 8` (rsv = 0) and `total = 9`
+  (rsv = 8); a strict-ordering check that the anti-collapse
+  deduction precedes the skip gate; the mono branch skipping all
+  stereo reservations even with budget; the stereo
+  intensity-reset-on-overflow path with `dual_stereo_rsv = 0`
+  follow-on; the stereo intensity-just-fits path with
+  `dual_stereo_rsv ∈ {0, 8}` depending on the remaining budget vs
+  the `total > 8` gate; the §4.3 Hybrid 4-band window producing
+  `intensity_rsv = 19` from `LOG2_FRAC_TABLE[4]`; the `coded_bands
+  ∈ {0, 1}` boundary cells; the §4.3.3 invariant `total_remaining +
+  reserved = frame_eighth − ec_tell − 1` across mono / stereo /
+  transient / non-transient / nonzero-tell permutations; the four
+  `ReservationError` paths; the mono short-circuit on out-of-range
+  `coded_bands` (intensity-stereo lookup is *not* attempted for
+  mono frames, so the input is harmless); the zero-byte and
+  one-byte frame edge cases; the §3.4 R5 1275-byte max-frame
+  headroom assertion with every reservation at its maximum (8 + 8 +
+  37 + 8 = 61, total_remaining = 81538); the
+  `ReservationOutcome::default()` all-zero pattern; determinism
+  across repeats; debug formatting; and the `From<Log2FracError>`
+  round-trip. The §4.3.3 *use* of the reservations — the actual
+  `dec_bit_logp(1)` reads of the anti-collapse / skip /
+  dual-stereo flags and the `ec_dec_uint(end − start)` read of the
+  intensity-stereo band — runs at the §4.3.3 allocator's consumer
+  site once the Table 57 search produces the per-band shape
+  allocation; the per-band `trim_offsets[]` derivation that biases
+  the Table 57 search is the responsibility of the §4.3.3 allocator
+  and runs in a downstream round.
+
 * **Clean-room round 33 (2026-06-04):** §4.3.3 *band-boost* decoder —
   a new `celt_band_boost` module delivering the §4.3.3 band-boost
   decode loop (RFC 6716 §4.3.3, pp. 113–114) — the third §4.3.3

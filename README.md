@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-04 (clean-room round 33)
+## Status — 2026-06-04 (clean-room round 34)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
@@ -127,13 +127,140 @@ boosted band + `BandBoostOutcome { per_band, total_boost_eighth_bits,
 total_bits_remaining_eighth_bits, dynalloc_logp_final }` bundling the
 §4.3.3 boost accumulator that feeds the §4.3.3 allocation-trim gate
 at `decode_alloc_trim` + the §4.3.3 invariant `total_bits +
-total_boost = frame_eighth_bits` conserved across boost steps);
+total_boost = frame_eighth_bits` conserved across boost steps) +
+§4.3.3 reservation block (`celt_reservations::reserve_block`: §4.3.3
+`total = frame_size_bytes * 64 − ec_tell_frac − 1` setup +
+`anti_collapse_rsv = 8` iff transient && `LM > 1` && `total ≥
+(LM + 2) * 8` + `skip_rsv = 8` iff `total > 8` after anti-collapse +
+stereo `intensity_rsv = LOG2_FRAC_TABLE[end − start]` with the §4.3.3
+"reset to 0 if greater than total" branch + `dual_stereo_rsv = 8` iff
+`total > 8` after intensity, gating dual-stereo on intensity having
+been successfully reserved + `ReservationOutcome { anti_collapse_rsv,
+skip_rsv, intensity_rsv, dual_stereo_rsv, total_remaining_eighth_bits }`
+typed outcome + `ONE_BIT_EIGHTH_BITS = 8` /
+`CONSERVATIVE_DEDUCTION_EIGHTH_BITS = 1` /
+`ANTI_COLLAPSE_LM_MIN_EXCLUSIVE = 1` /
+`ANTI_COLLAPSE_HEADROOM_MULT_EIGHTH_BITS = 8` /
+`ANTI_COLLAPSE_HEADROOM_LM_OFFSET = 2` cost + gating constants +
+`ReservationError::{FrameSizeOverflows, TellExceedsFrame,
+TotalBoostExceedsFrame, LogFracLookupFailed}`);
 the §4.3.2.1 Laplace decoder itself + 2-D `(time, frequency)` predictor
 + rest of §4.3.3 bit allocation (per-band `trim_offsets[]` derivation +
-anti-collapse / skip / dual-stereo reservations + Table 57
-static-allocation search) + §4.3.4 PVQ shape + band loop +
+Table 57 static-allocation search) + §4.3.4 PVQ shape + band loop +
 §4.3.7 inverse-MDCT window for the cross-lap still deferred. The
 per-LM *inter*-mode `(alpha, beta)` pair is a §4.3.2.1 docs gap.**
+
+## Round 34 — §4.3.3 reservation block (2026-06-04)
+
+Round 34 lands the §4.3.3 *reservation block* — the fixed-cost
+preamble that runs immediately after the §4.3.3 band-boost loop
+(round 33) and the §4.3.3 allocation-trim decode (round 32) but
+before the Table 57 static-allocation search. RFC 6716 §4.3.3 (p. 114)
+specifies four reservations skimmed off the working `total` budget:
+
+1. `anti_collapse_rsv` (8 1/8 bits) — reserved iff the §4.3.1
+   `transient` flag is set, LM > 1 (i.e. CELT frame size ≥ 10 ms),
+   and `total ≥ (LM + 2) * 8` at the time of the check.
+2. `skip_rsv` (8 1/8 bits) — reserved iff `total > 8` after the
+   anti-collapse deduction.
+3. `intensity_rsv` (stereo only) — equal to
+   `LOG2_FRAC_TABLE[end − start]` Q3 bits from round 30's
+   `celt_log2_frac_table::log2_frac` lookup, except reset to 0 if
+   that value would exceed the current `total` (in which case
+   `dual_stereo_rsv` is also skipped).
+4. `dual_stereo_rsv` (stereo only, 8 1/8 bits) — reserved iff
+   `total > 8` after the intensity-stereo deduction.
+
+The §4.3.3 working `total` starts at
+`frame_size_bytes * 64 − ec_tell_frac − 1` (the trailing `-1` is the
+§4.3.3 "one (8th bit) is subtracted to ensure that the resulting
+allocation will be conservative" deduction).
+
+New public surface:
+
+* `ReservationOutcome { anti_collapse_rsv, skip_rsv, intensity_rsv,
+  dual_stereo_rsv, total_remaining_eighth_bits }` — typed outcome
+  in 1/8 bits, with `reserved_total_eighth_bits()` summing the four
+  reservation costs for the §4.3.3 invariant check
+  `total_remaining + reserved = frame_eighth − ec_tell − 1`.
+* `reserve_block(frame_size_bytes, ec_tell_frac, total_boost, lm,
+  is_transient, is_stereo, coded_bands) -> Result<ReservationOutcome,
+  ReservationError>` — pure-function evaluator over the §4.3.3
+  reservation arithmetic. `lm` is typed `CeltFrameSize`; `coded_bands`
+  is `end − start` for the §4.3 band-coding window (0..=21 normally,
+  ≤ 4 in Hybrid mode), used directly as the
+  `crate::celt_log2_frac_table::LOG2_FRAC_TABLE` index for the
+  intensity-stereo lookup.
+* `ReservationError::{FrameSizeOverflows, TellExceedsFrame{…},
+  TotalBoostExceedsFrame{…}, LogFracLookupFailed(Log2FracError)}` —
+  caller-side bookkeeping bugs. The range coder's sticky error flag
+  is the right channel for a corrupt bitstream signal; this return
+  type captures only frame-arithmetic violations.
+* `ONE_BIT_EIGHTH_BITS = 8` — the §4.3.3 cost of each
+  anti-collapse / skip / dual-stereo reservation.
+* `CONSERVATIVE_DEDUCTION_EIGHTH_BITS = 1` — the §4.3.3 "one (8th
+  bit) is subtracted" rule.
+* `ANTI_COLLAPSE_LM_MIN_EXCLUSIVE = 1` — the strict `LM > 1` floor.
+* `ANTI_COLLAPSE_HEADROOM_MULT_EIGHTH_BITS = 8` and
+  `ANTI_COLLAPSE_HEADROOM_LM_OFFSET = 2` — the
+  `(LM + 2) * 8` 1/8-bit-headroom test.
+* `EIGHTH_BITS_PER_BYTE = 64` (module-local; mirrors round 32's
+  `celt_alloc_trim::EIGHTH_BITS_PER_BYTE`).
+
+The §4.3.3 *use* of the reservations — the actual `dec_bit_logp(1)`
+reads of the anti-collapse / skip / dual-stereo flags and the
+`ec_dec_uint(end − start)` read of the intensity-stereo band — runs
+at the §4.3.3 allocator's consumer site after the Table 57 static
+allocation search produces the per-band shape allocation. This module
+owns only the bookkeeping that decides *whether* each reservation
+slot is occupied and *how many 1/8 bits* it claims.
+
+Forty-one new unit tests (671 lib tests total, up from 630 at round-33
+close; 20 integration tests unchanged, grand total 691) cover: the
+five RFC constants pinned to their narrative sources; the
+`EIGHTH_BITS_PER_BYTE` agreement with `celt_alloc_trim`; the
+`CeltFrameSize::column_index() → LM` cross-check at every frame size;
+the four anti-collapse predicate paths (non-transient ⇒ no rsv,
+LM ∈ {0, 1} ⇒ no rsv even with transient, LM = 2 / LM = 3 with budget
+⇒ rsv = 8); the §4.3.3 anti-collapse threshold inequality at exact
+match and one short; the §4.3.3 skip gate at `total = 8` (rsv = 0)
+and `total = 9` (rsv = 8); a strict-ordering check that the
+anti-collapse deduction precedes the skip gate; the mono branch
+skipping all stereo reservations even with budget; the stereo
+intensity-reset-on-overflow path with `dual_stereo_rsv = 0` follow-on;
+the stereo intensity-just-fits path with `dual_stereo_rsv ∈ {0, 8}`
+depending on the remaining budget vs the `total > 8` gate; the
+§4.3 Hybrid 4-band window producing `intensity_rsv = 19` from
+`LOG2_FRAC_TABLE[4]`; the `coded_bands ∈ {0, 1}` boundary cells; the
+§4.3.3 invariant `total_remaining + reserved = frame_eighth − ec_tell
+− 1` across mono / stereo / transient / non-transient / nonzero-tell
+permutations; the four `ReservationError` paths (frame-byte overflow,
+tell exceeding frame, total_boost exceeding frame, coded_bands above
+the `LOG2_FRAC_TABLE` coverage); the mono short-circuit on out-of-range
+`coded_bands` (the intensity-stereo lookup is *not* attempted for mono
+frames, so the input is harmless); the zero-byte and one-byte frame
+edge cases; the §3.4 R5 1275-byte max-frame headroom assertion with
+every reservation reserved at its maximum
+(`anti_collapse + skip + intensity + dual_stereo = 8 + 8 + 37 + 8 =
+61`); the `ReservationOutcome::default()` all-zero pattern;
+determinism across repeats; debug formatting; and the
+`From<Log2FracError>` round-trip.
+
+Provenance: RFC 6716 §4.3.3 (p. 114) in
+`docs/audio/opus/rfc6716-opus.txt`; cross-referenced by
+`docs/audio/celt/spec/celt-coarse-energy-and-allocation.md` §2.5
+(steps 1–4 of the allocation initial-conditions list). No external
+numeric table is required for this module: the four reservation
+costs (8, 8, `LOG2_FRAC_TABLE[…]`, 8) and the §4.3.3 gating
+predicates are inlined in the RFC body.
+
+The §4.3.3 *use* of the reservations — the actual `dec_bit_logp(1)`
+reads of the anti-collapse / skip / dual-stereo flags and the
+`ec_dec_uint(end − start)` read of the intensity-stereo band — runs
+at the §4.3.3 allocator's consumer site once the Table 57 search
+produces the per-band shape allocation; the per-band `trim_offsets[]`
+derivation that biases the Table 57 search is the responsibility of
+the §4.3.3 allocator and runs in a downstream round.
 
 ## Round 33 — §4.3.3 band-boost decoder (2026-06-04)
 

@@ -421,6 +421,34 @@
 //!   responsibility of the §4.3.3 allocator and runs at the call
 //!   site of [`decode_band_boosts`].
 //!
+//! * Round 34 lands the §4.3.3 *reservation block*
+//!   ([`celt_reservations`]: [`reserve_block`] /
+//!   [`ReservationOutcome`] / [`ReservationError`] +
+//!   [`ONE_BIT_EIGHTH_BITS`] = 8 /
+//!   [`CONSERVATIVE_DEDUCTION_EIGHTH_BITS`] = 1 /
+//!   [`ANTI_COLLAPSE_LM_MIN_EXCLUSIVE`] = 1 /
+//!   [`ANTI_COLLAPSE_HEADROOM_MULT_EIGHTH_BITS`] = 8 /
+//!   [`ANTI_COLLAPSE_HEADROOM_LM_OFFSET`] = 2 reservation-cost +
+//!   gating constants). The §4.3.3 procedure (RFC 6716 §4.3.3, p. 114)
+//!   skims four fixed-cost reservations off the top of the working
+//!   `total` budget before the Table 57 static-allocation search:
+//!   `anti_collapse_rsv` (8 1/8 bits iff transient && LM > 1 &&
+//!   total ≥ (LM + 2) * 8), `skip_rsv` (8 1/8 bits iff total > 8 after
+//!   anti-collapse), `intensity_rsv = LOG2_FRAC_TABLE[end − start]`
+//!   (stereo only; reset to 0 if > total), and `dual_stereo_rsv`
+//!   (8 1/8 bits iff total > 8 after intensity). The initial `total`
+//!   is `frame_size_bytes * 64 − ec_tell_frac − 1` (the §4.3.3
+//!   conservative `-1` deduction). Bridges round 33's `total_boost`
+//!   accumulator (validated as `≤ frame_eighth − ec_tell_frac`) and
+//!   round 30's [`crate::celt_log2_frac_table::log2_frac`] lookup with
+//!   the §4.3.3 Table 57 static-allocation search at the consumer
+//!   site. The §4.3.3 *use* of the reservations — the actual
+//!   `dec_bit_logp(1)` reads of the anti-collapse / skip /
+//!   dual-stereo flags and the `ec_dec_uint(end − start)` read of the
+//!   intensity-stereo band — runs at the §4.3.3 allocator's consumer
+//!   site once the Table 57 search produces the per-band shape
+//!   allocation.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -476,6 +504,7 @@ pub mod celt_e_prob_model;
 pub mod celt_header;
 pub mod celt_log2_frac_table;
 pub mod celt_redundancy;
+pub mod celt_reservations;
 pub mod celt_tf_adjust;
 pub mod frames;
 pub mod framing;
@@ -540,6 +569,11 @@ pub use celt_redundancy::{
     REDUNDANCY_FLAG_ICDF, REDUNDANCY_FLAG_ICDF_FTB, REDUNDANCY_MIN_SIZE_BYTES,
     REDUNDANCY_POSITION_ICDF, REDUNDANCY_POSITION_ICDF_FTB,
     SILK_ONLY_REDUNDANCY_MIN_REMAINING_BITS,
+};
+pub use celt_reservations::{
+    reserve_block, ReservationError, ReservationOutcome, ANTI_COLLAPSE_HEADROOM_LM_OFFSET,
+    ANTI_COLLAPSE_HEADROOM_MULT_EIGHTH_BITS, ANTI_COLLAPSE_LM_MIN_EXCLUSIVE,
+    CONSERVATIVE_DEDUCTION_EIGHTH_BITS, ONE_BIT_EIGHTH_BITS,
 };
 pub use celt_tf_adjust::{
     celt_tf_adjustment, celt_tf_select_can_affect, TfAdjustment, TfDirection,
