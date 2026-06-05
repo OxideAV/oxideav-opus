@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-04 (clean-room round 34)
+## Status — 2026-06-06 (clean-room round 35)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
@@ -143,12 +143,97 @@ typed outcome + `ONE_BIT_EIGHTH_BITS = 8` /
 `ANTI_COLLAPSE_HEADROOM_MULT_EIGHTH_BITS = 8` /
 `ANTI_COLLAPSE_HEADROOM_LM_OFFSET = 2` cost + gating constants +
 `ReservationError::{FrameSizeOverflows, TellExceedsFrame,
-TotalBoostExceedsFrame, LogFracLookupFailed}`);
+TotalBoostExceedsFrame, LogFracLookupFailed}`) +
+§4.3.3 per-band minimum-allocation vector
+(`celt_band_thresh::{band_min_thresh, compute_band_min_thresh,
+band_min_thresh_vec, standard_band_window}`: §4.3.3 §4.3.3
+`thresh[b] = max((24 * N) / 16, 8 * channels)` in 1/8 bits — one whole
+bit per channel or 48 128th-bits per MDCT bin, whichever is greater +
+the §4.3.3 "band-size term not scaled by channel count" carve-out +
+`BAND_THRESH_BINS_MULTIPLIER = 24` / `BAND_THRESH_BINS_DIVISOR = 16` /
+`BAND_THRESH_PER_CHANNEL_EIGHTH_BITS = 8` /
+`BAND_THRESH_MONO_CHANNELS = 1` / `BAND_THRESH_STEREO_CHANNELS = 2`
+formula constants + `BandThreshError::{InvertedBandWindow,
+BandWindowOutOfRange, OutputBufferTooSmall}` caller-side bookkeeping
+errors);
 the §4.3.2.1 Laplace decoder itself + 2-D `(time, frequency)` predictor
 + rest of §4.3.3 bit allocation (per-band `trim_offsets[]` derivation +
 Table 57 static-allocation search) + §4.3.4 PVQ shape + band loop +
 §4.3.7 inverse-MDCT window for the cross-lap still deferred. The
 per-LM *inter*-mode `(alpha, beta)` pair is a §4.3.2.1 docs gap.**
+
+## Round 35 — §4.3.3 per-band minimum-allocation vector (2026-06-06)
+
+Round 35 lands the §4.3.3 *per-band minimum-allocation vector* — the
+hard lower bound on shape allocation that lets the §4.3.3 Table 57
+static-allocation search *drop* low-rate bands rather than code them
+with a sub-floor allocation. RFC 6716 §4.3.3 (p. 115) specifies the
+formula:
+
+```text
+thresh[band] = max((24 * N) / 16, 8 * channels)
+```
+
+with `N = celt_band_bins_per_channel(band, frame_size)` (round 24's
+Table 55) and `channels ∈ {1, 2}` the channel count. Both terms are
+in 1/8 bits — the §4.3.3 universal currency. The `(24 * N) / 16` term
+is 48 128th-bits per MDCT bin (= 1.5 1/8 bits per bin = 3/8 whole bits
+per bin); the `8 * channels` term is one whole bit per channel.
+
+The §4.3.3 narrative is explicit that the band-size dependent term
+`(24 * N) / 16` is *not* scaled by the channel count: at the very low
+rates where this floor binds, the §4.3.3 allocator concentrates the
+budget on the mid channel, so the per-band minimum tracks the mid
+only. This module pins that carve-out in its constants and tests.
+
+New public surface (`celt_band_thresh`):
+
+* `band_min_thresh(band, frame_size, is_stereo) -> Option<u32>` —
+  per-band `thresh[band]` lookup; `None` when `band ≥ 21` (Custom
+  mode is out of scope).
+* `compute_band_min_thresh(start, end, frame_size, is_stereo,
+  &mut thresh)` — in-place vector fill over the §4.3 coding window
+  `start..end` (`0..21` for CELT-only, `17..21` for Hybrid).
+* `band_min_thresh_vec(start, end, frame_size, is_stereo) ->
+  Result<Vec<u32>, BandThreshError>` — allocating convenience.
+* `standard_band_window(is_hybrid) -> (usize, usize)` — helper
+  producing the §4.3 full-frame window via
+  `celt_first_coded_band(is_hybrid)` +
+  `celt_end_coded_band()`.
+* Formula constants `BAND_THRESH_BINS_MULTIPLIER = 24`,
+  `BAND_THRESH_BINS_DIVISOR = 16`,
+  `BAND_THRESH_PER_CHANNEL_EIGHTH_BITS = 8`,
+  `BAND_THRESH_MONO_CHANNELS = 1`,
+  `BAND_THRESH_STEREO_CHANNELS = 2`.
+* `BandThreshError::{InvertedBandWindow, BandWindowOutOfRange,
+  OutputBufferTooSmall}` — caller-side bookkeeping bug variants
+  (the band layout itself is total over `band < 21`; an out-of-range
+  window cannot come from a corrupt bitstream).
+
+Thirty-eight new unit tests (709 lib tests total, up from 671 at
+round-34 close; 20 integration tests unchanged) pin the five §4.3.3
+constants to their narrative sources, cross-check the function
+against `max((24 * N) / 16, 8 * channels)` over every (band,
+frame_size, channels) cell of the standard 21-band × 4-frame-size ×
+2-channel matrix, validate the §4.3.3 "not scaled by channel count"
+invariant at bin-term-dominated cells, validate the
+channel-term-doubles-with-stereo invariant at channel-term-dominated
+cells, exercise the full CELT-only / Hybrid driver windows plus a
+partial NB 2.5 ms window, and check the `band_min_thresh_vec` ⇔
+slice-form agreement, the §4.3.3 "at least one whole bit per
+channel" floor across every cell, the thresh-monotonic-in-frame-size
+invariant, the `stereo ≥ mono` invariant, a units cross-check
+pinning the §4.3.3 "48 128th bits per MDCT bin" wording, and the
+three `BandThreshError` paths.
+
+What's still deferred: the §4.3.3 *use* of `thresh[]` (the Table 57
+static-allocation search competing `thresh[]` against the round-31
+`cap[]` per-band maximum and the upcoming `trim_offsets[]` per-band
+tilt) runs at the §4.3.3 allocator's consumer site in a downstream
+round. The `trim_offsets[]` vector itself is the next §4.3.3 piece;
+its formula (RFC 6716 §4.3.3 p. 115) depends on `alloc_trim`, the
+shortest frame size for the mode, and the number of remaining
+bands, and lives in a separate module.
 
 ## Round 34 — §4.3.3 reservation block (2026-06-04)
 

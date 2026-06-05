@@ -449,6 +449,33 @@
 //!   site once the Table 57 search produces the per-band shape
 //!   allocation.
 //!
+//! * Round 35 lands the §4.3.3 *per-band minimum-allocation vector*
+//!   ([`celt_band_thresh`]: [`band_min_thresh`] /
+//!   [`compute_band_min_thresh`] / [`band_min_thresh_vec`] /
+//!   [`standard_band_window`] / [`BandThreshError`] +
+//!   [`BAND_THRESH_BINS_MULTIPLIER`] = 24 /
+//!   [`BAND_THRESH_BINS_DIVISOR`] = 16 /
+//!   [`BAND_THRESH_PER_CHANNEL_EIGHTH_BITS`] = 8 /
+//!   [`BAND_THRESH_MONO_CHANNELS`] = 1 /
+//!   [`BAND_THRESH_STEREO_CHANNELS`] = 2 formula constants). The
+//!   §4.3.3 narrative (RFC 6716 §4.3.3, p. 115) computes a hard
+//!   per-band lower bound on the shape allocation: bands whose
+//!   allocation would drop below `thresh[band]` are dropped rather
+//!   than coded sparsely. For each coded band `b`, with
+//!   `N = celt_band_bins_per_channel(b, frame_size)` and
+//!   `channels ∈ {1, 2}`, the per-band minimum is
+//!   `thresh[b] = max((24 * N) / 16, 8 * channels)` in 1/8 bits — one
+//!   whole bit per channel or 48 128th-bits per MDCT bin, whichever is
+//!   greater. The §4.3.3 narrative is explicit that the band-size
+//!   dependent term `(24 * N) / 16` is *not* scaled by the channel
+//!   count (at the very low rates where this floor binds, the
+//!   §4.3.3 allocator concentrates the budget on the mid channel).
+//!   Bridges round 24's Table 55 band layout with the §4.3.3 Table 57
+//!   static-allocation search at the consumer site (where the
+//!   per-band minimum competes with the round-31 `cap[]` per-band
+//!   maximum, the round-33 boosts, and the upcoming
+//!   `trim_offsets[]`).
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -499,6 +526,7 @@ impl std::error::Error for Error {}
 pub mod celt_alloc_trim;
 pub mod celt_band_boost;
 pub mod celt_band_layout;
+pub mod celt_band_thresh;
 pub mod celt_cache_caps50;
 pub mod celt_e_prob_model;
 pub mod celt_header;
@@ -544,6 +572,11 @@ pub use celt_band_layout::{
     celt_band_at_hz, celt_band_bins_per_channel, celt_band_start_hz, celt_band_stop_hz,
     celt_end_coded_band, celt_first_coded_band, celt_total_bins_per_channel, CeltFrameSize,
     CELT_MAX_BINS_PER_BAND, CELT_NUM_BANDS, HYBRID_FIRST_CODED_BAND,
+};
+pub use celt_band_thresh::{
+    band_min_thresh, band_min_thresh_vec, compute_band_min_thresh, standard_band_window,
+    BandThreshError, BAND_THRESH_BINS_DIVISOR, BAND_THRESH_BINS_MULTIPLIER,
+    BAND_THRESH_MONO_CHANNELS, BAND_THRESH_PER_CHANNEL_EIGHTH_BITS, BAND_THRESH_STEREO_CHANNELS,
 };
 pub use celt_cache_caps50::{
     cache_caps_offset, cache_caps_row, cache_caps_value, cap_for_band_bits, init_caps,
