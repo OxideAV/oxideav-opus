@@ -476,6 +476,36 @@
 //!   maximum, the round-33 boosts, and the upcoming
 //!   `trim_offsets[]`).
 //!
+//! * Round 36 lands the §4.3.3 *per-band allocation-trim offsets*
+//!   ([`celt_trim_offsets`]: [`band_trim_offset`] /
+//!   [`band_trim_offset_for_band`] / [`band_n_shortest`] /
+//!   [`shortest_frame_size`] / [`TrimOffsetError`] +
+//!   [`TRIM_OFFSETS_BIAS`] = 5 /
+//!   [`TRIM_OFFSETS_NUMERATOR_SCALE`] = 8 /
+//!   [`TRIM_OFFSETS_DIVISOR`] = 64 /
+//!   [`TRIM_OFFSETS_WIDTH_ONE_BINS_PER_CHANNEL`] = 1 /
+//!   [`TRIM_OFFSETS_WIDTH_ONE_PER_CHANNEL_EIGHTH_BITS`] = 8 /
+//!   [`TRIM_OFFSETS_MONO_CHANNELS`] = 1 /
+//!   [`TRIM_OFFSETS_STEREO_CHANNELS`] = 2 formula constants). The
+//!   §4.3.3 narrative (RFC 6716 §4.3.3, p. 115) derives a per-band
+//!   *trim-offset* vector from the round-32 `alloc_trim` index; the
+//!   §4.3.3 Table 57 static-allocation search will add these offsets
+//!   to the per-band budget when ranking quality columns. For each
+//!   coded band `b`, with `channels ∈ {1, 2}`, `LM ∈ {0, 1, 2, 3}`,
+//!   `n_shortest = celt_band_bins_per_channel(b, Ms2_5)`,
+//!   `n_per_channel = celt_band_bins_per_channel(b, frame_size)`,
+//!   and `remaining_bands` the band-position-dependent factor:
+//!   `base = (alloc_trim - 5 - LM) * channels * n_shortest *
+//!   remaining_bands * (1 << LM) * 8 / 64`, then
+//!   `trim_offsets[b] = base - (8 * channels)` when
+//!   `n_per_channel == 1` (width-1 bands receive greater benefit
+//!   from the coarse-energy coding; the §4.3.3 narrative backs the
+//!   trim off by one whole bit per channel). All arithmetic is
+//!   signed; the output is in 1/8 bits. Bridges round 32's
+//!   [`decode_alloc_trim`] gate, round 24's Table 55 layout, and
+//!   round 35's [`band_min_thresh`] floor with the upcoming §4.3.3
+//!   Table 57 static-allocation search.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -534,6 +564,7 @@ pub mod celt_log2_frac_table;
 pub mod celt_redundancy;
 pub mod celt_reservations;
 pub mod celt_tf_adjust;
+pub mod celt_trim_offsets;
 pub mod frames;
 pub mod framing;
 pub mod mode_transition_reset;
@@ -612,6 +643,12 @@ pub use celt_tf_adjust::{
     celt_tf_adjustment, celt_tf_select_can_affect, TfAdjustment, TfDirection,
     TF_ADJUSTMENT_ABS_MAX, TF_ADJUSTMENT_MAX, TF_ADJ_NONTRANSIENT_SELECT0,
     TF_ADJ_NONTRANSIENT_SELECT1, TF_ADJ_TRANSIENT_SELECT0, TF_ADJ_TRANSIENT_SELECT1,
+};
+pub use celt_trim_offsets::{
+    band_n_shortest, band_trim_offset, band_trim_offset_for_band, shortest_frame_size,
+    TrimOffsetError, TRIM_OFFSETS_BIAS, TRIM_OFFSETS_DIVISOR, TRIM_OFFSETS_MONO_CHANNELS,
+    TRIM_OFFSETS_NUMERATOR_SCALE, TRIM_OFFSETS_STEREO_CHANNELS,
+    TRIM_OFFSETS_WIDTH_ONE_BINS_PER_CHANNEL, TRIM_OFFSETS_WIDTH_ONE_PER_CHANNEL_EIGHTH_BITS,
 };
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
 pub use framing::{OperatingMode, OpusFrameRouting, SilkBandwidth};

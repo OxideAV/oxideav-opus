@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-06 (clean-room round 35)
+## Status — 2026-06-07 (clean-room round 36)
 
 **Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
@@ -157,10 +157,110 @@ formula constants + `BandThreshError::{InvertedBandWindow,
 BandWindowOutOfRange, OutputBufferTooSmall}` caller-side bookkeeping
 errors);
 the §4.3.2.1 Laplace decoder itself + 2-D `(time, frequency)` predictor
-+ rest of §4.3.3 bit allocation (per-band `trim_offsets[]` derivation +
-Table 57 static-allocation search) + §4.3.4 PVQ shape + band loop +
-§4.3.7 inverse-MDCT window for the cross-lap still deferred. The
-per-LM *inter*-mode `(alpha, beta)` pair is a §4.3.2.1 docs gap.**
++ rest of §4.3.3 bit allocation (Table 57 static-allocation search) +
+§4.3.4 PVQ shape + band loop + §4.3.7 inverse-MDCT window for the
+cross-lap still deferred. The per-LM *inter*-mode `(alpha, beta)` pair
+is a §4.3.2.1 docs gap.**
+
+## Round 36 — §4.3.3 per-band allocation-trim offsets (2026-06-07)
+
+Round 36 lands the §4.3.3 *per-band allocation-trim offsets* — the
+per-band tilt vector that biases the §4.3.3 Table 57
+static-allocation search after the round-35 `band_min_thresh` floor
+is applied. RFC 6716 §4.3.3 (p. 115) specifies the formula:
+
+```text
+base = (alloc_trim - 5 - LM)
+     * channels
+     * n_shortest
+     * remaining_bands
+     * (1 << LM)
+     * 8
+     / 64
+trim_offsets[b] = base - (if n_per_channel == 1 { 8 * channels } else { 0 })
+```
+
+with `alloc_trim ∈ [0, 10]` the round-32 trim signal,
+`LM ∈ {0, 1, 2, 3}` the §4.3 frame-size scale,
+`channels ∈ {1, 2}`,
+`n_shortest = celt_band_bins_per_channel(band, Ms2_5)` (Table 55
+column 0 — the shortest §4.3 frame size for the standard CELT mode),
+`n_per_channel = celt_band_bins_per_channel(band, frame_size)`, and
+`remaining_bands` the band-position-dependent factor. All arithmetic
+is signed; the output is in 1/8 bits (the §4.3.3 universal currency).
+
+The §4.3.3 narrative attaches the width-1 carve-out to the per-band
+result: "width 1 bands receive greater benefit from the coarse energy
+coding", so the trim is backed off by one whole bit per channel for
+them. The "number of remaining bands" choice is deferred to the
+consumer site (the round that lands the §4.3.3 Table 57
+static-allocation search): the RFC narrative phrases it as a
+per-band-iteration quantity, and this module accepts `remaining_bands`
+as an explicit caller-supplied parameter — both readings of the spec
+phrasing fit through the same signature.
+
+New public surface (`celt_trim_offsets`):
+
+* `band_trim_offset(alloc_trim, lm, is_stereo, n_shortest,
+  n_per_channel, remaining_bands) -> Result<i32, TrimOffsetError>` —
+  per-band primitive; validates `alloc_trim ≤ ALLOC_TRIM_MAX`.
+* `band_trim_offset_for_band(band, alloc_trim, frame_size, is_stereo,
+  remaining_bands) -> Result<i32, TrimOffsetError>` — convenience
+  that derives `n_shortest` and `n_per_channel` from the round-24
+  Table 55 layout; rejects `band ≥ CELT_NUM_BANDS`.
+* `band_n_shortest(band) -> Option<u16>` — Table 55 column-0 lookup
+  helper.
+* `shortest_frame_size() -> CeltFrameSize` — returns `Ms2_5` for the
+  standard §4.3 CELT mode (which covers all four frame sizes).
+* Formula constants `TRIM_OFFSETS_BIAS = 5` (§4.3.3 "subtract 5"),
+  `TRIM_OFFSETS_NUMERATOR_SCALE = 8` (§4.3.3 "multiply by 8"),
+  `TRIM_OFFSETS_DIVISOR = 64` (§4.3.3 "divide by 64"),
+  `TRIM_OFFSETS_WIDTH_ONE_BINS_PER_CHANNEL = 1` (§4.3.3 width-1
+  trigger), `TRIM_OFFSETS_WIDTH_ONE_PER_CHANNEL_EIGHTH_BITS = 8`
+  (§4.3.3 per-channel subtraction = one whole bit), and
+  `TRIM_OFFSETS_MONO_CHANNELS = 1` / `TRIM_OFFSETS_STEREO_CHANNELS = 2`
+  channel multipliers matching the round-35
+  `BAND_THRESH_{MONO,STEREO}_CHANNELS` pins.
+* `TrimOffsetError::{AllocTrimOutOfRange{provided, max},
+  BandOutOfRange{band}}` — caller-side bookkeeping bug variants.
+
+Forty-two new unit tests (751 lib tests total, up from 709 at
+round-35 close; 20 integration tests unchanged) pin the seven §4.3.3
+formula constants to their narrative sources (including the
+`TRIM_OFFSETS_BIAS == ALLOC_TRIM_DEFAULT == 5` cross-check between
+the round-32 trim default and the §4.3.3 trim-cancel value), exercise
+the §4.3.3 single-band formula at six worked points (default-trim /
+LM 0 / no-width-1 ⇒ 0; default-trim / LM 0 / width-1 mono ⇒ -8;
+default-trim / LM 0 / width-1 stereo ⇒ -16; max-trim / LM 0 / large
+factors ⇒ +577; min-trim / LM 3 / large factors mono ⇒ -3 696;
+min-trim / LM 3 / width-1 stereo ⇒ -352), cross-check
+LM-factor-doubles (40 → 64 → 96 → 128 across the four LMs with
+`trim_term` adjusted per LM), validate the channel /  n_shortest /
+remaining_bands linear-scaling invariants in isolation, pin the
+truncating-toward-zero integer-division behaviour at three numerator
+cells (`-512/64 = -8` exact, `-8/64 = 0` truncating-positive-zero,
+`-80/64 = -1` truncating-toward-zero), check the kernel-cancel paths
+(`alloc_trim - 5 == LM` ⇒ result = width-1 correction only), validate
+the width-1 trigger fires only at `n_per_channel == 1` (verified at
+`{0, 2, 3, 22, 176}` exclusion edges), exercise the
+`band_trim_offset_for_band` Table-55 wrapper over the full 21 × 4 × 2
+matrix and on `band ≥ CELT_NUM_BANDS` rejection, the wrapper's
+width-1 trigger at band 0 / 2.5 ms (N = 1) and width-1 inactive at
+band 20 / 20 ms (N = 176 ⇒ -1 386), the
+output-fits-well-within-`i32` guarantee at worst-case input edges,
+plus a determinism sweep over five `alloc_trim` × four frame sizes ×
+21 bands × 2 channels × 4 `remaining_bands` values, and `Debug`
+rendering for both error variants.
+
+What's still deferred: the §4.3.3 Table 57 static-allocation search
+that consumes `trim_offsets[]` (against the round-31 `cap[]`
+per-band maximum, the round-33 `boosts[]`, and the round-35
+`thresh[]` floor) is the responsibility of the §4.3.3 allocator and
+runs in a downstream round. With round 36 now landed, every input to
+that search is in tree: per-band `cap[]` from round 31, the
+`alloc_trim` signal from round 32, per-band `boosts[]` from round 33,
+the reservation block from round 34, per-band `thresh[]` from round
+35, and per-band `trim_offsets[]` from this round.
 
 ## Round 35 — §4.3.3 per-band minimum-allocation vector (2026-06-06)
 

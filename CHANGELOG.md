@@ -6,6 +6,94 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 36 (2026-06-07):** §4.3.3 *per-band allocation-trim
+  offsets* — a new `celt_trim_offsets` module delivering the §4.3.3
+  `trim_offsets[]` per-band tilt vector that biases the §4.3.3 Table 57
+  static-allocation search after the round-35
+  [`band_min_thresh`] floor is applied. RFC 6716 §4.3.3 (p. 115)
+  specifies the formula: for each coded band `b`, with `channels ∈ {1, 2}`,
+  `LM ∈ {0, 1, 2, 3}` (the §4.3 frame-size scale),
+  `n_shortest = celt_band_bins_per_channel(b, Ms2_5)` (Table 55 column 0
+  — the shortest §4.3 frame size for the standard CELT mode),
+  `n_per_channel = celt_band_bins_per_channel(b, frame_size)`, and
+  `remaining_bands` the band-position-dependent factor,
+  `base = (alloc_trim - 5 - LM) * channels * n_shortest * remaining_bands
+  * (1 << LM) * 8 / 64`, then `trim_offsets[b] = base - 8 * channels`
+  when `n_per_channel == 1` (width-1 bands receive greater benefit from
+  the coarse-energy coding, so the §4.3.3 narrative backs the trim off by
+  one whole bit per channel for them). All arithmetic is signed (the
+  `(alloc_trim - 5 - LM)` factor reaches `-8` at the lowest trim with the
+  largest frame size); the output is in 1/8 bits, the same units the
+  §4.3.3 budget loop works in. The "number of remaining bands" choice is
+  deferred to the consumer site (the round that lands the §4.3.3 Table 57
+  static-allocation search): the RFC narrative phrases it as a
+  per-band-iteration quantity, and this module accepts `remaining_bands`
+  as an explicit caller-supplied parameter. New public surface:
+  `band_trim_offset(alloc_trim, lm, is_stereo, n_shortest, n_per_channel,
+  remaining_bands) -> Result<i32, TrimOffsetError>` per-band primitive
+  (validates `alloc_trim ≤ ALLOC_TRIM_MAX`); `band_trim_offset_for_band(
+  band, alloc_trim, frame_size, is_stereo, remaining_bands) ->
+  Result<i32, TrimOffsetError>` convenience that derives `n_shortest`
+  and `n_per_channel` from the round-24 Table 55 layout; `band_n_shortest
+  (band) -> Option<u16>` Table-55 column-0 lookup helper;
+  `shortest_frame_size() -> CeltFrameSize` returning `Ms2_5` for the
+  standard §4.3 mode; formula constants `TRIM_OFFSETS_BIAS = 5`
+  (§4.3.3 "subtract 5"), `TRIM_OFFSETS_NUMERATOR_SCALE = 8` (§4.3.3
+  "multiply by 8"), `TRIM_OFFSETS_DIVISOR = 64` (§4.3.3 "divide by 64"),
+  `TRIM_OFFSETS_WIDTH_ONE_BINS_PER_CHANNEL = 1` (§4.3.3 width-1 trigger),
+  `TRIM_OFFSETS_WIDTH_ONE_PER_CHANNEL_EIGHTH_BITS = 8` (§4.3.3
+  per-channel subtraction = one whole bit), and
+  `TRIM_OFFSETS_MONO_CHANNELS = 1` / `TRIM_OFFSETS_STEREO_CHANNELS = 2`
+  channel multipliers matching the round-35
+  `BAND_THRESH_{MONO,STEREO}_CHANNELS` pins; error variants
+  `TrimOffsetError::{AllocTrimOutOfRange{provided, max}, BandOutOfRange
+  {band}}` for caller-side bookkeeping bugs. Forty-two new unit tests
+  (751 lib tests total, up from 709 at round-35 close; 20 integration
+  tests unchanged, grand total 771) cover: the seven §4.3.3 formula
+  constants pinned to their narrative sources; the constant cross-check
+  `TRIM_OFFSETS_BIAS == ALLOC_TRIM_DEFAULT == 5` (the §4.3.3 trim
+  default cancels the multiplicative kernel at `LM = 0`); the
+  net-scale-keeps-Q3-units invariant (`8 / 64 = 1/8`); the
+  `band_n_shortest` Table-55-column-0 path at three pin cells
+  (band 0 ⇒ 1, band 20 ⇒ 22, band 21 ⇒ `None`); the
+  `band_n_shortest`-matches-`celt_band_bins_per_channel(_, Ms2_5)`
+  cross-check over the full 21 bands; the §4.3.3 single-band formula at
+  six worked points (default-trim / LM 0 / no-width-1 ⇒ 0; default-trim
+  / LM 0 / width-1 mono ⇒ -8; default-trim / LM 0 / width-1 stereo ⇒
+  -16; max-trim / LM 0 / large factors ⇒ +577; min-trim / LM 3 / large
+  factors mono ⇒ -3 696; min-trim / LM 3 / width-1 stereo ⇒ -352); the
+  LM-factor-doubles cross-check at four LMs (40 → 64 → 96 → 128 with
+  `trim_term` adjusted per LM); the channel-factor-scales-linearly
+  invariant; the n_shortest-scales-linearly invariant; the
+  remaining_bands-scales-linearly invariant; the
+  `remaining_bands = 0` case reducing to the width-1 correction only;
+  the `trim_term = 0` kernel-cancel path over many factor combinations
+  (with the width-1 correction still firing where applicable); the
+  `alloc_trim - 5 == LM` kernel-cancel pin at `(alloc_trim=8, LM=3)`;
+  the width-1 subtraction is purely additive (the difference between
+  `n_per_channel = 1` and `n_per_channel ≥ 2` is exactly `8 *
+  channels`); the width-1 trigger fires only at `n_per_channel == 1`
+  (verified at `{0, 2, 3, 22, 176}` exclusion edges); the
+  truncating-toward-zero integer-division behaviour at three numerator
+  cells (`-512 / 64 = -8` exact, `-8 / 64 = 0` truncating-positive-zero,
+  `-80 / 64 = -1` truncating-toward-zero); the
+  `alloc_trim > ALLOC_TRIM_MAX` error path at the boundary (11) and
+  far above (255); the `alloc_trim ∈ {0, ALLOC_TRIM_MAX}` accepted-edge
+  cases; the `band_trim_offset_for_band` Table-55 wrapper rejecting
+  `band ≥ CELT_NUM_BANDS`; the wrapper matching the primitive's output
+  over the full 21 × 4 × 2 (band × frame-size × stereo) matrix; the
+  wrapper propagating `AllocTrimOutOfRange`; the wrapper width-1
+  trigger at Table-55 band 0 / 2.5 ms (N = 1); the wrapper width-1
+  inactive at band 20 / 20 ms (N = 176 ⇒ result = -1 386); a
+  determinism sweep over five `alloc_trim` values × four frame sizes ×
+  21 bands × 2 channels × 4 `remaining_bands` values; the
+  output-fits-well-within-`i32` guarantee at the worst-case input
+  edges; and `Debug` rendering for both error variants. The §4.3.3
+  Table 57 static-allocation search that consumes `trim_offsets[]`
+  (against the round-31 `cap[]` per-band maximum, the round-33
+  `boosts[]`, and the round-35 `thresh[]` floor) is the responsibility
+  of the §4.3.3 allocator and runs in a downstream round.
+
 * **Clean-room round 35 (2026-06-06):** §4.3.3 *per-band minimum-allocation
   vector* — a new `celt_band_thresh` module delivering the §4.3.3
   `thresh[band]` lower bound used by the §4.3.3 Table 57 static-allocation
