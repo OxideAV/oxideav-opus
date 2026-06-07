@@ -90,6 +90,21 @@ impl<'a> OpusPacket<'a> {
     pub fn frame_count(&self) -> usize {
         self.frames.len()
     }
+
+    /// Build an [`OpusPacket`] from already-parsed components. This is
+    /// the construction path used by the Appendix-B self-delimited
+    /// parser (`framing_self_delim::parse_self_delimited`), which
+    /// derives the frame slices using the Appendix-B extra length
+    /// field rather than the §3.2 implicit-length rules. Crate-private
+    /// to keep external callers on [`OpusPacket::parse`] /
+    /// [`crate::framing_self_delim::parse_self_delimited`].
+    pub(crate) fn new_self_delim(toc: OpusTocByte, frames: Vec<&'a [u8]>, padding: usize) -> Self {
+        Self {
+            toc,
+            frames,
+            padding,
+        }
+    }
 }
 
 /// Decode a §3.2.1 length sequence at the start of `bytes`.
@@ -101,7 +116,7 @@ impl<'a> OpusPacket<'a> {
 /// * `1..=251` — that value in bytes. One byte consumed.
 /// * `252..=255` — a second byte is required; the total length is
 ///   `(second * 4) + first`. Two bytes consumed.
-fn decode_length(bytes: &[u8]) -> Result<(usize, usize), Error> {
+pub(crate) fn decode_length(bytes: &[u8]) -> Result<(usize, usize), Error> {
     let first = *bytes.first().ok_or(Error::MalformedPacket)? as usize;
     if first < 252 {
         Ok((first, 1))

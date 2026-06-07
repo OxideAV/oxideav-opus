@@ -6,6 +6,43 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 37 (2026-06-07):** RFC 6716 *Appendix B
+  self-delimiting framing* — a new `framing_self_delim` module wires
+  up the alternate Opus framing that prefixes one or two extra
+  §3.2.1 length fields so a transport can pack multiple Opus streams
+  back to back (the appendix's worked example is the multi-channel
+  case formed from several one- or two-channel Opus streams). The
+  parser handles all five Appendix-B shapes — Figure 25 (code 0,
+  one Opus frame, one length), Figure 26 (code 1, two equal-size
+  frames, one length), Figure 27 (code 2, two length fields: the
+  §3.2.4 inline length for the first frame and the Appendix-B
+  extra length for the second), Figure 28 (CBR code 3, the
+  Appendix-B length applies to every frame; padding chain handled
+  per §3.2.5), and Figure 29 (VBR code 3, `M − 1` §3.2.1 inline
+  lengths plus the Appendix-B trailing length for frame M). New
+  public surface: `parse_self_delimited(buffer) -> Result<
+  SelfDelimitedParse<'_>, Error>` returns the parsed
+  `OpusPacket<'_>` plus a `consumed` byte count so a multistream
+  demuxer can advance exactly one packet at a time (`buffer[
+  consumed..]` is the next stream's TOC byte). Frame slices borrow
+  the buffer just like [`OpusPacket::parse`] — the two construction
+  paths are interchangeable downstream. All Appendix-B malformation
+  conditions are bundled into [`Error::MalformedPacket`] / [`Error::
+  EmptyPacket`]: zero-byte buffer, truncated length, truncated
+  padding chain, frame larger than [`MAX_FRAME_BYTES`] (= 1275, the
+  §3.2.1 cap), `M = 0` or `M > MAX_FRAMES_PER_PACKET` (= 48), or
+  any frame / padding payload running past the buffer end. Unlike
+  [`OpusPacket::parse`] (which consumes the entire input as one
+  packet), this entry point consumes only the bytes its lengths
+  describe — that's the whole point of the Appendix-B variant.
+  Reuses the §3.2.1 length decoder via a crate-private re-export
+  (`frames::decode_length`) so the two framing modes share one
+  length-encoding implementation. 17 new tests cover each of the
+  five figures, multistream chaining (parse, advance, parse), and
+  the seven malformation paths. Source: RFC 6716 Appendix B
+  (September 2012), pp. 321–325 — held in-repo at
+  `docs/audio/opus/rfc6716-opus.txt`.
+
 * **Clean-room round 36 (2026-06-07):** §4.3.3 *per-band allocation-trim
   offsets* — a new `celt_trim_offsets` module delivering the §4.3.3
   `trim_offsets[]` per-band tilt vector that biases the §4.3.3 Table 57

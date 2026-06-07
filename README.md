@@ -2,9 +2,13 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-07 (clean-room round 36)
+## Status — 2026-06-07 (clean-room round 37)
 
-**Packet header + §3.2 frame-packing parser + §3.1 / §4.2 framing
+**Packet header + §3.2 frame-packing parser + RFC 6716 Appendix B
+self-delimiting framing (`parse_self_delimited` — Figures 25..29 for
+codes 0/1/2 and CBR/VBR code 3, with a `consumed` byte count so a
+multistream demuxer can chain calls; reuses the §3.2.1 length
+encoding via the shared `decode_length` helper) + §3.1 / §4.2 framing
 dispatch (`OpusFrameRouting`: SILK-only / Hybrid / CELT-only mode +
 SILK internal bandwidth pinned to WB for Hybrid + §4.2.2 SILK-frame
 count + §4.2.4 per-frame LBRR-flag presence gate + channel-count
