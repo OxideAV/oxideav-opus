@@ -506,6 +506,36 @@
 //!   round 35's [`band_min_thresh`] floor with the upcoming §4.3.3
 //!   Table 57 static-allocation search.
 //!
+//! * Round 38 lands the §4.5.3 *Summary of Transitions* (Figure 18
+//!   plus Figure 19) ([`celt_transitions`]: [`NormativeTransition`]
+//!   with one variant per row of Figure 18 +
+//!   [`RecommendedNonNormativeTransition`] with one variant per row
+//!   of Figure 19 + [`BoundaryOp`] lifting the §4.5.3 figure-key
+//!   markers `;` / `|` / `!` / `&` / `+` / `c` / `P` / `>` to a
+//!   typed list +
+//!   [`classify_normative_transition`](crate::celt_transitions::classify_normative_transition)
+//!   `(prev_mode, prev_silk_bw, next_mode, next_silk_bw,
+//!   redundancy_present) -> Option<NormativeTransition>` for the
+//!   Figure-18 lookup +
+//!   [`recommended_non_normative`](crate::celt_transitions::recommended_non_normative)
+//!   `(prev_mode, prev_silk_bw, next_mode, next_silk_bw) ->
+//!   Option<RecommendedNonNormativeTransition>` for the Figure-19
+//!   lookup + the
+//!   [`NormativeTransition::seam_operations`](crate::celt_transitions::NormativeTransition::seam_operations)
+//!   and
+//!   [`RecommendedNonNormativeTransition::seam_operations`](crate::celt_transitions::RecommendedNonNormativeTransition::seam_operations)
+//!   accessors returning the ordered marker list at each
+//!   transition seam, transcribed from the §4.5.3 figures). Closes
+//!   the §4.5 chain after the round-26 §4.5.1 redundancy side
+//!   information, the round-28 §4.5.1.4 cross-lap placement, and
+//!   the round-27 §4.5.2 state-reset policy. The §4.5.3
+//!   classifier's SILK-bandwidth split between Figure-18 rows 2
+//!   (NB/MB SILK to Hybrid with R) and row 3 (WB SILK to Hybrid, no
+//!   R), the symmetric Hybrid to SILK split (rows 5 and 6), and the
+//!   §4.5 "audio-bandwidth change is the glitch source" reading
+//!   that rules out same-bandwidth SILK to SILK from row 1 are all
+//!   baked in.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -564,6 +594,7 @@ pub mod celt_log2_frac_table;
 pub mod celt_redundancy;
 pub mod celt_reservations;
 pub mod celt_tf_adjust;
+pub mod celt_transitions;
 pub mod celt_trim_offsets;
 pub mod frames;
 pub mod framing;
@@ -644,6 +675,10 @@ pub use celt_tf_adjust::{
     celt_tf_adjustment, celt_tf_select_can_affect, TfAdjustment, TfDirection,
     TF_ADJUSTMENT_ABS_MAX, TF_ADJUSTMENT_MAX, TF_ADJ_NONTRANSIENT_SELECT0,
     TF_ADJ_NONTRANSIENT_SELECT1, TF_ADJ_TRANSIENT_SELECT0, TF_ADJ_TRANSIENT_SELECT1,
+};
+pub use celt_transitions::{
+    classify_normative_transition, recommended_non_normative, BoundaryOp, NormativeTransition,
+    RecommendedNonNormativeTransition,
 };
 pub use celt_trim_offsets::{
     band_n_shortest, band_trim_offset, band_trim_offset_for_band, shortest_frame_size,

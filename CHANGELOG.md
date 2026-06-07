@@ -6,6 +6,41 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 38 (2026-06-07):** RFC 6716 §4.5.3 *Summary of
+  Transitions* (Figure 18 + Figure 19) — a new `celt_transitions`
+  module that closes the §4.5 chain after the round-26 §4.5.1
+  redundancy side information, the round-28 §4.5.1.4 cross-lap
+  placement, and the round-27 §4.5.2 state-reset policy. §4.5.3
+  enumerates the nine *normative* transition shapes (Figure 18)
+  the encoder is allowed to use, plus seven *recommended
+  non-normative* shapes (Figure 19) for transitions without
+  redundancy where PLC is allowed. New public surface:
+  `NormativeTransition` with one variant per Figure-18 row,
+  `RecommendedNonNormativeTransition` with one variant per
+  Figure-19 row, `BoundaryOp` lifting the figure-key markers (`;`,
+  `|`, `!`, `&`, `+`, `c`, `P`, `>`) to a typed list,
+  `classify_normative_transition(prev_mode, prev_silk_bw,
+  next_mode, next_silk_bw, redundancy_present) ->
+  Option<NormativeTransition>` for Figure-18 lookup, and
+  `recommended_non_normative(prev_mode, prev_silk_bw, next_mode,
+  next_silk_bw) -> Option<RecommendedNonNormativeTransition>` for
+  Figure-19 lookup. Each enum exposes a `seam_operations() ->
+  &'static [BoundaryOp]` accessor returning the ordered §4.5.3
+  marker list at the transition seam. The classifier bakes in the
+  SILK-bandwidth split between Figure-18 rows 2 ("NB or MB SILK to
+  Hybrid with Redundancy") and 3 ("WB SILK to Hybrid"), the
+  symmetric Hybrid → SILK split (rows 5 and 6), and the §4.5
+  first-paragraph "audio-bandwidth change is the glitch source"
+  reading that rules out same-bandwidth SILK→SILK from row 1.
+  Forty-two new unit tests pin every Figure-18 and Figure-19 row,
+  the SILK-bandwidth splits, the §4.5 first-paragraph "no special
+  treatment" exemption for same-configuration CELT→CELT and
+  Hybrid→Hybrid pairs, the seam-op ordering per row, and a
+  cross-check that the §4.5.3 figure-reset markers agree with the
+  §4.5.2 state-reset policy already encoded in
+  `mode_transition_reset`. Source: RFC 6716 §4.5.3 (pp. 128–130) —
+  held in-repo at `docs/audio/opus/rfc6716-opus.txt`.
+
 * **Clean-room round 37 (2026-06-07):** RFC 6716 *Appendix B
   self-delimiting framing* — a new `framing_self_delim` module wires
   up the alternate Opus framing that prefixes one or two extra

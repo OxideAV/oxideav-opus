@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-07 (clean-room round 37)
+## Status — 2026-06-07 (clean-room round 38)
 
 **Packet header + §3.2 frame-packing parser + RFC 6716 Appendix B
 self-delimiting framing (`parse_self_delimited` — Figures 25..29 for
@@ -165,6 +165,88 @@ the §4.3.2.1 Laplace decoder itself + 2-D `(time, frequency)` predictor
 §4.3.4 PVQ shape + band loop + §4.3.7 inverse-MDCT window for the
 cross-lap still deferred. The per-LM *inter*-mode `(alpha, beta)` pair
 is a §4.3.2.1 docs gap.**
+
+## Round 38 — §4.5.3 normative + recommended-non-normative transition table (2026-06-07)
+
+Round 38 lands the RFC 6716 §4.5.3 *Summary of Transitions* (Figure 18 +
+Figure 19) — the configuration-switch lookup that closes the §4.5
+chain after the round-26 §4.5.1 redundancy side information, the
+round-28 §4.5.1.4 cross-lap placement, and the round-27 §4.5.2
+state-reset policy. §4.5.3 enumerates the exhaustive set of
+*normative* transitions (nine rows in Figure 18) the encoder is
+allowed to use, plus the *recommended non-normative* shapes (seven
+rows in Figure 19) for transitions without redundancy where PLC is
+allowed.
+
+New public surface (`celt_transitions`):
+
+* `NormativeTransition::{SilkToSilkWithRedundancy,
+  NbOrMbSilkToHybridWithRedundancy, WbSilkToHybrid,
+  SilkToCeltWithRedundancy, HybridToNbOrMbSilkWithRedundancy,
+  HybridToWbSilk, HybridToCeltWithRedundancy,
+  CeltToSilkWithRedundancy, CeltToHybridWithRedundancy}` — one
+  variant per row of Figure 18.
+* `RecommendedNonNormativeTransition::{SilkToSilkAudioBandwidthChange,
+  NbOrMbSilkToHybrid, SilkToCeltWithoutRedundancy,
+  HybridToNbOrMbSilk, HybridToCeltWithoutRedundancy,
+  CeltToSilkWithoutRedundancy, CeltToHybridWithoutRedundancy}` — one
+  variant per row of Figure 19.
+* `BoundaryOp::{SilkReset, SilkAndCeltReset, CeltReset,
+  WindowedCrossLap, DirectMix, CeltOverlapExtract,
+  PacketLossConcealment, StreamJoin}` — the §4.5.3 figure key
+  markers (`;`, `|`, `!`, `&`, `+`, `c`, `P`, `>`) lifted to a
+  typed list so a consumer can cross-check its per-seam dispatch
+  decisions against the figure.
+* `classify_normative_transition(prev_mode, prev_silk_bandwidth,
+  next_mode, next_silk_bandwidth, redundancy_present) ->
+  Option<NormativeTransition>` — pure-function lookup against
+  Figure 18 rows. The SILK-bandwidth split between rows 2 and 3
+  ("NB or MB SILK to Hybrid with Redundancy" vs "WB SILK to
+  Hybrid"), between rows 5 and 6 (the symmetric Hybrid → SILK
+  case), and the §4.5 "audio-bandwidth change is the glitch
+  source" reading that rules out same-bandwidth SILK→SILK from
+  row 1, are baked into the classifier.
+* `recommended_non_normative(prev_mode, prev_silk_bandwidth,
+  next_mode, next_silk_bandwidth) -> Option<RecommendedNonNormativeTransition>`
+  — the Figure-19 companion lookup; mutually exclusive with
+  Figure 18's two no-redundancy rows (WB-SILK → Hybrid and
+  Hybrid → WB-SILK) so consumers can chain the two classifiers
+  without overlap.
+* `NormativeTransition::seam_operations() -> &'static [BoundaryOp]`
+  and the matching method on `RecommendedNonNormativeTransition`
+  — the ordered marker list at the transition seam, transcribed
+  from the §4.5.3 figure for each row.
+* `NormativeTransition::carries_redundancy() -> bool` — `true`
+  for the seven `WithRedundancy` rows, `false` for `WbSilkToHybrid`
+  and `HybridToWbSilk` (the two no-redundancy normative
+  exceptions §4.5 calls out).
+* `redundancy_is_present(decision)` — bridge from the round-26
+  `RedundancyDecision` to the boolean the classifier consumes,
+  matching the round-27 `mode_transition_reset` convention that
+  treats `RedundancyDecision::Invalid` as "no usable redundancy"
+  per the §4.5.1.3 stop-and-discard recommendation.
+
+Forty-two new unit tests (810 lib tests total, up from 768 at
+round-37 close; 20 integration tests unchanged) pin every Figure-18
+and Figure-19 row, the SILK-bandwidth splits, the same-mode
+exclusions, the §4.5 first-paragraph carve-outs that exempt same-
+configuration CELT→CELT / Hybrid→Hybrid transitions, the seam-op
+ordering for every row, and a cross-check that the §4.5.3 figure-
+reset markers (`;`, `|`, `!`) agree with the §4.5.2 state-reset
+policy already encoded in [`crate::mode_transition_reset`]. The
+§4.5.3 invariant that "no-redundancy Figure-18 rows do not appear
+on Figure 19" is asserted by sweeping the full
+`(prev_mode, prev_bw, next_mode, next_bw)` cross-product.
+
+The actual §4.3.7 power-complementary MDCT cross-lap, the §4.4 PLC
+algorithm interior, and the §4.5 mid/side overlap-buffer arithmetic
+remain deferred — this round owns only the *boundary classification*
+(which seam markers fire for which transition), not the arithmetic
+at the seam.
+
+Source: RFC 6716 §4.5.3 (pp. 128–130) — held in-repo at
+`docs/audio/opus/rfc6716-opus.txt`. No external library source was
+consulted; the §4.5.3 figures and key are the only source.
 
 ## Round 36 — §4.3.3 per-band allocation-trim offsets (2026-06-07)
 
@@ -2434,9 +2516,9 @@ The clean-room rebuild will consult only:
 * Black-box invocations of `opusdec` / `opusenc` (the binaries — not
   their source) as opaque validators.
 
-No external library source — libopus, the Opus reference encoder /
-decoder, etc. — is permitted as a reference under the workspace
-clean-room policy.
+No external library source — neither the Opus reference encoder /
+decoder nor any third-party Opus implementation — is permitted as a
+reference under the workspace clean-room policy.
 
 ## License
 
