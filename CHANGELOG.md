@@ -6,6 +6,80 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 40 (2026-06-08):** RFC 6716 §4.3.3 *1/64-step
+  interpolated static-allocation search* — a new `celt_alloc_search`
+  module that closes the interpolation + search gap round 39 noted
+  as the natural next step on top of `celt_static_alloc`. RFC 6716
+  §4.3.3 (p. 111, lines 6223–6230) is explicit: "The allocation is
+  obtained by linearly interpolating between two values of q (in
+  steps of 1/64) to find the highest allocation that does not
+  exceed the number of bits remaining." This module owns the
+  interpolation + search half; the orchestrated §4.3.3 allocator
+  that folds in the round-31 per-band cap, the round-33 boosts,
+  the round-34 reservations, the round-35 per-band minimum, the
+  round-36 trim offsets, and the skip / dual-stereo / intensity-
+  stereo flag reads runs at the consumer site. New public surface:
+  `Q_FP_MAX = 640` (the fixed-point quality bound packing `q'_fp =
+  q_lo * 64 + frac` with `q_lo ∈ 0..=9`, `frac ∈ 0..=63`, plus the
+  saturation endpoint `(q_lo = 9, frac = 64)` representing
+  `q' = 10.0`); `STATIC_ALLOC_INTERP_RIGHT_SHIFT = 8` (the
+  combined `>> 2` Q5→Q3 fold plus `>> 6` Q6 step-weight reduction);
+  the typed decomposition `QFpComponents { q_lo, frac }` and the
+  invertible `q_fp_to_components(q_fp) -> QFpComponents` /
+  `q_fp_from_components(q_lo, frac) -> u32` accessors;
+  `per_band_eighth_bits_at_q_fp(band, q_fp, channels, n_bins, lm) ->
+  u64` returning the per-band Q3 allocation under the linear
+  interpolation `cell_q11 = alloc[b][q_lo] * (64 - frac) +
+  alloc[b][q_lo + 1] * frac` followed by the
+  `(channels * N * cell_q11) << LM >> 8` unit conversion;
+  `total_eighth_bits_at_q_fp(q_fp, channels, frame_size, is_hybrid)
+  -> u64` summing across coded bands while respecting the §4.3
+  first-coded-band rule (`0` for CELT-only / `17` for Hybrid);
+  `search_q_fp(budget, channels, frame_size, is_hybrid) ->
+  AllocSearchOutcome` running the §4.3.3 linear scan from
+  `q_fp = Q_FP_MAX` downwards and returning the highest
+  `q_fp ∈ 0..=640` whose summed allocation fits the budget;
+  `AllocSearchOutcome { q_fp, total_eighth_bits }` carrying the
+  chosen quality plus its evaluated total; and `AllocSearchError::
+  {ChannelsOutOfRange, QFpOutOfRange, BandOutOfRange}` for
+  caller-side bookkeeping errors. Twenty-seven new unit tests pin
+  the `Q_FP_MAX = 640` constant + `STATIC_ALLOC_INTERP_RIGHT_SHIFT
+  = 8` derived constant; the `(q_lo, frac)` decomposition at
+  `q_fp = 0` (`q_lo = 0, frac = 0`), at every integer column
+  (`q_fp = q * 64 ⇒ frac = 0`), at the saturation endpoint
+  (`q_fp = 640 ⇒ q_lo = 9, frac = 64`), and at a mid-step
+  (`q_fp = 352 ⇒ q_lo = 5, frac = 32`); the round-trip identity
+  `q_fp_from_components(q_fp_to_components(q_fp)) == q_fp` for
+  every `q_fp ∈ 0..=640`; the four invalid `(q_lo, frac)` shapes
+  the recomposer rejects (q_lo = 10 with non-zero frac, frac = 64
+  at q_lo ≠ 9, frac > 64, q_lo > 10); the per-band parity check
+  that `per_band_eighth_bits_at_q_fp(band, q * 64, ...)` exactly
+  reproduces the round-39 `static_alloc_eighth_bits(band, q, ...)`
+  for every `(band, q, channels, n_bins, lm)` in a representative
+  sweep; the saturation parity check that
+  `per_band_eighth_bits_at_q_fp(band, Q_FP_MAX, ...)` matches the
+  pure column-10 `static_alloc_eighth_bits(band, 10, ...)`; the
+  column-zero pin (`per_band_eighth_bits_at_q_fp(_, 0, ...) = 0`);
+  the §4.3.3 invariant that per-band allocations are monotone
+  non-decreasing in `q_fp` across the full `0..=640` sweep; every
+  caller-bookkeeping error path (`BandOutOfRange`,
+  `ChannelsOutOfRange`, `QFpOutOfRange`); the total-across-coded-
+  bands properties (`total(q_fp = 0) = 0` across every
+  `(frame_size, channels, is_hybrid)` combination; monotone-non-
+  decreasing-in-`q_fp` total; CELT-only total exceeds Hybrid at
+  saturation; stereo total is bounded by `2 * mono` and
+  `2 * mono + 21` to capture the per-band `>> 8` rounding slack);
+  and the search behaviour (`budget = 0` ⇒ `q_fp = 0`,
+  `budget = u64::MAX` ⇒ `q_fp = Q_FP_MAX`, exact-target probes
+  return at least the target quality; one-less-than-target probes
+  fall strictly below; the self-consistency invariant that the
+  returned total recomputes to the same value AND if
+  `q_fp < Q_FP_MAX` the next step's total strictly exceeds the
+  budget). Bridges round 39's `celt_static_alloc` parameter
+  surface with the orchestrated §4.3.3 allocator the next round
+  will land. Source: RFC 6716 §4.3.3 (pp. 111–112) — held in-repo
+  at `docs/audio/opus/rfc6716-opus.txt`.
+
 * **Clean-room round 39 (2026-06-08):** RFC 6716 §4.3.3 *static
   allocation table* (Table 57) — a new `celt_static_alloc` module
   landing the 21-band × 11-quality-column Q5 grid `alloc[band][q]`

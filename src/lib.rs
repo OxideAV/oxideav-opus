@@ -567,6 +567,42 @@
 //!   threshold, and the round-36 trim offsets with the §4.3.3
 //!   1/64-step interpolated search the next round will land.
 //!
+//! * Round 40 lands the §4.3.3 *1/64-step interpolated static-allocation
+//!   search* ([`celt_alloc_search`]:
+//!   [`Q_FP_MAX`](crate::celt_alloc_search::Q_FP_MAX) = 640
+//!   fixed-point-quality bound +
+//!   [`STATIC_ALLOC_INTERP_RIGHT_SHIFT`](crate::celt_alloc_search::STATIC_ALLOC_INTERP_RIGHT_SHIFT)
+//!   = 8 combined shift constant +
+//!   [`QFpComponents`](crate::celt_alloc_search::QFpComponents)
+//!   `(q_lo, frac)` decomposition +
+//!   [`q_fp_to_components`](crate::celt_alloc_search::q_fp_to_components)
+//!   `/ q_fp_from_components` invertible accessors +
+//!   [`per_band_eighth_bits_at_q_fp`](crate::celt_alloc_search::per_band_eighth_bits_at_q_fp)
+//!   `(band, q_fp, channels, n_bins, lm) -> u64` per-band Q3 lookup
+//!   under the §4.3.3 1/64-step linear interpolation
+//!   `cell_q11 = alloc[b][q_lo] * (64 - frac) + alloc[b][q_lo + 1] *
+//!   frac` followed by the `(channels * N * cell_q11) << LM >> 8`
+//!   unit conversion that folds the round-39 `>> 2` (Q5 → Q3) with
+//!   the 1/64-step `>> 6` (Q11 → Q5) in one step +
+//!   [`total_eighth_bits_at_q_fp`](crate::celt_alloc_search::total_eighth_bits_at_q_fp)
+//!   `(q_fp, channels, frame_size, is_hybrid) -> u64` summing across
+//!   coded bands respecting the §4.3 first-coded-band rule (`0` for
+//!   CELT-only / `17` for Hybrid) +
+//!   [`search_q_fp`](crate::celt_alloc_search::search_q_fp)
+//!   `(budget, channels, frame_size, is_hybrid) -> AllocSearchOutcome`
+//!   the §4.3.3 "highest allocation that does not exceed the number
+//!   of bits remaining" linear scan returning
+//!   [`AllocSearchOutcome`](crate::celt_alloc_search::AllocSearchOutcome)
+//!   `{ q_fp, total_eighth_bits }` +
+//!   [`AllocSearchError`](crate::celt_alloc_search::AllocSearchError)).
+//!   Closes the §4.3.3 1/64-step interpolation gap round 39 noted as
+//!   the next step. The orchestrated §4.3.3 allocator that consumes
+//!   the search output (folding in the round-33 boosts, the round-35
+//!   per-band minimum threshold, the round-31 per-band cap, and the
+//!   round-36 trim offsets, then running the skip / dual-stereo /
+//!   intensity-stereo flag reads) runs at the consumer site once the
+//!   round-34 reservation block + this round's search are composed.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -614,6 +650,7 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+pub mod celt_alloc_search;
 pub mod celt_alloc_trim;
 pub mod celt_band_boost;
 pub mod celt_band_layout;
@@ -652,6 +689,11 @@ pub mod silk_resampler;
 pub mod silk_stereo;
 pub mod toc;
 
+pub use celt_alloc_search::{
+    per_band_eighth_bits_at_q_fp, q_fp_from_components, q_fp_to_components, search_q_fp,
+    total_eighth_bits_at_q_fp, AllocSearchError, AllocSearchOutcome, QFpComponents, Q_FP_MAX,
+    STATIC_ALLOC_INTERP_RIGHT_SHIFT,
+};
 pub use celt_alloc_trim::{
     alloc_trim_icdf, alloc_trim_is_signalled, alloc_trim_pdf, decode_alloc_trim, frame_eighth_bits,
     AllocTrimError, ALLOC_TRIM_DEFAULT, ALLOC_TRIM_FTB, ALLOC_TRIM_ICDF, ALLOC_TRIM_MAX,
