@@ -536,6 +536,37 @@
 //!   that rules out same-bandwidth SILK to SILK from row 1 are all
 //!   baked in.
 //!
+//! * Round 39 lands the §4.3.3 *static allocation table*
+//!   ([`celt_static_alloc`]:
+//!   [`STATIC_ALLOC`](crate::celt_static_alloc::STATIC_ALLOC) —
+//!   the 21×11 Q5 grid `alloc[band][q]` in 1/32-bit per MDCT bin
+//!   units transcribed from RFC 6716 §4.3.3 Table 57 (p. 112) +
+//!   [`STATIC_ALLOC_Q_COUNT`](crate::celt_static_alloc::STATIC_ALLOC_Q_COUNT)
+//!   = 11 / [`STATIC_ALLOC_Q_MIN`](crate::celt_static_alloc::STATIC_ALLOC_Q_MIN)
+//!   = 0 / [`STATIC_ALLOC_Q_MAX`](crate::celt_static_alloc::STATIC_ALLOC_Q_MAX)
+//!   = 10 / [`STATIC_ALLOC_TOTAL_CELLS`](crate::celt_static_alloc::STATIC_ALLOC_TOTAL_CELLS)
+//!   = 231 / [`STATIC_ALLOC_RIGHT_SHIFT`](crate::celt_static_alloc::STATIC_ALLOC_RIGHT_SHIFT)
+//!   = 2 / [`STATIC_ALLOC_INTERP_STEPS`](crate::celt_static_alloc::STATIC_ALLOC_INTERP_STEPS)
+//!   = 64 layout / conversion constants +
+//!   [`static_alloc_cell`](crate::celt_static_alloc::static_alloc_cell)
+//!   `(band, q) -> u8` raw-cell lookup +
+//!   [`static_alloc_row`](crate::celt_static_alloc::static_alloc_row)
+//!   `(band) -> &[u8; 11]` row borrow for the §4.3.3 search's
+//!   per-band quality inner loop +
+//!   [`static_alloc_eighth_bits`](crate::celt_static_alloc::static_alloc_eighth_bits)
+//!   `(band, q, channels, n_bins, lm) -> u32` applying the §4.3.3
+//!   `channels * N * alloc[band][q] << LM >> 2` unit conversion
+//!   from Q5 to Q3 (1/8-bit) per-band units +
+//!   [`StaticAllocError`](crate::celt_static_alloc::StaticAllocError)).
+//!   Pins the §4.3.3 invariants the allocator relies on: column 0
+//!   is uniformly zero (the no-allocation floor), each row is
+//!   monotone non-decreasing in `q`, and the saturation column
+//!   (col 10) is `200` for bands 0..=7 and declines to `104` at
+//!   band 20. Bridges the round-31 cap surface, the round-33
+//!   boosts, the round-34 reservations, the round-35 minimum
+//!   threshold, and the round-36 trim offsets with the §4.3.3
+//!   1/64-step interpolated search the next round will land.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -593,6 +624,7 @@ pub mod celt_header;
 pub mod celt_log2_frac_table;
 pub mod celt_redundancy;
 pub mod celt_reservations;
+pub mod celt_static_alloc;
 pub mod celt_tf_adjust;
 pub mod celt_transitions;
 pub mod celt_trim_offsets;
@@ -670,6 +702,11 @@ pub use celt_reservations::{
     reserve_block, ReservationError, ReservationOutcome, ANTI_COLLAPSE_HEADROOM_LM_OFFSET,
     ANTI_COLLAPSE_HEADROOM_MULT_EIGHTH_BITS, ANTI_COLLAPSE_LM_MIN_EXCLUSIVE,
     CONSERVATIVE_DEDUCTION_EIGHTH_BITS, ONE_BIT_EIGHTH_BITS,
+};
+pub use celt_static_alloc::{
+    static_alloc_cell, static_alloc_eighth_bits, static_alloc_row, StaticAllocError, STATIC_ALLOC,
+    STATIC_ALLOC_INTERP_STEPS, STATIC_ALLOC_Q_COUNT, STATIC_ALLOC_Q_MAX, STATIC_ALLOC_Q_MIN,
+    STATIC_ALLOC_RIGHT_SHIFT, STATIC_ALLOC_TOTAL_CELLS,
 };
 pub use celt_tf_adjust::{
     celt_tf_adjustment, celt_tf_select_can_affect, TfAdjustment, TfDirection,

@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-07 (clean-room round 38)
+## Status — 2026-06-08 (clean-room round 39)
 
 **Packet header + §3.2 frame-packing parser + RFC 6716 Appendix B
 self-delimiting framing (`parse_self_delimited` — Figures 25..29 for
@@ -159,12 +159,93 @@ the §4.3.3 "band-size term not scaled by channel count" carve-out +
 `BAND_THRESH_MONO_CHANNELS = 1` / `BAND_THRESH_STEREO_CHANNELS = 2`
 formula constants + `BandThreshError::{InvertedBandWindow,
 BandWindowOutOfRange, OutputBufferTooSmall}` caller-side bookkeeping
-errors);
+errors) + §4.3.3 static allocation table
+(`celt_static_alloc::STATIC_ALLOC` — the 21-band × 11-quality-column
+Q5 grid `alloc[band][q]` in 1/32-bit per MDCT bin units transcribed
+from RFC 6716 §4.3.3 Table 57 (p. 112), `STATIC_ALLOC_Q_COUNT = 11` /
+`STATIC_ALLOC_Q_MIN = 0` / `STATIC_ALLOC_Q_MAX = 10` /
+`STATIC_ALLOC_TOTAL_CELLS = 231` / `STATIC_ALLOC_RIGHT_SHIFT = 2` /
+`STATIC_ALLOC_INTERP_STEPS = 64` layout / conversion constants +
+`static_alloc_cell(band, q) -> u8` raw-cell lookup + `static_alloc_row(band)
+-> &[u8; 11]` row borrow + `static_alloc_eighth_bits(band, q, channels,
+n_bins, lm) -> u32` applying the §4.3.3
+`channels * N * alloc[band][q] << LM >> 2` unit fold from Q5 to Q3
+1/8-bit units + `StaticAllocError::{BandOutOfRange, QualityOutOfRange,
+ChannelsOutOfRange, LmOutOfRange}` caller-side bookkeeping errors);
 the §4.3.2.1 Laplace decoder itself + 2-D `(time, frequency)` predictor
-+ rest of §4.3.3 bit allocation (Table 57 static-allocation search) +
-§4.3.4 PVQ shape + band loop + §4.3.7 inverse-MDCT window for the
-cross-lap still deferred. The per-LM *inter*-mode `(alpha, beta)` pair
-is a §4.3.2.1 docs gap.**
++ §4.3.3 1/64-step interpolated search over Table 57 + §4.3.4 PVQ
+shape + band loop + §4.3.7 inverse-MDCT window for the cross-lap
+still deferred. The per-LM *inter*-mode `(alpha, beta)` pair is a
+§4.3.2.1 docs gap.**
+
+## Round 39 — §4.3.3 static allocation table (Table 57) (2026-06-08)
+
+Round 39 lands the RFC 6716 §4.3.3 *static allocation table* — Table
+57's 21-band × 11-quality-column Q5 grid `alloc[band][q]` that the
+§4.3.3 *Bit Allocation* search interpolates over to derive each band's
+static shape allocation. RFC 6716 §4.3.3 (p. 111) describes the
+conversion as
+`channels * N * alloc[band][q] << LM >> 2`, where the result is in
+1/8 bits — the same units every other §4.3.3 budget quantity uses
+(compatible with the round-34 [`celt_reservations`] output, the
+round-35 [`celt_band_thresh`] floor, the round-36
+[`celt_trim_offsets`] tilt bias, the round-33 boosts, and the
+round-31 [`celt_cache_caps50`] per-band cap at the consumer site).
+
+New public surface (`celt_static_alloc`):
+
+* `STATIC_ALLOC: [[u8; 11]; 21]` — the §4.3.3 Table 57 grid
+  reproduced inline; row `b ∈ 0..=20` indexes the §4.3 Table 55
+  band; column `q ∈ 0..=10` indexes the §4.3.3 quality parameter;
+  each cell is a Q5 value in 1/32-bit per MDCT bin units.
+* `STATIC_ALLOC_Q_COUNT = 11` / `STATIC_ALLOC_Q_MIN = 0` /
+  `STATIC_ALLOC_Q_MAX = 10` / `STATIC_ALLOC_TOTAL_CELLS = 231` —
+  layout constants for the table.
+* `STATIC_ALLOC_RIGHT_SHIFT = 2` — the `>> 2` half of the §4.3.3
+  `<< LM >> 2` unit fold from Q5 to Q3.
+* `STATIC_ALLOC_INTERP_STEPS = 64` — the §4.3.3 1/64-step
+  interpolation denominator the orchestrated search will multiply
+  by inside its inner loop.
+* `static_alloc_cell(band, q) -> Result<u8, StaticAllocError>` —
+  raw-cell lookup before the unit conversion.
+* `static_alloc_row(band) -> Result<&[u8; 11], StaticAllocError>` —
+  full-row borrow for the §4.3.3 per-band inner-loop search shape.
+* `static_alloc_eighth_bits(band, q, channels, n_bins, lm) ->
+  Result<u32, StaticAllocError>` — applies the §4.3.3
+  `channels * N * alloc[band][q] << LM >> 2` conversion, returning
+  the per-band static shape allocation in 1/8 bits.
+* `StaticAllocError::{BandOutOfRange, QualityOutOfRange,
+  ChannelsOutOfRange, LmOutOfRange}` — caller-side bookkeeping errors.
+
+Twenty-eight new unit tests (838 lib tests total, up from 810 at
+round-38 close; 20 integration tests unchanged) pin the table shape
+(21 × 11 = 231 cells; column 0 uniformly zero; column 10 at 200 for
+bands 0..=7 then declining monotonically to 104 at band 20), the
+monotone-non-decreasing-in-`q` invariant the §4.3.3 search depends
+on, hand-picked corner cells (band 0 / q 1 = 90; band 0 / q 10 =
+200; band 8 / q 10 = 198; band 13 / q 1 = 0 / q 2 = 20; band 20 / q
+5..=8 = 1; band 20 / q 10 = 104), worked-example traces of the
+`<< LM >> 2` unit conversion at LM = 0 and LM = 3, the `<< LM`
+doubling property across the four CELT frame sizes (`2.5 / 5 / 10
+/ 20 ms`), a cross-check against the round-24
+[`celt_band_layout::celt_band_bins_per_channel`] band-width lookup
+(band 0 at 20 ms = 8 / band 20 at 20 ms = 176 traced through to the
+final 1/8-bit allocation), and every out-of-range guard.
+
+The §4.3.3 1/64-step interpolated search over Table 57 itself — the
+loop that converges on a quality `q` whose interpolated allocation
+fits the working budget (after the round-34 reservations, the
+round-35 minimum threshold, the round-36 trim offsets, the round-33
+boosts, and the round-31 per-band cap have applied their
+constraints) — remains deferred to a subsequent round; this round
+owns only the *parameter surface* (the table plus the per-band /
+per-cell unit conversion).
+
+Source: RFC 6716 §4.3.3 Table 57 (pp. 111–112) — held in-repo at
+`docs/audio/opus/rfc6716-opus.txt`. No external library source was
+consulted; the §4.3.3 RFC text identifies the table by its
+`(band, q)` indexing rule and gives the values directly in the
+standards-track text.
 
 ## Round 38 — §4.5.3 normative + recommended-non-normative transition table (2026-06-07)
 

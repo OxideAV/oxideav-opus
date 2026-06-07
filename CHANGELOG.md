@@ -6,6 +6,41 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 39 (2026-06-08):** RFC 6716 §4.3.3 *static
+  allocation table* (Table 57) — a new `celt_static_alloc` module
+  landing the 21-band × 11-quality-column Q5 grid `alloc[band][q]`
+  the §4.3.3 *Bit Allocation* procedure interpolates over to derive
+  each band's static shape allocation. RFC 6716 §4.3.3 (p. 111)
+  describes the conversion as
+  `channels * N * alloc[band][q] << LM >> 2`, where the result is
+  in 1/8 bits (the same units as every other §4.3.3 budget
+  quantity). New public surface: `STATIC_ALLOC: [[u8; 11]; 21]`
+  reproducing the 231 cells of Table 57, the layout / conversion
+  constants `STATIC_ALLOC_Q_COUNT = 11`, `STATIC_ALLOC_Q_MIN = 0`,
+  `STATIC_ALLOC_Q_MAX = 10`, `STATIC_ALLOC_TOTAL_CELLS = 231`,
+  `STATIC_ALLOC_RIGHT_SHIFT = 2`, `STATIC_ALLOC_INTERP_STEPS = 64`,
+  the typed accessors `static_alloc_cell(band, q) -> u8` and
+  `static_alloc_row(band) -> &[u8; 11]` for raw Q5 lookups, the
+  `static_alloc_eighth_bits(band, q, channels, n_bins, lm) -> u32`
+  conversion folding the per-band scale `(channels * N) << LM >> 2`
+  into the Q5-to-Q3 unit fold, and `StaticAllocError::{BandOutOfRange,
+  QualityOutOfRange, ChannelsOutOfRange, LmOutOfRange}` for caller-side
+  bookkeeping errors. Twenty-eight new unit tests pin the table shape
+  (21 × 11 = 231 cells; column 0 uniformly zero; column 10 at 200 for
+  bands 0..=7 then declining to 104 at band 20), the
+  monotone-non-decreasing-in-`q` invariant the §4.3.3 search depends
+  on, hand-picked corner cells (band 0 / q 1 / q 10; band 13 / q 1 / q
+  2; band 20 / q 5..=9), worked-example traces of the `<< LM >> 2`
+  unit conversion at LM = 0 and LM = 3, the `<< LM` doubling property
+  across the four CELT frame sizes, a cross-check against the round-24
+  Table 55 band-width lookup, and every out-of-range guard. Bridges
+  the round-31 cap surface (`celt_cache_caps50`), the round-33
+  band-boost decoder, the round-34 reservation block, the round-35
+  per-band minimum threshold, and the round-36 trim offsets with the
+  §4.3.3 1/64-step interpolated search the next round will land.
+  Source: RFC 6716 §4.3.3 Table 57 (pp. 111–112) — held in-repo at
+  `docs/audio/opus/rfc6716-opus.txt`.
+
 * **Clean-room round 38 (2026-06-07):** RFC 6716 §4.5.3 *Summary of
   Transitions* (Figure 18 + Figure 19) — a new `celt_transitions`
   module that closes the §4.5 chain after the round-26 §4.5.1
