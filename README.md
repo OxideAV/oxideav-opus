@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-08 (clean-room round 40)
+## Status — 2026-06-08 (clean-room round 41)
 
 **Packet header + §3.2 frame-packing parser + RFC 6716 Appendix B
 self-delimiting framing (`parse_self_delimited` — Figures 25..29 for
@@ -176,7 +176,96 @@ the §4.3.2.1 Laplace decoder itself + 2-D `(time, frequency)` predictor
 + §4.3.3 1/64-step interpolated search over Table 57 + §4.3.4 PVQ
 shape + band loop + §4.3.7 inverse-MDCT window for the cross-lap
 still deferred. The per-LM *inter*-mode `(alpha, beta)` pair is a
-§4.3.2.1 docs gap.**
+§4.3.2.1 docs gap.
+
+Round 41 adds the §4.3.4.2 *PVQ codebook-size function*
+(`celt_pvq_v::pvq_codebook_size(n, k) -> Result<u32, PvqVError>`)
+evaluating the RFC 6716 §4.3.4.2 bivariate recurrence
+`V(N, K) = V(N - 1, K) + V(N, K - 1) + V(N - 1, K - 1)` with base
+cases `V(N, 0) = 1` / `V(0, K) = 0 (K != 0)` over two rolling rows
+of length `K + 1`, plus `PVQ_V_N_MAX = 352` / `PVQ_V_K_MAX = 4096`
+caller-side bookkeeping bounds and the `PVQ_V_MAX = 2**32 − 1`
+overflow guard inherited from RFC 6716 §4.1.5's `ec_dec_uint(ft)`
+upper bound (`PvqVError::OverflowsDecUintRange` reports
+stream-impossible inputs). Both the §4.3.4.2 PVQ index decode
+(`ec_dec_uint(V(N, K))`) and the §4.3.4.1 *Bits-to-Pulses* search
+consume this primitive at their respective consumer sites.**
+
+## Round 41 — §4.3.4.2 PVQ codebook-size function `V(N, K)` (2026-06-08)
+
+Round 41 lands the RFC 6716 §4.3.4.2 *PVQ codebook-size function*
+`V(N, K)`. RFC 6716 §4.3.4.2 (p. 116) defines it directly:
+
+> The number of combinations can be computed recursively as
+> `V(N, K) = V(N-1, K) + V(N, K-1) + V(N-1, K-1)`, with `V(N, 0) = 1`
+> and `V(0, K) = 0, K != 0`. There are many different ways to compute
+> `V(N, K)`, including precomputed tables and direct use of the
+> recursive formulation. […] Implementations MAY use any methods they
+> like, as long as they are equivalent to the mathematical definition.
+
+`V(N, K)` is the number of integer-magnitude lattice points
+`{ x ∈ Z^N : |x_0| + |x_1| + ... + |x_{N-1}| = K }` — the size of
+the §4.3.4 PVQ codebook for `N` MDCT bins and `K` pulses. The
+§4.3.4.2 PVQ index is decoded with `ec_dec_uint(V(N, K))`, and the
+§4.3.4.1 *Bits-to-Pulses* search picks `K` by searching the codebook
+size against the §4.3.3 per-band allocation. Both consume this
+primitive at their consumer site.
+
+RFC 6716 §4.1.5 (p. 29) caps `ec_dec_uint`'s `ft` parameter at
+`2**32 − 1`; the §4.3.3 bit-allocation procedure keeps the
+reachable `(N, K)` pairs inside that bound. This module short-
+circuits with `PvqVError::OverflowsDecUintRange` the moment any
+intermediate recurrence cell crosses `2**32 − 1`, since such a
+PVQ index could not be transmitted by a conforming Opus stream.
+
+New public surface (`celt_pvq_v`):
+
+* `pvq_codebook_size(n, k) -> Result<u32, PvqVError>` — evaluates
+  the §4.3.4.2 bivariate recurrence in `u64` over two rolling rows
+  of length `K + 1`, returning a `u32` (the `ec_dec_uint` natural
+  width). Constant-space (over `K`), `O(N · K)` time.
+* `PVQ_V_N_MAX = 352` — caller-side bookkeeping bound on `N`
+  covering joint-stereo bands at the 20 ms frame size
+  (`2 × CELT_MAX_BINS_PER_BAND = 2 × 176 = 352`).
+* `PVQ_V_K_MAX = 4096` — conservative caller-side bookkeeping
+  bound on `K` so fuzz callers can sweep wide envelopes.
+* `PVQ_V_MAX = 2**32 − 1` — the RFC 6716 §4.1.5 `ec_dec_uint(ft)`
+  ceiling, inherited as the overflow guard's threshold.
+* `PvqVError::{NOutOfRange{provided, max}, KOutOfRange{provided,
+  max}, OverflowsDecUintRange{n, k}}` — caller-side bookkeeping
+  errors and stream-impossibility reports.
+
+Twenty-three new unit tests (888 lib tests total, up from 865 at
+round-40 close; 20 integration tests unchanged) pin the four
+§4.3.4.2 base cases (`V(0, 0) = 1`, `V(N, 0) = 1` for every
+`N ∈ 0..=PVQ_V_N_MAX`, `V(0, K) = 0` for every `K ∈ 1..=PVQ_V_K_MAX`,
+`V(1, K) = 2` for every `K ≥ 1`, `V(N, 1) = 2N` for every
+`N ∈ 1..=PVQ_V_N_MAX`), cross-check the bivariate recurrence over a
+`(N, K) ∈ 1..=12` sweep, pin a 7×7 hand-computed table of `V(N, K)`
+values, pin two specific worked points (`V(3, 3) = 38`, `V(4, 2) =
+32`) that demonstrate the `V(N, K) ≠ V(K, N)` asymmetry (matching
+the spec's strictly-ordered coordinate convention), validate the
+monotone-non-decreasing-in-`N` invariant for every fixed `K`,
+validate the monotone-non-decreasing-in-`K` invariant for `N ≥ 2`
+(the `N = 1` carve-out where `V(1, K) = 2` for every `K ≥ 1` is the
+documented exception), exercise the §4.1.5 overflow guard on
+`V(176, 176)` (well above `2**32`), confirm the guard does *not*
+trip on values just under the ceiling (`V(2, K) = 4K` over the full
+`K ∈ 0..=100` window), exercise both `PVQ_V_N_MAX` and `PVQ_V_K_MAX`
+boundary-rejection paths, validate the three module constants
+(`PVQ_V_N_MAX = 352`, `PVQ_V_K_MAX = 4096`, `PVQ_V_MAX = 4_294_967_295
+= 2**32 − 1`), and pin every error-Display message at the failing
+input.
+
+The §4.3.4.2 PVQ index decode itself (`ec_dec_uint(V(N, K))` then
+the §4.3.4.2 index-to-vector conversion) and the §4.3.4.1
+*Bits-to-Pulses* search are the natural downstream consumers; both
+remain deferred to subsequent rounds.
+
+Source: RFC 6716 §4.3.4.2 (p. 116) — held in-repo at
+`docs/audio/opus/rfc6716-opus.txt`. No external library source was
+consulted; the recurrence is given directly in the standards-track
+text.
 
 ## Round 40 — §4.3.3 1/64-step interpolated allocation search (2026-06-08)
 

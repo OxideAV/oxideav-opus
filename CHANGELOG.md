@@ -6,6 +6,46 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 41 (2026-06-08):** RFC 6716 §4.3.4.2 *PVQ
+  codebook-size function `V(N, K)`* — a new `celt_pvq_v` module
+  evaluating the bivariate recurrence the RFC states directly:
+  `V(N, K) = V(N - 1, K) + V(N, K - 1) + V(N - 1, K - 1)` with base
+  cases `V(N, 0) = 1` and `V(0, K) = 0 (K != 0)`. `V(N, K)` counts
+  the integer-magnitude lattice points `{ x ∈ Z^N : |x_0| + |x_1|
+  + ... + |x_{N-1}| = K }` — the size of the §4.3.4 PVQ codebook for
+  `N` MDCT bins and `K` pulses. The §4.3.4.2 PVQ index is decoded
+  with `ec_dec_uint(V(N, K))` (§4.1.5 caps `ec_dec_uint`'s `ft`
+  parameter at `2**32 − 1`), and §4.3.4.1 *Bits to Pulses* picks
+  `K` by searching the codebook size at the §4.3.3 per-band
+  allocation; both consume this primitive. New public surface:
+  `pvq_codebook_size(n, k) -> Result<u32, PvqVError>` evaluating
+  the recurrence in `u64` over two rolling rows of length `K + 1`
+  and short-circuiting when any intermediate cell crosses
+  `2**32 − 1`; `PVQ_V_N_MAX = 352` (caller-side bookkeeping bound
+  covering joint-stereo bands at 20 ms: `2 × CELT_MAX_BINS_PER_BAND
+  = 2 × 176 = 352`); `PVQ_V_K_MAX = 4096` (conservative caller-side
+  upper bound on `K` so fuzz callers can sweep wide envelopes);
+  `PVQ_V_MAX = 2**32 − 1` (the §4.1.5 `ec_dec_uint` ceiling
+  inherited as the overflow guard); and `PvqVError::{NOutOfRange,
+  KOutOfRange, OverflowsDecUintRange}` for caller-side bookkeeping
+  errors and stream-impossibility reports. Twenty-three new unit
+  tests (888 lib tests total, up from 865 at round-40 close; 20
+  integration tests unchanged) pin the four §4.3.4.2 base cases
+  (`V(0, 0) = 1`, `V(N, 0) = 1`, `V(0, K) = 0`, `V(1, K) = 2`,
+  `V(N, 1) = 2N`), cross-check the bivariate recurrence over the
+  N, K ∈ 1..=12 sweep, pin a 7×7 hand-computed table of `V(N, K)`
+  values, pin two specific worked points (`V(3, 3) = 38`,
+  `V(4, 2) = 32`) showing the `V(N, K) ≠ V(K, N)` asymmetry,
+  validate the monotone-non-decreasing-in-`N` invariant (for every
+  fixed `K`), validate the monotone-non-decreasing-in-`K`
+  invariant for `N ≥ 2`, exercise the §4.1.5 overflow guard on
+  `V(176, 176)` (well above `2**32`), confirm the guard does *not*
+  trip on values just under the ceiling (`V(2, K) = 4K` for the
+  full `K ∈ 0..=100` window), exercise the boundary `PVQ_V_N_MAX`
+  and `PVQ_V_K_MAX` rejection paths, validate the three module
+  constants (`PVQ_V_N_MAX = 352`, `PVQ_V_K_MAX = 4096`, `PVQ_V_MAX
+  = 4_294_967_295`), and pin every error-Display message at the
+  failing input.
 * **Clean-room round 40 (2026-06-08):** RFC 6716 §4.3.3 *1/64-step
   interpolated static-allocation search* — a new `celt_alloc_search`
   module that closes the interpolation + search gap round 39 noted

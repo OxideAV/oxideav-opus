@@ -603,6 +603,21 @@
 //!   intensity-stereo flag reads) runs at the consumer site once the
 //!   round-34 reservation block + this round's search are composed.
 //!
+//! * Round 41 lands the §4.3.4.2 *PVQ codebook-size function*
+//!   ([`celt_pvq_v`]: [`pvq_codebook_size`]`(n, k) -> Result<u32,
+//!   PvqVError>` evaluating the RFC 6716 §4.3.4.2 bivariate
+//!   recurrence `V(N, K) = V(N - 1, K) + V(N, K - 1) + V(N - 1,
+//!   K - 1)` with base cases `V(N, 0) = 1` / `V(0, K) = 0 (K != 0)`
+//!   over two rolling rows + [`PVQ_V_N_MAX`] = 352 / [`PVQ_V_K_MAX`]
+//!   = 4096 caller-side bookkeeping bounds + [`PVQ_V_MAX`] =
+//!   `2**32 − 1` overflow guard inherited from RFC 6716 §4.1.5's
+//!   `ec_dec_uint(ft)` upper bound + [`PvqVError::{NOutOfRange,
+//!   KOutOfRange, OverflowsDecUintRange}`] error reporting). The
+//!   §4.3.4.2 PVQ index decode (`ec_dec_uint(V(N, K))` followed by
+//!   the §4.3.4.2 conversion of the index to a sign-magnitude
+//!   lattice point) and the §4.3.4.1 *Bits-to-Pulses* search both
+//!   consume this primitive; both run at the consumer site.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -659,6 +674,7 @@ pub mod celt_cache_caps50;
 pub mod celt_e_prob_model;
 pub mod celt_header;
 pub mod celt_log2_frac_table;
+pub mod celt_pvq_v;
 pub mod celt_redundancy;
 pub mod celt_reservations;
 pub mod celt_static_alloc;
@@ -732,6 +748,7 @@ pub use celt_log2_frac_table::{
     log2_frac, log2_frac_row, Log2FracError, LOG2_FRAC_TABLE, LOG2_FRAC_TABLE_LEN,
     Q3_BITS_PER_WHOLE_BIT,
 };
+pub use celt_pvq_v::{pvq_codebook_size, PvqVError, PVQ_V_K_MAX, PVQ_V_MAX, PVQ_V_N_MAX};
 pub use celt_redundancy::{
     decode_redundancy, remaining_bits, whole_bytes_remaining, RedundancyDecision,
     RedundancyPosition, HYBRID_REDUNDANCY_MIN_REMAINING_BITS,
