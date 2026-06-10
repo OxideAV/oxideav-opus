@@ -672,6 +672,7 @@ pub mod celt_band_layout;
 pub mod celt_band_thresh;
 pub mod celt_cache_caps50;
 pub mod celt_e_prob_model;
+pub mod celt_fine_energy;
 pub mod celt_header;
 pub mod celt_log2_frac_table;
 pub mod celt_pvq_v;

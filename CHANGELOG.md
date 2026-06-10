@@ -6,6 +6,38 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 42 (2026-06-10):** RFC 6716 §4.3.2.2 *fine-energy
+  quantization* — a new `celt_fine_energy` module that converts an
+  already-read fine-energy refinement `f ∈ [0, 2**B_i - 1]` into the
+  §4.3.2.2 correction `(f + 1/2) / 2**B_i - 1/2 = (2f + 1 - 2**B_i) /
+  2**(B_i + 1)`, a zero-mean fraction of a 6 dB coarse-energy step,
+  and plans the §4.3.2.2 *final* fine-energy bit allocation (one extra
+  bit per band per channel, priority-0 bands band-0-upward then
+  priority-1 bands band-0-upward, leftover bits unused). New public
+  surface: `fine_correction_ratio(bits, f) -> Result<(i32, i32), …>`
+  (exact reduced `(numerator, denominator)`); `fine_correction_q15(bits,
+  f) -> Result<i32, …>` (correction in Q15, exact for every reachable
+  `B_i`, strictly within `(-16384, +16384)`); `fine_correction_q(bits,
+  f, shift) -> Result<i64, …>` (arbitrary Q-format, e.g. CELT's
+  `DB_SHIFT = 10`); `fine_energy_levels(bits) -> Result<u32, …>`
+  (`2**B_i`); `plan_final_fine_bits(priorities, channels, leftover_bits)
+  -> FinalFineBitPlan { granted, bits_used, bits_unused }`; the
+  `FineEnergyChannels::{Mono, Stereo}` / `FinalBitPriority::{Priority0,
+  Priority1}` enums; constants `FINE_ENERGY_MAX_BITS = 14`,
+  `FINE_ENERGY_Q15_ONE = 32768`, `FINE_ENERGY_HALF_Q15 = 16384`; and
+  `FineEnergyError::{BitsOutOfRange, RefinementOutOfRange}` for
+  caller-side bookkeeping bugs. The range-decoder `dec_bits(B_i)` /
+  `dec_bits(channels)` reads and the addition of the correction onto
+  the §4.3.2.1 reconstructed log-energy run at the consumer site.
+  Thirty-three new unit tests pin the correction at worked `(B_i, f)`
+  points, the odd-numerator-lowest-terms / zero-mean-symmetry /
+  uniform-step / strictly-within-`±1/2` invariants, the Q15 exactness
+  against the ratio form, the `DB_SHIFT = 10` parity, and the
+  final-bit priority sweep (priority ordering, band order within a
+  priority, stereo two-bit cost, leftover-unused, None-band exclusion,
+  and the `bits_used + bits_unused == leftover` conservation law).
+  Source: RFC 6716 §4.3.2.2 (p. 109).
+
 * **Clean-room round 41 (2026-06-08):** RFC 6716 §4.3.4.2 *PVQ
   codebook-size function `V(N, K)`* — a new `celt_pvq_v` module
   evaluating the bivariate recurrence the RFC states directly:

@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-08 (clean-room round 41)
+## Status — 2026-06-10 (clean-room round 42)
 
 **Packet header + §3.2 frame-packing parser + RFC 6716 Appendix B
 self-delimiting framing (`parse_self_delimited` — Figures 25..29 for
@@ -189,7 +189,82 @@ overflow guard inherited from RFC 6716 §4.1.5's `ec_dec_uint(ft)`
 upper bound (`PvqVError::OverflowsDecUintRange` reports
 stream-impossible inputs). Both the §4.3.4.2 PVQ index decode
 (`ec_dec_uint(V(N, K))`) and the §4.3.4.1 *Bits-to-Pulses* search
-consume this primitive at their respective consumer sites.**
+consume this primitive at their respective consumer sites.
+
+Round 42 adds the §4.3.2.2 *fine-energy quantization* primitive
+(`celt_fine_energy`): the §4.3.2.2 correction `(f + 1/2) / 2**B_i −
+1/2 = (2f + 1 − 2**B_i) / 2**(B_i + 1)` exposed as an exact reduced
+ratio (`fine_correction_ratio`), in Q15 (`fine_correction_q15`,
+exact for every reachable `B_i`, strictly within `(−16384, +16384)`),
+and in an arbitrary Q-format (`fine_correction_q`, e.g. CELT's
+`DB_SHIFT = 10`), plus the §4.3.2.2 *final* fine-energy bit planner
+(`plan_final_fine_bits`: one extra bit per band per channel,
+priority-0 bands band-0-upward then priority-1, leftover unused).**
+
+## Round 42 — §4.3.2.2 fine-energy quantization (2026-06-10)
+
+Round 42 lands the RFC 6716 §4.3.2.2 *fine-energy quantization*
+primitive. After the §4.3.2.1 coarse-energy predictor reconstructs
+each band's log-energy in 6 dB steps, §4.3.2.2 (p. 109) refines it
+with a small uniform correction: "Let `B_i` be the number of fine
+energy bits for band `i`; the refinement is an integer `f` in the
+range `[0, 2**B_i − 1]`. The mapping between `f` and the correction
+applied to the coarse energy is equal to `(f + 1/2) / 2**B_i − 1/2`."
+Algebraically that is `(2f + 1 − 2**B_i) / 2**(B_i + 1)` — a
+zero-mean fraction of a 6 dB step whose `2**B_i` reconstruction
+levels tile the open interval `(−1/2, +1/2)` symmetrically about
+zero.
+
+§4.3.2.2 also specifies the *final* fine-energy step: "When some
+bits are left 'unused' … these bits are used to add one extra fine
+energy bit per band per channel. … remaining bits are first assigned
+only to bands of priority 0, starting from band 0 and going up. If
+all bands of priority 0 have received one bit per channel, then bands
+of priority 1 are assigned an extra bit per channel … If any bits are
+left after this, they are left unused."
+
+New public surface (`celt_fine_energy`):
+
+* `fine_correction_ratio(bits, f) -> Result<(i32, i32), …>` — the
+  exact reduced `(numerator, denominator)` = `(2f + 1 − 2**B_i,
+  2**(B_i + 1))`; numerator is always odd (lowest terms).
+* `fine_correction_q15(bits, f) -> Result<i32, …>` — the correction
+  in Q15, exact for every reachable `B_i` (denominator divides
+  `2**16`), strictly within `(−16384, +16384)`.
+* `fine_correction_q(bits, f, shift) -> Result<i64, …>` — the
+  correction in an arbitrary Q-format (e.g. CELT's `DB_SHIFT = 10`).
+* `fine_energy_levels(bits) -> Result<u32, …>` — `2**B_i`.
+* `plan_final_fine_bits(priorities, channels, leftover_bits) ->
+  FinalFineBitPlan { granted, bits_used, bits_unused }` — the
+  §4.3.2.2 priority-0-then-priority-1, band-0-upward final-bit sweep;
+  `None`-priority bands are excluded; `bits_used + bits_unused ==
+  leftover_bits` always.
+* `FineEnergyChannels::{Mono, Stereo}`, `FinalBitPriority::{Priority0,
+  Priority1}`, constants `FINE_ENERGY_MAX_BITS = 14` /
+  `FINE_ENERGY_Q15_ONE = 32768` / `FINE_ENERGY_HALF_Q15 = 16384`,
+  and `FineEnergyError::{BitsOutOfRange, RefinementOutOfRange}`.
+
+Thirty-three new unit tests (921 lib tests total, up from 888 at
+round-41 close; 20 integration tests unchanged) pin the correction at
+worked `(B_i, f)` points (`B_i = 1 ⇒ ±1/4`; `B_i = 2 ⇒ ±1/8, ±3/8`),
+the odd-numerator-lowest-terms / zero-mean-symmetry / uniform-step /
+strictly-within-`±1/2` / monotone-in-`f` invariants, the Q15
+exactness against the ratio form, the `DB_SHIFT = 10` parity, and the
+final-bit priority sweep (priority ordering, band order within a
+priority, the stereo two-bit-per-band cost, leftover-unused,
+`None`-band exclusion, zero-budget, empty-priorities, and the
+`bits_used + bits_unused == leftover` conservation law).
+
+The §4.3.2.2 range-decoder reads — `dec_bits(B_i)` producing `f` and
+`dec_bits(channels)` reading the final extra bits — and the addition
+of the correction onto the §4.3.2.1 reconstructed log-energy run at
+the consumer site once the §4.3.3 allocator produces the per-band
+`B_i` and priority vectors.
+
+Source: RFC 6716 §4.3.2.2 (p. 109) — held in-repo at
+`docs/audio/opus/rfc6716-opus.txt`. No external library source was
+consulted; the correction formula and the final-allocation priority
+rule are both stated verbatim in the standards-track text.
 
 ## Round 41 — §4.3.4.2 PVQ codebook-size function `V(N, K)` (2026-06-08)
 
