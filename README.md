@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-10 (clean-room round 42)
+## Status — 2026-06-11 (clean-room round 43)
 
 **Packet header + §3.2 frame-packing parser + RFC 6716 Appendix B
 self-delimiting framing (`parse_self_delimited` — Figures 25..29 for
@@ -199,7 +199,84 @@ exact for every reachable `B_i`, strictly within `(−16384, +16384)`),
 and in an arbitrary Q-format (`fine_correction_q`, e.g. CELT's
 `DB_SHIFT = 10`), plus the §4.3.2.2 *final* fine-energy bit planner
 (`plan_final_fine_bits`: one extra bit per band per channel,
-priority-0 bands band-0-upward then priority-1, leftover unused).**
+priority-0 bands band-0-upward then priority-1, leftover unused).
+
+Round 43 adds the §4.3.4.2 *PVQ index-to-vector decode*
+(`celt_pvq_decode`): `decode_pvq_vector(n, k, index) -> Vec<i32>` /
+`decode_pvq_vector_into(n, k, index, &mut [i32])` implementing the
+§4.3.4.2 five-step recovery (`p = (V(N-j-1,k) + V(N-j,k))/2`, sign on
+`i < p`, the `p -= V(N-j-1,k)` magnitude walk, `X[j] = sgn*(k0-k)`)
+that consumes the round-41 `pvq_codebook_size` `V(N, K)` and turns a
+codeword index into the integer pulse vector with `sum |X[j]| = K`,
+plus `pvq_l1_norm` / `pvq_l2_norm_squared` invariant helpers (the
+final unit-L2 normalization is a float step deferred to the §4.3.4
+consumer) and `PvqDecodeError::{CodebookSize, IndexOutOfRange,
+OutputBufferTooSmall}`.**
+
+## Round 43 — §4.3.4.2 PVQ index-to-vector decode (2026-06-11)
+
+Round 43 lands the RFC 6716 §4.3.4.2 *PVQ index-to-vector decode* —
+the consumer of round 41's `V(N, K)` codebook-size primitive that
+turns a decoded codeword index `i ∈ 0..V(N, K)` into the
+integer-magnitude pulse vector `X` with `|X_0| + ... + |X_{N-1}| =
+K`. RFC 6716 §4.3.4.2 (p. 116–117) states the recovery as a
+five-step per-coordinate walk: for `j = 0..N-1`,
+
+1. `p = (V(N-j-1, k) + V(N-j, k)) / 2`;
+2. if `i < p` then `sgn = 1`, else `sgn = -1` and `i = i - p`;
+3. `k0 = k`; `p = p - V(N-j-1, k)`;
+4. while `p > i`: `k = k - 1`; `p = p - V(N-j-1, k)`;
+5. `X[j] = sgn * (k0 - k)`; `i = i - p`.
+
+The two halves of step 1 split the count of configurations whose
+`j`-th coordinate is strictly positive (`sgn = +1`) from the rest;
+the step 3–4 loop walks the per-coordinate magnitude `k0 - k` down to
+the slice the index falls into. The arithmetic is `V(N, K)`-counting
+only — no probability model, no range-coder interaction beyond the
+single up-front `ec_dec_uint(V(N, K))` read that supplies `i`.
+
+New public surface (`celt_pvq_decode`):
+
+* `decode_pvq_vector(n, k, index) -> Result<Vec<i32>, PvqDecodeError>`
+  — allocating decode; the returned vector has length `N` and
+  satisfies `sum |X[j]| == K`.
+* `decode_pvq_vector_into(n, k, index, &mut [i32]) -> Result<usize,
+  PvqDecodeError>` — in-place decode into a caller buffer of length
+  `≥ N`; returns the count written (`N`).
+* `pvq_l1_norm(&[i32]) -> u64` / `pvq_l2_norm_squared(&[i32]) -> u64`
+  — invariant helpers; the §4.3.4.2 final "L2-norm equals one"
+  normalization is a floating-point step left to the §4.3.4 consumer
+  site (it depends on the band's energy scaling).
+* `PVQ_DECODE_N_MAX` / `PVQ_DECODE_K_MAX` — caller-side bookkeeping
+  bounds mirrored from `celt_pvq_v`.
+* `PvqDecodeError::{CodebookSize(PvqVError), IndexOutOfRange,
+  OutputBufferTooSmall}`.
+
+Twenty-seven new unit tests (948 lib tests total, up from 921 at
+round-42 close; 20 integration tests unchanged) pin: the
+full-index-range bijection (`L1 == K` for every codeword `i ∈ 0..V(N,
+K)` over `(N, K) ∈ 1..=6 × 0..=6`, plus injectivity over the same
+sweep — combined with the codebook size `V(N, K)` this is a counting
+proof of surjectivity onto the K-pulse lattice); hand-enumerated full
+codebooks at `(1,1)/(1,3)/(2,1)/(2,2)`; the `K = 0` all-zero codeword;
+the index-0 leading-positive-pulse and last-index
+leading-non-positive properties; the L1/L2 helpers against manual
+values; `decode_into` parity with the allocating variant and its
+short-buffer rejection; index-out-of-range rejection at and above
+`V(N, K)`; the `V(0, K)` empty-codeword edges; a larger-band
+(`N = 16, K = 4`) strided spot check; the §4.1.5 overflow propagation
+at `V(176, 176)`; and the error-`Display` / `From<PvqVError>`
+plumbing.
+
+The up-front `ec_dec_uint(V(N, K))` index read (wiring the round-3
+[`RangeDecoder::dec_uint`] to this decode) and the §4.3.4.1
+Bits-to-Pulses search that supplies `K` from the §4.3.3 allocation
+remain deferred to the §4.3.4 consumer site.
+
+Source: RFC 6716 §4.3.4.2 (p. 116–117) — held in-repo at
+`docs/audio/opus/rfc6716-opus.txt`. No external library source was
+consulted; the five-step index-to-vector procedure is stated verbatim
+in the standards-track text.
 
 ## Round 42 — §4.3.2.2 fine-energy quantization (2026-06-10)
 

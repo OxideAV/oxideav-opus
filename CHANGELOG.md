@@ -6,6 +6,33 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 43 (2026-06-11):** RFC 6716 §4.3.4.2 *PVQ
+  index-to-vector decoding* — a new `celt_pvq_decode` module that
+  turns a decoded codeword index `i ∈ 0..V(N, K)` into the
+  integer-magnitude pulse vector `X` with `sum |X[j]| == K`, the
+  consumer of the round-41 `celt_pvq_v::pvq_codebook_size` primitive.
+  Implements the §4.3.4.2 five-step recovery verbatim: per coordinate
+  `j`, `p = (V(N-j-1,k) + V(N-j,k)) / 2`, sign selection on `i < p`,
+  then the `p -= V(N-j-1,k)` magnitude-walk loop, yielding
+  `X[j] = sgn*(k0 - k)`. New public surface:
+  `decode_pvq_vector(n, k, index) -> Result<Vec<i32>, PvqDecodeError>`
+  (allocating) and `decode_pvq_vector_into(n, k, index, &mut [i32]) ->
+  Result<usize, PvqDecodeError>` (in-place); `pvq_l1_norm(&[i32]) ->
+  u64` and `pvq_l2_norm_squared(&[i32]) -> u64` invariant helpers (the
+  §4.3.4.2 final "L2-norm equals one" normalization is a
+  floating-point step left to the §4.3.4 consumer site); constants
+  `PVQ_DECODE_N_MAX` / `PVQ_DECODE_K_MAX` mirrored from `celt_pvq_v`;
+  and `PvqDecodeError::{CodebookSize(PvqVError), IndexOutOfRange,
+  OutputBufferTooSmall}`. Twenty-seven new unit tests including a
+  full-index-range bijection proof (`L1 == K` for every codeword over
+  `(N, K) ∈ 1..=6 × 0..=6`, plus injectivity giving surjectivity onto
+  the K-pulse lattice by a counting argument), hand-enumerated
+  codebooks at `(1,1)/(1,3)/(2,1)/(2,2)/(3,2)`, the index-0 leading-
+  positive-pulse property, error-path and buffer-handling coverage,
+  and the §4.1.5 overflow propagation at `V(176,176)`. The up-front
+  `ec_dec_uint(V(N, K))` index read and the §4.3.4.1 Bits-to-Pulses
+  search that supplies `K` remain deferred to the consumer site.
+
 * **Clean-room round 42 (2026-06-10):** RFC 6716 §4.3.2.2 *fine-energy
   quantization* — a new `celt_fine_energy` module that converts an
   already-read fine-energy refinement `f ∈ [0, 2**B_i - 1]` into the
