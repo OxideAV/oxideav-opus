@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-11 (clean-room round 43)
+## Status — 2026-06-11 (clean-room round 44)
 
 **Packet header + §3.2 frame-packing parser + RFC 6716 Appendix B
 self-delimiting framing (`parse_self_delimited` — Figures 25..29 for
@@ -211,7 +211,102 @@ codeword index into the integer pulse vector with `sum |X[j]| = K`,
 plus `pvq_l1_norm` / `pvq_l2_norm_squared` invariant helpers (the
 final unit-L2 normalization is a float step deferred to the §4.3.4
 consumer) and `PvqDecodeError::{CodebookSize, IndexOutOfRange,
-OutputBufferTooSmall}`.**
+OutputBufferTooSmall}`.
+
+Round 44 adds the §4.3.4.3 *spreading (rotation)* layer
+(`celt_spreading`): the Table 56 per-frame "spread" symbol decode
+(`decode_spread` with `SPREAD_PDF = {7, 2, 21, 2}/32` /
+`SPREAD_ICDF`), the Table 59 `spread → f_r` map (`spread_f_r` /
+`SPREAD_F_R`: 0 → no rotation, 1 → 15, 2 → 10, 3 → 5), the §4.3.4.3
+rotation gain `g_r = N/(N + f_r*K)` (`rotation_gain`) and angle
+`theta = pi*g_r^2/4` (`rotation_angle`, composed as `spread_theta`),
+the back-and-forth 2-D rotation series (`rotate_in_place`), the
+multi-block interleave stride `round(sqrt(N/nb_blocks))`
+(`spreading_stride`) with the strided per-set variant
+(`rotate_strided`), and the composed `apply_spreading` (per-block
+rotation + the `(pi/2 − theta)` strided pre-rotation when
+`nb_blocks > 1` and blocks span ≥ 8 samples).**
+
+## Round 44 — §4.3.4.3 spreading (rotation) (2026-06-11)
+
+Round 44 lands RFC 6716 §4.3.4.3 *Spreading* — the rotation applied
+to the §4.3.4.2-decoded shape vector "for the purpose of avoiding
+tonal artifacts" (RFC 6716 §4.3.4.3, pp. 117–118). The procedure is
+stated directly in the standards-track prose: the rotation gain
+`g_r = N / (N + f_r*K)` with `f_r` from Table 59 (spread value 0 →
+infinite, i.e. no rotation; 1 → 15; 2 → 10; 3 → 5), the angle
+`theta = pi * g_r^2 / 4`, the 2-D step `x_i' = cos(theta)*x_i +
+sin(theta)*x_j` / `x_j' = -sin(theta)*x_i + cos(theta)*x_j`, and the
+N-D composition as a back-and-forth series of adjacent-pair 2-D
+rotations (`R(x_1, x_2) … R(x_{N-1}, x_N)` then back down to
+`R(x_1, x_2)`). The "spread" symbol itself is the Table 56 per-frame
+PDF `{7, 2, 21, 2}/32`.
+
+New public surface (`celt_spreading`):
+
+* `decode_spread(&mut RangeDecoder) -> u8` — the Table 56 symbol
+  read (`SPREAD_PDF` / `SPREAD_ICDF` / `SPREAD_FTB = 5`).
+* `spread_f_r(spread) -> Result<Option<u32>, …>` / `SPREAD_F_R` —
+  the Table 59 map; `None` is the "infinite (no rotation)" row.
+* `rotation_gain(n, k, f_r)` / `rotation_angle(g_r)` /
+  `spread_theta(n, k, spread)` — `g_r` and `theta`.
+* `rotate_in_place(&mut [f64], theta)` — the §4.3.4.3
+  back-and-forth 2-D rotation series (orthogonal; preserves the L2
+  norm).
+* `spreading_stride(len, nb_blocks)` — `round(sqrt(N/nb_blocks))`
+  (round-half-up documented; the RFC does not pin the tie rule).
+* `rotate_strided(&mut [f64], stride, theta)` — the same series
+  applied independently to each interleaved set
+  `S_k = {stride*n + k}`.
+* `apply_spreading(&mut [f64], k, spread, nb_blocks)` — the composed
+  process: no-op for spread 0; per-block rotation by `theta`
+  (`N` = block length per "applied separately on each time block");
+  and, when `nb_blocks > 1` with blocks ≥ 8 samples
+  (`SPREAD_PRE_ROTATION_MIN_BLOCK_LEN`), the extra `(pi/2 − theta)`
+  rotation applied first, interleaved over the whole vector. The
+  module doc records the reading of the §4.3.4.3 multi-block
+  paragraph (whose prose reuses `N` for both the full vector and a
+  block); the primitives are exact transcriptions so the §4.3.4
+  consumer site can recompose if fixture-level verification pins a
+  different reading.
+* `SpreadingError::{SpreadOutOfRange, ZeroDimensions, ZeroBlocks,
+  ZeroStride, BlocksDoNotDivideLength}`.
+
+Twenty-eight new unit tests (976 lib tests total, up from 948 at
+round-43 close; 20 integration tests unchanged) pin: the Table 56
+PDF/iCDF consistency and an exhaustive first-byte sweep showing
+`decode_spread` always yields a Table 59 row; the Table 59 map and
+its out-of-range rejection; worked `g_r` / `theta` points
+(`g_r(16, 4, 5) = 4/9`, `theta = 4*pi/81`, `K = 0 ⇒ g_r = 1`,
+`g_r = 1 ⇒ theta = pi/4`) and the monotonicities (more pulses ⇒
+smaller `theta`; Table 59 spread 1 < 2 < 3 in rotation strength);
+the 2-D step against the RFC definition; the `N = 3` series against
+an explicit-matrix composition; L2-norm preservation, zero-angle
+identity, and sign-linearity of the series; stride worked points
+including the 2.5-tie; strided-rotation equivalence to
+gather-rotate-scatter, set independence, norm preservation, and the
+singleton-set no-op; and the composed `apply_spreading` paths
+(spread-0 identity, single-block equivalence, small-block
+pre-rotation skip, multi-block pre-rotation effect + exact
+composition, zero-vector fixed point, and every error path).
+
+What's deferred: the §4.3.4 band loop that feeds decoded shape
+vectors through this rotation, and the §4.3.4.1 Bits-to-Pulses
+conversion. §4.3.4.1 is a **docs gap**: the staged
+`docs/audio/opus/tables/cache-bits50.csv` / `cache-index50.csv`
+carry the precomputed pulse-cache *values* (392 + 105 entries), but
+no staged trace describes the table's internal layout — how a
+`(band, LM)` pair selects a run inside `cache-bits50`, the
+per-entry bits units/bias, and the permitted-`K` mapping the RFC
+alludes to ("the search is performed against a precomputed
+allocation table that only permits some K values for each N", RFC
+6716 §4.3.4.1, p. 116). RFC prose alone does not pin the layout,
+and the allocation must be recovered bit-exactly.
+
+Source: RFC 6716 §4.3.4.3 (pp. 117–118), Table 59 (p. 117), and the
+Table 56 "spread" row (p. 107) — held in-repo at
+`docs/audio/opus/rfc6716-opus.txt`. No external library source was
+consulted.
 
 ## Round 43 — §4.3.4.2 PVQ index-to-vector decode (2026-06-11)
 

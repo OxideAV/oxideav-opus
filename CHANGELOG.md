@@ -6,6 +6,43 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 44 (2026-06-11):** RFC 6716 §4.3.4.3 *spreading
+  (rotation)* — a new `celt_spreading` module applying the §4.3.4.3
+  anti-tonal rotation to the §4.3.4.2-decoded shape vector. Implements
+  the RFC prose verbatim: the Table 56 per-frame "spread" symbol
+  (`decode_spread`, PDF `{7, 2, 21, 2}/32` as `SPREAD_PDF` /
+  `SPREAD_ICDF` / `SPREAD_FTB = 5`); the Table 59 `spread → f_r` map
+  (`spread_f_r` / `SPREAD_F_R`: 0 → infinite/no rotation, 1 → 15,
+  2 → 10, 3 → 5); the rotation gain `g_r = N/(N + f_r*K)`
+  (`rotation_gain`) and angle `theta = pi*g_r^2/4` (`rotation_angle`,
+  composed as `spread_theta`); the back-and-forth adjacent-pair 2-D
+  rotation series (`rotate_in_place`, orthogonal /
+  L2-norm-preserving); the multi-block interleave stride
+  `round(sqrt(N/nb_blocks))` (`spreading_stride`, round-half-up
+  documented since the RFC leaves the tie rule open); the per-set
+  strided variant (`rotate_strided`, sets `S_k = {stride*n + k}`);
+  and the composed `apply_spreading` (per-block `theta` rotation +
+  the `(pi/2 − theta)` strided pre-rotation when `nb_blocks > 1` and
+  blocks span ≥ 8 samples — `SPREAD_PRE_ROTATION_MIN_BLOCK_LEN`; the
+  module doc records the documented reading of the §4.3.4.3
+  multi-block paragraph, whose prose reuses `N` for the full vector
+  and a block). `SpreadingError::{SpreadOutOfRange, ZeroDimensions,
+  ZeroBlocks, ZeroStride, BlocksDoNotDivideLength}` covers
+  caller-side bookkeeping. Twenty-eight new unit tests (976 lib
+  tests, up from 948; 20 integration tests unchanged): Table 56
+  PDF/iCDF consistency + exhaustive first-byte decode sweep, the
+  Table 59 map, worked `g_r`/`theta` points and monotonicities, the
+  2-D step against the RFC definition, the `N = 3` series against an
+  explicit-matrix composition, norm-preservation / zero-angle /
+  sign-linearity properties, stride worked points including the
+  2.5-tie, strided-rotation gather-scatter equivalence + set
+  independence, and every composed path + error path. Docs-gap note:
+  §4.3.4.1 Bits-to-Pulses stays blocked — the staged
+  `cache-bits50.csv` / `cache-index50.csv` carry the pulse-cache
+  *values* but no staged trace describes the run layout /
+  permitted-`K` mapping, and RFC 6716 §4.3.4.1 prose (p. 116) does
+  not pin it. Source: RFC 6716 §4.3.4.3 (pp. 117–118) + Tables 56/59.
+
 * **Clean-room round 43 (2026-06-11):** RFC 6716 §4.3.4.2 *PVQ
   index-to-vector decoding* — a new `celt_pvq_decode` module that
   turns a decoded codeword index `i ∈ 0..V(N, K)` into the

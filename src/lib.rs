@@ -679,6 +679,7 @@ pub mod celt_pvq_decode;
 pub mod celt_pvq_v;
 pub mod celt_redundancy;
 pub mod celt_reservations;
+pub mod celt_spreading;
 pub mod celt_static_alloc;
 pub mod celt_tf_adjust;
 pub mod celt_transitions;
@@ -767,6 +768,12 @@ pub use celt_reservations::{
     reserve_block, ReservationError, ReservationOutcome, ANTI_COLLAPSE_HEADROOM_LM_OFFSET,
     ANTI_COLLAPSE_HEADROOM_MULT_EIGHTH_BITS, ANTI_COLLAPSE_LM_MIN_EXCLUSIVE,
     CONSERVATIVE_DEDUCTION_EIGHTH_BITS, ONE_BIT_EIGHTH_BITS,
+};
+pub use celt_spreading::{
+    apply_spreading, decode_spread, rotate_in_place, rotate_strided, rotation_angle, rotation_gain,
+    spread_f_r, spread_theta, spreading_stride, SpreadingError, SPREAD_FTB, SPREAD_F_R,
+    SPREAD_ICDF, SPREAD_MAX, SPREAD_PDF, SPREAD_PDF_DENOMINATOR, SPREAD_PRE_ROTATION_MIN_BLOCK_LEN,
+    SPREAD_VALUE_COUNT,
 };
 pub use celt_static_alloc::{
     static_alloc_cell, static_alloc_eighth_bits, static_alloc_row, StaticAllocError, STATIC_ALLOC,
