@@ -96,7 +96,12 @@ CELT-header `intra` flag + `e_prob_pair(lm, mode, band) -> EProbPair`
 / `e_prob_row(lm, mode) -> &[u8; 42]` accessors + intra-mode
 prediction-coefficient constants `INTRA_PRED_ALPHA_Q15 = 0` /
 `INTRA_PRED_BETA_Q15 = 4915` against `Q15_ONE = 32768` per RFC 6716
-§4.3.2.1 p. 108) + §4.3.3 intensity-stereo reservation parameter
+§4.3.2.1 p. 108 + per-LM inter-mode coefficients
+`INTER_PRED_ALPHA_Q15 = {29440, 26112, 21248, 16384}` /
+`INTER_PRED_BETA_Q15 = {30147, 22282, 12124, 6554}` with the
+`energy_pred_coef(lm, mode) -> EnergyPredCoef` accessor, the Q15
+numerators fixed by the RFC 6716 Appendix A normative reference code)
++ §4.3.3 intensity-stereo reservation parameter
 surface (`celt_log2_frac_table`: `LOG2_FRAC_TABLE` — the 24-byte Q3
 (1/8-bit) conservative `log2` table feeding the §4.3.3
 `intensity_rsv = LOG2_FRAC_TABLE[end − start]` reservation +
@@ -175,8 +180,7 @@ ChannelsOutOfRange, LmOutOfRange}` caller-side bookkeeping errors);
 the §4.3.2.1 Laplace decoder itself + 2-D `(time, frequency)` predictor
 + §4.3.3 1/64-step interpolated search over Table 57 + §4.3.4 PVQ
 shape + band loop + §4.3.7 inverse-MDCT window for the cross-lap
-still deferred. The per-LM *inter*-mode `(alpha, beta)` pair is a
-§4.3.2.1 docs gap.
+still deferred.
 
 Round 41 adds the §4.3.4.2 *PVQ codebook-size function*
 (`celt_pvq_v::pvq_codebook_size(n, k) -> Result<u32, PvqVError>`)
@@ -226,6 +230,72 @@ multi-block interleave stride `round(sqrt(N/nb_blocks))`
 (`rotate_strided`), and the composed `apply_spreading` (per-block
 rotation + the `(pi/2 − theta)` strided pre-rotation when
 `nb_blocks > 1` and blocks span ≥ 8 samples).**
+
+Round 45 adds the §4.3.2.1 per-LM *inter*-mode coarse-energy
+prediction coefficients (`celt_e_prob_model`):
+`INTER_PRED_ALPHA_Q15 = {29440, 26112, 21248, 16384}` /
+`INTER_PRED_BETA_Q15 = {30147, 22282, 12124, 6554}` (Q15 against
+`Q15_ONE = 32768`, indexed by `LM = log2(frame_size/120)`), plus the
+`energy_pred_coef(lm, mode) -> EnergyPredCoef { alpha_q15, beta_q15 }`
+accessor unifying the intra carve-out (`(0, 4915)` for every LM) and
+the per-LM inter pairs. This closes the round-29 deferral: the values
+come from the `pred_coef[4]` / `beta_coef[4]` data in `quant_bands.c`
+of the RFC 6716 Appendix A normative reference code, which is embedded
+in the staged RFC text itself (§A.1 extraction procedure, SHA-1
+verified; §A.2: "it is the code in this document that shall remain
+normative").
+
+## Round 45 — §4.3.2.1 per-LM inter-mode (alpha, beta) prediction coefficients (2026-06-12)
+
+Round 45 lands the per-LM *inter*-mode `(alpha, beta)` coarse-energy
+prediction parameterisation deferred since round 29 (RFC 6716
+§4.3.2.1, p. 108). The RFC prose fixes the intra case
+(`alpha = 0`, `beta = 4915/32768`) and states that the inter
+coefficients "depend on the frame size in use", but defers the numeric
+values to the normative Appendix A reference code. Those values —
+`pred_coef[4] = {29440, 26112, 21248, 16384}` and
+`beta_coef[4] = {30147, 22282, 12124, 6554}` (Q15, indexed by
+`LM = log2(frame_size/120) ∈ 0..=3`) — are numeric facts read from
+`quant_bands.c` inside the Appendix A source embedded in the staged
+`docs/audio/opus/rfc6716-opus.txt` (extracted with the RFC's own §A.1
+command; the tarball SHA-1 matched the value printed in §A.1, and the
+`beta_intra = 4915` declaration in the same file confirms the p. 108
+intra constant). RFC 6716 §1 includes Appendix A in the normative
+text and §A.2 states the in-document code remains normative, so these
+constants carry spec weight; no external reference distribution or
+other implementation was consulted.
+
+New API surface in `celt_e_prob_model`:
+
+* `INTER_PRED_ALPHA_Q15: [u16; 4]` — time-domain predictor weight per
+  LM; `alpha` shrinks as frames grow (exactly `1/2` at 20 ms) because
+  a longer inter-frame gap weakens the previous-frame predictor.
+* `INTER_PRED_BETA_Q15: [u16; 4]` — frequency-leakage coefficient per
+  LM (`≈ {0.920, 0.680, 0.370, 0.200}`).
+* `EnergyPredCoef { alpha_q15, beta_q15 }` with exact-binary-fraction
+  `alpha()` / `beta()` float views.
+* `energy_pred_coef(lm, mode) -> Result<EnergyPredCoef,
+  EProbModelError>` — one range-checked contract for both modes;
+  intra returns the LM-independent `(0, 4915)`.
+
+Ten new unit tests (986 lib tests, up from 976; 20 integration tests
+unchanged): Appendix A value pins for both arrays, the exact-half
+`LM = 3` alpha, strict monotone decrease of both coefficient sets in
+LM, inter-beta > intra-beta for every LM, accessor↔table agreement,
+intra LM-independence, out-of-range `lm` rejection in both modes,
+exact float views, and the 3-decimal doc-comment approximations.
+
+A consequence worth recording for §4.3.4.1 (Bits-to-Pulses, still
+deferred): the same Appendix A carve-out stages the normative
+pulse-cache construction (`rate.c`), so the `cache-bits50` /
+`cache-index50` run layout that round 44 recorded as a docs gap is now
+reachable through the staged RFC text; a future round can consume it
+under the same grounding.
+
+Source: RFC 6716 §4.3.2.1 (p. 108), §1 (p. 5), §A.1–A.3
+(pp. 163–164), and the Appendix A `quant_bands.c` coefficient data —
+all held in-repo at `docs/audio/opus/rfc6716-opus.txt`. No external
+library source was consulted.
 
 ## Round 44 — §4.3.4.3 spreading (rotation) (2026-06-11)
 

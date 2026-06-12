@@ -6,6 +6,35 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 45 (2026-06-12):** RFC 6716 §4.3.2.1 per-LM
+  *inter*-mode `(alpha, beta)` coarse-energy prediction coefficients,
+  closing the round-29 deferral. `celt_e_prob_model` gains
+  `INTER_PRED_ALPHA_Q15 = [29440, 26112, 21248, 16384]` and
+  `INTER_PRED_BETA_Q15 = [30147, 22282, 12124, 6554]` (Q15 numerators
+  against `Q15_ONE = 32768`, indexed by `LM = log2(frame_size/120) ∈
+  0..=3`), the `EnergyPredCoef { alpha_q15, beta_q15 }` pair type with
+  exact `alpha()` / `beta()` binary-fraction float views, and the
+  range-checked `energy_pred_coef(lm, mode)` accessor unifying the
+  §4.3.2.1 p. 108 intra carve-out (`(0, 4915)`, LM-independent) with
+  the per-LM inter pairs. Provenance: the RFC prose states the inter
+  coefficients "depend on the frame size in use" and defers the
+  numbers to the normative Appendix A reference code; the values are
+  numeric facts read from the `pred_coef[4]` / `beta_coef[4]`
+  declarations in `quant_bands.c` of the Appendix A source embedded in
+  the staged `docs/audio/opus/rfc6716-opus.txt` (extracted via the
+  RFC's own §A.1 procedure, tarball SHA-1 verified against §A.1;
+  §A.2 keeps the in-document code normative; `beta_intra = 4915` in
+  the same file confirms the p. 108 intra constant). Ten new unit
+  tests (986 lib tests, up from 976; 20 integration unchanged): value
+  pins, the exact-half `LM = 3` alpha, strict monotone decrease of
+  both arrays in LM, inter-beta > intra-beta, accessor↔table
+  agreement, intra LM-independence, `lm` range rejection in both
+  modes, exact float views, and the doc-comment approximations.
+  Follow-up note: the same Appendix A grounding stages the normative
+  pulse-cache construction (`rate.c`), making the §4.3.4.1
+  `cache-bits50` / `cache-index50` run-layout gap recorded in round 44
+  reachable for a future round.
+
 * **Clean-room round 44 (2026-06-11):** RFC 6716 §4.3.4.3 *spreading
   (rotation)* — a new `celt_spreading` module applying the §4.3.4.3
   anti-tonal rotation to the §4.3.4.2-decoded shape vector. Implements

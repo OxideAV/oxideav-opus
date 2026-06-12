@@ -7,11 +7,16 @@
 //! and in frequency (across bands). The decoder needs three pieces of
 //! data to drive that decode:
 //!
-//! 1. The intra-frame prediction coefficients `(alpha, beta)`. RFC 6716
-//!    §4.3.2.1 (p. 108) fixes the *intra* case at `alpha = 0` and
+//! 1. The prediction coefficients `(alpha, beta)`. RFC 6716 §4.3.2.1
+//!    (p. 108) fixes the *intra* case at `alpha = 0` and
 //!    `beta = 4915 / 32768` (Q15). The *inter* coefficients depend on
-//!    the frame size; their numeric values are not given in the RFC
-//!    body and are a documented gap for this module.
+//!    the frame size; the RFC body states the dependency but defers
+//!    the numeric values to the normative Appendix A reference code
+//!    (`quant_bands.c`), which fixes them per `LM` at
+//!    `alpha = {29440, 26112, 21248, 16384} / 32768` and
+//!    `beta = {30147, 22282, 12124, 6554} / 32768` (Q15) for
+//!    `LM = 0..=3`. See [`INTER_PRED_ALPHA_Q15`] /
+//!    [`INTER_PRED_BETA_Q15`] and the [`energy_pred_coef`] accessor.
 //! 2. The `e_prob_model` table — the per-band, per-mode parameters of
 //!    the Laplace distribution. The RFC describes the table as keyed
 //!    by `(LM, intra, band)` where `LM = log2(frame_size / 120)` so
@@ -35,6 +40,17 @@
 //! (see `docs/audio/celt/spec/celt-coarse-energy-and-allocation.md`
 //! §1.2 for the canonical layout). The values are reproduced inline
 //! here so the table is available without filesystem I/O at runtime.
+//!
+//! The eight per-LM *inter* `(alpha, beta)` Q15 numerators are numeric
+//! facts read from the `pred_coef[4]` / `beta_coef[4]` declarations in
+//! `quant_bands.c` of the RFC 6716 Appendix A reference code, which is
+//! embedded in the staged RFC text itself (extracted per the §A.1
+//! procedure; tarball SHA-1 verified against the value printed in
+//! §A.1). RFC 6716 §A.2 states that "it is the code in this document
+//! that shall remain normative", and §1 includes Appendix A in the
+//! normative text, so these constants carry the same normative weight
+//! as the prose. The `beta_intra = 4915` declaration in the same file
+//! confirms the §4.3.2.1 p. 108 intra value.
 //!
 //! ## Layout
 //!
@@ -94,6 +110,34 @@ pub const Q15_ONE: u32 = 32768;
 /// against [`Q15_ONE`] for symmetry with [`INTRA_PRED_BETA_Q15`].
 pub const INTRA_PRED_ALPHA_Q15: u16 = 0;
 
+/// §4.3.2.1 *inter-frame* prediction coefficient `alpha` per frame
+/// size, indexed by `LM = log2(frame_size / 120) ∈ 0..=3`. Stored as
+/// Q15 numerators against [`Q15_ONE`].
+///
+/// `alpha` weights the time-domain predictor (the prior frame's final
+/// fine-quantised energy) in the §4.3.2.1 2-D prediction filter
+/// `A(z_l, z_b)`. RFC 6716 §4.3.2.1 (p. 108) states the inter
+/// coefficients "depend on the frame size in use"; the numeric values
+/// are fixed by the normative Appendix A reference code
+/// (`pred_coef[4]` in `quant_bands.c`): `{29440, 26112, 21248, 16384}
+/// / 32768 ≈ {0.898, 0.797, 0.648, 0.500}`. The weight shrinks as
+/// the frame grows — at 20 ms (`LM = 3`) it is exactly `1/2` — because
+/// a longer gap between frames makes the previous frame's energy a
+/// weaker predictor.
+pub const INTER_PRED_ALPHA_Q15: [u16; E_PROB_MODEL_LM_COUNT] = [29440, 26112, 21248, 16384];
+
+/// §4.3.2.1 *inter-frame* prediction coefficient `beta` per frame
+/// size, indexed by `LM = log2(frame_size / 120) ∈ 0..=3`. Stored as
+/// Q15 numerators against [`Q15_ONE`].
+///
+/// `beta` is the leakage coefficient of the in-frame frequency
+/// predictor (the `1 / (1 - beta * z_b^-1)` denominator of the
+/// §4.3.2.1 2-D prediction filter). The numeric values are fixed by
+/// the normative Appendix A reference code (`beta_coef[4]` in
+/// `quant_bands.c`): `{30147, 22282, 12124, 6554} / 32768 ≈
+/// {0.920, 0.680, 0.370, 0.200}`.
+pub const INTER_PRED_BETA_Q15: [u16; E_PROB_MODEL_LM_COUNT] = [30147, 22282, 12124, 6554];
+
 /// §4.3.2.1 Laplace-model `(prob, decay)` Q8 pair for a single band.
 ///
 /// `prob` is the probability of `0` returned by the Laplace decoder
@@ -118,8 +162,8 @@ pub struct EProbPair {
 pub enum EnergyPredictionMode {
     /// Inter-frame prediction (the default). §4.3.2.1: the predictor
     /// runs across the prior frame's final fine quantisation; the
-    /// `alpha` coefficient depends on the frame size and is a
-    /// documented gap for this module.
+    /// `(alpha, beta)` coefficients depend on the frame size — see
+    /// [`INTER_PRED_ALPHA_Q15`] / [`INTER_PRED_BETA_Q15`].
     Inter,
     /// Intra-frame prediction (the §4.3.2.1 carve-out signalled by the
     /// CELT header `intra` flag). `alpha = 0` and `beta = 4915/32768`;
@@ -147,6 +191,60 @@ impl EnergyPredictionMode {
             EnergyPredictionMode::Intra => E_PROB_MODEL_MODE_INTRA,
         }
     }
+}
+
+/// §4.3.2.1 coarse-energy prediction coefficients `(alpha, beta)` for
+/// one `(LM, mode)` cell, as Q15 numerators against [`Q15_ONE`].
+///
+/// `alpha` weights the time-domain (previous-frame) predictor and
+/// `beta` the in-frame frequency-leakage term of the §4.3.2.1 2-D
+/// prediction filter `A(z_l, z_b)`. Obtain via [`energy_pred_coef`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnergyPredCoef {
+    /// Time-domain prediction weight (Q15). `0` in intra mode.
+    pub alpha_q15: u16,
+    /// Frequency-domain leakage coefficient (Q15).
+    pub beta_q15: u16,
+}
+
+impl EnergyPredCoef {
+    /// `alpha` as the exact binary fraction `alpha_q15 / 32768`.
+    pub fn alpha(self) -> f64 {
+        f64::from(self.alpha_q15) / f64::from(Q15_ONE)
+    }
+
+    /// `beta` as the exact binary fraction `beta_q15 / 32768`.
+    pub fn beta(self) -> f64 {
+        f64::from(self.beta_q15) / f64::from(Q15_ONE)
+    }
+}
+
+/// Look up the §4.3.2.1 prediction coefficients `(alpha, beta)` for a
+/// frame size and prediction mode.
+///
+/// `lm` is `log2(frame_size / 120) ∈ 0..=3`. In intra mode the result
+/// is the frame-size-independent pair `(0, 4915)` (RFC 6716 §4.3.2.1
+/// p. 108); `lm` is still range-checked so both modes share one
+/// contract. In inter mode the result is
+/// `(INTER_PRED_ALPHA_Q15[lm], INTER_PRED_BETA_Q15[lm])`, the per-LM
+/// pair fixed by the normative Appendix A reference code.
+pub fn energy_pred_coef(
+    lm: u32,
+    mode: EnergyPredictionMode,
+) -> Result<EnergyPredCoef, EProbModelError> {
+    if lm >= E_PROB_MODEL_LM_COUNT as u32 {
+        return Err(EProbModelError::LmOutOfRange { lm });
+    }
+    Ok(match mode {
+        EnergyPredictionMode::Inter => EnergyPredCoef {
+            alpha_q15: INTER_PRED_ALPHA_Q15[lm as usize],
+            beta_q15: INTER_PRED_BETA_Q15[lm as usize],
+        },
+        EnergyPredictionMode::Intra => EnergyPredCoef {
+            alpha_q15: INTRA_PRED_ALPHA_Q15,
+            beta_q15: INTRA_PRED_BETA_Q15,
+        },
+    })
 }
 
 /// §4.3.2.1 `e_prob_model` table — 4 frame sizes × 2 modes × 21 bands
@@ -333,6 +431,116 @@ mod tests {
         // The Q15 ratio 4915/32768 = 0.14999389648437500 — within
         // ~6.1e-6 of the RFC's textual 0.15 approximation. We don't
         // assert a float here; we pin the numerator/denominator.
+    }
+
+    // ---- Inter prediction coefficients (RFC 6716 §4.3.2.1 +
+    //      normative Appendix A `quant_bands.c` data) ----
+
+    #[test]
+    fn inter_alpha_q15_values_per_appendix_a() {
+        // Appendix A `pred_coef[4]` (quant_bands.c): one Q15 numerator
+        // per LM = 0..=3 (120/240/480/960-sample frames).
+        assert_eq!(INTER_PRED_ALPHA_Q15, [29440, 26112, 21248, 16384]);
+    }
+
+    #[test]
+    fn inter_beta_q15_values_per_appendix_a() {
+        // Appendix A `beta_coef[4]` (quant_bands.c).
+        assert_eq!(INTER_PRED_BETA_Q15, [30147, 22282, 12124, 6554]);
+    }
+
+    #[test]
+    fn inter_alpha_lm3_is_exactly_one_half() {
+        // 16384 / 32768 = 1/2 exactly — the 20 ms frame halves the
+        // previous-frame predictor weight.
+        assert_eq!(u32::from(INTER_PRED_ALPHA_Q15[3]) * 2, Q15_ONE);
+    }
+
+    #[test]
+    fn inter_coefficients_strictly_decrease_with_frame_size() {
+        // §4.3.2.1: longer frames lean less on both predictors; the
+        // Appendix A data is strictly decreasing in LM for alpha and
+        // beta alike.
+        for lm in 0..E_PROB_MODEL_LM_COUNT - 1 {
+            assert!(
+                INTER_PRED_ALPHA_Q15[lm] > INTER_PRED_ALPHA_Q15[lm + 1],
+                "alpha should strictly decrease between LM={lm} and LM={}",
+                lm + 1
+            );
+            assert!(
+                INTER_PRED_BETA_Q15[lm] > INTER_PRED_BETA_Q15[lm + 1],
+                "beta should strictly decrease between LM={lm} and LM={}",
+                lm + 1
+            );
+        }
+    }
+
+    #[test]
+    fn inter_beta_always_exceeds_intra_beta() {
+        // Even the weakest inter leakage (LM = 3, 6554) exceeds the
+        // intra constant 4915: with the time predictor active, the
+        // frequency predictor leaks more.
+        for &beta in &INTER_PRED_BETA_Q15 {
+            assert!(beta > INTRA_PRED_BETA_Q15);
+        }
+    }
+
+    #[test]
+    fn energy_pred_coef_inter_matches_tables_for_every_lm() {
+        for lm in 0..E_PROB_MODEL_LM_COUNT as u32 {
+            let c = energy_pred_coef(lm, EnergyPredictionMode::Inter).unwrap();
+            assert_eq!(c.alpha_q15, INTER_PRED_ALPHA_Q15[lm as usize]);
+            assert_eq!(c.beta_q15, INTER_PRED_BETA_Q15[lm as usize]);
+        }
+    }
+
+    #[test]
+    fn energy_pred_coef_intra_is_lm_independent() {
+        for lm in 0..E_PROB_MODEL_LM_COUNT as u32 {
+            let c = energy_pred_coef(lm, EnergyPredictionMode::Intra).unwrap();
+            assert_eq!(
+                c,
+                EnergyPredCoef {
+                    alpha_q15: 0,
+                    beta_q15: 4915,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn energy_pred_coef_rejects_lm_out_of_range_in_both_modes() {
+        for mode in [EnergyPredictionMode::Inter, EnergyPredictionMode::Intra] {
+            let err = energy_pred_coef(4, mode).unwrap_err();
+            assert_eq!(err, EProbModelError::LmOutOfRange { lm: 4 });
+            let err = energy_pred_coef(u32::MAX, mode).unwrap_err();
+            assert_eq!(err, EProbModelError::LmOutOfRange { lm: u32::MAX });
+        }
+    }
+
+    #[test]
+    fn energy_pred_coef_float_views_match_q15_ratios() {
+        let c = energy_pred_coef(3, EnergyPredictionMode::Inter).unwrap();
+        // 16384/32768 and 6554/32768 are exact binary fractions.
+        assert_eq!(c.alpha(), 0.5);
+        assert_eq!(c.beta(), 6554.0 / 32768.0);
+        let c = energy_pred_coef(0, EnergyPredictionMode::Intra).unwrap();
+        assert_eq!(c.alpha(), 0.0);
+        assert_eq!(c.beta(), 4915.0 / 32768.0);
+    }
+
+    #[test]
+    fn inter_q15_approximations_documented_in_doc_comments() {
+        // The doc comments cite ≈ {0.920, 0.680, 0.370, 0.200} and
+        // ≈ {0.898, 0.797, 0.648, 0.500}; pin them to 3 decimals.
+        let beta_approx = [0.920, 0.680, 0.370, 0.200];
+        let alpha_approx = [0.898, 0.797, 0.648, 0.500];
+        for lm in 0..E_PROB_MODEL_LM_COUNT {
+            let a = f64::from(INTER_PRED_ALPHA_Q15[lm]) / f64::from(Q15_ONE);
+            let b = f64::from(INTER_PRED_BETA_Q15[lm]) / f64::from(Q15_ONE);
+            assert!((a - alpha_approx[lm]).abs() < 5e-4, "alpha LM={lm}");
+            assert!((b - beta_approx[lm]).abs() < 5e-4, "beta LM={lm}");
+        }
     }
 
     // ---- EnergyPredictionMode mapping ----

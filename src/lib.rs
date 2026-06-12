@@ -356,7 +356,11 @@
 //!   parameter-surface fragment needed before the §4.3.2.1
 //!   Laplace decoder + 2-D `(time, frequency)` predictor can run;
 //!   the decoder itself and the per-LM inter-mode `(alpha, beta)`
-//!   pair are deferred (inter coefficients are a §4.3.2.1 docs gap).
+//!   pair were deferred (the latter landed in round 45 —
+//!   [`INTER_PRED_ALPHA_Q15`] / [`INTER_PRED_BETA_Q15`] /
+//!   [`energy_pred_coef`] returning [`EnergyPredCoef`], the Q15
+//!   numerators fixed by the RFC 6716 Appendix A normative
+//!   reference code).
 //!
 //! * Round 30 lands the §4.3.3 *intensity-stereo reservation*
 //!   parameter surface ([`celt_log2_frac_table`]:
@@ -741,10 +745,11 @@ pub use celt_cache_caps50::{
     CACHE_CAPS50_TOTAL_BYTES, INIT_CAPS_BIAS, INIT_CAPS_DIVISOR, INIT_CAPS_MAX_CHANNELS,
 };
 pub use celt_e_prob_model::{
-    e_prob_pair, e_prob_row, EProbModelError, EProbPair, EnergyPredictionMode, E_PROB_MODEL,
-    E_PROB_MODEL_BYTES_PER_BAND, E_PROB_MODEL_BYTES_PER_ROW, E_PROB_MODEL_LM_COUNT,
-    E_PROB_MODEL_MODE_COUNT, E_PROB_MODEL_MODE_INTER, E_PROB_MODEL_MODE_INTRA,
-    E_PROB_MODEL_TOTAL_BYTES, INTRA_PRED_ALPHA_Q15, INTRA_PRED_BETA_Q15, Q15_ONE,
+    e_prob_pair, e_prob_row, energy_pred_coef, EProbModelError, EProbPair, EnergyPredCoef,
+    EnergyPredictionMode, E_PROB_MODEL, E_PROB_MODEL_BYTES_PER_BAND, E_PROB_MODEL_BYTES_PER_ROW,
+    E_PROB_MODEL_LM_COUNT, E_PROB_MODEL_MODE_COUNT, E_PROB_MODEL_MODE_INTER,
+    E_PROB_MODEL_MODE_INTRA, E_PROB_MODEL_TOTAL_BYTES, INTER_PRED_ALPHA_Q15, INTER_PRED_BETA_Q15,
+    INTRA_PRED_ALPHA_Q15, INTRA_PRED_BETA_Q15, Q15_ONE,
 };
 pub use celt_header::{CeltHeaderPrefix, CeltPostFilter};
 pub use celt_log2_frac_table::{
