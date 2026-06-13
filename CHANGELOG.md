@@ -6,6 +6,34 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 46 (2026-06-13):** public two-step range-coder
+  symbol API `RangeDecoder::ec_decode(ft) -> fs` and
+  `RangeDecoder::ec_dec_update(fl, fh, ft)` per RFC 6716 §4.1.2,
+  promoting the previously-private `decode` / `dec_update` helpers to a
+  validated public surface. `ec_decode` computes the §4.1.2 symbol
+  proxy `fs = ft - min(val/(rng/ft) + 1, ft)` and rejects `ft == 0`
+  (division by zero) by latching the sticky error flag; `ec_dec_update`
+  narrows the range to the chosen symbol's `[fl, fh)` sub-interval of
+  `[0, ft)` and rejects malformed tuples (`ft == 0`, `fh > ft`,
+  `fl >= fh`) with the same error-latch-and-no-op guard, so a corrupt
+  search result cannot underflow `val` or zero `rng`. This is the
+  generic symbol path required when the frequency model is computed at
+  run time rather than baked into a fixed `icdf[]` table — the building
+  block for the deferred §4.3.2.1 CELT coarse-energy Laplace decoder and
+  the §4.3.3 allocation interpolation search. Five new unit tests (991
+  lib tests, up from 986; 20 integration unchanged): split-path ↔
+  fused-`dec_icdf` lockstep over a uniform 8-way PDF, split-path ↔
+  `dec_uint` lockstep in the small (`ftb <= 8`) regime, `fs ∈ [0, ft)`
+  for `ft` up to `2**16`, `ec_decode(0)` error latch, and the three
+  malformed-tuple rejections for `ec_dec_update`. Provenance: §4.1.2
+  prose (the `ec_decode` / `ec_dec_update` equations) is fully normative
+  in the staged `docs/audio/opus/rfc6716-opus.txt`; no reference source
+  was consulted. Note: the §4.3.2.1 `ec_laplace_decode` *control flow*
+  remains a docs gap — the RFC defers its algorithm to `laplace.c` in
+  the Appendix A tarball (reference source, off-limits to the
+  Implementer); this round lands the documented primitive that decoder
+  will consume once a clean-room §4.3.2.1 Laplace trace is staged.
+
 * **Clean-room round 45 (2026-06-12):** RFC 6716 §4.3.2.1 per-LM
   *inter*-mode `(alpha, beta)` coarse-energy prediction coefficients,
   closing the round-29 deferral. `celt_e_prob_model` gains

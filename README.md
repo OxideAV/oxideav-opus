@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-11 (clean-room round 44)
+## Status — 2026-06-13 (clean-room round 46)
 
 **Packet header + §3.2 frame-packing parser + RFC 6716 Appendix B
 self-delimiting framing (`parse_self_delimited` — Figures 25..29 for
@@ -16,7 +16,10 @@ multiplier) + §3.4 R1..R7 malformed-input rejection audit
 (`tests/malformed_input.rs`: 20 integration tests sweeping every
 R1..R7 violation shape + TOC-byte total-function determinism +
 §4.2.3 / §4.2.4 SILK-header truncation safety property) + §4.1
-range decoder +
+range decoder (incl. the §4.1.2 public two-step symbol path
+`ec_decode(ft)` + `ec_dec_update(fl, fh, ft)` for run-time-computed
+frequency models — the building block for the §4.3.2.1 coarse-energy
+Laplace decoder and the §4.3.3 allocation search) +
 §4.2.3 SILK header bits (VAD + LBRR flag per channel) + §4.2.4
 per-frame LBRR flags (Table 4 PDFs at 40/60 ms) +
 SILK §4.2.7.1–§4.2.7.5.1 frame-header decoder + §4.2.7.4 subframe

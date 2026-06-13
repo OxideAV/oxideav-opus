@@ -28,11 +28,13 @@
 //! * [`RangeDecoder::tell`] for whole-bit accounting (§4.1.6.1).
 //! * [`RangeDecoder::tell_frac`] for 1/8th-bit-precision accounting
 //!   (§4.1.6.2).
-//!
-//! The generic `ec_decode` / `ec_dec_update` symbol path is reachable
-//! through private helpers and is exercised internally by `dec_uint`;
-//! a dedicated public symbol-decoding API will land alongside the
-//! SILK / CELT decoders when they need it.
+//! * [`RangeDecoder::ec_decode`] / [`RangeDecoder::ec_dec_update`] for
+//!   the generic two-step symbol path (§4.1.2). These are the building
+//!   blocks for custom symbol decoders that an inverse-CDF table cannot
+//!   express directly — notably the CELT §4.3.2.1 coarse-energy
+//!   Laplace decoder and the §4.3.3 allocation interpolation search,
+//!   both of which decode against a frequency model computed at
+//!   run time rather than a fixed `icdf[]` table.
 
 use crate::Error;
 
@@ -351,6 +353,56 @@ impl<'a> RangeDecoder<'a> {
         // value.
         self.error = true;
         0
+    }
+
+    /// `ec_decode(ft)` per RFC 6716 §4.1.2 — the first of the two
+    /// symbol-decode steps.
+    ///
+    /// Computes the 16-bit symbol proxy
+    /// `fs = ft - min(val / (rng / ft) + 1, ft)`, which "lies within
+    /// the range of some symbol in the current context". The caller
+    /// then identifies the symbol `k` whose three-tuple
+    /// `(fl[k], fh[k], ft)` satisfies `fl[k] <= fs < fh[k]` and feeds
+    /// that tuple to [`Self::ec_dec_update`].
+    ///
+    /// This split form is needed when the frequency model is computed
+    /// at run time and cannot be pre-baked into a static inverse-CDF
+    /// table (RFC 6716 §4.3.2.1 coarse-energy Laplace decode, §4.3.3
+    /// allocation search). For fixed PDFs prefer [`Self::dec_icdf`],
+    /// which fuses both steps and avoids a division.
+    ///
+    /// `ft` must be in `1..=2**16` for the §4.1.2 derivation to hold
+    /// (the renormalization invariant keeps `rng > 2**23`, so
+    /// `rng / ft >= 1`). `ft == 0` would divide by zero; the decoder
+    /// latches its sticky error flag and returns `0` instead. The
+    /// returned `fs` lies in `[0, ft)`.
+    pub fn ec_decode(&mut self, ft: u32) -> u32 {
+        if ft == 0 {
+            self.error = true;
+            return 0;
+        }
+        self.decode(ft)
+    }
+
+    /// `ec_dec_update(fl, fh, ft)` per RFC 6716 §4.1.2 — the second of
+    /// the two symbol-decode steps.
+    ///
+    /// Narrows the range to the chosen symbol's `[fl, fh)` sub-interval
+    /// of `[0, ft)` per the §4.1.2 update equations, then renormalizes
+    /// to restore `rng > 2**23`. Pair this with the index returned by
+    /// the caller's search over the value from [`Self::ec_decode`].
+    ///
+    /// The three-tuple MUST satisfy `0 <= fl < fh <= ft` and
+    /// `1 <= ft <= 2**16`. A malformed tuple (`ft == 0`, `fh > ft`, or
+    /// `fl >= fh`) cannot come from a well-formed search; the decoder
+    /// latches its sticky error flag and leaves its state unchanged
+    /// rather than underflowing `val` or zeroing `rng`.
+    pub fn ec_dec_update(&mut self, fl: u32, fh: u32, ft: u32) {
+        if ft == 0 || fh > ft || fl >= fh {
+            self.error = true;
+            return;
+        }
+        self.dec_update(fl, fh, ft);
     }
 
     // ----- internal helpers -----
@@ -726,5 +778,112 @@ mod tests {
         let v = dec.dec_bits(33);
         assert_eq!(v, 0);
         assert!(dec.has_error());
+    }
+
+    /// The public two-step `ec_decode` / `ec_dec_update` path must
+    /// reproduce, symbol for symbol, what the fused `dec_icdf` produces
+    /// for the same fixed PDF. This is the RFC 6716 §4.1.2 ↔ §4.1.3.3
+    /// equivalence: `dec_icdf` is exactly `ec_decode(1<<ftb)` followed
+    /// by a search and `ec_dec_update`. We drive both decoders over
+    /// identical input bytes and assert they stay in lockstep.
+    #[test]
+    fn ec_decode_update_matches_dec_icdf_for_fixed_pdf() {
+        // Uniform 8-way PDF: fh = {1,2,..,8}, ft = 8, icdf = {7,..,0}.
+        let icdf = [7u8, 6, 5, 4, 3, 2, 1, 0];
+        let ftb = 3u32;
+        let ft = 1u32 << ftb;
+        let buf = [0x42u8, 0x18, 0xC3, 0x7F, 0x55, 0xAA, 0x33, 0xCC];
+        let mut fused = RangeDecoder::new(&buf);
+        let mut split = RangeDecoder::new(&buf);
+        for _ in 0..16 {
+            let k_fused = fused.dec_icdf(&icdf, ftb);
+
+            // Reconstruct the same decode via the public split steps.
+            let fs = split.ec_decode(ft);
+            // icdf[k] == ft - fh[k]; fl[k] == fh[k-1] (fl[0] == 0).
+            // Find the symbol whose [fl, fh) contains fs.
+            let mut k_split = 0u32;
+            let mut fl = 0u32;
+            let mut fh = ft - icdf[0] as u32;
+            for (idx, w) in icdf.windows(2).enumerate() {
+                if fs < fh {
+                    break;
+                }
+                fl = ft - w[0] as u32;
+                fh = ft - w[1] as u32;
+                k_split = (idx + 1) as u32;
+            }
+            split.ec_dec_update(fl, fh, ft);
+
+            assert_eq!(
+                k_fused, k_split,
+                "fused dec_icdf and split ec_decode/ec_dec_update diverged"
+            );
+        }
+        assert!(!fused.has_error() && !split.has_error());
+    }
+
+    /// `ec_decode(ft)` returns a value in `[0, ft)` for every well-formed
+    /// `ft`, matching the §4.1.2 derivation `fs = ft - min(.., ft)`.
+    #[test]
+    fn ec_decode_returns_in_range() {
+        let buf = [0x37u8, 0x91, 0xC4, 0x18, 0xA2, 0x5D, 0x6E, 0xFF];
+        for &ft in &[2u32, 7, 100, 1000, 1 << 16] {
+            let mut dec = RangeDecoder::new(&buf);
+            let fs = dec.ec_decode(ft);
+            assert!(fs < ft, "ec_decode({ft}) = {fs} out of [0, {ft})");
+            assert!(!dec.has_error());
+        }
+    }
+
+    /// `ec_decode(0)` is malformed (division by zero in the §4.1.2
+    /// formula); it must latch the error flag and return 0 rather than
+    /// panic.
+    #[test]
+    fn ec_decode_ft_zero_latches_error() {
+        let mut dec = RangeDecoder::new(&[0x11, 0x22, 0x33, 0x44]);
+        let fs = dec.ec_decode(0);
+        assert_eq!(fs, 0);
+        assert!(dec.has_error());
+    }
+
+    /// `ec_dec_update` with a malformed tuple (`fl >= fh`, `fh > ft`,
+    /// or `ft == 0`) latches the error flag and leaves state untouched,
+    /// guarding against an underflow of `val` or a zeroing of `rng`.
+    #[test]
+    fn ec_dec_update_rejects_malformed_tuple() {
+        // fl >= fh
+        let mut a = RangeDecoder::new(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        a.ec_dec_update(4, 4, 8);
+        assert!(a.has_error());
+
+        // fh > ft
+        let mut b = RangeDecoder::new(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        b.ec_dec_update(0, 9, 8);
+        assert!(b.has_error());
+
+        // ft == 0
+        let mut c = RangeDecoder::new(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        c.ec_dec_update(0, 1, 0);
+        assert!(c.has_error());
+    }
+
+    /// The public split path must also reproduce the `dec_uint` small
+    /// regime (`ftb <= 8`), which is internally `decode(ft)` followed by
+    /// `dec_update(t, t+1, ft)`. Drive `dec_uint` and the public
+    /// `ec_decode` / `ec_dec_update` in lockstep for a small `ft`.
+    #[test]
+    fn ec_decode_update_matches_dec_uint_small_regime() {
+        let buf = [0x42u8, 0x18, 0xC3, 0x7F, 0x55, 0xAA, 0x33, 0xCC];
+        let ft = 200u32; // ftb <= 8 → small dec_uint regime
+        let mut via_uint = RangeDecoder::new(&buf);
+        let mut via_split = RangeDecoder::new(&buf);
+        for _ in 0..8 {
+            let u = via_uint.dec_uint(ft).expect("ft=200 small regime");
+            let t = via_split.ec_decode(ft);
+            via_split.ec_dec_update(t, t + 1, ft);
+            assert_eq!(u, t, "dec_uint and split ec_decode/update diverged");
+        }
+        assert!(!via_uint.has_error() && !via_split.has_error());
     }
 }
