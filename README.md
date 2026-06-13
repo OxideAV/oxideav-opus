@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-13 (clean-room round 46)
+## Status — 2026-06-14 (clean-room round 47)
 
 **Packet header + §3.2 frame-packing parser + RFC 6716 Appendix B
 self-delimiting framing (`parse_self_delimited` — Figures 25..29 for
@@ -182,8 +182,8 @@ n_bins, lm) -> u32` applying the §4.3.3
 ChannelsOutOfRange, LmOutOfRange}` caller-side bookkeeping errors);
 the §4.3.2.1 Laplace decoder itself + 2-D `(time, frequency)` predictor
 + §4.3.3 1/64-step interpolated search over Table 57 + §4.3.4 PVQ
-shape + band loop + §4.3.7 inverse-MDCT window for the cross-lap
-still deferred.
+shape + band loop + the §4.3.7 inverse MDCT transform proper and its
+weighted overlap-add still deferred.
 
 Round 41 adds the §4.3.4.2 *PVQ codebook-size function*
 (`celt_pvq_v::pvq_codebook_size(n, k) -> Result<u32, PvqVError>`)
@@ -247,6 +247,64 @@ of the RFC 6716 Appendix A normative reference code, which is embedded
 in the staged RFC text itself (§A.1 extraction procedure, SHA-1
 verified; §A.2: "it is the code in this document that shall remain
 normative").
+
+## Round 47 — §4.3.7 inverse-MDCT overlap window (2026-06-14)
+
+Round 47 lands the RFC 6716 §4.3.7 *inverse-MDCT overlap window*
+(`celt_mdct_window`) — the windowed overlap ramp the CELT decoder
+applies after the inverse MDCT, before weighted overlap-add. §4.3.7
+(p. 121) gives the basic full-overlap 240-sample window directly as a
+squared-double-sine "derived from the window used by the Vorbis
+codec":
+
+```text
+  W(n) = sin( (pi/2) * sin( (pi/2) * (n + 1/2) / L )^2 )
+```
+
+The ASCII figure's `2` superscript squares the *inner* sine. The
+module fixes this nesting from the §4.3.7 power-complementarity
+requirement (the window "still satisfies power complementarity",
+`[PRINCEN86]`): only the inner-squared form yields
+`W(n)^2 + W(L-1-n)^2 = 1`, because with `s(n) = sin((pi/2)t)^2` the
+reflected index gives `s(L-1-n) = 1 - s(n)` and the outer sine maps a
+`(sin, cos)` pair back to a complementary `(sin, cos)` pair. The
+module proves the identity algebraically in its header and pins it in
+tests on both the basic window and arbitrary overlaps.
+
+New public surface (`celt_mdct_window`):
+
+* `window_tap(n, len)` — the amplitude window tap for window length
+  `L = len`; range `[0, 1]`.
+* `basic_window() -> [f64; 240]` — the §4.3.7 full-overlap window.
+* `mdct_window(overlap) -> Vec<f64>` — the §4.3.7 "low-overlap" rising
+  ramp for an arbitrary even `overlap`, built by evaluating the same
+  shape with `L = overlap`. This expresses the RFC's "zero-pad the
+  basic window and insert ones in the middle" construction as a
+  per-overlap ramp: the consumer applies the ramp to the leading
+  `overlap` samples (and its time-reverse to the trailing `overlap`),
+  with the `2N - 2*overlap` centre samples at unity.
+* `celt_overlap_window() -> [f64; 120]` — the fixed CELT overlap at
+  48 kHz (the 2.5 ms look-ahead "fixed by the decoder", RFC 6716 §1).
+* `BASIC_WINDOW_LEN = 240` / `CELT_OVERLAP_48K = 120` constants and
+  `MdctWindowError::{PositionOutOfRange, ZeroLength, OddOverlap}`.
+
+Eighteen new unit tests (1009 lib tests total, up from 991 at
+round-46 close; 20 integration tests unchanged) pin the inner-squared
+formula spot-check, the `[0, 1]` bound, the monotone-increasing ramp,
+power complementarity on the basic window and on overlaps `2/4/16/120/
+240`, the half-power centre pair, the endpoint shape, the
+`mdct_window` ↔ `window_tap` and `celt_overlap_window` ↔
+`mdct_window(120)` parities, and every error path.
+
+The §4.3.7 inverse MDCT transform proper ("no special
+characteristics … `2*N` time-domain samples, while scaling by 1/2")
+and the weighted overlap-add that consumes this ramp remain deferred
+to the §4.3.7 consumer site.
+
+Source: RFC 6716 §4.3.7 (p. 121) and the §1 fixed-overlap statement
+(p. 10) — held in-repo at `docs/audio/opus/rfc6716-opus.txt`. No
+external library source was consulted; the window equation is stated
+directly in the standards-track text.
 
 ## Round 45 — §4.3.2.1 per-LM inter-mode (alpha, beta) prediction coefficients (2026-06-12)
 

@@ -679,6 +679,7 @@ pub mod celt_e_prob_model;
 pub mod celt_fine_energy;
 pub mod celt_header;
 pub mod celt_log2_frac_table;
+pub mod celt_mdct_window;
 pub mod celt_pvq_decode;
 pub mod celt_pvq_v;
 pub mod celt_redundancy;
@@ -755,6 +756,10 @@ pub use celt_header::{CeltHeaderPrefix, CeltPostFilter};
 pub use celt_log2_frac_table::{
     log2_frac, log2_frac_row, Log2FracError, LOG2_FRAC_TABLE, LOG2_FRAC_TABLE_LEN,
     Q3_BITS_PER_WHOLE_BIT,
+};
+pub use celt_mdct_window::{
+    basic_window, celt_overlap_window, mdct_window, window_tap, MdctWindowError, BASIC_WINDOW_LEN,
+    CELT_OVERLAP_48K,
 };
 pub use celt_pvq_decode::{
     decode_pvq_vector, decode_pvq_vector_into, pvq_l1_norm, pvq_l2_norm_squared, PvqDecodeError,

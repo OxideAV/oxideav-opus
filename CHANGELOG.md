@@ -6,6 +6,35 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 47 (2026-06-14):** §4.3.7 inverse-MDCT overlap
+  window (`celt_mdct_window`). RFC 6716 §4.3.7 (p. 121) states the
+  basic full-overlap 240-sample Vorbis-derived window directly:
+  `W(n) = sin( (pi/2) * sin( (pi/2) * (n + 1/2) / L )^2 )` (the `2`
+  superscript squares the *inner* sine — the only nesting that
+  satisfies the §4.3.7 power-complementarity / Princen-Bradley
+  requirement `W(n)^2 + W(L-1-n)^2 = 1`, which the module proves
+  algebraically and pins in tests). New surface: `window_tap(n, len)`
+  (the amplitude tap for window length `L = len`), `basic_window()`
+  (the 240-tap full-overlap window), `mdct_window(overlap)` (the
+  §4.3.7 "low-overlap" ramp for an arbitrary even overlap, built by
+  evaluating the same shape with `L = overlap` — the "zero-pad +
+  insert ones in the middle" construction expressed as a per-overlap
+  rising ramp), `celt_overlap_window()` (the fixed CELT 120-sample
+  overlap at 48 kHz — the 2.5 ms look-ahead "fixed by the decoder",
+  RFC 6716 §1), constants `BASIC_WINDOW_LEN = 240` /
+  `CELT_OVERLAP_48K = 120`, and `MdctWindowError::{PositionOutOfRange,
+  ZeroLength, OddOverlap}`. Eighteen new unit tests (1009 lib tests,
+  up from 991; 20 integration unchanged): the formula spot-check,
+  unit-interval bound, monotone-increasing ramp, power complementarity
+  on both the basic window and arbitrary overlaps, the half-power
+  centre pair, endpoint shape, `mdct_window` ↔ `window_tap` parity,
+  the `celt_overlap_window` ↔ `mdct_window(120)` parity, and every
+  error path. The inverse MDCT itself and the weighted overlap-add
+  that consumes this ramp run at the §4.3.7 consumer site.
+  Provenance: §4.3.7 window equation + low-overlap narrative + §1
+  fixed-overlap statement, all in the staged
+  `docs/audio/opus/rfc6716-opus.txt`; no reference source consulted.
+
 * **Clean-room round 46 (2026-06-13):** public two-step range-coder
   symbol API `RangeDecoder::ec_decode(ft) -> fs` and
   `RangeDecoder::ec_dec_update(fl, fh, ft)` per RFC 6716 §4.1.2,
