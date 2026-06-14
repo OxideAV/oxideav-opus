@@ -764,7 +764,8 @@ pub use celt_mdct_window::{
     CELT_OVERLAP_48K,
 };
 pub use celt_pvq_decode::{
-    decode_pvq_vector, decode_pvq_vector_into, pvq_l1_norm, pvq_l2_norm_squared, PvqDecodeError,
+    decode_pvq_shape, decode_pvq_shape_into, decode_pvq_vector, decode_pvq_vector_into,
+    pvq_l1_norm, pvq_l2_norm_squared, pvq_unit_normalize, PvqDecodeError, PvqShapeError,
     PVQ_DECODE_K_MAX, PVQ_DECODE_N_MAX,
 };
 pub use celt_pvq_v::{pvq_codebook_size, PvqVError, PVQ_V_K_MAX, PVQ_V_MAX, PVQ_V_N_MAX};

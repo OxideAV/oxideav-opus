@@ -6,6 +6,28 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 49 (2026-06-15):** §4.3.4.2 PVQ *shape* read path
+  (`celt_pvq_decode`). Composes the three steps RFC 6716 §4.3.4.2
+  (p. 116–117) states in sequence: the up-front
+  `i = ec_dec_uint(V(N, K))` codeword-index read
+  (`RangeDecoder::dec_uint`), the round-43 five-step index-to-vector
+  walk, and the final normalization — "The decoded vector X is then
+  normalized such that its L2-norm equals one." New surface:
+  `pvq_unit_normalize(&[i32], &mut [f64])` (the unit-L2 scaling, with
+  the `K = 0` no-direction case left all-zeros); `decode_pvq_shape(rd,
+  n, k) -> Vec<f64>` and `decode_pvq_shape_into(rd, n, k, &mut [f64])`
+  (the full read path returning the unit-norm `f64` shape the §4.3.4.3
+  spreading rotation operates on and §4.3.6 denormalization later
+  scales by the band energy); and `PvqShapeError::{CodebookSize,
+  RangeDecoder, PulseVector, OutputBufferTooSmall}` with `From<PvqVError>`
+  / `From<PvqDecodeError>`. Fourteen new unit tests (1038 lib tests, up
+  from 1024; 20 integration unchanged): the unit-L2 norm over every
+  codeword of `(N, K) ∈ 1..=6 × 1..=6`, direction preservation,
+  single-pulse ±1, the zero-vector carve-out, the buffer paths;
+  `decode_pvq_shape` ↔ `decode_pvq_vector` + `pvq_unit_normalize`
+  consistency from fixed buffers, the `_into` parity, the `K = 0`
+  no-bit-consumption edge, `N = 1` signed-unit, codebook-size error
+  propagation, and the error conversions/`Display`.
 * **Clean-room round 48 (2026-06-14):** §4.3.7.2 de-emphasis filter
   (`celt_deemphasis`). The final stage of the CELT decode pipeline,
   applied after the inverse MDCT + overlap-add (§4.3.7) and the

@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-14 (clean-room round 48)
+## Status — 2026-06-15 (clean-room round 49)
 
 **Packet header + §3.2 frame-packing parser + RFC 6716 Appendix B
 self-delimiting framing (`parse_self_delimited` — Figures 25..29 for
@@ -181,9 +181,10 @@ n_bins, lm) -> u32` applying the §4.3.3
 1/8-bit units + `StaticAllocError::{BandOutOfRange, QualityOutOfRange,
 ChannelsOutOfRange, LmOutOfRange}` caller-side bookkeeping errors);
 the §4.3.2.1 Laplace decoder itself + 2-D `(time, frequency)` predictor
-+ §4.3.3 1/64-step interpolated search over Table 57 + §4.3.4 PVQ
-shape + band loop + the §4.3.7 inverse MDCT transform proper and its
-weighted overlap-add still deferred.
++ §4.3.3 1/64-step interpolated search over Table 57 + the §4.3.4 band
+loop + the §4.3.7 inverse MDCT transform proper and its weighted
+overlap-add still deferred (the §4.3.4.2 PVQ shape read path landed in
+round 49).
 
 Round 41 adds the §4.3.4.2 *PVQ codebook-size function*
 (`celt_pvq_v::pvq_codebook_size(n, k) -> Result<u32, PvqVError>`)
@@ -247,6 +248,75 @@ of the RFC 6716 Appendix A normative reference code, which is embedded
 in the staged RFC text itself (§A.1 extraction procedure, SHA-1
 verified; §A.2: "it is the code in this document that shall remain
 normative").
+
+## Round 49 — §4.3.4.2 PVQ shape read path (2026-06-15)
+
+Round 49 lands the RFC 6716 §4.3.4.2 *PVQ shape* read path
+(`celt_pvq_decode`), composing the three steps the standards-track text
+states in sequence (§4.3.4.2, p. 116–117) into a single call from the
+range decoder to the band's normalized float "shape":
+
+1. `i = ec_dec_uint(V(N, K))` — the uniformly-distributed codeword
+   index, read with the round-3 [`RangeDecoder::dec_uint`] on the
+   round-41 `V(N, K)` codebook size.
+2. The round-43 five-step index-to-vector walk
+   (`decode_pvq_vector_into`), producing the integer pulse vector `X`
+   with `sum |X[j]| == K`.
+3. The §4.3.4.2 final normalization: *"The decoded vector X is then
+   normalized such that its L2-norm equals one."*
+
+This closes the round-43 deferral of the unit-L2 normalization (then
+left to the consumer site because it depends on the float scaling) and
+the round-43 deferral of the up-front `ec_dec_uint(V(N, K))` index read
+(then noted as the wiring of [`RangeDecoder::dec_uint`] to the decode).
+The result is exactly the vector the §4.3.4.3 spreading rotation
+(`celt_spreading`) operates on — its RFC prose opens *"The normalized
+vector decoded in Section 4.3.4.2 is then rotated…"* — and the vector
+§4.3.6 denormalization later multiplies by the square root of the
+decoded band energy.
+
+New public surface (`celt_pvq_decode`):
+
+* `pvq_unit_normalize(&[i32], &mut [f64]) -> Result<(), PvqShapeError>`
+  — the §4.3.4.2 unit-L2 scaling `out[j] = X[j] / sqrt(sum X[j]**2)`.
+  The `K = 0` all-zero codeword has no defined direction, so it is left
+  all-zeros (a band that carries no shape); every `K > 0` codeword
+  yields `sum out[j]**2 == 1` to float precision.
+* `decode_pvq_shape(rd, n, k) -> Result<Vec<f64>, PvqShapeError>` — the
+  full read path; returns the unit-norm `f64` shape of length `N`.
+* `decode_pvq_shape_into(rd, n, k, &mut [f64]) -> Result<usize,
+  PvqShapeError>` — the same into a caller buffer of length `≥ N`.
+* `PvqShapeError::{CodebookSize, RangeDecoder, PulseVector,
+  OutputBufferTooSmall}` with `From<PvqVError>` / `From<PvqDecodeError>`
+  (the latter flattening a codebook-size sub-error so the variant set
+  stays orthogonal).
+
+Fourteen new unit tests (1038 lib tests total, up from 1024 at round-48
+close; 20 integration tests unchanged) pin: the unit-L2 norm over every
+codeword of `(N, K) ∈ 1..=6 × 1..=6`, exact direction preservation
+(`(3,0,-4) → (0.6, 0, -0.8)`), single-pulse ±1, the zero-vector
+carve-out, and the normalize buffer paths (short rejection, over-long
+tail preserved); the full-path `decode_pvq_shape` ↔ `decode_pvq_vector`
++ `pvq_unit_normalize` consistency from fixed range-decoder buffers, the
+`_into` ↔ allocating parity, the `K = 0` all-zero + no-bit-consumption
+edge (`dec_uint(1)` reads nothing), the `N = 1` signed-unit shape,
+codebook-size error propagation, and every error conversion / `Display`.
+
+What's deferred at the §4.3.4 consumer site: the §4.3.4.1
+*Bits-to-Pulses* search that supplies `K` from the §4.3.3 allocation —
+still a **docs gap** (the precomputed pulse-cache layout that selects
+the permitted-`K` set per `(band, LM)` lives in `rate.c`'s
+`compute_pulse_cache()`, which the RFC names but does not embed; the
+`docs/audio/opus/tables/cache-bits50.csv` / `cache-index50.csv` values
+are staged but no trace describes the run layout, per-entry bits units,
+or the `(band, LM) → run` index calculation, and the allocation must be
+recovered bit-exactly), and the §4.3.4 band loop that feeds each band's
+`(N, K)` through this shape decode then the spreading rotation.
+
+Source: RFC 6716 §4.3.4.2 (p. 116–117) — held in-repo at
+`docs/audio/opus/rfc6716-opus.txt`. No external library source was
+consulted; the index read, the index-to-vector walk, and the unit-L2
+normalization are all stated directly in the standards-track text.
 
 ## Round 48 — §4.3.7.2 de-emphasis filter (2026-06-14)
 

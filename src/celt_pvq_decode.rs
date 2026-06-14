@@ -37,15 +37,19 @@
 //! `V(N, K)`-counting only — no probability model, no range-coder
 //! interaction beyond the single up-front `ec_dec_uint(V(N, K))` read.
 //!
-//! This module owns the **integer pulse vector** half: the `X[j] ∈ Z`
-//! magnitudes-and-signs reconstruction. The §4.3.4.2 final
-//! "normalize such that the L2-norm equals one" step is a
-//! floating-point operation that depends on the band's energy scaling
-//! and runs at the §4.3.4 consumer site; this module returns the
-//! integer pulse vector that feeds it and exposes
-//! [`pvq_l1_norm`] / [`pvq_l2_norm_squared`] so a caller (and these
-//! tests) can assert the `L1 = K` invariant that every conforming
-//! codeword satisfies.
+//! This module owns the full §4.3.4.2 *shape* read path. The
+//! integer-pulse-vector half ([`decode_pvq_vector`] /
+//! [`decode_pvq_vector_into`]) reconstructs the `X[j] ∈ Z`
+//! magnitudes-and-signs; the §4.3.4.2 final "normalize such that the
+//! L2-norm equals one" step ([`pvq_unit_normalize`]) scales it to the
+//! unit-L2 `f64` shape; and [`decode_pvq_shape`] /
+//! [`decode_pvq_shape_into`] compose the up-front
+//! `ec_dec_uint(V(N, K))` index read with both. The
+//! [`pvq_l1_norm`] / [`pvq_l2_norm_squared`] helpers expose the
+//! `L1 = K` / `L2² = 1` invariants every conforming codeword satisfies.
+//! The §4.3.4.3 spreading rotation operates on the normalized shape
+//! this module returns; §4.3.6 denormalization later multiplies it by
+//! the square root of the decoded band energy.
 //!
 //! ## Provenance
 //!
@@ -248,6 +252,194 @@ pub fn pvq_l1_norm(x: &[i32]) -> u64 {
 /// floating-point division/sqrt is intentionally left to the caller.
 pub fn pvq_l2_norm_squared(x: &[i32]) -> u64 {
     x.iter().map(|&v| (v as i64 * v as i64) as u64).sum()
+}
+
+/// Normalizes an integer pulse vector to unit L2 norm, writing the
+/// `f64` result into `out`.
+///
+/// This is the §4.3.4.2 final step ("The decoded vector X is then
+/// normalized such that its L2-norm equals one", RFC 6716 §4.3.4.2,
+/// p. 117): each coordinate is scaled by `1 / sqrt(sum X[j]**2)`.
+///
+/// `out.len()` must equal `x.len()`. The all-zero pulse vector (the
+/// `K = 0` codeword) has no defined direction; the RFC's shape
+/// normalization only applies to bands that received pulses, so a
+/// zero vector is left as all-zeros (the consumer's denormalization in
+/// §4.3.6 multiplies by the band energy, and a `K = 0` band carries no
+/// shape). The returned vector then satisfies `sum out[j]**2 == 1`
+/// (to floating-point precision) whenever `K > 0`.
+///
+/// # Errors
+///
+/// * [`PvqShapeError::OutputBufferTooSmall`] if `out.len() < x.len()`.
+pub fn pvq_unit_normalize(x: &[i32], out: &mut [f64]) -> Result<(), PvqShapeError> {
+    if out.len() < x.len() {
+        return Err(PvqShapeError::OutputBufferTooSmall {
+            required: x.len(),
+            provided: out.len(),
+        });
+    }
+    let norm_sq = pvq_l2_norm_squared(x);
+    if norm_sq == 0 {
+        for slot in out.iter_mut().take(x.len()) {
+            *slot = 0.0;
+        }
+        return Ok(());
+    }
+    let inv_norm = 1.0 / (norm_sq as f64).sqrt();
+    for (slot, &v) in out.iter_mut().zip(x.iter()) {
+        *slot = v as f64 * inv_norm;
+    }
+    Ok(())
+}
+
+/// Errors returnable by [`decode_pvq_shape`] / [`decode_pvq_shape_into`]
+/// and [`pvq_unit_normalize`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PvqShapeError {
+    /// `V(N, K)` could not be evaluated (e.g. `N > PVQ_V_N_MAX`,
+    /// `K > PVQ_V_K_MAX`, or the size overflows the §4.1.5
+    /// `ec_dec_uint` range). Wraps the underlying [`PvqVError`].
+    CodebookSize(PvqVError),
+    /// The range decoder reported an error while reading the §4.1.5
+    /// `ec_dec_uint(V(N, K))` index (e.g. an out-of-range raw read on a
+    /// truncated frame). Wraps the crate [`crate::Error`].
+    RangeDecoder(crate::Error),
+    /// The integer pulse-vector decode rejected the recovered index
+    /// (a stream-impossibility cross-check; see [`PvqDecodeError`]).
+    PulseVector(PvqDecodeError),
+    /// The caller-supplied output buffer is shorter than `N`.
+    OutputBufferTooSmall {
+        /// The required length (`N`).
+        required: usize,
+        /// The length the caller provided.
+        provided: usize,
+    },
+}
+
+impl core::fmt::Display for PvqShapeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            PvqShapeError::CodebookSize(e) => {
+                write!(f, "oxideav-opus: PVQ shape decode codebook-size error: {e}")
+            }
+            PvqShapeError::RangeDecoder(e) => write!(
+                f,
+                "oxideav-opus: PVQ shape decode range-decoder error reading \
+                 ec_dec_uint(V(N, K)): {e}"
+            ),
+            PvqShapeError::PulseVector(e) => {
+                write!(f, "oxideav-opus: PVQ shape decode pulse-vector error: {e}")
+            }
+            PvqShapeError::OutputBufferTooSmall { required, provided } => write!(
+                f,
+                "oxideav-opus: PVQ shape decode output buffer too small: \
+                 required={required}, provided={provided}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PvqShapeError {}
+
+impl From<PvqVError> for PvqShapeError {
+    fn from(e: PvqVError) -> Self {
+        PvqShapeError::CodebookSize(e)
+    }
+}
+
+impl From<PvqDecodeError> for PvqShapeError {
+    fn from(e: PvqDecodeError) -> Self {
+        match e {
+            PvqDecodeError::CodebookSize(v) => PvqShapeError::CodebookSize(v),
+            other => PvqShapeError::PulseVector(other),
+        }
+    }
+}
+
+/// Decodes a complete §4.3.4.2 PVQ *shape* vector from the range
+/// decoder: reads the codeword index, recovers the integer pulse
+/// vector, and normalizes it to unit L2 norm.
+///
+/// This is the full §4.3.4.2 read path, composing three steps that the
+/// RFC states in sequence (p. 116–117):
+///
+/// 1. `i = ec_dec_uint(V(N, K))` — the uniformly-distributed codeword
+///    index, read with [`crate::RangeDecoder::dec_uint`].
+/// 2. The five-step index-to-vector walk ([`decode_pvq_vector_into`]),
+///    producing the integer pulse vector `X` with `sum |X[j]| == K`.
+/// 3. The unit-L2 normalization ([`pvq_unit_normalize`]): "The decoded
+///    vector X is then normalized such that its L2-norm equals one."
+///
+/// The result is the band's normalized *shape*; the §4.3.4.3 spreading
+/// rotation ([`crate::celt_spreading`]) operates on exactly this
+/// vector, and §4.3.6 denormalization later multiplies it by the
+/// square root of the decoded band energy.
+///
+/// Returns the unit-norm `Vec<f64>` of length `N`. For `K = 0` (no
+/// pulses) the returned vector is all-zeros — a band with no shape.
+///
+/// # Errors
+///
+/// * [`PvqShapeError::CodebookSize`] if `V(N, K)` cannot be evaluated.
+/// * [`PvqShapeError::RangeDecoder`] if the `ec_dec_uint` read fails.
+/// * [`PvqShapeError::PulseVector`] if the recovered index is rejected
+///   by the integer decode (stream impossibility).
+pub fn decode_pvq_shape(
+    rd: &mut crate::RangeDecoder<'_>,
+    n: u32,
+    k: u32,
+) -> Result<Vec<f64>, PvqShapeError> {
+    let mut out = vec![0.0f64; n as usize];
+    decode_pvq_shape_into(rd, n, k, &mut out)?;
+    Ok(out)
+}
+
+/// Decodes a §4.3.4.2 PVQ shape vector into a caller-supplied `f64`
+/// buffer, filling `out[0..N]` with the unit-L2-normalized shape.
+///
+/// Behaves exactly like [`decode_pvq_shape`] but writes into `out`
+/// (whose length must be at least `N`) instead of allocating. Returns
+/// the number of coordinates written (`N`).
+///
+/// # Errors
+///
+/// In addition to the [`decode_pvq_shape`] errors:
+///
+/// * [`PvqShapeError::OutputBufferTooSmall`] if `out.len() < N`.
+pub fn decode_pvq_shape_into(
+    rd: &mut crate::RangeDecoder<'_>,
+    n: u32,
+    k: u32,
+    out: &mut [f64],
+) -> Result<usize, PvqShapeError> {
+    let n_usize = n as usize;
+    if out.len() < n_usize {
+        return Err(PvqShapeError::OutputBufferTooSmall {
+            required: n_usize,
+            provided: out.len(),
+        });
+    }
+
+    // Step 1: the codebook size both bounds the index and validates
+    // (N, K) against the §4.1.5 ec_dec_uint range. Evaluating it up
+    // front lets the dec_uint(V) read happen on a known-valid `ft`.
+    let codebook_size = pvq_codebook_size(n, k)?;
+
+    // §4.1.5 `ec_dec_uint(ft)` with ft = V(N, K). `dec_uint` returns 0
+    // for ft <= 1 (the V(N, 0) = 1 and the empty-codeword edges), which
+    // is the only valid index in those degenerate codebooks.
+    let index = rd
+        .dec_uint(codebook_size)
+        .map_err(PvqShapeError::RangeDecoder)?;
+
+    // Step 2: recover the integer pulse vector into a scratch buffer.
+    let mut pulses = vec![0i32; n_usize];
+    decode_pvq_vector_into(n, k, index, &mut pulses)?;
+
+    // Step 3: unit-L2 normalization into the caller's f64 buffer.
+    pvq_unit_normalize(&pulses, out)?;
+    Ok(n_usize)
 }
 
 /// Caller-side bookkeeping bound on `N` mirrored from
@@ -657,5 +849,267 @@ mod tests {
             e,
             PvqDecodeError::CodebookSize(PvqVError::NOutOfRange { .. })
         ));
+    }
+
+    // ---- §4.3.4.2 unit-L2 normalization ------------------------------------
+    //
+    // "The decoded vector X is then normalized such that its L2-norm
+    // equals one." (RFC 6716 §4.3.4.2, p. 117).
+
+    use crate::RangeDecoder;
+
+    fn approx_eq(a: f64, b: f64, eps: f64) -> bool {
+        (a - b).abs() <= eps
+    }
+
+    #[test]
+    fn unit_normalize_produces_unit_l2_norm() {
+        // For every non-zero pulse vector, the normalized vector has
+        // L2 norm exactly one (to float precision).
+        for n in 1..=6u32 {
+            for k in 1..=6u32 {
+                let v = pvq_codebook_size(n, k).unwrap();
+                for index in 0..v {
+                    let x = decode_pvq_vector(n, k, index).unwrap();
+                    let mut out = vec![0.0f64; n as usize];
+                    pvq_unit_normalize(&x, &mut out).unwrap();
+                    let norm_sq: f64 = out.iter().map(|&c| c * c).sum();
+                    assert!(
+                        approx_eq(norm_sq, 1.0, 1e-12),
+                        "‖shape‖² = {norm_sq} at (N={n}, K={k}, i={index})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unit_normalize_preserves_direction() {
+        // Each normalized coordinate equals the integer coordinate
+        // divided by the L2 norm — direction is preserved exactly.
+        let x = [3i32, 0, -4];
+        let mut out = [0.0f64; 3];
+        pvq_unit_normalize(&x, &mut out).unwrap();
+        // ‖(3,0,-4)‖ = 5.
+        assert!(approx_eq(out[0], 0.6, 1e-15));
+        assert!(approx_eq(out[1], 0.0, 1e-15));
+        assert!(approx_eq(out[2], -0.8, 1e-15));
+    }
+
+    #[test]
+    fn unit_normalize_single_pulse_is_signed_unit() {
+        // A single +K (or -K) pulse normalizes to ±1 in that slot.
+        let x = [0i32, 5, 0];
+        let mut out = [0.0f64; 3];
+        pvq_unit_normalize(&x, &mut out).unwrap();
+        assert!(approx_eq(out[0], 0.0, 1e-15));
+        assert!(approx_eq(out[1], 1.0, 1e-15));
+        assert!(approx_eq(out[2], 0.0, 1e-15));
+
+        let xn = [0i32, -2];
+        let mut outn = [0.0f64; 2];
+        pvq_unit_normalize(&xn, &mut outn).unwrap();
+        assert!(approx_eq(outn[1], -1.0, 1e-15));
+    }
+
+    #[test]
+    fn unit_normalize_zero_vector_stays_zero() {
+        // The K = 0 codeword has no defined direction; left all-zeros.
+        let x = [0i32, 0, 0];
+        let mut out = [9.0f64; 3];
+        pvq_unit_normalize(&x, &mut out).unwrap();
+        assert_eq!(out, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn unit_normalize_rejects_short_buffer() {
+        let x = [1i32, 1, 1];
+        let mut out = [0.0f64; 2];
+        let r = pvq_unit_normalize(&x, &mut out);
+        assert_eq!(
+            r,
+            Err(PvqShapeError::OutputBufferTooSmall {
+                required: 3,
+                provided: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn unit_normalize_over_long_buffer_leaves_tail() {
+        let x = [3i32, -4];
+        let mut out = [7.0f64; 4];
+        pvq_unit_normalize(&x, &mut out).unwrap();
+        assert!(approx_eq(out[0], 0.6, 1e-15));
+        assert!(approx_eq(out[1], -0.8, 1e-15));
+        // Trailing slots untouched.
+        assert_eq!(out[2], 7.0);
+        assert_eq!(out[3], 7.0);
+    }
+
+    // ---- §4.3.4.2 full shape read path -------------------------------------
+    //
+    // decode_pvq_shape reads i = ec_dec_uint(V(N, K)), recovers the
+    // pulse vector, and normalizes. With no range *encoder* available,
+    // the strongest available property is internal consistency:
+    // decode_pvq_shape from a fixed buffer must equal
+    // decode_pvq_vector(<the index dec_uint yielded>) + normalize. We
+    // recover that index by reading dec_uint(V) from an identical
+    // decoder, then cross-check.
+
+    #[test]
+    fn shape_matches_vector_then_normalize() {
+        let buf = [0x9Au8, 0x3C, 0x71, 0x05, 0xE2, 0x4D, 0xB8, 0x16];
+        for n in 1..=6u32 {
+            for k in 1..=6u32 {
+                let v = pvq_codebook_size(n, k).unwrap();
+
+                // Recover the index a fresh decoder would yield.
+                let mut probe = RangeDecoder::new(&buf);
+                let index = probe.dec_uint(v).unwrap();
+                assert!(index < v, "probe index in range at (N={n}, K={k})");
+
+                let pulses = decode_pvq_vector(n, k, index).unwrap();
+                let mut expected = vec![0.0f64; n as usize];
+                pvq_unit_normalize(&pulses, &mut expected).unwrap();
+
+                // The real path from an identical decoder.
+                let mut rd = RangeDecoder::new(&buf);
+                let shape = decode_pvq_shape(&mut rd, n, k).unwrap();
+                assert_eq!(shape.len(), n as usize);
+                for (a, b) in shape.iter().zip(expected.iter()) {
+                    assert!(
+                        approx_eq(*a, *b, 1e-15),
+                        "shape mismatch at (N={n}, K={k}): {shape:?} vs {expected:?}"
+                    );
+                }
+                // And it has unit norm.
+                let norm_sq: f64 = shape.iter().map(|&c| c * c).sum();
+                assert!(approx_eq(norm_sq, 1.0, 1e-12));
+            }
+        }
+    }
+
+    #[test]
+    fn shape_into_matches_allocating_variant() {
+        let buf = [0x42u8, 0xF1, 0x08, 0xAC, 0x55, 0x9D];
+        for n in 1..=5u32 {
+            for k in 1..=5u32 {
+                let mut rd_a = RangeDecoder::new(&buf);
+                let owned = decode_pvq_shape(&mut rd_a, n, k).unwrap();
+
+                let mut rd_b = RangeDecoder::new(&buf);
+                let mut buf_out = vec![0.0f64; n as usize + 2];
+                let written = decode_pvq_shape_into(&mut rd_b, n, k, &mut buf_out).unwrap();
+                assert_eq!(written, n as usize);
+                assert_eq!(&buf_out[..n as usize], owned.as_slice());
+                // Trailing slots untouched.
+                assert_eq!(&buf_out[n as usize..], &[0.0, 0.0]);
+            }
+        }
+    }
+
+    #[test]
+    fn shape_k_zero_is_all_zero_and_consumes_nothing() {
+        // V(N, 0) = 1 ⇒ dec_uint(1) returns 0 without consuming bits;
+        // the shape is the all-zero vector.
+        let buf = [0xABu8, 0xCD, 0xEF, 0x12];
+        for n in 1..=6u32 {
+            let mut rd = RangeDecoder::new(&buf);
+            let tell_before = rd.tell();
+            let shape = decode_pvq_shape(&mut rd, n, 0).unwrap();
+            assert_eq!(shape, vec![0.0f64; n as usize]);
+            // dec_uint(1) consumes no range-coder bits.
+            assert_eq!(rd.tell(), tell_before);
+        }
+    }
+
+    #[test]
+    fn shape_rejects_short_output_buffer() {
+        let buf = [0x00u8, 0x11, 0x22];
+        let mut rd = RangeDecoder::new(&buf);
+        let mut out = [0.0f64; 2];
+        let r = decode_pvq_shape_into(&mut rd, 3, 2, &mut out);
+        assert_eq!(
+            r,
+            Err(PvqShapeError::OutputBufferTooSmall {
+                required: 3,
+                provided: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn shape_propagates_codebook_size_error() {
+        let buf = [0x00u8; 4];
+        let mut rd = RangeDecoder::new(&buf);
+        let r = decode_pvq_shape(&mut rd, PVQ_V_N_MAX + 1, 2);
+        match r {
+            Err(PvqShapeError::CodebookSize(PvqVError::NOutOfRange { .. })) => {}
+            other => panic!("expected CodebookSize(NOutOfRange), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shape_n_one_is_signed_unit() {
+        // N = 1, K ≥ 1: V(1, K) = 2, the codeword is ±K on the single
+        // coordinate, normalizing to ±1.
+        let buf = [0x80u8, 0x00, 0x00, 0x00];
+        let mut rd = RangeDecoder::new(&buf);
+        let shape = decode_pvq_shape(&mut rd, 1, 3).unwrap();
+        assert_eq!(shape.len(), 1);
+        assert!(approx_eq(shape[0].abs(), 1.0, 1e-15));
+    }
+
+    // ---- error plumbing for the shape path ---------------------------------
+
+    #[test]
+    fn shape_error_from_conversions() {
+        // PvqVError → PvqShapeError::CodebookSize.
+        let e: PvqShapeError = PvqVError::KOutOfRange {
+            provided: 99_999,
+            max: PVQ_V_K_MAX,
+        }
+        .into();
+        assert!(matches!(
+            e,
+            PvqShapeError::CodebookSize(PvqVError::KOutOfRange { .. })
+        ));
+
+        // PvqDecodeError::CodebookSize flattens to CodebookSize.
+        let flat: PvqShapeError =
+            PvqDecodeError::CodebookSize(PvqVError::OverflowsDecUintRange { n: 176, k: 176 })
+                .into();
+        assert!(matches!(
+            flat,
+            PvqShapeError::CodebookSize(PvqVError::OverflowsDecUintRange { .. })
+        ));
+
+        // A non-codebook PvqDecodeError maps to PulseVector.
+        let pv: PvqShapeError = PvqDecodeError::IndexOutOfRange {
+            index: 5,
+            codebook_size: 3,
+        }
+        .into();
+        assert!(matches!(pv, PvqShapeError::PulseVector(_)));
+    }
+
+    #[test]
+    fn shape_error_display_mentions_inputs() {
+        let small = PvqShapeError::OutputBufferTooSmall {
+            required: 9,
+            provided: 4,
+        };
+        let msg = format!("{small}");
+        assert!(msg.contains('9'));
+        assert!(msg.contains('4'));
+
+        let rd = PvqShapeError::RangeDecoder(crate::Error::MalformedPacket);
+        let msg = format!("{rd}");
+        assert!(msg.contains("ec_dec_uint"));
+
+        let cb = PvqShapeError::CodebookSize(PvqVError::OverflowsDecUintRange { n: 176, k: 176 });
+        let msg = format!("{cb}");
+        assert!(msg.contains("176"));
     }
 }
