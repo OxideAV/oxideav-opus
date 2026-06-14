@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-14 (clean-room round 47)
+## Status — 2026-06-14 (clean-room round 48)
 
 **Packet header + §3.2 frame-packing parser + RFC 6716 Appendix B
 self-delimiting framing (`parse_self_delimited` — Figures 25..29 for
@@ -247,6 +247,73 @@ of the RFC 6716 Appendix A normative reference code, which is embedded
 in the staged RFC text itself (§A.1 extraction procedure, SHA-1
 verified; §A.2: "it is the code in this document that shall remain
 normative").
+
+## Round 48 — §4.3.7.2 de-emphasis filter (2026-06-14)
+
+Round 48 lands the RFC 6716 §4.3.7.2 *de-emphasis filter*
+(`celt_deemphasis`) — the last stage of the CELT decode pipeline,
+applied after the §4.3.7 inverse MDCT + weighted overlap-add and the
+§4.3.7.1 pitch post-filter, just before the time-domain samples leave
+the decoder. RFC 6716 §4.3.7.2 (p. 122) specifies it as the inverse of
+the encoder's pre-emphasis filter:
+
+```text
+    1            1
+   ---- = ---------------
+   A(z)                -1
+          1 - alpha_p*z
+```
+
+with `alpha_p = 0.8500061035`. The encoder's pre-emphasis is the FIR
+`A(z) = 1 - alpha_p*z^-1` (`x(n) = s(n) - alpha_p*s(n-1)`); inverting
+that one pole gives the decoder-side one-pole IIR recurrence
+
+```text
+  y(n) = x(n) + alpha_p * y(n-1)
+```
+
+The pole `≈ 0.85` is just inside the unit circle (stable), and its
+single state element `y(n-1)` carries across frame boundaries — the
+recurrence is continuous over the whole decoded stream, reset only on a
+§4.5.2 CELT state reset. Each channel carries its own independent
+memory.
+
+New public surface (`celt_deemphasis`):
+
+* `DEEMPHASIS_ALPHA_P = 0.8500061035` — the §4.3.7.2 coefficient,
+  exactly the decimal the RFC prints.
+* `DeemphasisFilter` — a single-channel filter carrying the one-pole
+  memory: `new()` (zeroed), `with_memory(mem)` (seeded), `memory()`,
+  `reset()`, `step(x) -> y` (one-sample recurrence advancing state),
+  `process_in_place(&mut [f64])`, and `process(input, output) ->
+  Result<usize, DeemphasisError>` (state left unchanged on error).
+* `DeemphasisError::OutputBufferTooSmall`.
+
+Fifteen new unit tests (1024 lib tests total, up from 1009 at round-47
+close; 20 integration tests unchanged) pin the `alpha_p` constant and
+its stability bound, fresh-filter zero memory, first-sample
+pass-through, a hand-computed recurrence run, constant-input
+convergence to the DC gain `1/(1 - alpha_p)`, the
+**pre-emphasis-round-trip inverse property** (pre-emphasise then
+de-emphasise recovers the original signal to `1e-12`), memory carry
+across split blocks (two-block filtering == whole-stream filtering),
+`with_memory` seeding, `reset`, the `process_in_place` ↔ `step` parity,
+the output-buffer write path + over-long-buffer acceptance +
+short-buffer rejection (state unchanged on error), the empty-input
+no-op, and the error `Display`.
+
+The §4.3.7.1 pitch post-filter *response* (the §4.3.7.1
+`y(n) = x(n) + G*(g0*y(n-T) + ...)` filter that feeds this stage; the
+post-filter *parameters* land in `celt_header` at round 20) and the
+§4.3.7 inverse MDCT transform proper + weighted overlap-add (which
+consume the round-47 `celt_mdct_window` ramp) remain deferred to their
+consumer sites.
+
+Source: RFC 6716 §4.3.7.2 (p. 122) — held in-repo at
+`docs/audio/opus/rfc6716-opus.txt`. The recurrence is the textbook
+inverse of the stated one-pole transfer function. No external library
+source was consulted; the filter and its single coefficient are stated
+directly in the standards-track text.
 
 ## Round 47 — §4.3.7 inverse-MDCT overlap window (2026-06-14)
 

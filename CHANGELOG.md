@@ -6,6 +6,35 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 48 (2026-06-14):** §4.3.7.2 de-emphasis filter
+  (`celt_deemphasis`). The final stage of the CELT decode pipeline,
+  applied after the inverse MDCT + overlap-add (§4.3.7) and the
+  §4.3.7.1 pitch post-filter. RFC 6716 §4.3.7.2 (p. 122) states it as
+  the inverse of the encoder's pre-emphasis filter,
+  `1/A(z) = 1/(1 - alpha_p*z^-1)` with `alpha_p = 0.8500061035`;
+  inverting the one-pole transfer function gives the time-domain
+  recurrence `y(n) = x(n) + alpha_p*y(n-1)`. The single state element
+  carries across frame boundaries (the recurrence is continuous over
+  the whole stream, reset only on a §4.5.2 CELT state reset). New
+  surface: `DEEMPHASIS_ALPHA_P = 0.8500061035` constant;
+  `DeemphasisFilter` with `new()` / `with_memory(mem)` / `memory()` /
+  `reset()` / `step(x)` (one-sample recurrence) /
+  `process_in_place(&mut [f64])` / `process(input, output)`; and
+  `DeemphasisError::OutputBufferTooSmall`. Fifteen new unit tests
+  (1024 lib tests, up from 1009; 20 integration unchanged): the
+  `alpha_p` constant + stability bound, fresh-filter zero memory,
+  first-sample pass-through, hand-computed recurrence, constant-input
+  convergence to the DC gain `1/(1 - alpha_p)`, the
+  pre-emphasis-round-trip inverse property, memory carry across split
+  blocks, `with_memory` seeding, `reset`, the `process_in_place` ↔
+  `step` parity, output-buffer write + over-long acceptance +
+  short-buffer rejection (state unchanged on error), empty-input
+  no-op, and the error `Display`. Provenance: §4.3.7.2 transfer
+  function + `alpha_p` constant in the staged
+  `docs/audio/opus/rfc6716-opus.txt`; the recurrence is the textbook
+  inverse of the stated one-pole filter; no reference source
+  consulted.
+
 * **Clean-room round 47 (2026-06-14):** §4.3.7 inverse-MDCT overlap
   window (`celt_mdct_window`). RFC 6716 §4.3.7 (p. 121) states the
   basic full-overlap 240-sample Vorbis-derived window directly:
