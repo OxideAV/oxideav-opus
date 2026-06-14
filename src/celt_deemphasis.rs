@@ -204,7 +204,7 @@ mod tests {
     fn alpha_p_constant_matches_rfc() {
         assert_eq!(DEEMPHASIS_ALPHA_P, 0.850_006_103_5);
         // Just inside the unit circle ⇒ stable one-pole IIR.
-        assert!(DEEMPHASIS_ALPHA_P > 0.0 && DEEMPHASIS_ALPHA_P < 1.0);
+        const { assert!(DEEMPHASIS_ALPHA_P > 0.0 && DEEMPHASIS_ALPHA_P < 1.0) };
     }
 
     /// Fresh filter starts with zeroed memory.
