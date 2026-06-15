@@ -2,7 +2,7 @@
 
 Pure-Rust Opus audio codec (SILK + CELT).
 
-## Status — 2026-06-15 (clean-room round 49)
+## Status — 2026-06-15 (clean-room round 50)
 
 **Packet header + §3.2 frame-packing parser + RFC 6716 Appendix B
 self-delimiting framing (`parse_self_delimited` — Figures 25..29 for
@@ -248,6 +248,80 @@ of the RFC 6716 Appendix A normative reference code, which is embedded
 in the staged RFC text itself (§A.1 extraction procedure, SHA-1
 verified; §A.2: "it is the code in this document that shall remain
 normative").
+
+## Round 50 — §4.3.7.1 pitch post-filter response (2026-06-15)
+
+Round 50 lands the RFC 6716 §4.3.7.1 *post-filter response*
+(`celt_post_filter`) — the pitch comb filter the CELT decoder applies to
+the inverse-MDCT / overlap-add output (§4.3.7) just before the
+round-48 §4.3.7.2 de-emphasis. The §4.3.7.1 post-filter *parameters*
+(enable bit, octave, fine pitch, gain index, tapset) already landed in
+`celt_header` (round 20); this round owns their *application*.
+
+RFC 6716 §4.3.7.1 (p. 121) states the response as the five-tap symmetric
+comb
+
+```text
+  y(n) = x(n) + G*( g0*y(n-T) + g1*(y(n-T+1)+y(n-T-1))
+                              + g2*(y(n-T+2)+y(n-T-2)) )
+```
+
+a recursive filter over past *output* samples `y` (state = the trailing
+`T + 2` outputs, carried across frames, reset only on a §4.5.2 CELT
+state reset). The ASCII equation prints each pair term with a repeated
+index (`y(n-T+1)+y(n-T+1)`); the symmetric reading `y(n-T±1)` /
+`y(n-T±2)` is the only one consistent with the surrounding "g0, g1, g2"
+symmetric-tap-set prose, and the module documents that the literal
+repeated-index form would degenerate the comb into a non-symmetric
+single tap. The three tapsets, the gain map `G = 3*(gain_index+1)/32`,
+and the `T ∈ 15..=1022` pitch bound are exact facts from the text.
+
+New public surface (`celt_post_filter`):
+
+* `POST_FILTER_TAPS` (the three §4.3.7.1 `(g0, g1, g2)` tapsets),
+  `tapset_coefficients(tapset)`, `post_filter_gain(gain_index)`, and the
+  formula constants (`POST_FILTER_{MIN,MAX}_PERIOD`,
+  `POST_FILTER_GAIN_{NUMERATOR,DENOMINATOR}`, `POST_FILTER_TAPSET_COUNT`,
+  `POST_FILTER_GAIN_INDEX_MAX`).
+* `PostFilterCoeffs { period, a0, a1, a2 }` (gain folded into each tap),
+  built via `new(period, gain_index, tapset)` or `from_header(&CeltPostFilter)`.
+* `PostFilter` — a single-channel filter carrying the output history:
+  `new()` / `reset()` / `step(x, &coeffs)` / `process_in_place` /
+  `process` and the §4.3.7.1 gain-transition crossfade
+  `process_gain_transition(input, output, old, new, overlap)` that mixes
+  the two coefficient sets' comb responses with the squared
+  [`celt_mdct_window`] weights `(1-W(n)^2)` / `W(n)^2`, pushing the
+  *mixed* value into the shared feedback history per the §4.3.7.1
+  "interpolated one at a time … the past value of y(n) used is
+  interpolated" rule.
+* `crossfade_transition(old_out, new_out, out, overlap)` — the
+  non-recursive squared-window crossfade for callers that produced the
+  two branches separately.
+* `PostFilterError::{TapsetOutOfRange, PeriodOutOfRange,
+  GainIndexOutOfRange, OutputBufferTooSmall, TransitionLengthMismatch,
+  Window}` with `From<MdctWindowError>`.
+
+Twenty-six new unit tests (1064 lib tests total, up from 1038 at
+round-49 close; 20 integration tests unchanged) pin the tapset decimals
+and `g2 = 0` for tapsets 1/2, the gain formula + monotonicity, the
+gain-fold, the period bounds, header round-trip, fresh-history
+pass-through, a hand-expanded impulse response placing each tap at its
+exact lag, impulse-response symmetry about `T`, history carry across
+split blocks, the buffer paths, `reset`, the gain-transition endpoints +
+old==new identity + length checks, the standalone crossfade convexity,
+and every error `Display`.
+
+What's deferred at the §4.3.7 consumer site: the inverse MDCT transform
+proper + weighted overlap-add (which produce this filter's `x(n)` input
+and consume the round-47 `celt_mdct_window` ramp; the FFT layout defers
+to the staged twiddle/bitrev tables whose run mapping is not yet
+traced), and the exact transition-region length / placement the encoder
+chooses per §4.5 mode change.
+
+Source: RFC 6716 §4.3.7.1 (pp. 120–121) — held in-repo at
+`docs/audio/opus/rfc6716-opus.txt`. No external library source was
+consulted; the comb response, tapsets, gain map, and squared-window
+transition rule are stated directly in the standards-track text.
 
 ## Round 49 — §4.3.4.2 PVQ shape read path (2026-06-15)
 

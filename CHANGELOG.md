@@ -6,6 +6,41 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+* **Clean-room round 50 (2026-06-15):** §4.3.7.1 pitch *post-filter
+  response* (`celt_post_filter`). The pitch comb filter the CELT decoder
+  applies to the inverse-MDCT / overlap-add output (§4.3.7) just before
+  the round-48 §4.3.7.2 de-emphasis; the post-filter *parameters* landed
+  in `celt_header` at round 20, this round owns their *application*. RFC
+  6716 §4.3.7.1 (p. 121) states the five-tap symmetric comb response
+  `y(n) = x(n) + G*(g0*y(n-T) + g1*(y(n-T+1)+y(n-T-1)) +
+  g2*(y(n-T+2)+y(n-T-2)))` — recursive over past *output* samples (state
+  = the trailing `T + 2` outputs, carried across frames, reset only on a
+  §4.5.2 CELT state reset). The ASCII equation prints each pair term with
+  a repeated index; the symmetric `y(n-T±1)` / `y(n-T±2)` reading is the
+  only one consistent with the "g0, g1, g2" symmetric-tap-set prose, and
+  the module documents the slip. New surface: `POST_FILTER_TAPS` (the
+  three §4.3.7.1 `(g0, g1, g2)` tapsets) + `tapset_coefficients` +
+  `post_filter_gain` (`G = 3*(gain_index+1)/32`) + the formula constants;
+  `PostFilterCoeffs { period, a0, a1, a2 }` (gain folded into each tap)
+  via `new` / `from_header`; `PostFilter` carrying the output history
+  (`new` / `reset` / `step` / `process_in_place` / `process` /
+  `process_gain_transition` — the §4.3.7.1 squared-MDCT-window gain
+  crossfade pushing the mixed value into the shared feedback history per
+  "interpolated one at a time"); the standalone `crossfade_transition`;
+  and `PostFilterError::{TapsetOutOfRange, PeriodOutOfRange,
+  GainIndexOutOfRange, OutputBufferTooSmall, TransitionLengthMismatch,
+  Window}` with `From<MdctWindowError>`. Twenty-six new unit tests (1064
+  lib tests, up from 1038; 20 integration unchanged): the tapset decimals
+  + `g2 = 0` for tapsets 1/2, the gain formula + monotonicity, the
+  gain-fold, period bounds, header round-trip, fresh-history
+  pass-through, a hand-expanded impulse response placing each tap at its
+  exact lag, impulse-response symmetry about `T`, history carry across
+  split blocks, the buffer paths, `reset`, the gain-transition endpoints
+  + old==new identity + length checks, the standalone crossfade
+  convexity, and every error `Display`. Provenance: §4.3.7.1 comb
+  response, tapsets, gain map, and squared-window transition rule in the
+  staged `docs/audio/opus/rfc6716-opus.txt`; the squared window reuses
+  the round-47 `celt_mdct_window`; no external library source consulted.
 * **Clean-room round 49 (2026-06-15):** §4.3.4.2 PVQ *shape* read path
   (`celt_pvq_decode`). Composes the three steps RFC 6716 §4.3.4.2
   (p. 116–117) states in sequence: the up-front

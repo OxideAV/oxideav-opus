@@ -681,6 +681,7 @@ pub mod celt_fine_energy;
 pub mod celt_header;
 pub mod celt_log2_frac_table;
 pub mod celt_mdct_window;
+pub mod celt_post_filter;
 pub mod celt_pvq_decode;
 pub mod celt_pvq_v;
 pub mod celt_redundancy;
