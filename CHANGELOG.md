@@ -4,6 +4,18 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- §4.3.4.1 *Bits-to-Pulses* pulse-cost cache (`celt_pulse_cache`): the
+  105-entry band-major `(band, LM)` → offset `CACHE_INDEX50`, the
+  392-byte run-packed `CACHE_BITS50` cost curves (1/8-bit / Q3 units),
+  the `bits_to_pulses` budget-inversion scan, the run accessors
+  (`cache_run_offset` / `cache_max_pulses` / `cache_pulse_cost`), and
+  the eight-tuple sentinel closed-form signal (`PulseCacheError`). 17
+  unit tests: index/bits table lengths, 23-distinct-run packing closes
+  exactly 392 bytes, per-run monotone cost curves, sentinel routing,
+  exact-threshold and saturating inversion, budget monotonicity.
+
 ## [0.0.12](https://github.com/OxideAV/oxideav-opus/compare/v0.0.11...v0.0.12) - 2026-06-15
 
 ### Other

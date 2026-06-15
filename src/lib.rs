@@ -622,6 +622,21 @@
 //!   lattice point) and the §4.3.4.1 *Bits-to-Pulses* search both
 //!   consume this primitive; both run at the consumer site.
 //!
+//! * The §4.3.4.1 *Bits-to-Pulses* pulse-cost cache
+//!   ([`celt_pulse_cache`]: the 105-entry [`CACHE_INDEX50`] band-major
+//!   `(band, LM)` → offset map + the 392-byte run-packed
+//!   [`CACHE_BITS50`] cost curves, [`bits_to_pulses`]`(band, lm,
+//!   b_target) -> Result<u8, PulseCacheError>` returning the largest
+//!   pulse count whose 1/8-bit cost fits the per-band budget +
+//!   [`cache_run_offset`] / [`cache_max_pulses`] / [`cache_pulse_cost`]
+//!   run accessors + [`PulseCacheError::{BandOutOfRange, LmOutOfRange,
+//!   SentinelTuple, PulseCountOutOfRange}`]). Closes the cache half of
+//!   the §4.3.4 PVQ allocator: given the §4.3.3 per-band budget, the
+//!   §4.3.4.2 [`celt_pvq_v`] codebook-size function and this round's
+//!   bits-to-pulses inversion together select `K` before the
+//!   [`celt_pvq_decode`] shape decode. The closed-form path for the
+//!   eight sentinel `(band, LM)` tuples runs at the consumer site.
+//!
 //! The rest of the CELT layer is not yet wired up; the [`Decoder`]
 //! / [`Encoder`] entry points still return [`Error::NotImplemented`].
 
@@ -682,6 +697,7 @@ pub mod celt_header;
 pub mod celt_log2_frac_table;
 pub mod celt_mdct_window;
 pub mod celt_post_filter;
+pub mod celt_pulse_cache;
 pub mod celt_pvq_decode;
 pub mod celt_pvq_v;
 pub mod celt_redundancy;
@@ -763,6 +779,11 @@ pub use celt_log2_frac_table::{
 pub use celt_mdct_window::{
     basic_window, celt_overlap_window, mdct_window, window_tap, MdctWindowError, BASIC_WINDOW_LEN,
     CELT_OVERLAP_48K,
+};
+pub use celt_pulse_cache::{
+    bits_to_pulses, cache_flat_index, cache_max_pulses, cache_pulse_cost, cache_run_offset,
+    PulseCacheError, CACHE_BITS50, CACHE_BITS_LEN, CACHE_INDEX50, CACHE_INDEX_LEN,
+    CACHE_INDEX_SENTINEL, CACHE_LM_COUNT, CACHE_MAX_PULSES,
 };
 pub use celt_pvq_decode::{
     decode_pvq_shape, decode_pvq_shape_into, decode_pvq_vector, decode_pvq_vector_into,

@@ -50,11 +50,13 @@ LTP parameters (§4.2.7.6), LCG seed (§4.2.7.7), excitation
 pre-band header symbols (silence / post-filter / transient / intra),
 TF-resolution adjustment (§4.3.4.5), the coarse-energy Laplace
 parameter tables (§4.3.2.1), the allocation parameter surfaces
-(log2-frac / alloc-trim / cache-caps / static-allocation), and the
-§4.5 redundancy / mode-transition state-reset machinery. The
-allocation orchestration and the PVQ shape decode are partially
-landed; the inverse MDCT and de-emphasis output stage are the
-remaining decode milestones.
+(log2-frac / alloc-trim / cache-caps / static-allocation), the
+§4.3.4.1 *Bits-to-Pulses* pulse-cost cache (the run-packed
+`cache_bits50` / `cache_index50` lookup plus the budget-to-pulse-count
+inversion), and the §4.5 redundancy / mode-transition state-reset
+machinery. The allocation orchestration and the PVQ shape decode are
+partially landed; the inverse MDCT and de-emphasis output stage are
+the remaining decode milestones.
 
 ## Clean-room sources
 
