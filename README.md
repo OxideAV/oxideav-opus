@@ -53,10 +53,12 @@ parameter tables (§4.3.2.1), the allocation parameter surfaces
 (log2-frac / alloc-trim / cache-caps / static-allocation), the
 §4.3.4.1 *Bits-to-Pulses* pulse-cost cache (the run-packed
 `cache_bits50` / `cache_index50` lookup plus the budget-to-pulse-count
-inversion), and the §4.5 redundancy / mode-transition state-reset
-machinery. The allocation orchestration and the PVQ shape decode are
-partially landed; the inverse MDCT and de-emphasis output stage are
-the remaining decode milestones.
+inversion), the §4.3.6 band denormalisation (unit-norm PVQ shape ×
+`sqrt(2**log2_energy)`, laid out across the coded bands into the
+inverse-MDCT input buffer), and the §4.5 redundancy / mode-transition
+state-reset machinery. The allocation orchestration and the PVQ shape
+decode are partially landed; the §4.3.5 anti-collapse and the §4.3.7
+inverse MDCT are the remaining decode milestones.
 
 ## Clean-room sources
 

@@ -6,6 +6,20 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- §4.3.6 *Denormalisation* (`celt_denormalise`): the last CELT step
+  before the inverse MDCT. `denormalise_gain` converts a per-band
+  base-2-log energy `L` to the linear shape gain `sqrt(2**L) =
+  2**(L/2)`; `denormalise_band` multiplies one band's unit-L2-norm
+  PVQ shape by that gain in place; `denormalise_bands` walks the coded
+  bands (`0..21` CELT-only, `17..21` Hybrid) via the Table-55 layout
+  and lays each band's denormalised coefficients end-to-end into the
+  frequency-domain buffer the inverse MDCT consumes, returning the
+  coefficient count written. `DenormaliseError` covers band-range,
+  output-too-small, and shape/output length-mismatch. 11 unit tests:
+  gain vs independent `sqrt(2**L)`, energy-preservation
+  (`||g·shape||² = 2**L`), zero-shape passthrough, attenuating
+  negative `L`, full CELT-only and Hybrid buffer fills, and every
+  error path.
 - §4.3.4.1 *Bits-to-Pulses* pulse-cost cache (`celt_pulse_cache`): the
   105-entry band-major `(band, LM)` → offset `CACHE_INDEX50`, the
   392-byte run-packed `CACHE_BITS50` cost curves (1/8-bit / Q3 units),

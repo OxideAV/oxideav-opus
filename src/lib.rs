@@ -691,6 +691,7 @@ pub mod celt_band_layout;
 pub mod celt_band_thresh;
 pub mod celt_cache_caps50;
 pub mod celt_deemphasis;
+pub mod celt_denormalise;
 pub mod celt_e_prob_model;
 pub mod celt_fine_energy;
 pub mod celt_header;
@@ -764,6 +765,9 @@ pub use celt_cache_caps50::{
     CACHE_CAPS50_TOTAL_BYTES, INIT_CAPS_BIAS, INIT_CAPS_DIVISOR, INIT_CAPS_MAX_CHANNELS,
 };
 pub use celt_deemphasis::{DeemphasisError, DeemphasisFilter, DEEMPHASIS_ALPHA_P};
+pub use celt_denormalise::{
+    denormalise_band, denormalise_bands, denormalise_gain, DenormaliseError,
+};
 pub use celt_e_prob_model::{
     e_prob_pair, e_prob_row, energy_pred_coef, EProbModelError, EProbPair, EnergyPredCoef,
     EnergyPredictionMode, E_PROB_MODEL, E_PROB_MODEL_BYTES_PER_BAND, E_PROB_MODEL_BYTES_PER_ROW,
