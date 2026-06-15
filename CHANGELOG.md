@@ -4,6 +4,38 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-opus/compare/v0.0.11...v0.0.12) - 2026-06-15
+
+### Other
+
+- §4.3.7.1 pitch post-filter response (celt_post_filter)
+- §4.3.4.2 PVQ shape read path (index read + unit-L2 normalization)
+- fix clippy assertions-on-constants in celt_deemphasis test
+- §4.3.7.2 de-emphasis filter (round 48)
+- §4.3.7 inverse-MDCT overlap window (round 47)
+- §4.1.2 public two-step range-coder symbol API (ec_decode + ec_dec_update)
+- §4.3.2.1 per-LM inter-mode (alpha, beta) prediction coefficients (round 45)
+- §4.3.4.3 spreading rotation (round 44)
+- §4.3.4.2 PVQ index-to-vector decode (round 43)
+- clean-room round 42 — §4.3.2.2 fine-energy quantization
+- §4.3.4.2 PVQ codebook-size function V(N, K) (round 41)
+- §4.3.3 1/64-step interpolated allocation search (round 40)
+- §4.3.3 static allocation table (Table 57) (round 39)
+- §4.5.3 normative + recommended-non-normative transition table (round 38)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- RFC 6716 Appendix B self-delimiting framing (round 37)
+- §4.3.3 per-band allocation-trim offsets (round 36)
+- §4.3.3 per-band minimum-allocation vector (round 35)
+- §4.3.3 reservation block (round 34)
+- §4.3.3 band-boost decoder (round 33)
+- §4.3.3 allocation-trim Table-58 PDF + signalling gate (round 32)
+- §4.3.3 CACHE_CAPS50 per-band maximum-allocation parameter surface (round 31)
+- §4.3.3 LOG2_FRAC_TABLE intensity-stereo reservation parameter surface (round 30)
+- §4.3.2.1 CELT coarse-energy Laplace-model parameter surface (round 29)
+- §4.5.1.4 redundant-CELT-frame decode parameters + cross-lap placement (round 28)
+- §4.5.2 SILK + CELT state-reset policy across mode transitions (round 27)
+- §4.5.1 CELT redundancy / mode-transition side information (round 26)
+
 ### Added
 
 * **Clean-room round 50 (2026-06-15):** §4.3.7.1 pitch *post-filter
