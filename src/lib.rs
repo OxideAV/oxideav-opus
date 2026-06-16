@@ -695,6 +695,7 @@ pub mod celt_denormalise;
 pub mod celt_e_prob_model;
 pub mod celt_fine_energy;
 pub mod celt_header;
+pub mod celt_imdct;
 pub mod celt_log2_frac_table;
 pub mod celt_mdct_window;
 pub mod celt_post_filter;

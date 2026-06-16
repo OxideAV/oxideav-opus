@@ -55,10 +55,14 @@ parameter tables (§4.3.2.1), the allocation parameter surfaces
 `cache_bits50` / `cache_index50` lookup plus the budget-to-pulse-count
 inversion), the §4.3.6 band denormalisation (unit-norm PVQ shape ×
 `sqrt(2**log2_energy)`, laid out across the coded bands into the
-inverse-MDCT input buffer), and the §4.5 redundancy / mode-transition
+inverse-MDCT input buffer), the §4.3.7 inverse MDCT transform core (the
+`N` frequency-domain bins → `2N` time-domain samples mapping, scaled by
+`1/2`, with the §4.3.7 overlap-add window already landed at
+`celt_mdct_window`), and the §4.5 redundancy / mode-transition
 state-reset machinery. The allocation orchestration and the PVQ shape
 decode are partially landed; the §4.3.5 anti-collapse and the §4.3.7
-inverse MDCT are the remaining decode milestones.
+weighted overlap-add / post-filter wiring into a full CELT decode loop
+are the remaining decode milestones.
 
 ## Clean-room sources
 

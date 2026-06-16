@@ -6,6 +6,23 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- §4.3.7 *Inverse MDCT* transform core (`celt_imdct`): the CELT stage
+  between band denormalisation (§4.3.6) and the weighted overlap-add /
+  post-filter (§4.3.7.1). `imdct_into` / `imdct` map the `N`
+  denormalised MDCT bins to `2N` time-domain samples via the textbook
+  inverse type-IV/MDCT cosine kernel
+  `y(n) = (1/N)·Σ_k X(k)·cos[(pi/N)(n+1/2+N/2)(k+1/2)]`, the `1/N`
+  constant realising the RFC's stated "scaling by 1/2" relative to the
+  unnormalised forward/inverse pair. A matched-kernel `mdct_forward`
+  (test-only partner; the decoder never runs a forward MDCT) lets the
+  round-trip / TDAC behaviour be pinned. `ImdctError` covers empty
+  spectra and output-length mismatch. 13 unit tests: direct-formula
+  recompute, linearity, the canonical MDCT time-domain aliasing folds
+  (`y(n) = -y(N-1-n)` lower / mirror upper), the exact aliased
+  round-trip block, and a windowed forward/inverse overlap-add of two
+  adjacent frames reconstructing an arbitrary signal at the documented
+  `1/2` gain (TDAC, err < 1e-9) using a symmetric Princen-Bradley
+  window, plus every error path.
 - §4.3.6 *Denormalisation* (`celt_denormalise`): the last CELT step
   before the inverse MDCT. `denormalise_gain` converts a per-band
   base-2-log energy `L` to the linear shape gain `sqrt(2**L) =
