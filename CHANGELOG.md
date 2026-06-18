@@ -6,6 +6,32 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- §3 / §4 *Top-level packet → PCM orchestration* (`decoder`): the
+  keystone `OpusDecoder` that turns a raw Opus packet into interleaved
+  48 kHz PCM. `decode_packet` performs the §3.1 TOC parse, the §3.2
+  frame split (via `OpusPacket::parse`, covering all four frame-count
+  codes), and the §4.5 multi-frame loop — every Opus frame in a
+  code-1 / code-2 / code-3 packet is decoded in order and its PCM
+  appended to one contiguous output buffer. Each frame is routed
+  through its `OpusFrameRouting` to a per-mode decode seam
+  (`decode_silk_only_frame` / `decode_celt_only_frame` /
+  `decode_hybrid_frame`). The §3.2.1 zero-length DTX / lost-frame
+  marker contributes one Opus-frame of silence (the §4.6 PLC floor),
+  flagged `FrameDecodeStatus::DtxOrLost`; a frame whose layer decode is
+  not yet composed emits silence of the correct length flagged
+  `FrameDecodeStatus::LayerNotWired(mode)`, so the multi-frame loop and
+  the RFC 7845 §5.1 48 kHz sample-count accounting
+  (`output_samples_per_channel`: tenths-ms × 48 / 10, exact for all six
+  Table-2 durations) are exercised end-to-end regardless of which
+  layer's range-coded decode has landed. `DecodedAudio` carries the
+  interleaved `pcm`, the channel count, the 48 kHz rate, and the
+  per-frame `FrameOutcome` vector. `OpusDecoder::reset` implements the
+  §4.5.2 decoder reset. 8 unit tests: the six-duration sample-count
+  table, empty-packet rejection (§3.1 R1), the SILK-NB-mono single-frame
+  PCM length + status, the CELT-only stereo interleaved length, the
+  code-1 two-frame PCM concatenation, the §3.2.1 DTX silence + status,
+  the reset clearing carried channel state, and an all-32-config silence
+  sweep verifying every routing produces the routed PCM length.
 - §4.3.4.5 *Time-frequency change decode* (`celt_tf_decode`): the
   range-coded read path that complements the round-20 `celt_tf_adjust`
   tables. `decode_tf` walks the coded band range (`0..21` CELT-only /

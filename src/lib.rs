@@ -711,6 +711,7 @@ pub mod celt_tf_adjust;
 pub mod celt_tf_decode;
 pub mod celt_transitions;
 pub mod celt_trim_offsets;
+pub mod decoder;
 pub mod frames;
 pub mod framing;
 pub mod framing_self_delim;
@@ -838,6 +839,10 @@ pub use celt_trim_offsets::{
     TrimOffsetError, TRIM_OFFSETS_BIAS, TRIM_OFFSETS_DIVISOR, TRIM_OFFSETS_MONO_CHANNELS,
     TRIM_OFFSETS_NUMERATOR_SCALE, TRIM_OFFSETS_STEREO_CHANNELS,
     TRIM_OFFSETS_WIDTH_ONE_BINS_PER_CHANNEL, TRIM_OFFSETS_WIDTH_ONE_PER_CHANNEL_EIGHTH_BITS,
+};
+pub use decoder::{
+    channel_count, output_samples_per_channel, DecodedAudio, FrameDecodeStatus, FrameOutcome,
+    OpusDecoder, OUTPUT_SAMPLES_PER_MS, OUTPUT_SAMPLE_RATE_HZ,
 };
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
 pub use framing::{OperatingMode, OpusFrameRouting, SilkBandwidth};
