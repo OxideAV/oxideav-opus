@@ -6,6 +6,30 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- §4.3.4.5 *Time-frequency change decode* (`celt_tf_decode`): the
+  range-coded read path that complements the round-20 `celt_tf_adjust`
+  tables. `decode_tf` walks the coded band range (`0..21` CELT-only /
+  `17..21` Hybrid) reading one `tf_change[b]` flag per band — the first
+  coded band as an *absolute* choice (`{3,1}/4` transient / `{15,1}/16`
+  otherwise) and every subsequent band as a *difference* bit coded
+  relative to the previous band's choice (`{15,1}/16` transient /
+  `{31,1}/32` otherwise), the running choice toggled by each diff. After
+  the band loop it reads the §4.3.1 `tf_select` flag (`{1,1}/2`) *only*
+  when `celt_tf_select_can_affect` reports it can change at least one
+  band's adjustment, otherwise leaving it implicitly `0` with no bit
+  consumed, then maps each `(frame_size, transient, tf_select,
+  tf_change[b])` tuple through `celt_tf_adjustment` to the per-band
+  Table-60..63 adjustment. The "relative = difference/toggle" reading of
+  the §4.3.4.5 subsequent-band prose is documented in the module. The
+  `TfDecode` result carries the per-band `tf_change`, the `tf_select`
+  flag, and the parallel adjustment vector. 11 unit tests built on a
+  bit-exact §5.1 range-*encoder* test fixture (transcribed from the
+  normative RFC 6716 §5.1.1 / §5.1.1.2 / §5.1.5 encoder, the inverse of
+  the §4.1 decoder): a fixture self-round-trip through the real decoder,
+  empty-range no-op, absolute first-band choice, relative-toggle
+  subsequent bands, the tf_select skip/read gate at 2.5 ms (never) and
+  10 ms / 20 ms (conditional), full 21-band CELT-only decode, and the
+  Table-63 tf_select=1 route.
 - §4.3.7 *Weighted overlap-add* (`celt_overlap_add`): the CELT stage
   between the inverse MDCT (§4.3.7, `celt_imdct`) and the post-filter
   (§4.3.7.1). `WeightedOverlapAdd` is the stateful, per-channel adder

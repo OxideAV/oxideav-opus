@@ -48,7 +48,12 @@ LTP parameters (§4.2.7.6), LCG seed (§4.2.7.7), excitation
 
 **CELT (RFC 6716 §4.3 / §4.5):** the §4.3 band layout (Table 55), the
 pre-band header symbols (silence / post-filter / transient / intra),
-TF-resolution adjustment (§4.3.4.5), the coarse-energy Laplace
+the §4.3.4.5 *time-frequency change decode* (`celt_tf_decode` — the
+per-band `tf_change` flag loop, first band absolute and subsequent
+bands difference-coded relative to the previous band's choice, plus the
+§4.3.1-gated `tf_select` flag and the resulting per-band TF adjustment
+vector) layered on the §4.3.4.5 TF-resolution adjustment tables, the
+coarse-energy Laplace
 parameter tables (§4.3.2.1), the allocation parameter surfaces
 (log2-frac / alloc-trim / cache-caps / static-allocation), the
 §4.3.4.1 *Bits-to-Pulses* pulse-cost cache (the run-packed

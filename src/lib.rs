@@ -708,6 +708,7 @@ pub mod celt_reservations;
 pub mod celt_spreading;
 pub mod celt_static_alloc;
 pub mod celt_tf_adjust;
+pub mod celt_tf_decode;
 pub mod celt_transitions;
 pub mod celt_trim_offsets;
 pub mod frames;
@@ -827,6 +828,7 @@ pub use celt_tf_adjust::{
     TF_ADJUSTMENT_ABS_MAX, TF_ADJUSTMENT_MAX, TF_ADJ_NONTRANSIENT_SELECT0,
     TF_ADJ_NONTRANSIENT_SELECT1, TF_ADJ_TRANSIENT_SELECT0, TF_ADJ_TRANSIENT_SELECT1,
 };
+pub use celt_tf_decode::{decode_tf, TfDecode};
 pub use celt_transitions::{
     classify_normative_transition, recommended_non_normative, BoundaryOp, NormativeTransition,
     RecommendedNonNormativeTransition,
