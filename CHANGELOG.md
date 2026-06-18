@@ -6,6 +6,35 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- §4.2.6 / §4.2.7 *In-order SILK frame decode* (`silk_decode`):
+  `decode_silk_frame` composes the individually-tested per-stage SILK
+  decoders into one call that reads a regular SILK frame's bitstream in
+  the exact Table-5 symbol order — frame type (§4.2.7.3), subframe gains
+  (§4.2.7.4), LSF stage-1 (§4.2.7.5.1), LSF stage-2 (§4.2.7.5.2), LSF
+  interpolation weight (§4.2.7.5.5, 20 ms), LTP lags/gains/scaling
+  (§4.2.7.6, voiced), LCG seed (§4.2.7.7), and quantized excitation
+  (§4.2.7.8) — with the critical property that the §4.2.7.4 gains are
+  read *between* the frame type and the LSF stage-1 index, as Table 5
+  requires. After the bitstream is consumed it runs the non-bitstream
+  §4.2.7.5.3–§4.2.7.5.8 LSF → LPC chain (codebook lookup →
+  stabilization → interpolation → NLSF→LPC → bandwidth-expansion →
+  prediction-gain limiting) so the `SilkFrameDecoded` result carries the
+  final stable Q12 LPC coefficients (both halves for a 20 ms frame), the
+  LTP parameters, and the Q23 excitation. To support this, `silk_frame`
+  gained composable `SilkFrameHeader::decode_pre_gains` (stereo weights +
+  mid-only + frame type) and `decode_lsf_stage1` entries plus a
+  `SilkHeaderPreGains` carrier — the old `SilkFrameHeader::decode`
+  (which read the LSF index back-to-back after the frame type, with no
+  gains slot) is now documented as a header-field utility unsuitable for
+  full-frame decode. 4 unit tests (zero-buffer totality, bit-consumption
+  + d_LPC per bandwidth, the 10 ms no-interpolation-split case, SWB/FB
+  rejection). `decoder::decode_silk_only_frame` now runs the real §4.2.3
+  header bits + §4.2.5 LBRR / §4.2.6 regular SILK frame loop for **mono**
+  SILK-only packets (1 / 2 / 3 SILK frames per §4.2.2), threading the
+  inter-frame previous-gain / previous-lag / previous-NLSF state, and
+  reports `FrameDecodeStatus::SilkParamsDecoded` / `SilkDecodeError`. The
+  §4.2.7.9 synthesis + §4.2.9 resample to 48 kHz samples (and the stereo
+  mid/side interleave) remain follow-ups; mono SILK PCM is still silence.
 - §3 / §4 *Top-level packet → PCM orchestration* (`decoder`): the
   keystone `OpusDecoder` that turns a raw Opus packet into interleaved
   48 kHz PCM. `decode_packet` performs the §3.1 TOC parse, the §3.2

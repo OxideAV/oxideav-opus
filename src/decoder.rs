@@ -38,11 +38,23 @@
 //! The packet-level orchestration (TOC → framing → routing → 48 kHz PCM
 //! buffer layout) is complete and total over all 32 §3.1 configs and all
 //! four §3.2 frame-count codes. The per-frame audio decode is wired
-//! incrementally: a frame whose mode is not yet composed into a sample-
-//! producing path emits silence of the correct length and flags the
-//! reason in [`FrameDecodeStatus`], so the multi-frame packet loop and
-//! the PCM sample-count accounting are exercised end-to-end regardless of
-//! which layer's range-coded decode has landed.
+//! incrementally:
+//!
+//! * **Mono SILK-only** frames run the real §4.2 bitstream decode: the
+//!   §4.2.3 header bits, the §4.2.5 LBRR / §4.2.6 regular SILK frame loop
+//!   (1 / 2 / 3 SILK frames per §4.2.2), each frame decoded in Table-5
+//!   order via [`crate::silk_decode::decode_silk_frame`] with the
+//!   inter-frame state threaded across them. The decoded parameters +
+//!   excitation confirm the bitstream is consumed correctly; the
+//!   §4.2.7.9 synthesis + §4.2.9 resample that turn them into 48 kHz
+//!   samples are a follow-up, so the emitted PCM is silence
+//!   ([`FrameDecodeStatus::SilkParamsDecoded`]).
+//! * **Stereo SILK / CELT / Hybrid** frames emit silence of the correct
+//!   length flagged [`FrameDecodeStatus::LayerNotWired`] (CELT is gated on
+//!   the §4.3.2.1 coarse-energy Laplace decode).
+//!
+//! Either way the multi-frame packet loop and the RFC 7845 §5.1 48 kHz
+//! sample-count accounting are exercised end-to-end.
 
 use crate::frames::OpusPacket;
 use crate::framing::{OperatingMode, OpusFrameRouting};
@@ -87,6 +99,18 @@ pub enum FrameDecodeStatus {
     /// correct length was emitted. The variant carries the mode so the
     /// caller knows which layer is pending.
     LayerNotWired(OperatingMode),
+    /// A mono SILK-only frame whose full §4.2.7 bitstream (frame type,
+    /// gains, LSF chain, LTP, LCG seed, excitation) was decoded in
+    /// Table-5 order via [`crate::silk_decode::decode_silk_frame`]. The
+    /// §4.2.7.9 LTP / LPC synthesis + §4.2.9 resample that turn the
+    /// decoded parameters into 48 kHz samples are wired in a follow-up,
+    /// so the PCM emitted for this frame is still silence; the decoded
+    /// parameters confirm the bitstream was consumed correctly.
+    SilkParamsDecoded,
+    /// A SILK-only frame whose §4.2.7 bitstream decode latched an error
+    /// (a malformed / truncated frame). Silence of the correct length was
+    /// emitted in its place per the §4.6 floor.
+    SilkDecodeError,
 }
 
 /// The result of decoding one Opus frame: how many per-channel samples
@@ -215,22 +239,153 @@ impl OpusDecoder {
         }
     }
 
-    /// Decode one SILK-only Opus frame (§4.2). Currently emits silence of
-    /// the correct length and flags [`OperatingMode::SilkOnly`] as not yet
-    /// composed; the per-stage SILK decoders exist but the Table-5 in-order
-    /// range-coded composition is wired in a follow-up.
+    /// Decode one SILK-only Opus frame (§4.2).
+    ///
+    /// For a **mono** Opus frame this runs the real §4.2.3 header-bit
+    /// decode followed by the §4.2.5 LBRR / §4.2.6 regular SILK frame
+    /// loop, calling [`crate::silk_decode::decode_silk_frame`] for each
+    /// regular SILK frame in Table-5 order with the inter-frame state
+    /// (previous gain / lag / NLSF) threaded across the frames of the
+    /// Opus frame. The decoded parameters + excitation confirm the
+    /// bitstream was consumed correctly; the §4.2.7.9 synthesis + §4.2.9
+    /// resample that turn them into 48 kHz samples are wired in a
+    /// follow-up, so the PCM emitted is still silence
+    /// ([`FrameDecodeStatus::SilkParamsDecoded`]). A truncated / malformed
+    /// frame yields [`FrameDecodeStatus::SilkDecodeError`] and silence.
+    ///
+    /// The **stereo** mid/side interleave (§4.2.6) reuses the same
+    /// per-frame decode with the §4.2.7.1 / §4.2.7.2 symbols enabled and
+    /// is wired once the stereo unmixing back half lands; until then a
+    /// stereo SILK-only frame routes to
+    /// [`FrameDecodeStatus::LayerNotWired`].
     fn decode_silk_only_frame(
         &mut self,
-        _frame: &[u8],
+        frame: &[u8],
         routing: &OpusFrameRouting,
         pcm: &mut Vec<i16>,
     ) -> FrameOutcome {
         let per_channel = output_samples_per_channel(routing.frame_size_tenths_ms);
-        push_silence(pcm, per_channel, routing.channel_count());
+        let channels = routing.channel_count();
+        push_silence(pcm, per_channel, channels);
+
+        // Stereo SILK is not yet composed (the §4.2.6 mid/side interleave
+        // + §4.2.8 unmixing back half are a follow-up).
+        if channels != 1 {
+            return FrameOutcome {
+                samples_per_channel: per_channel,
+                status: FrameDecodeStatus::LayerNotWired(OperatingMode::SilkOnly),
+            };
+        }
+
+        let status = match self.decode_silk_only_mono(frame, routing) {
+            Ok(()) => FrameDecodeStatus::SilkParamsDecoded,
+            Err(_) => FrameDecodeStatus::SilkDecodeError,
+        };
         FrameOutcome {
             samples_per_channel: per_channel,
-            status: FrameDecodeStatus::LayerNotWired(OperatingMode::SilkOnly),
+            status,
         }
+    }
+
+    /// Decode the full §4.2 bitstream of one mono SILK-only Opus frame:
+    /// §4.2.3 header bits, the §4.2.5 LBRR frames, and the §4.2.6 regular
+    /// SILK frames, consuming every symbol in order. Returns `Ok(())`
+    /// when the whole frame decodes cleanly.
+    fn decode_silk_only_mono(
+        &mut self,
+        frame: &[u8],
+        routing: &OpusFrameRouting,
+    ) -> Result<(), Error> {
+        use crate::range_decoder::RangeDecoder;
+        use crate::silk_decode::{decode_silk_frame, SilkFrameConfig};
+        use crate::silk_excitation::SilkFrameSize;
+        use crate::silk_frame::FrameKind;
+        use crate::silk_header::SilkHeaderBits;
+
+        let bandwidth = routing
+            .silk_bandwidth
+            .ok_or(Error::MalformedPacket)?
+            .to_bandwidth();
+        let num_silk_frames = routing
+            .silk_frames_per_channel
+            .ok_or(Error::MalformedPacket)?;
+        // §4.2.2: each SILK frame is 20 ms, except a 10 ms Opus frame
+        // (one SILK frame of 10 ms).
+        let frame_size = if routing.frame_size_tenths_ms == 100 {
+            SilkFrameSize::TenMs
+        } else {
+            SilkFrameSize::TwentyMs
+        };
+
+        let mut rd = RangeDecoder::new(frame);
+
+        // §4.2.3 / §4.2.4 header bits (mono => stereo = false).
+        let header = SilkHeaderBits::decode(&mut rd, num_silk_frames, false)?;
+
+        // §4.2.5 LBRR frames: one per SILK frame whose mid LBRR bit is
+        // set, in time-interval order. LBRR frames are independent of the
+        // regular-frame inter-frame state (they form their own sequence),
+        // but for this mono path we decode them to consume their bits and
+        // keep the range coder aligned with the regular frames that
+        // follow. Per §4.2.7.3 an LBRR frame is always active-coded.
+        let mut lbrr_prev_gain: Option<u8> = None;
+        let mut lbrr_prev_lag: Option<i32> = None;
+        let mut lbrr_first = true;
+        for idx in 0..num_silk_frames {
+            if !header.mid_has_lbrr(idx) {
+                continue;
+            }
+            let cfg = SilkFrameConfig {
+                bandwidth,
+                frame_size,
+                voice_active: true, // §4.2.7.3: LBRR uses the active PDF.
+                first_subframe_independent: lbrr_first || lbrr_prev_gain.is_none(),
+                previous_log_gain: lbrr_prev_gain,
+                previous_primary_lag: lbrr_prev_lag,
+                ltp_scaling_present: lbrr_first,
+                lsf_interp_after_reset: lbrr_first,
+                previous_nlsf_q15: None,
+                previous_nlsf_len: 0,
+            };
+            let decoded = decode_silk_frame(&mut rd, cfg)?;
+            lbrr_prev_gain = Some(decoded.gains.last_log_gain());
+            lbrr_prev_lag = Some(decoded.ltp.primary_lag());
+            lbrr_first = false;
+            let _ = FrameKind::Lbrr; // documents the §4.2.7.3 kind.
+        }
+
+        // §4.2.6 regular SILK frames: one per time interval, even when
+        // the VAD flag is unset. Inter-frame state threads across them.
+        let mut prev_gain: Option<u8> = None;
+        let mut prev_lag: Option<i32> = None;
+        let mut prev_nlsf: Option<[i16; crate::silk_lsf_stage2::D_LPC_MAX]> = None;
+        let mut prev_nlsf_len = 0usize;
+        let mut first = true;
+        for idx in 0..num_silk_frames {
+            let cfg = SilkFrameConfig {
+                bandwidth,
+                frame_size,
+                voice_active: header.mid_vad(idx),
+                first_subframe_independent: first || prev_gain.is_none(),
+                previous_log_gain: prev_gain,
+                previous_primary_lag: prev_lag,
+                ltp_scaling_present: first,
+                lsf_interp_after_reset: first || prev_nlsf.is_none(),
+                previous_nlsf_q15: prev_nlsf,
+                previous_nlsf_len: prev_nlsf_len,
+            };
+            let decoded = decode_silk_frame(&mut rd, cfg)?;
+            prev_gain = Some(decoded.gains.last_log_gain());
+            prev_lag = Some(decoded.ltp.primary_lag());
+            prev_nlsf = Some(decoded.nlsf_q15);
+            prev_nlsf_len = decoded.d_lpc;
+            first = false;
+        }
+
+        if rd.has_error() {
+            return Err(Error::MalformedPacket);
+        }
+        Ok(())
     }
 
     /// Decode one CELT-only Opus frame (§4.3). Currently emits silence;
@@ -331,9 +486,17 @@ mod tests {
         assert_eq!(out.samples_per_channel(), 960);
         assert_eq!(out.pcm.len(), 960);
         assert_eq!(out.frame_outcomes.len(), 1);
-        assert_eq!(
-            out.frame_outcomes[0].status,
-            FrameDecodeStatus::LayerNotWired(OperatingMode::SilkOnly)
+        // A mono SILK-only frame now runs the real §4.2 bitstream decode;
+        // the status is either a clean params-decoded or a decode-error
+        // (a 3-byte arbitrary body may truncate mid-frame), never the
+        // not-wired placeholder.
+        assert!(
+            matches!(
+                out.frame_outcomes[0].status,
+                FrameDecodeStatus::SilkParamsDecoded | FrameDecodeStatus::SilkDecodeError
+            ),
+            "got {:?}",
+            out.frame_outcomes[0].status
         );
     }
 
@@ -397,6 +560,65 @@ mod tests {
         assert_eq!(dec.last_channels, Some(2));
         dec.reset();
         assert_eq!(dec.last_channels, None);
+    }
+
+    #[test]
+    fn silk_mono_full_decode_consumes_bitstream_cleanly() {
+        // A long pseudo-random SILK NB mono 20 ms body: the range coder
+        // does not run out of bits, so the full §4.2 frame decodes and the
+        // status is the clean params-decoded outcome (not a decode error).
+        let body: Vec<u8> = (0..120u16)
+            .map(|i| (i.wrapping_mul(101).wrapping_add(7) & 0xff) as u8)
+            .collect();
+        let pkt = code0_packet(1, false, &body); // config 1 = SILK NB 20 ms.
+        let mut dec = OpusDecoder::new();
+        let out = dec.decode_packet(&pkt).expect("decode");
+        assert_eq!(out.frame_outcomes.len(), 1);
+        assert_eq!(
+            out.frame_outcomes[0].status,
+            FrameDecodeStatus::SilkParamsDecoded,
+            "a long SILK NB mono body should fully decode"
+        );
+        // PCM length is correct even though the samples are silence
+        // (synthesis pending).
+        assert_eq!(out.samples_per_channel(), 960);
+    }
+
+    #[test]
+    fn silk_mono_40ms_two_silk_frames_decode() {
+        // config 2 = SILK NB 40 ms => 2 SILK frames per channel; mono.
+        let body: Vec<u8> = (0..220u16)
+            .map(|i| (i.wrapping_mul(53).wrapping_add(3) & 0xff) as u8)
+            .collect();
+        let pkt = code0_packet(2, false, &body);
+        let mut dec = OpusDecoder::new();
+        let out = dec.decode_packet(&pkt).expect("decode");
+        let routing = OpusFrameRouting::from_toc(OpusTocByte::from_byte(pkt[0]));
+        assert_eq!(routing.silk_frames_per_channel, Some(2));
+        // 40 ms => 1920 samples/channel; one Opus frame (code 0).
+        assert_eq!(out.frame_outcomes.len(), 1);
+        assert_eq!(out.samples_per_channel(), 1920);
+        // The two-SILK-frame loop ran; the status reflects a SILK decode
+        // (clean or truncated), never the not-wired placeholder.
+        assert!(matches!(
+            out.frame_outcomes[0].status,
+            FrameDecodeStatus::SilkParamsDecoded | FrameDecodeStatus::SilkDecodeError
+        ));
+    }
+
+    #[test]
+    fn stereo_silk_only_routes_to_not_wired() {
+        // Stereo SILK is not yet composed; verify it still produces
+        // correct-length silence and the not-wired status.
+        let pkt = code0_packet(1, true, &[0x11, 0x22, 0x33, 0x44]);
+        let mut dec = OpusDecoder::new();
+        let out = dec.decode_packet(&pkt).expect("decode");
+        assert_eq!(out.channels, 2);
+        assert_eq!(
+            out.frame_outcomes[0].status,
+            FrameDecodeStatus::LayerNotWired(OperatingMode::SilkOnly)
+        );
+        assert!(out.pcm.iter().all(|&s| s == 0));
     }
 
     #[test]

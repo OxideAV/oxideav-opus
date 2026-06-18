@@ -262,6 +262,28 @@ const LSF_STAGE1_ICDF_NB_MB_VOICED: [u8; 33] = pdf_to_icdf32(&LSF_STAGE1_NB_MB_V
 const LSF_STAGE1_ICDF_WB_INACTIVE: [u8; 33] = pdf_to_icdf32(&LSF_STAGE1_WB_INACTIVE_PDF);
 const LSF_STAGE1_ICDF_WB_VOICED: [u8; 33] = pdf_to_icdf32(&LSF_STAGE1_WB_VOICED_PDF);
 
+/// The §4.2.7.1–§4.2.7.3 header symbols that precede the §4.2.7.4
+/// subframe gains in the Table-5 read order, plus the derived signal /
+/// quantization-offset type.
+///
+/// Returned by [`SilkFrameHeader::decode_pre_gains`]; the caller reads
+/// the §4.2.7.4 gains next, then the §4.2.7.5.1 LSF stage-1 index via
+/// [`SilkFrameHeader::decode_lsf_stage1`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SilkHeaderPreGains {
+    /// §4.2.7.1 stereo prediction weights (mid channel of a stereo Opus
+    /// frame); `None` otherwise.
+    pub stereo_pred: Option<StereoPredictionWeights>,
+    /// §4.2.7.2 mid-only flag; `None` when not present.
+    pub mid_only_flag: Option<bool>,
+    /// Raw §4.2.7.3 frame-type symbol in `0..=5`.
+    pub frame_type: u8,
+    /// Decoded signal type (§4.2.7.3, Table 10).
+    pub signal_type: SignalType,
+    /// Decoded quantization-offset type (§4.2.7.3, Table 10).
+    pub qoff_type: QuantizationOffsetType,
+}
+
 impl SilkFrameHeader {
     /// Decode the §4.2.7.1–§4.2.7.5.1 header prefix from `rd`.
     ///
@@ -270,7 +292,49 @@ impl SilkFrameHeader {
     /// present, and whether the current frame is regular-inactive,
     /// regular-active, or LBRR. The function does not consult the
     /// §3.1 TOC byte or the §4.2.3/§4.2.4 packet-level header bits.
+    /// Decode the §4.2.7.1–§4.2.7.5.1 header fields as a single unit.
+    ///
+    /// **Note on read order:** this convenience entry reads the LSF
+    /// stage-1 index (§4.2.7.5.1) immediately after the frame type
+    /// (§4.2.7.3), i.e. it does *not* leave room for the §4.2.7.4
+    /// subframe gains that Table 5 places between them. It is therefore
+    /// only correct on a bitstream that has no gains symbol, and exists
+    /// as a header-field utility / test helper. A full SILK frame decode
+    /// must instead use the Table-5-ordered composable entries
+    /// [`Self::decode_pre_gains`] (stereo weights + mid-only + frame
+    /// type) and [`Self::decode_lsf_stage1`] (the §4.2.7.5.1 index),
+    /// reading the §4.2.7.4 gains in between — see
+    /// [`crate::silk_decode`].
     pub fn decode(rd: &mut RangeDecoder<'_>, cfg: SilkFrameHeaderConfig) -> Result<Self, Error> {
+        let pre = Self::decode_pre_gains(rd, cfg)?;
+        let lsf_stage1 = Self::decode_lsf_stage1(rd, cfg.bandwidth, pre.signal_type)?;
+
+        if rd.has_error() {
+            return Err(Error::MalformedPacket);
+        }
+
+        Ok(Self {
+            stereo_pred: pre.stereo_pred,
+            mid_only_flag: pre.mid_only_flag,
+            frame_type: pre.frame_type,
+            signal_type: pre.signal_type,
+            qoff_type: pre.qoff_type,
+            lsf_stage1,
+        })
+    }
+
+    /// Decode the §4.2.7.1 stereo prediction weights, §4.2.7.2 mid-only
+    /// flag, and §4.2.7.3 frame type — every header symbol that precedes
+    /// the §4.2.7.4 subframe gains in the Table-5 read order.
+    ///
+    /// The returned [`SilkHeaderPreGains`] carries the decoded fields plus
+    /// the derived `(signal_type, qoff_type)` needed to choose the gains
+    /// PDF and the §4.2.7.5.1 LSF stage-1 PDF. The caller reads the gains
+    /// next, then calls [`Self::decode_lsf_stage1`].
+    pub fn decode_pre_gains(
+        rd: &mut RangeDecoder<'_>,
+        cfg: SilkFrameHeaderConfig,
+    ) -> Result<SilkHeaderPreGains, Error> {
         // -------- §4.2.7.1 Stereo Prediction Weights --------
         let stereo_pred = if cfg.stereo && cfg.stereo_mid_channel {
             Some(Self::decode_stereo_pred(rd))
@@ -312,8 +376,27 @@ impl SilkFrameHeader {
         }
         let (signal_type, qoff_type) = frame_type_to_signal_qoff(frame_type_raw);
 
-        // -------- §4.2.7.5.1 LSF Stage-1 --------
-        let lsf_icdf: &[u8] = match (cfg.bandwidth, signal_type) {
+        Ok(SilkHeaderPreGains {
+            stereo_pred,
+            mid_only_flag,
+            frame_type: frame_type_raw,
+            signal_type,
+            qoff_type,
+        })
+    }
+
+    /// Decode the §4.2.7.5.1 normalized LSF stage-1 index `I1 ∈ 0..32`.
+    ///
+    /// The PDF is selected by `(bandwidth, signal_type)` per Table 14;
+    /// `signal_type` comes from [`Self::decode_pre_gains`]. In the
+    /// Table-5 read order this symbol follows the §4.2.7.4 subframe
+    /// gains.
+    pub fn decode_lsf_stage1(
+        rd: &mut RangeDecoder<'_>,
+        bandwidth: Bandwidth,
+        signal_type: SignalType,
+    ) -> Result<u8, Error> {
+        let lsf_icdf: &[u8] = match (bandwidth, signal_type) {
             (Bandwidth::Nb | Bandwidth::Mb, SignalType::Inactive | SignalType::Unvoiced) => {
                 &LSF_STAGE1_ICDF_NB_MB_INACTIVE
             }
@@ -331,19 +414,7 @@ impl SilkFrameHeader {
         if lsf_stage1 >= 32 {
             return Err(Error::MalformedPacket);
         }
-
-        if rd.has_error() {
-            return Err(Error::MalformedPacket);
-        }
-
-        Ok(Self {
-            stereo_pred,
-            mid_only_flag,
-            frame_type: frame_type_raw,
-            signal_type,
-            qoff_type,
-            lsf_stage1,
-        })
+        Ok(lsf_stage1)
     }
 
     /// Internal: decode the five sub-symbols of §4.2.7.1 (`n`, `i0`,
