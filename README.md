@@ -10,14 +10,36 @@ implementation was retired under the workspace clean-room policy; the
 crate is being re-implemented from scratch against the published RFCs
 using only material under `docs/` and black-box validator binaries.
 
-The codec does **not** yet decode a full Opus packet end-to-end. The
-crate's `register` entry point is currently a no-op and no `Decoder`
-implementation is exposed. What exists today is the packet/framing
-layer plus a large, individually unit-tested set of SILK and CELT
-decode building blocks (~340 lib tests). Per-stage progress lives in
+A top-level `OpusDecoder::decode_packet` packet → PCM orchestration is
+now in place: it parses the §3.1 TOC, splits the §3.2 frame packing
+(all four frame-count codes), runs the §4.5 multi-frame loop, routes
+each Opus frame by mode, and lays out the interleaved 48 kHz output
+buffer (RFC 7845 §5.1) with correct per-frame sample counts. A **mono
+SILK-only** packet runs the real §4.2 bitstream decode end-to-end (the
+§4.2.3 header bits, the §4.2.5 LBRR / §4.2.6 regular SILK frame loop,
+each frame decoded in Table-5 order through gains / LSF chain / LTP /
+excitation, with inter-frame state threaded across frames). The
+§4.2.7.9 LTP / LPC synthesis + §4.2.9 resample that turn the decoded
+SILK parameters into 48 kHz samples — and the CELT layer's §4.3.2.1
+coarse-energy decode — are the remaining decode milestones, so the
+emitted PCM is currently silence (the bitstream is fully consumed and
+the decoded parameters are exposed via `FrameDecodeStatus`). The crate
+ships a large, individually unit-tested set of SILK and CELT decode
+building blocks (~1145 lib tests). Per-stage progress lives in
 `CHANGELOG.md`.
 
 ## What works
+
+**Packet → PCM orchestration (RFC 6716 §3 / §4):**
+
+- `OpusDecoder::decode_packet` — the top-level packet → interleaved
+  48 kHz PCM path: TOC parse, §3.2 frame split, §4.5 multi-frame loop,
+  per-mode routing, and the RFC 7845 §5.1 output sample-count layout.
+  Mono SILK-only packets run the real §4.2 bitstream decode; other modes
+  emit correct-length silence flagged via `FrameDecodeStatus`.
+- `silk_decode::decode_silk_frame` — the §4.2.6 / §4.2.7 in-order SILK
+  frame decode that composes the per-stage decoders in exact Table-5
+  symbol order and runs the LSF → stable-Q12-LPC chain.
 
 **Packet & framing (RFC 6716 §3 / §4.2):**
 
