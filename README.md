@@ -58,11 +58,17 @@ inversion), the §4.3.6 band denormalisation (unit-norm PVQ shape ×
 inverse-MDCT input buffer), the §4.3.7 inverse MDCT transform core (the
 `N` frequency-domain bins → `2N` time-domain samples mapping, scaled by
 `1/2`, with the §4.3.7 overlap-add window already landed at
-`celt_mdct_window`), and the §4.5 redundancy / mode-transition
-state-reset machinery. The allocation orchestration and the PVQ shape
-decode are partially landed; the §4.3.5 anti-collapse and the §4.3.7
-weighted overlap-add / post-filter wiring into a full CELT decode loop
-are the remaining decode milestones.
+`celt_mdct_window`), the §4.3.7 *weighted overlap-add* (`celt_overlap_add`
+— the stateful per-channel adder that windows each `2N` inverse-MDCT
+block with the low-overlap synthesis window and overlap-adds the leading
+half with the previous block's windowed trailing half at hop `N`,
+carrying the overlap history across frames and reconstructing the
+aliasing-free time-domain signal), and the §4.5 redundancy /
+mode-transition state-reset machinery. The allocation orchestration and
+the PVQ shape decode are partially landed; the §4.3.5 anti-collapse and
+wiring the now-complete time-domain chain (denormalise → inverse MDCT →
+weighted overlap-add → post-filter → de-emphasis) into a full CELT
+decode loop are the remaining decode milestones.
 
 ## Clean-room sources
 

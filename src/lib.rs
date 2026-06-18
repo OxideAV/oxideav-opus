@@ -698,6 +698,7 @@ pub mod celt_header;
 pub mod celt_imdct;
 pub mod celt_log2_frac_table;
 pub mod celt_mdct_window;
+pub mod celt_overlap_add;
 pub mod celt_post_filter;
 pub mod celt_pulse_cache;
 pub mod celt_pvq_decode;
@@ -785,6 +786,7 @@ pub use celt_mdct_window::{
     basic_window, celt_overlap_window, mdct_window, window_tap, MdctWindowError, BASIC_WINDOW_LEN,
     CELT_OVERLAP_48K,
 };
+pub use celt_overlap_add::{apply_synthesis_window, OverlapAddError, WeightedOverlapAdd};
 pub use celt_pulse_cache::{
     bits_to_pulses, cache_flat_index, cache_max_pulses, cache_pulse_cost, cache_run_offset,
     PulseCacheError, CACHE_BITS50, CACHE_BITS_LEN, CACHE_INDEX50, CACHE_INDEX_LEN,

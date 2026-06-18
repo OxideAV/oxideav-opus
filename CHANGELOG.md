@@ -6,6 +6,28 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- §4.3.7 *Weighted overlap-add* (`celt_overlap_add`): the CELT stage
+  between the inverse MDCT (§4.3.7, `celt_imdct`) and the post-filter
+  (§4.3.7.1). `WeightedOverlapAdd` is the stateful, per-channel adder
+  that turns the stream of `2N`-sample inverse-MDCT blocks into the
+  aliasing-free time-domain signal: each frame it applies the §4.3.7
+  low-overlap synthesis window (rising ramp on the leading `overlap`
+  samples, falling ramp on the trailing `overlap`, unity in the middle),
+  overlap-adds the windowed leading half with the previous block's
+  windowed trailing half (hop = `N`), emits `N` samples, and carries the
+  new trailing half forward as the overlap history. `new` / `reset`
+  give the all-zero stream-start / §4.5.2-reset state; `process` /
+  `process_into` run one frame; `apply_synthesis_window` is the reusable
+  free-function windower. `OverlapAddError` covers zero `N`, non-even /
+  mismatched block lengths, out-of-range or odd overlap, and a too-small
+  output buffer. 14 unit tests + 1 doctest: silence-stays-silent, the
+  zero-history first-frame leading-half emission, the windowed
+  trailing-half history carry, reset, the rising/falling/unity window
+  layout, a multi-frame arithmetic cross-check against an independent
+  hand computation with the §4.3.7 ramp, an end-to-end TDAC
+  reconstruction (windowed forward MDCT -> inverse MDCT -> hop-`N`
+  overlap-add reconstructs the input at the documented `1/2` scale,
+  err < 1e-9), and every error path.
 - §4.3.7 *Inverse MDCT* transform core (`celt_imdct`): the CELT stage
   between band denormalisation (§4.3.6) and the weighted overlap-add /
   post-filter (§4.3.7.1). `imdct_into` / `imdct` map the `N`
