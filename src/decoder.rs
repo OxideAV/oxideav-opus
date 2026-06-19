@@ -701,56 +701,45 @@ impl OpusDecoder {
             .as_mut()
             .expect("stereo synth state set above");
 
-        let mut mid_signal = Vec::new();
-        let mut side_signal = Vec::new();
-        for (idx, mid_frame) in mid_frames.iter().enumerate() {
-            let mid_out = synthesize_silk_frame(bandwidth, frame_size, mid_frame, mid_synth)?;
-            let n = mid_out.len();
-            mid_signal.extend_from_slice(&mid_out);
-            match &side_frames[idx] {
-                Some(side_frame) => {
-                    let side_out =
-                        synthesize_silk_frame(bandwidth, frame_size, side_frame, side_synth)?;
-                    side_signal.extend_from_slice(&side_out);
-                }
-                None => {
-                    // §4.5.2: clear the side LTP buffer after an uncoded
-                    // side frame; feed zeros to the §4.2.8 unmixer.
-                    side_synth.reset();
-                    side_signal.extend(std::iter::repeat(0.0f32).take(n));
-                }
-            }
-        }
-
-        // §4.2.8 stereo unmixing: mid/side → left/right over the whole
-        // Opus frame. The unmix history (two prior mid samples, one prior
-        // side sample, previous weights) is carried in `silk_stereo_unmix`.
-        // The §4.2.8 weights interpolate from the previous frame's to the
-        // current frame's over the first n1 samples; we use the first
-        // interval's weights as the "current" set (the steady-state value
-        // for the rest of the Opus frame's leading interval).
+        // §4.2.8 stereo unmixing runs **per SILK frame** (per 20 ms
+        // interval), not once over the whole Opus frame: the spec defines
+        // the unmix over `j <= i < (j + n2)` where `j` is the SILK frame
+        // start and `n2` is "the total number of samples in the frame"
+        // (the SILK frame). Each interval carries its own §4.2.7.1 weights
+        // and restarts the 8 ms interpolation phase; the previous
+        // interval's weights and trailing samples thread through the
+        // carried `StereoUnmixState`. We therefore synthesize and unmix
+        // each interval in turn and concatenate the L/R outputs.
         let unmix = self
             .silk_stereo_unmix
             .get_or_insert_with(StereoUnmixState::new);
-        let current_weights = interval_weights.first().copied().unwrap_or_default();
-        // Treat the side channel as uncoded for the unmix only when EVERY
-        // interval skipped it (all-zero side history term); otherwise feed
-        // the synthesized side signal (already zero-filled for skipped
-        // intervals).
-        let any_side_coded = side_frames.iter().any(|s| s.is_some());
-        let stereo = stereo_ms_to_lr(
-            bandwidth,
-            &mid_signal,
-            if any_side_coded {
-                Some(&side_signal)
-            } else {
-                None
-            },
-            current_weights,
-            unmix,
-        )?;
 
-        Ok((stereo.left, stereo.right, bandwidth))
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for (idx, mid_frame) in mid_frames.iter().enumerate() {
+            let mid_out = synthesize_silk_frame(bandwidth, frame_size, mid_frame, mid_synth)?;
+            let n = mid_out.len();
+            let weights = interval_weights[idx];
+            let stereo = match &side_frames[idx] {
+                Some(side_frame) => {
+                    let side_out =
+                        synthesize_silk_frame(bandwidth, frame_size, side_frame, side_synth)?;
+                    stereo_ms_to_lr(bandwidth, &mid_out, Some(&side_out), weights, unmix)?
+                }
+                None => {
+                    // §4.2.7.2 / §4.5.2: an uncoded side SILK frame clears
+                    // the side LTP buffer; zeros feed the §4.2.8 unmixer
+                    // (`side = None` ⇒ side[i] treated as 0 everywhere).
+                    side_synth.reset();
+                    stereo_ms_to_lr(bandwidth, &mid_out, None, weights, unmix)?
+                }
+            };
+            debug_assert_eq!(stereo.left.len(), n);
+            left.extend_from_slice(&stereo.left);
+            right.extend_from_slice(&stereo.right);
+        }
+
+        Ok((left, right, bandwidth))
     }
 
     /// Decode one CELT-only Opus frame (§4.3). Currently emits silence;
@@ -1235,6 +1224,31 @@ mod tests {
         // 40 ms => 1920 samples/channel interleaved.
         assert_eq!(out.samples_per_channel(), 1920);
         assert_eq!(out.pcm.len(), 2 * 1920);
+        assert!(matches!(
+            out.frame_outcomes[0].status,
+            FrameDecodeStatus::SilkStereoDecoded | FrameDecodeStatus::SilkDecodeError
+        ));
+    }
+
+    #[test]
+    fn stereo_silk_60ms_three_intervals_per_interval_unmix() {
+        // config 3 = SILK NB 60 ms => 3 SILK frames per channel; stereo.
+        // Each 20 ms interval is unmixed separately (its own §4.2.7.1
+        // weights + a fresh §4.2.8 interpolation phase), and the three
+        // L/R interval outputs are concatenated. This pins the per-interval
+        // unmix path for a multi-interval stereo frame.
+        let body: Vec<u8> = (0..640u16)
+            .map(|i| (i.wrapping_mul(73).wrapping_add(31) & 0xff) as u8)
+            .collect();
+        let pkt = code0_packet(3, true, &body);
+        let mut dec = OpusDecoder::new();
+        let out = dec.decode_packet(&pkt).expect("decode");
+        let routing = OpusFrameRouting::from_toc(OpusTocByte::from_byte(pkt[0]));
+        assert_eq!(routing.silk_frames_per_channel, Some(3));
+        assert_eq!(out.channels, 2);
+        // 60 ms => 2880 samples/channel interleaved.
+        assert_eq!(out.samples_per_channel(), 2880);
+        assert_eq!(out.pcm.len(), 2 * 2880);
         assert!(matches!(
             out.frame_outcomes[0].status,
             FrameDecodeStatus::SilkStereoDecoded | FrameDecodeStatus::SilkDecodeError

@@ -20,16 +20,22 @@ All notable changes to `oxideav-opus` are recorded here.
   the existing §4.2.8 `silk_stereo::stereo_ms_to_lr` (threading the
   cross-packet `StereoUnmixState`), resampled to 48 kHz, and written
   interleaved (`[L0, R0, …]`). A new `FrameDecodeStatus::SilkStereoDecoded`
-  outcome flags the real audio. The §4.2.7.1 "previous weights reset to
-  zeros on any mono→stereo transition" rule and the §4.5.2 SILK state
-  reset now clear the stereo synthesis + unmix state alongside the mono
-  state. A new per-channel `ChannelDecodeState` helper threads the
+  outcome flags the real audio. The §4.2.8 unmixing runs **per SILK frame**
+  (per 20 ms interval), matching the spec's `j <= i < (j + n2)` definition
+  where `j` is the SILK frame start and `n2` is the SILK frame length: each
+  interval applies its own §4.2.7.1 weights and restarts the 8 ms
+  interpolation phase, with the previous interval's weights and trailing
+  mid/side samples threaded through the carried `StereoUnmixState`; the
+  per-interval L/R outputs are concatenated. The §4.2.7.1 "previous weights
+  reset to zeros on any mono→stereo transition" rule and the §4.5.2 SILK
+  state reset now clear the stereo synthesis + unmix state alongside the
+  mono state. A new per-channel `ChannelDecodeState` helper threads the
   §4.2.7.4 / §4.2.7.6.1 / §4.2.7.5.5 inter-frame prediction state for the
-  mid and side channels independently. Five decoder tests cover the
+  mid and side channels independently. Six decoder tests cover the
   happy-path interleaved decode, a fully-decoded long body, the 40 ms
-  two-interval case, cross-packet state threading, and the mono→stereo
-  transition; the former `stereo_silk_only_routes_to_not_wired` test was
-  rewritten.
+  two-interval and 60 ms three-interval per-interval-unmix cases,
+  cross-packet state threading, and the mono→stereo transition; the former
+  `stereo_silk_only_routes_to_not_wired` test was rewritten.
 
 ### Changed
 
