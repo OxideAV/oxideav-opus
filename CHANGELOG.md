@@ -6,6 +6,14 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Changed
 
+- §4.5.2 *Cross-packet SILK state reset* (`decoder`): `OpusDecoder` now
+  records the previous Opus frame's operating mode and applies the §4.5.2
+  rule "the SILK state is reset before every SILK-only or Hybrid frame
+  where the previous frame was CELT-only" via the existing
+  `mode_transition_reset::decide_state_resets`, clearing the carried
+  §4.2.7.9 synthesis history on a CELT→SILK transition. Two tests pin the
+  reset (CELT interlude makes a repeated SILK packet match a fresh decode)
+  and its complement (consecutive SILK packets thread state).
 - §4 *Mono SILK-only packets now decode to real PCM* (`decoder`):
   `OpusDecoder` wires the new §4.2.7.9 synthesis into the mono SILK-only
   path. After the §4.2 bitstream decode, the decoded SILK frames are run

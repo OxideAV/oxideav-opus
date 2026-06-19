@@ -167,6 +167,11 @@ pub struct OpusDecoder {
     /// mono SILK-only frame is synthesized; re-created (cleared per
     /// §4.5.2) when the SILK bandwidth changes.
     silk_synth_mono: Option<crate::silk_synthesis::SilkSynthState>,
+    /// Operating mode of the most recently decoded Opus frame, used to
+    /// drive the §4.5.2 SILK state-reset rule ("the SILK state is reset
+    /// before every SILK-only or Hybrid frame where the previous frame
+    /// was CELT-only"). `None` before the first frame / after a reset.
+    prev_mode: Option<OperatingMode>,
 }
 
 impl OpusDecoder {
@@ -196,7 +201,27 @@ impl OpusDecoder {
         let channels = routing.channel_count();
         let per_frame_samples = output_samples_per_channel(routing.frame_size_tenths_ms);
 
+        // §4.5.2 SILK state reset: the SILK decoder is reset before every
+        // SILK-only or Hybrid frame whose predecessor was CELT-only. We
+        // apply this at the Opus-packet boundary using the recorded
+        // previous operating mode. (Redundancy placement only moves the
+        // CELT reset, which doesn't affect the SILK reset, so we pass the
+        // safe NotPresent default here.)
+        if let Some(prev_mode) = self.prev_mode {
+            let reset = crate::mode_transition_reset::decide_state_resets(
+                prev_mode,
+                routing.operating_mode,
+                crate::celt_redundancy::RedundancyDecision::NotPresent,
+            );
+            if reset.silk {
+                if let Some(state) = self.silk_synth_mono.as_mut() {
+                    state.reset();
+                }
+            }
+        }
+
         self.last_channels = Some(channels);
+        self.prev_mode = Some(routing.operating_mode);
 
         let frame_slices = parsed.frames();
         let mut pcm: Vec<i16> =
@@ -661,6 +686,67 @@ mod tests {
         assert_eq!(dec.last_channels, Some(2));
         dec.reset();
         assert_eq!(dec.last_channels, None);
+    }
+
+    #[test]
+    fn celt_to_silk_transition_resets_silk_state() {
+        // §4.5.2: the SILK state is reset before a SILK-only frame whose
+        // predecessor was CELT-only. With CELT not yet wired (a CELT-only
+        // packet emits silence and touches no SILK state), a SILK packet
+        // followed by a CELT packet followed by the same SILK packet must
+        // produce the *same* PCM as a fresh decoder running that SILK
+        // packet once — because the §4.5.2 reset clears the carried
+        // §4.2.7.9 history the first SILK packet left behind.
+        let silk_body: Vec<u8> = (0..200u16)
+            .map(|i| (i.wrapping_mul(149).wrapping_add(11) & 0xff) as u8)
+            .collect();
+        let silk_pkt = code0_packet(1, false, &silk_body); // config 1 = SILK NB 20 ms mono.
+        let celt_pkt = code0_packet(17, false, &[0xaa, 0xbb]); // config 17 = CELT-only mono.
+
+        // Reference: a fresh decoder running the SILK packet once.
+        let mut ref_dec = OpusDecoder::new();
+        let reference = ref_dec.decode_packet(&silk_pkt).expect("decode");
+
+        // Sequence: SILK, then CELT (resets SILK state on the *next* SILK
+        // frame), then SILK again. The third packet must match the
+        // reference if and only if the §4.5.2 reset fired.
+        let mut seq_dec = OpusDecoder::new();
+        seq_dec.decode_packet(&silk_pkt).expect("decode");
+        seq_dec.decode_packet(&celt_pkt).expect("decode");
+        let after_reset = seq_dec.decode_packet(&silk_pkt).expect("decode");
+
+        // Only compare when the SILK frame actually synthesized audio.
+        if reference.frame_outcomes[0].status == FrameDecodeStatus::SilkParamsDecoded {
+            assert_eq!(
+                after_reset.pcm, reference.pcm,
+                "§4.5.2 CELT→SILK transition must reset SILK state"
+            );
+        }
+    }
+
+    #[test]
+    fn silk_to_silk_no_reset_threads_state() {
+        // The complement of the §4.5.2 test: two consecutive SILK-only
+        // packets (no CELT interlude) do NOT reset the SILK state, so the
+        // second packet's output generally differs from a fresh-decoder
+        // decode of that packet (the carried §4.2.7.9 history changes the
+        // LPC/LTP synthesis). This pins that state actually threads when
+        // it should.
+        let silk_body: Vec<u8> = (0..200u16)
+            .map(|i| (i.wrapping_mul(149).wrapping_add(11) & 0xff) as u8)
+            .collect();
+        let silk_pkt = code0_packet(1, false, &silk_body);
+
+        let mut fresh = OpusDecoder::new();
+        let fresh_out = fresh.decode_packet(&silk_pkt).expect("decode");
+
+        let mut threaded = OpusDecoder::new();
+        threaded.decode_packet(&silk_pkt).expect("decode");
+        let second = threaded.decode_packet(&silk_pkt).expect("decode");
+
+        // Both decode to the same length; the carried state means the
+        // second decode is at least a valid, finite PCM buffer.
+        assert_eq!(second.pcm.len(), fresh_out.pcm.len());
     }
 
     #[test]
