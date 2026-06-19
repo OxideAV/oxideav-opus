@@ -6,6 +6,21 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- §4.2.7.9 *SILK frame synthesis composition* (`silk_synthesis`): the new
+  `synthesize_silk_frame` composes the individually-tested §4.2.7.9.1 LTP
+  synthesis (`silk_ltp_synth`) and §4.2.7.9.2 LPC synthesis
+  (`silk_lpc_synth`) filters into one call that turns a decoded
+  `SilkFrameDecoded` parameter set + excitation into the SILK frame's
+  internal-rate (8/12/16 kHz) time-domain `out[]` samples, subframe by
+  subframe. It owns the §4.2.7.9 per-subframe LPC selection (subframes
+  0/1 of an interpolation-split 20 ms frame use the interpolated `n1`
+  filter, every other subframe the uninterpolated `n2` filter) and drives
+  the §4.2.7.9.1 LSF-interpolation-split rewhitening branch for subframes
+  2/3. The cross-frame `SilkSynthState` carries the §4.2.7.9.1 `out[]` /
+  `lpc[]` histories and the §4.2.7.9.2 LPC history across SILK frames and
+  resets per §4.5.2. `synthesize_silk_frames` chains a 2/3-SILK-frame
+  Opus frame; `silk_frame_internal_samples` reports the per-frame output
+  geometry. 8 unit tests.
 - §4.2.6 / §4.2.7 *In-order SILK frame decode* (`silk_decode`):
   `decode_silk_frame` composes the individually-tested per-stage SILK
   decoders into one call that reads a regular SILK frame's bitstream in

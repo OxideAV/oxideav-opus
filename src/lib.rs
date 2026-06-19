@@ -735,6 +735,7 @@ pub mod silk_ltp;
 pub mod silk_ltp_synth;
 pub mod silk_resampler;
 pub mod silk_stereo;
+pub mod silk_synthesis;
 pub mod toc;
 
 pub use celt_alloc_search::{
