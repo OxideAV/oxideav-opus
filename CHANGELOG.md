@@ -4,6 +4,33 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- §4.2 / §4.2.8 *Stereo SILK-only packets now decode to real interleaved
+  PCM* (`decoder`): `OpusDecoder` wires the full stereo SILK path it
+  previously stubbed as `LayerNotWired`. A new `decode_silk_only_stereo`
+  decodes the §4.2.3 two-channel header bits, then the §4.2.5 LBRR and
+  §4.2.6 regular SILK frames in §4.2.2 interleaved order — per 20 ms
+  interval the mid SILK frame (carrying the §4.2.7.1 stereo prediction
+  weights and, when signalled, the §4.2.7.2 mid-only flag) followed by the
+  side SILK frame, with the side frame skipped (and its §4.2.7.9 LTP
+  buffer cleared per §4.5.2) when the mid-only flag is set or the side VAD
+  path leaves it uncoded. Each channel is synthesized through its own
+  carried `SilkSynthState`, then converted from mid/side to left/right via
+  the existing §4.2.8 `silk_stereo::stereo_ms_to_lr` (threading the
+  cross-packet `StereoUnmixState`), resampled to 48 kHz, and written
+  interleaved (`[L0, R0, …]`). A new `FrameDecodeStatus::SilkStereoDecoded`
+  outcome flags the real audio. The §4.2.7.1 "previous weights reset to
+  zeros on any mono→stereo transition" rule and the §4.5.2 SILK state
+  reset now clear the stereo synthesis + unmix state alongside the mono
+  state. A new per-channel `ChannelDecodeState` helper threads the
+  §4.2.7.4 / §4.2.7.6.1 / §4.2.7.5.5 inter-frame prediction state for the
+  mid and side channels independently. Five decoder tests cover the
+  happy-path interleaved decode, a fully-decoded long body, the 40 ms
+  two-interval case, cross-packet state threading, and the mono→stereo
+  transition; the former `stereo_silk_only_routes_to_not_wired` test was
+  rewritten.
+
 ### Changed
 
 - §4.5.2 *Cross-packet SILK state reset* (`decoder`): `OpusDecoder` now

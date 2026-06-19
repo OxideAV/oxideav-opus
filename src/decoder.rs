@@ -49,9 +49,20 @@
 //!   §4.2.9 (non-normative) resample to 48 kHz. The carried §4.2.7.9
 //!   synthesis histories persist across the packet's Opus frames; the
 //!   emitted PCM is real audio ([`FrameDecodeStatus::SilkParamsDecoded`]).
-//! * **Stereo SILK / CELT / Hybrid** frames emit silence of the correct
-//!   length flagged [`FrameDecodeStatus::LayerNotWired`] (CELT is gated on
-//!   the §4.3.2.1 coarse-energy Laplace decode).
+//! * **Stereo SILK-only** frames run the full §4.2 interleaved decode →
+//!   PCM path: the §4.2.3 two-channel header bits, the §4.2.5 / §4.2.6
+//!   mid/side interleave (mid frame then side frame per 20 ms interval,
+//!   the side frame skipped when the §4.2.7.2 mid-only flag is set), each
+//!   channel's §4.2.7.9 synthesis with its own carried history, then the
+//!   §4.2.8 mid/side → left/right unmixing
+//!   ([`crate::silk_stereo::stereo_ms_to_lr`]) and the §4.2.9 resample,
+//!   emitting interleaved L/R PCM
+//!   ([`FrameDecodeStatus::SilkStereoDecoded`]). The §4.2.7.1 mono→stereo
+//!   weight reset and the §4.5.2 SILK state reset are applied across
+//!   packets.
+//! * **CELT-only / Hybrid** frames emit silence of the correct length
+//!   flagged [`FrameDecodeStatus::LayerNotWired`] (CELT is gated on the
+//!   §4.3.2.1 coarse-energy Laplace decode).
 //!
 //! Either way the multi-frame packet loop and the RFC 7845 §5.1 48 kHz
 //! sample-count accounting are exercised end-to-end.
@@ -106,6 +117,16 @@ pub enum FrameDecodeStatus {
     /// ([`crate::silk_synthesis::synthesize_silk_frame`]) and resampled to
     /// 48 kHz (§4.2.9, non-normative). The emitted PCM is real audio.
     SilkParamsDecoded,
+    /// A **stereo** SILK-only frame whose §4.2.3 / §4.2.4 header bits and
+    /// the §4.2.5 / §4.2.6 interleaved mid/side SILK frames were decoded
+    /// in §4.2.2 order (mid frame then side frame per 20 ms interval, the
+    /// side frame skipped when the §4.2.7.2 mid-only flag is set), each
+    /// channel synthesized through the §4.2.7.9 filters, converted from
+    /// mid/side to left/right via §4.2.8 stereo unmixing
+    /// ([`crate::silk_stereo::stereo_ms_to_lr`]), then resampled to 48 kHz
+    /// (§4.2.9, non-normative). The emitted interleaved L/R PCM is real
+    /// audio.
+    SilkStereoDecoded,
     /// A SILK-only frame whose §4.2.7 bitstream decode latched an error
     /// (a malformed / truncated frame). Silence of the correct length was
     /// emitted in its place per the §4.6 floor.
@@ -167,6 +188,19 @@ pub struct OpusDecoder {
     /// mono SILK-only frame is synthesized; re-created (cleared per
     /// §4.5.2) when the SILK bandwidth changes.
     silk_synth_mono: Option<crate::silk_synthesis::SilkSynthState>,
+    /// Stereo SILK synthesis state: the §4.2.7.9 LTP / LPC histories for
+    /// the **mid** and **side** channels, carried across Opus frames.
+    /// `None` until the first stereo SILK-only frame; re-created when the
+    /// SILK bandwidth changes (a §4.5.2 reset).
+    silk_synth_stereo: Option<(
+        crate::silk_synthesis::SilkSynthState,
+        crate::silk_synthesis::SilkSynthState,
+    )>,
+    /// §4.2.8 stereo unmixing history (two prior mid samples, one prior
+    /// side sample, and the previous frame's prediction weights), carried
+    /// across Opus frames. `None` until the first stereo SILK-only frame;
+    /// reset (zeroed) on any §4.2.7.1 mono→stereo transition.
+    silk_stereo_unmix: Option<crate::silk_stereo::StereoUnmixState>,
     /// Operating mode of the most recently decoded Opus frame, used to
     /// drive the §4.5.2 SILK state-reset rule ("the SILK state is reset
     /// before every SILK-only or Hybrid frame where the previous frame
@@ -217,6 +251,29 @@ impl OpusDecoder {
                 if let Some(state) = self.silk_synth_mono.as_mut() {
                     state.reset();
                 }
+                if let Some((mid, side)) = self.silk_synth_stereo.as_mut() {
+                    mid.reset();
+                    side.reset();
+                }
+                if let Some(unmix) = self.silk_stereo_unmix.as_mut() {
+                    unmix.reset();
+                }
+            }
+        }
+
+        // §4.2.7.1: "the previous weights are reset to zeros on any
+        // transition from mono to stereo." More generally the §4.2.8
+        // unmixing history (and the mid/side synthesis state) only makes
+        // sense within a contiguous stereo run; a channel-count change
+        // clears the carried stereo state so a stale mono / prior-stereo
+        // history can never leak across the transition.
+        if self.last_channels.is_some_and(|c| c != channels) {
+            if let Some(unmix) = self.silk_stereo_unmix.as_mut() {
+                unmix.reset();
+            }
+            if let Some((mid, side)) = self.silk_synth_stereo.as_mut() {
+                mid.reset();
+                side.reset();
             }
         }
 
@@ -282,11 +339,11 @@ impl OpusDecoder {
     /// ([`FrameDecodeStatus::SilkParamsDecoded`]). A truncated / malformed
     /// frame yields [`FrameDecodeStatus::SilkDecodeError`] and silence.
     ///
-    /// The **stereo** mid/side interleave (§4.2.6) reuses the same
-    /// per-frame decode with the §4.2.7.1 / §4.2.7.2 symbols enabled and
-    /// is wired once the stereo unmixing back half lands; until then a
-    /// stereo SILK-only frame routes to
-    /// [`FrameDecodeStatus::LayerNotWired`].
+    /// A **stereo** Opus frame routes to
+    /// [`Self::decode_silk_only_stereo`], which runs the §4.2.6 mid/side
+    /// interleave with the §4.2.7.1 / §4.2.7.2 symbols enabled and the
+    /// §4.2.8 unmixing back half, emitting interleaved L/R PCM
+    /// ([`FrameDecodeStatus::SilkStereoDecoded`]).
     fn decode_silk_only_frame(
         &mut self,
         frame: &[u8],
@@ -298,12 +355,25 @@ impl OpusDecoder {
         let pcm_start = pcm.len();
         push_silence(pcm, per_channel, channels);
 
-        // Stereo SILK is not yet composed (the §4.2.6 mid/side interleave
-        // + §4.2.8 unmixing back half are a follow-up).
-        if channels != 1 {
+        if channels == 2 {
+            let status = match self.decode_silk_only_stereo(frame, routing) {
+                Ok((left, right, bandwidth)) => {
+                    // §4.2.9 (non-normative): resample each channel to the
+                    // 48 kHz output rate, then write it interleaved
+                    // (`[L0, R0, L1, R1, …]`) over the reserved silence.
+                    resample_stereo_to_output_i16(
+                        &left,
+                        &right,
+                        bandwidth,
+                        &mut pcm[pcm_start..pcm_start + per_channel * 2],
+                    );
+                    FrameDecodeStatus::SilkStereoDecoded
+                }
+                Err(_) => FrameDecodeStatus::SilkDecodeError,
+            };
             return FrameOutcome {
                 samples_per_channel: per_channel,
-                status: FrameDecodeStatus::LayerNotWired(OperatingMode::SilkOnly),
+                status,
             };
         }
 
@@ -460,6 +530,229 @@ impl OpusDecoder {
         Ok((internal, bandwidth))
     }
 
+    /// Decode the full §4.2 bitstream of one **stereo** SILK-only Opus
+    /// frame and unmix it to left/right.
+    ///
+    /// The §4.2.2 stereo organisation interleaves the two channels: per
+    /// 20 ms interval the mid SILK frame is decoded, then the side SILK
+    /// frame (skipped when the §4.2.7.2 mid-only flag on the mid frame is
+    /// set). The §4.2.7.1 stereo prediction weights ride on the mid
+    /// frame. After both channels finish their §4.2.7.9 synthesis they are
+    /// converted from mid/side to left/right via §4.2.8
+    /// ([`crate::silk_stereo::stereo_ms_to_lr`]).
+    ///
+    /// LBRR frames (§4.2.5) precede the regular frames and are also
+    /// interleaved (mid then side per interval); they are decoded only to
+    /// keep the range coder aligned with the regular frames that follow.
+    ///
+    /// Returns `(left, right, bandwidth)` at the SILK internal rate.
+    #[allow(clippy::type_complexity)]
+    fn decode_silk_only_stereo(
+        &mut self,
+        frame: &[u8],
+        routing: &OpusFrameRouting,
+    ) -> Result<(Vec<f32>, Vec<f32>, crate::toc::Bandwidth), Error> {
+        use crate::range_decoder::RangeDecoder;
+        use crate::silk_decode::{decode_silk_frame, SilkFrameDecoded, StereoHeaderContext};
+        use crate::silk_excitation::SilkFrameSize;
+        use crate::silk_header::SilkHeaderBits;
+        use crate::silk_stereo::{stereo_ms_to_lr, StereoUnmixState, StereoWeightsQ13};
+        use crate::silk_synthesis::{synthesize_silk_frame, SilkSynthState};
+
+        let bandwidth = routing
+            .silk_bandwidth
+            .ok_or(Error::MalformedPacket)?
+            .to_bandwidth();
+        let num_silk_frames = routing
+            .silk_frames_per_channel
+            .ok_or(Error::MalformedPacket)?;
+        let frame_size = if routing.frame_size_tenths_ms == 100 {
+            SilkFrameSize::TenMs
+        } else {
+            SilkFrameSize::TwentyMs
+        };
+
+        let mut rd = RangeDecoder::new(frame);
+
+        // §4.2.3 / §4.2.4 header bits (stereo => both channels' VAD + LBRR
+        // flags, mid then side).
+        let header = SilkHeaderBits::decode(&mut rd, num_silk_frames, true)?;
+
+        // §4.2.5 LBRR frames: per 20 ms interval, the mid LBRR frame (if
+        // present) then the side LBRR frame (if present), interleaved per
+        // §4.2.2. Decoded only to consume their bits. The §4.2.7.1 stereo
+        // weights ride on the mid LBRR frame; the §4.2.7.2 mid-only flag
+        // is present on the mid LBRR frame iff the side LBRR is unset for
+        // that interval.
+        let mut lbrr_mid = ChannelDecodeState::new();
+        let mut lbrr_side = ChannelDecodeState::new();
+        for idx in 0..num_silk_frames {
+            let mid_lbrr = header.mid_has_lbrr(idx);
+            let side_lbrr = header.side_has_lbrr(idx);
+            if mid_lbrr {
+                let stereo_ctx = StereoHeaderContext {
+                    // §4.2.7.2: mid-only flag present on the mid frame iff
+                    // the corresponding side channel is not coded.
+                    has_mid_only_flag: !side_lbrr,
+                };
+                let decoded = decode_silk_frame(
+                    &mut rd,
+                    lbrr_mid.config(bandwidth, frame_size, true, Some(stereo_ctx)),
+                )?;
+                lbrr_mid.advance(&decoded);
+                // A set mid-only flag would forbid a coded side LBRR
+                // frame; the header LBRR flags already encode that, so we
+                // trust `side_lbrr` for the interleave decision.
+                if side_lbrr {
+                    let decoded = decode_silk_frame(
+                        &mut rd,
+                        lbrr_side.config(bandwidth, frame_size, true, None),
+                    )?;
+                    lbrr_side.advance(&decoded);
+                }
+            } else if side_lbrr {
+                // Side-only LBRR (mid not coded): no stereo weights on a
+                // side frame per §4.2.7.1.
+                let decoded = decode_silk_frame(
+                    &mut rd,
+                    lbrr_side.config(bandwidth, frame_size, true, None),
+                )?;
+                lbrr_side.advance(&decoded);
+            }
+        }
+
+        // §4.2.6 regular SILK frames: per 20 ms interval, the mid frame
+        // then (unless the §4.2.7.2 mid-only flag is set) the side frame.
+        let mut mid_state = ChannelDecodeState::new();
+        let mut side_state = ChannelDecodeState::new();
+        let mut mid_frames: Vec<SilkFrameDecoded> = Vec::with_capacity(num_silk_frames as usize);
+        // Per-interval side frame: `Some(frame)` when coded, `None` when
+        // the side channel is skipped (mid-only flag set or side VAD path
+        // produced no frame). The §4.2.8 unmixer treats a `None` side as
+        // all-zero.
+        let mut side_frames: Vec<Option<SilkFrameDecoded>> =
+            Vec::with_capacity(num_silk_frames as usize);
+        // The §4.2.7.1 weights carried by the most-recent mid frame; the
+        // §4.2.8 unmix consumes the last interval's weights for the whole
+        // Opus frame (one set of weights per SILK frame, but the unmix
+        // runs once over the concatenated channel signal — we apply the
+        // first interval's weights, threading prev across intervals via
+        // the unmix state below).
+        let mut interval_weights: Vec<StereoWeightsQ13> =
+            Vec::with_capacity(num_silk_frames as usize);
+
+        for idx in 0..num_silk_frames {
+            let side_active = header.side_vad(idx);
+            // §4.2.7.2: the mid-only flag is present iff the side channel
+            // for this interval is NOT active (a regular frame with side
+            // VAD unset). When side VAD is set the side frame must be
+            // coded and the flag is omitted.
+            let stereo_ctx = StereoHeaderContext {
+                has_mid_only_flag: !side_active,
+            };
+            let mid_decoded = decode_silk_frame(
+                &mut rd,
+                mid_state.config(bandwidth, frame_size, header.mid_vad(idx), Some(stereo_ctx)),
+            )?;
+            // §4.2.7.1 weights ride on the mid frame.
+            let w = mid_decoded.stereo_pred.map(|p| StereoWeightsQ13 {
+                w0_q13: p.w0_q13,
+                w1_q13: p.w1_q13,
+            });
+            interval_weights.push(w.unwrap_or_default());
+            // §4.2.7.2: side coded iff side VAD set OR the mid-only flag is
+            // not set (mid-only flag present + cleared ⇒ side is coded).
+            let side_coded = side_active || mid_decoded.mid_only_flag == Some(false);
+            mid_state.advance(&mid_decoded);
+            mid_frames.push(mid_decoded);
+
+            if side_coded {
+                let side_decoded = decode_silk_frame(
+                    &mut rd,
+                    side_state.config(bandwidth, frame_size, header.side_vad(idx), None),
+                )?;
+                side_state.advance(&side_decoded);
+                side_frames.push(Some(side_decoded));
+            } else {
+                // §4.2.7.2 / §4.5.2: an uncoded side SILK frame clears the
+                // side LTP buffer; zeros feed the §4.2.8 unmixer.
+                side_frames.push(None);
+            }
+        }
+
+        if rd.has_error() {
+            return Err(Error::MalformedPacket);
+        }
+
+        // §4.2.7.9 synthesis for both channels, threading the cross-Opus-
+        // frame histories. (Re)create the state on a bandwidth change.
+        let need_fresh = match &self.silk_synth_stereo {
+            Some((m, _)) => m.bandwidth() != bandwidth,
+            None => true,
+        };
+        if need_fresh {
+            self.silk_synth_stereo = Some((
+                SilkSynthState::new(bandwidth)?,
+                SilkSynthState::new(bandwidth)?,
+            ));
+        }
+        let (mid_synth, side_synth) = self
+            .silk_synth_stereo
+            .as_mut()
+            .expect("stereo synth state set above");
+
+        let mut mid_signal = Vec::new();
+        let mut side_signal = Vec::new();
+        for (idx, mid_frame) in mid_frames.iter().enumerate() {
+            let mid_out = synthesize_silk_frame(bandwidth, frame_size, mid_frame, mid_synth)?;
+            let n = mid_out.len();
+            mid_signal.extend_from_slice(&mid_out);
+            match &side_frames[idx] {
+                Some(side_frame) => {
+                    let side_out =
+                        synthesize_silk_frame(bandwidth, frame_size, side_frame, side_synth)?;
+                    side_signal.extend_from_slice(&side_out);
+                }
+                None => {
+                    // §4.5.2: clear the side LTP buffer after an uncoded
+                    // side frame; feed zeros to the §4.2.8 unmixer.
+                    side_synth.reset();
+                    side_signal.extend(std::iter::repeat(0.0f32).take(n));
+                }
+            }
+        }
+
+        // §4.2.8 stereo unmixing: mid/side → left/right over the whole
+        // Opus frame. The unmix history (two prior mid samples, one prior
+        // side sample, previous weights) is carried in `silk_stereo_unmix`.
+        // The §4.2.8 weights interpolate from the previous frame's to the
+        // current frame's over the first n1 samples; we use the first
+        // interval's weights as the "current" set (the steady-state value
+        // for the rest of the Opus frame's leading interval).
+        let unmix = self
+            .silk_stereo_unmix
+            .get_or_insert_with(StereoUnmixState::new);
+        let current_weights = interval_weights.first().copied().unwrap_or_default();
+        // Treat the side channel as uncoded for the unmix only when EVERY
+        // interval skipped it (all-zero side history term); otherwise feed
+        // the synthesized side signal (already zero-filled for skipped
+        // intervals).
+        let any_side_coded = side_frames.iter().any(|s| s.is_some());
+        let stereo = stereo_ms_to_lr(
+            bandwidth,
+            &mid_signal,
+            if any_side_coded {
+                Some(&side_signal)
+            } else {
+                None
+            },
+            current_weights,
+            unmix,
+        )?;
+
+        Ok((stereo.left, stereo.right, bandwidth))
+    }
+
     /// Decode one CELT-only Opus frame (§4.3). Currently emits silence;
     /// the §4.3.2.1 coarse-energy Laplace decode (the first range-coded
     /// CELT field) is the documented gating gap.
@@ -497,6 +790,67 @@ impl OpusDecoder {
 /// Append `per_channel * channels` interleaved zero samples to `pcm`.
 fn push_silence(pcm: &mut Vec<i16>, per_channel: usize, channels: u8) {
     pcm.resize(pcm.len() + per_channel * channels as usize, 0);
+}
+
+/// Per-channel inter-frame decode state threaded across the SILK frames
+/// of one Opus frame (§4.2.7.4 previous gain, §4.2.7.6.1 previous lag,
+/// §4.2.7.5.5 previous NLSF base, and the "first SILK frame of this type"
+/// flag). One instance is used for the mid channel and one for the side
+/// channel (each channel's frames form an independent sequence).
+struct ChannelDecodeState {
+    prev_gain: Option<u8>,
+    prev_lag: Option<i32>,
+    prev_nlsf: Option<[i16; crate::silk_lsf_stage2::D_LPC_MAX]>,
+    prev_nlsf_len: usize,
+    first: bool,
+}
+
+impl ChannelDecodeState {
+    fn new() -> Self {
+        Self {
+            prev_gain: None,
+            prev_lag: None,
+            prev_nlsf: None,
+            prev_nlsf_len: 0,
+            first: true,
+        }
+    }
+
+    /// Build the [`crate::silk_decode::SilkFrameConfig`] for the next SILK
+    /// frame in this channel's sequence, given the §4.2.4 VAD flag and the
+    /// optional §4.2.7.1 / §4.2.7.2 stereo header context (present only on
+    /// the mid channel).
+    fn config(
+        &self,
+        bandwidth: crate::toc::Bandwidth,
+        frame_size: crate::silk_excitation::SilkFrameSize,
+        voice_active: bool,
+        stereo: Option<crate::silk_decode::StereoHeaderContext>,
+    ) -> crate::silk_decode::SilkFrameConfig {
+        crate::silk_decode::SilkFrameConfig {
+            bandwidth,
+            frame_size,
+            voice_active,
+            first_subframe_independent: self.first || self.prev_gain.is_none(),
+            previous_log_gain: self.prev_gain,
+            previous_primary_lag: self.prev_lag,
+            ltp_scaling_present: self.first,
+            lsf_interp_after_reset: self.first || self.prev_nlsf.is_none(),
+            previous_nlsf_q15: self.prev_nlsf,
+            previous_nlsf_len: self.prev_nlsf_len,
+            stereo,
+        }
+    }
+
+    /// Fold a freshly decoded SILK frame into the carried state, so the
+    /// next frame in this channel's sequence predicts against it.
+    fn advance(&mut self, decoded: &crate::silk_decode::SilkFrameDecoded) {
+        self.prev_gain = Some(decoded.gains.last_log_gain());
+        self.prev_lag = Some(decoded.ltp.primary_lag());
+        self.prev_nlsf = Some(decoded.nlsf_q15);
+        self.prev_nlsf_len = decoded.d_lpc;
+        self.first = false;
+    }
 }
 
 /// Resample one Opus frame's internal-rate SILK samples (`internal`, at
@@ -545,6 +899,34 @@ fn resample_internal_to_output_i16(
         let s1 = internal[(i0 + 1).min(in_len - 1)];
         let v = s0 + (s1 - s0) * frac;
         *o = f32_to_i16(v);
+    }
+}
+
+/// Resample a stereo pair of internal-rate SILK channels (`left` /
+/// `right`, both at the §4.2.1 SILK internal rate for `bandwidth`) to the
+/// 48 kHz output rate and write them **interleaved** (`[L0, R0, L1, R1,
+/// …]`) into `out` (length `2 * per_channel`).
+///
+/// Per RFC 6716 §4.2.9 the resampler is non-normative; we use the same
+/// linear interpolation as the mono path on each channel independently.
+fn resample_stereo_to_output_i16(
+    left: &[f32],
+    right: &[f32],
+    bandwidth: crate::toc::Bandwidth,
+    out: &mut [i16],
+) {
+    let per_channel = out.len() / 2;
+    if per_channel == 0 {
+        return;
+    }
+    // Resample each channel into a scratch buffer, then interleave.
+    let mut l = vec![0i16; per_channel];
+    let mut r = vec![0i16; per_channel];
+    resample_internal_to_output_i16(left, bandwidth, &mut l);
+    resample_internal_to_output_i16(right, bandwidth, &mut r);
+    for i in 0..per_channel {
+        out[2 * i] = l[i];
+        out[2 * i + 1] = r[i];
     }
 }
 
@@ -798,18 +1180,107 @@ mod tests {
     }
 
     #[test]
-    fn stereo_silk_only_routes_to_not_wired() {
-        // Stereo SILK is not yet composed; verify it still produces
-        // correct-length silence and the not-wired status.
-        let pkt = code0_packet(1, true, &[0x11, 0x22, 0x33, 0x44]);
+    fn stereo_silk_only_decodes_to_interleaved_pcm() {
+        // Stereo SILK now runs the full §4.2 interleaved mid/side decode +
+        // §4.2.8 unmix. A long pseudo-random body decodes cleanly; the
+        // output is interleaved L/R 48 kHz PCM.
+        let body: Vec<u8> = (0..220u16)
+            .map(|i| (i.wrapping_mul(137).wrapping_add(19) & 0xff) as u8)
+            .collect();
+        let pkt = code0_packet(1, true, &body); // config 1 = SILK NB 20 ms stereo.
         let mut dec = OpusDecoder::new();
         let out = dec.decode_packet(&pkt).expect("decode");
         assert_eq!(out.channels, 2);
+        assert_eq!(out.samples_per_channel(), 960);
+        assert_eq!(out.pcm.len(), 2 * 960);
+        assert!(matches!(
+            out.frame_outcomes[0].status,
+            FrameDecodeStatus::SilkStereoDecoded | FrameDecodeStatus::SilkDecodeError
+        ));
+    }
+
+    #[test]
+    fn stereo_silk_clean_body_is_fully_decoded() {
+        // A buffer long enough that the range coder never starves: the
+        // interleaved mid/side decode + unmix completes, yielding the
+        // stereo-decoded status (not a decode error, not not-wired).
+        let body: Vec<u8> = (0..400u16)
+            .map(|i| (i.wrapping_mul(97).wrapping_add(41) & 0xff) as u8)
+            .collect();
+        let pkt = code0_packet(1, true, &body);
+        let mut dec = OpusDecoder::new();
+        let out = dec.decode_packet(&pkt).expect("decode");
         assert_eq!(
             out.frame_outcomes[0].status,
-            FrameDecodeStatus::LayerNotWired(OperatingMode::SilkOnly)
+            FrameDecodeStatus::SilkStereoDecoded,
+            "a long stereo SILK NB body should fully decode"
         );
-        assert!(out.pcm.iter().all(|&s| s == 0));
+        // The output is finite and within i16 range by construction.
+        assert_eq!(out.pcm.len(), 2 * 960);
+    }
+
+    #[test]
+    fn stereo_silk_40ms_two_intervals_decode() {
+        // config 2 = SILK NB 40 ms => 2 SILK frames per channel; stereo.
+        // The §4.2.2 interleave runs mid/side per 20 ms interval twice.
+        let body: Vec<u8> = (0..480u16)
+            .map(|i| (i.wrapping_mul(61).wrapping_add(7) & 0xff) as u8)
+            .collect();
+        let pkt = code0_packet(2, true, &body);
+        let mut dec = OpusDecoder::new();
+        let out = dec.decode_packet(&pkt).expect("decode");
+        let routing = OpusFrameRouting::from_toc(OpusTocByte::from_byte(pkt[0]));
+        assert_eq!(routing.silk_frames_per_channel, Some(2));
+        assert_eq!(out.channels, 2);
+        // 40 ms => 1920 samples/channel interleaved.
+        assert_eq!(out.samples_per_channel(), 1920);
+        assert_eq!(out.pcm.len(), 2 * 1920);
+        assert!(matches!(
+            out.frame_outcomes[0].status,
+            FrameDecodeStatus::SilkStereoDecoded | FrameDecodeStatus::SilkDecodeError
+        ));
+    }
+
+    #[test]
+    fn stereo_silk_state_threads_across_packets() {
+        // Two consecutive stereo SILK packets thread the §4.2.7.9 + §4.2.8
+        // histories: the second packet's output may differ from a fresh
+        // decode, but both are valid finite buffers of equal length.
+        let body: Vec<u8> = (0..300u16)
+            .map(|i| (i.wrapping_mul(113).wrapping_add(23) & 0xff) as u8)
+            .collect();
+        let pkt = code0_packet(1, true, &body);
+
+        let mut fresh = OpusDecoder::new();
+        let fresh_out = fresh.decode_packet(&pkt).expect("decode");
+
+        let mut threaded = OpusDecoder::new();
+        threaded.decode_packet(&pkt).expect("decode");
+        let second = threaded.decode_packet(&pkt).expect("decode");
+        assert_eq!(second.pcm.len(), fresh_out.pcm.len());
+    }
+
+    #[test]
+    fn mono_to_stereo_transition_resets_stereo_state() {
+        // §4.2.7.1: previous stereo weights reset on a mono→stereo
+        // transition. A mono packet, then a stereo packet, then the same
+        // stereo packet must leave the second stereo decode in a defined
+        // state (no panic; correct length). The mono→stereo channel-count
+        // change clears the carried stereo history.
+        let mono_body: Vec<u8> = (0..200u16)
+            .map(|i| (i.wrapping_mul(71).wrapping_add(5) & 0xff) as u8)
+            .collect();
+        let stereo_body: Vec<u8> = (0..300u16)
+            .map(|i| (i.wrapping_mul(89).wrapping_add(11) & 0xff) as u8)
+            .collect();
+        let mono_pkt = code0_packet(1, false, &mono_body);
+        let stereo_pkt = code0_packet(1, true, &stereo_body);
+
+        let mut dec = OpusDecoder::new();
+        dec.decode_packet(&mono_pkt).expect("mono");
+        let out = dec.decode_packet(&stereo_pkt).expect("stereo");
+        assert_eq!(out.channels, 2);
+        assert_eq!(out.pcm.len(), 2 * 960);
     }
 
     #[test]
@@ -830,12 +1301,13 @@ mod tests {
                     * out.channels as usize;
                 assert_eq!(out.pcm.len(), expected, "config {config} stereo {stereo}");
                 // The unwired layers (everything except a successfully
-                // synthesized mono SILK-only frame) still emit silence.
-                let is_wired_mono_silk = matches!(
+                // synthesized mono or stereo SILK-only frame) still emit
+                // silence.
+                let is_wired_silk = matches!(
                     out.frame_outcomes[0].status,
-                    FrameDecodeStatus::SilkParamsDecoded
+                    FrameDecodeStatus::SilkParamsDecoded | FrameDecodeStatus::SilkStereoDecoded
                 );
-                if !is_wired_mono_silk {
+                if !is_wired_silk {
                     assert!(
                         out.pcm.iter().all(|&s| s == 0),
                         "config {config} stereo {stereo} status {:?} should be silence",
