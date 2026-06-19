@@ -15,18 +15,20 @@ now in place: it parses the §3.1 TOC, splits the §3.2 frame packing
 (all four frame-count codes), runs the §4.5 multi-frame loop, routes
 each Opus frame by mode, and lays out the interleaved 48 kHz output
 buffer (RFC 7845 §5.1) with correct per-frame sample counts. A **mono
-SILK-only** packet runs the real §4.2 bitstream decode end-to-end (the
-§4.2.3 header bits, the §4.2.5 LBRR / §4.2.6 regular SILK frame loop,
-each frame decoded in Table-5 order through gains / LSF chain / LTP /
-excitation, with inter-frame state threaded across frames). The
-§4.2.7.9 LTP / LPC synthesis + §4.2.9 resample that turn the decoded
-SILK parameters into 48 kHz samples — and the CELT layer's §4.3.2.1
-coarse-energy decode — are the remaining decode milestones, so the
-emitted PCM is currently silence (the bitstream is fully consumed and
-the decoded parameters are exposed via `FrameDecodeStatus`). The crate
-ships a large, individually unit-tested set of SILK and CELT decode
-building blocks (~1145 lib tests). Per-stage progress lives in
-`CHANGELOG.md`.
+SILK-only** packet now decodes **end-to-end to real PCM**: the §4.2
+bitstream decode (the §4.2.3 header bits, the §4.2.5 LBRR / §4.2.6
+regular SILK frame loop, each frame decoded in Table-5 order through
+gains / LSF chain / LTP / excitation with inter-frame state threaded),
+then the §4.2.7.9 LTP / LPC synthesis filters (composed in the new
+`silk_synthesis` module with the §4.2.7.9 per-subframe LPC selection and
+cross-frame histories), then a §4.2.9 non-normative resample to 48 kHz
+and i16 conversion. The §4.5.2 SILK state reset (CELT→SILK transition)
+is applied across packets. The remaining decode milestones are the
+**stereo** SILK mid/side unmixing (§4.2.8) and the CELT layer's §4.3.2.1
+coarse-energy decode; those modes still emit correct-length silence
+flagged via `FrameDecodeStatus`. The crate ships a large, individually
+unit-tested set of SILK and CELT decode building blocks (~1156 lib
+tests). Per-stage progress lives in `CHANGELOG.md`.
 
 ## What works
 
@@ -34,12 +36,18 @@ building blocks (~1145 lib tests). Per-stage progress lives in
 
 - `OpusDecoder::decode_packet` — the top-level packet → interleaved
   48 kHz PCM path: TOC parse, §3.2 frame split, §4.5 multi-frame loop,
-  per-mode routing, and the RFC 7845 §5.1 output sample-count layout.
-  Mono SILK-only packets run the real §4.2 bitstream decode; other modes
-  emit correct-length silence flagged via `FrameDecodeStatus`.
+  per-mode routing, the §4.5.2 cross-packet SILK state reset, and the
+  RFC 7845 §5.1 output sample-count layout. Mono SILK-only packets decode
+  end-to-end to real PCM (bitstream → §4.2.7.9 synthesis → §4.2.9
+  resample); other modes emit correct-length silence flagged via
+  `FrameDecodeStatus`.
 - `silk_decode::decode_silk_frame` — the §4.2.6 / §4.2.7 in-order SILK
   frame decode that composes the per-stage decoders in exact Table-5
   symbol order and runs the LSF → stable-Q12-LPC chain.
+- `silk_synthesis::synthesize_silk_frame` — the §4.2.7.9 synthesis
+  composition: §4.2.7.9.1 LTP + §4.2.7.9.2 LPC filters with the §4.2.7.9
+  per-subframe LPC selection and cross-frame `SilkSynthState` histories,
+  producing internal-rate (8/12/16 kHz) time-domain samples.
 
 **Packet & framing (RFC 6716 §3 / §4.2):**
 
