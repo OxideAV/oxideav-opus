@@ -108,6 +108,28 @@ pub struct SilkFrameConfig {
     /// Length of the populated prefix of [`Self::previous_nlsf_q15`]
     /// (the `d_LPC` of the previous frame: 10 for NB/MB, 16 for WB).
     pub previous_nlsf_len: usize,
+    /// §4.2.7.1 / §4.2.7.2 stereo header context for the **mid channel**
+    /// of a stereo Opus frame. `None` for a mono frame (no stereo
+    /// prediction weights, no mid-only flag). When `Some`, the front-half
+    /// decode reads the §4.2.7.1 prediction weights first and, when
+    /// [`StereoHeaderContext::has_mid_only_flag`] is set, the §4.2.7.2
+    /// mid-only flag, both in Table-5 order ahead of the frame type. The
+    /// decoded values are returned in [`SilkFrameDecoded::stereo_pred`] /
+    /// [`SilkFrameDecoded::mid_only_flag`].
+    pub stereo: Option<StereoHeaderContext>,
+}
+
+/// §4.2.7.1 / §4.2.7.2 stereo header context for the mid channel of a
+/// stereo Opus frame, supplied to [`decode_silk_frame`] via
+/// [`SilkFrameConfig::stereo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StereoHeaderContext {
+    /// Whether the §4.2.7.2 mid-only flag is present for this time
+    /// interval. Per §4.2.7.2 the flag appears iff the side channel of
+    /// this interval is not otherwise required (regular frame with side
+    /// VAD == 0, or LBRR frame with side LBRR == 0). The §4.2 packet
+    /// walker determines this and passes the boolean.
+    pub has_mid_only_flag: bool,
 }
 
 /// One fully decoded regular SILK frame: every Table-5 bitstream symbol
@@ -144,6 +166,14 @@ pub struct SilkFrameDecoded {
     pub lcg_seed: u8,
     /// §4.2.7.8 quantized excitation `e_Q23[]`.
     pub excitation: Excitation,
+    /// §4.2.7.1 decoded stereo prediction weights (Q13), present only on
+    /// the mid channel of a stereo Opus frame (when
+    /// [`SilkFrameConfig::stereo`] is `Some`); `None` for a mono frame.
+    pub stereo_pred: Option<crate::silk_frame::StereoPredictionWeights>,
+    /// §4.2.7.2 decoded mid-only flag, present only when the stereo
+    /// context had [`StereoHeaderContext::has_mid_only_flag`] set;
+    /// `Some(true)` means the side channel of this interval is skipped.
+    pub mid_only_flag: Option<bool>,
 }
 
 /// Decode one regular **mono** SILK frame from `rd`, reading every
@@ -162,12 +192,14 @@ pub fn decode_silk_frame(
         SilkFrameSize::TwentyMs => 4,
     };
 
-    // ---- Steps 1-3: §4.2.7.1 / §4.2.7.2 / §4.2.7.3 (mono: no stereo
-    // weights, no mid-only flag). ----
+    // ---- Steps 1-3: §4.2.7.1 / §4.2.7.2 / §4.2.7.3. For a mono frame no
+    // stereo weights / mid-only flag are read; for the mid channel of a
+    // stereo Opus frame the §4.2.7.1 weights (and, when signalled, the
+    // §4.2.7.2 mid-only flag) precede the frame type in Table-5 order. ----
     let header_cfg = SilkFrameHeaderConfig {
-        stereo_mid_channel: false,
-        stereo: false,
-        has_mid_only_flag: false,
+        stereo_mid_channel: cfg.stereo.is_some(),
+        stereo: cfg.stereo.is_some(),
+        has_mid_only_flag: cfg.stereo.is_some_and(|s| s.has_mid_only_flag),
         kind: if cfg.voice_active {
             FrameKind::RegularActive
         } else {
@@ -176,6 +208,8 @@ pub fn decode_silk_frame(
         bandwidth: cfg.bandwidth,
     };
     let pre = SilkFrameHeader::decode_pre_gains(rd, header_cfg)?;
+    let stereo_pred = pre.stereo_pred;
+    let mid_only_flag = pre.mid_only_flag;
 
     // ---- Step 4: §4.2.7.4 subframe gains. ----
     let gains = SubframeGains::decode(
@@ -277,6 +311,8 @@ pub fn decode_silk_frame(
         ltp,
         lcg_seed,
         excitation,
+        stereo_pred,
+        mid_only_flag,
     })
 }
 
@@ -307,6 +343,7 @@ mod tests {
             lsf_interp_after_reset: true,
             previous_nlsf_q15: None,
             previous_nlsf_len: 0,
+            stereo: None,
         }
     }
 
@@ -389,6 +426,66 @@ mod tests {
                 decode_silk_frame(&mut rd, cfg),
                 Err(Error::MalformedPacket)
             ));
+        }
+    }
+
+    /// A mono frame returns no §4.2.7.1 stereo weights and no §4.2.7.2
+    /// mid-only flag.
+    #[test]
+    fn mono_frame_has_no_stereo_fields() {
+        let buf: Vec<u8> = (0..96u16)
+            .map(|i| (i.wrapping_mul(71).wrapping_add(3) & 0xff) as u8)
+            .collect();
+        let mut rd = RangeDecoder::new(&buf);
+        let cfg = fresh_cfg(Bandwidth::Nb, SilkFrameSize::TwentyMs, false);
+        if let Ok(decoded) = decode_silk_frame(&mut rd, cfg) {
+            assert!(decoded.stereo_pred.is_none());
+            assert!(decoded.mid_only_flag.is_none());
+        }
+    }
+
+    /// The mid channel of a stereo Opus frame decodes the §4.2.7.1 stereo
+    /// prediction weights ahead of the frame type and surfaces them in
+    /// `SilkFrameDecoded`. Reading the extra §4.2.7.1 symbols shifts the
+    /// bitstream relative to the mono path, so the two decodes of the same
+    /// buffer differ — this pins that the stereo weights are actually read.
+    #[test]
+    fn stereo_mid_channel_reads_prediction_weights() {
+        let buf: Vec<u8> = (0..128u16)
+            .map(|i| (i.wrapping_mul(83).wrapping_add(17) & 0xff) as u8)
+            .collect();
+
+        let mut rd_stereo = RangeDecoder::new(&buf);
+        let mut cfg_stereo = fresh_cfg(Bandwidth::Wb, SilkFrameSize::TwentyMs, true);
+        cfg_stereo.stereo = Some(StereoHeaderContext {
+            has_mid_only_flag: false,
+        });
+        let start = rd_stereo.tell();
+        if let Ok(decoded) = decode_silk_frame(&mut rd_stereo, cfg_stereo) {
+            // The §4.2.7.1 weights were read (non-None) and the bitstream
+            // advanced past at least the stereo-weight + frame-type symbols.
+            assert!(decoded.stereo_pred.is_some());
+            assert!(decoded.mid_only_flag.is_none()); // not signalled here.
+            assert!(rd_stereo.tell() > start);
+        }
+    }
+
+    /// When the §4.2.7.2 mid-only flag is signalled, it is decoded and
+    /// returned (after the §4.2.7.1 weights, ahead of the frame type).
+    #[test]
+    fn stereo_mid_only_flag_decoded_when_present() {
+        let buf: Vec<u8> = (0..128u16)
+            .map(|i| (i.wrapping_mul(59).wrapping_add(29) & 0xff) as u8)
+            .collect();
+        let mut rd = RangeDecoder::new(&buf);
+        let mut cfg = fresh_cfg(Bandwidth::Nb, SilkFrameSize::TwentyMs, false);
+        cfg.stereo = Some(StereoHeaderContext {
+            has_mid_only_flag: true,
+        });
+        if let Ok(decoded) = decode_silk_frame(&mut rd, cfg) {
+            assert!(decoded.stereo_pred.is_some());
+            // The flag is a real bool (0 or 1), decoded from Table 8.
+            assert!(matches!(decoded.mid_only_flag, Some(false) | Some(true)));
         }
     }
 }

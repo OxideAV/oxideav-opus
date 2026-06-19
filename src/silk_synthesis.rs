@@ -321,6 +321,7 @@ mod tests {
             lsf_interp_after_reset: true,
             previous_nlsf_q15: None,
             previous_nlsf_len: 0,
+            stereo: None,
         }
     }
 

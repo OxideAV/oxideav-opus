@@ -389,6 +389,8 @@ impl OpusDecoder {
                 lsf_interp_after_reset: lbrr_first,
                 previous_nlsf_q15: None,
                 previous_nlsf_len: 0,
+                // Mono SILK-only path: no §4.2.7.1 / §4.2.7.2 stereo header.
+                stereo: None,
             };
             let decoded = decode_silk_frame(&mut rd, cfg)?;
             lbrr_prev_gain = Some(decoded.gains.last_log_gain());
@@ -418,6 +420,8 @@ impl OpusDecoder {
                 lsf_interp_after_reset: first || prev_nlsf.is_none(),
                 previous_nlsf_q15: prev_nlsf,
                 previous_nlsf_len: prev_nlsf_len,
+                // Mono SILK-only path: no §4.2.7.1 / §4.2.7.2 stereo header.
+                stereo: None,
             };
             let decoded = decode_silk_frame(&mut rd, cfg)?;
             prev_gain = Some(decoded.gains.last_log_gain());

@@ -30,6 +30,17 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- §4.2.7.1 / §4.2.7.2 *Stereo mid-channel header decode in
+  `decode_silk_frame`* (`silk_decode`): `SilkFrameConfig` gained an
+  optional `stereo: Option<StereoHeaderContext>` field; when `Some`, the
+  front-half decode reads the §4.2.7.1 stereo prediction weights (and,
+  when signalled, the §4.2.7.2 mid-only flag) in Table-5 order ahead of
+  the frame type, surfacing them in `SilkFrameDecoded::stereo_pred` /
+  `mid_only_flag`. This makes the SILK bitstream front half stereo-ready
+  (a prerequisite for the §4.2.8 mid/side unmixing); the mono path passes
+  `None` and is unchanged. 3 tests (mono has no stereo fields, mid-channel
+  reads the §4.2.7.1 weights and advances the bitstream, mid-only flag
+  decoded when present).
 - §4.2.7.9 *SILK frame synthesis composition* (`silk_synthesis`): the new
   `synthesize_silk_frame` composes the individually-tested §4.2.7.9.1 LTP
   synthesis (`silk_ltp_synth`) and §4.2.7.9.2 LPC synthesis
