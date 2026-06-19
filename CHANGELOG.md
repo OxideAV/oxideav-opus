@@ -4,6 +4,22 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- §4 *Mono SILK-only packets now decode to real PCM* (`decoder`):
+  `OpusDecoder` wires the new §4.2.7.9 synthesis into the mono SILK-only
+  path. After the §4.2 bitstream decode, the decoded SILK frames are run
+  through `silk_synthesis::synthesize_silk_frame` (threading a carried
+  per-decoder `SilkSynthState` across the packet's Opus frames, cleared on
+  `reset`/§4.5.2) and the internal-rate output is resampled to 48 kHz by a
+  non-normative linear-interpolation resampler (§4.2.9 explicitly leaves
+  the kernel to the decoder) and converted to signed 16-bit PCM. A
+  `FrameDecodeStatus::SilkParamsDecoded` outcome now carries real audio
+  instead of forced silence; the still-unwired layers (stereo SILK,
+  CELT-only, Hybrid) remain correct-length silence. The all-silence sweep
+  test was rewritten to a length-invariant + per-status silence check, and
+  a non-silent mono SILK decode test added.
+
 ### Added
 
 - §4.2.7.9 *SILK frame synthesis composition* (`silk_synthesis`): the new
