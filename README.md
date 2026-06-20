@@ -29,15 +29,24 @@ synthesis states and converted from mid/side to left/right by the §4.2.8
 `silk_stereo` unmixer, run **per SILK interval** with that interval's
 §4.2.7.1 weights and the cross-packet `StereoUnmixState` history. The
 §4.5.2 SILK state reset (CELT→SILK transition) and the §4.2.7.1
-mono→stereo weight reset are applied across packets. The remaining decode
-milestones are the CELT layer's §4.3.2.1 coarse-energy decode (CELT-only
-and Hybrid still emit correct-length silence flagged via
-`FrameDecodeStatus`) and the §4.4 packet-loss concealment (the RFC
-defines PLC as a non-normative decoder feature with no bitstream
-algorithm; lost / DTX frames currently emit the §4.6 silence floor). The
-crate ships a large, individually unit-tested set of SILK and CELT decode
-building blocks (1163 lib tests). Per-stage progress lives in
-`CHANGELOG.md`.
+mono→stereo weight reset are applied across packets. The CELT **synthesis
+backend** is now composed end-to-end: `celt_synthesis::CeltSynthState`
+turns already-decoded per-band shapes + `log2` energies into time-domain
+PCM through §4.3.6 denormalise → §4.3.7 inverse MDCT → §4.3.7 weighted
+overlap-add → §4.3.7.2 de-emphasis, threading the cross-frame overlap and
+de-emphasis state (the CELT analogue of `silk_synthesis`), and emits
+interleaved 48 kHz i16 via `synthesize_frame_interleaved_i16`. The
+remaining CELT decode milestone is the §4.3.2 entropy *front half*
+(coarse-energy / PVQ bitstream decode) that feeds this backend — its
+§4.3.2.1 coarse-energy Laplace step (`ec_laplace_decode`) is an open
+clean-room gap, so CELT-only and Hybrid frames still emit correct-length
+silence flagged via `FrameDecodeStatus` until that lands. The §4.4
+packet-loss concealment is also outstanding (the RFC defines PLC as a
+non-normative decoder feature with no bitstream algorithm; lost / DTX
+frames currently emit the §4.6 silence floor). The crate ships a large,
+individually unit-tested set of SILK and CELT decode building blocks
+(1178 lib tests + a CELT synthesis-backend integration suite). Per-stage
+progress lives in `CHANGELOG.md`.
 
 ## What works
 

@@ -6,6 +6,37 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- §4.3.6 / §4.3.7 / §4.3.7.2 *CELT synthesis backend composition*
+  (`celt_synthesis`): a new `CeltSynthState` composes the
+  individually-tested §4.3.6 denormalise → §4.3.7 inverse MDCT → §4.3.7
+  weighted overlap-add → §4.3.7.2 de-emphasis primitives into one
+  per-channel call (`synthesize_channel_into`) that turns the
+  frequency-domain output of the CELT entropy front half (per-band
+  unit-L2 shapes + per-band `log2` energies) into time-domain PCM,
+  threading the cross-frame overlap-add history and de-emphasis one-pole
+  memory the spec's continuous reconstruction requires; `reset` zeroes
+  both for the §4.5.2 CELT reset. The frequency buffer is sized to the
+  **full** MDCT size `N = frame_samples` (120/240/480/960) and the
+  denormaliser fills only the lower `coded_bins` (Table-55 column sum,
+  100/200/400/800 CELT-only), leaving the high bins above the 20 kHz band
+  edge as the exact zero-pad the inverse MDCT consumes.
+  `synthesize_frame_interleaved_i16` runs every channel and returns
+  interleaved 48 kHz signed-16-bit PCM using the decoder's SILK amplitude
+  convention (clamp ±1.0, ×32767, round). 14 module tests + a 5-test
+  `celt_synthesis_roundtrip` integration suite (long silent stream → exact
+  silence, an independent per-stage re-derivation of the backend with the
+  de-emphasis undone, the §4.3.7 TDAC constant-spectrum steady state,
+  frame-boundary continuity, and finite/bounded output across all four
+  frame sizes × mono/stereo). This is the CELT analogue of
+  `silk_synthesis`; the gapped §4.3.2 entropy front half
+  (`ec_laplace_decode`) is the remaining CELT decode milestone that will
+  feed it.
+- §4.3 *`celt_total_bins_per_channel` doc correction* (`celt_band_layout`):
+  the doc comment claimed 120/960/640 band-bin sums where the function
+  (and its own `column_sum_pinned_values` test) returns 100/800/480, and
+  now documents that these band-bin sums are strictly below the full MDCT
+  size `frame_samples`.
+
 - §4.2 / §4.2.8 *Stereo SILK-only packets now decode to real interleaved
   PCM* (`decoder`): `OpusDecoder` wires the full stereo SILK path it
   previously stubbed as `LayerNotWired`. A new `decode_silk_only_stereo`
