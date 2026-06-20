@@ -236,14 +236,20 @@ pub const fn celt_end_coded_band() -> usize {
 
 /// Total MDCT bins per channel summed across every coded band, for a
 /// frame at `frame_size` with `is_hybrid` set or unset. RFC 6716 §4.3
-/// Table 55 column sums:
+/// Table 55 column sums (pinned exactly by `column_sum_pinned_values`):
 ///
-/// * CELT-only, 2.5 ms — `120` bins / channel (the 8 + 8 + 12 + 18 + 22
-///   tail covers `1600..=20000 Hz`; the 8× `1` covers `0..=1600 Hz`).
-/// * CELT-only, 20 ms — `960` bins / channel (= 8 × 120).
-/// * Hybrid, 20 ms — `608` bins / channel (= 960 − 8×8 − 4×16 − 3×32 −
-///   2×48 = `960 − 64 − 64 − 96 − 96 = 640`… see the test pin for the
-///   exact figure).
+/// * CELT-only, 2.5 ms — `100` bins / channel (`8×1 + 4×2 + 3×4 + 2×6 +
+///   8 + 12 + 18 + 22`). The column doubles per frame-size step, so
+///   5 / 10 / 20 ms are `200` / `400` / `800`.
+/// * Hybrid (bands `17..=20` only) — `60` / `120` / `240` / `480` for
+///   2.5 / 5 / 10 / 20 ms.
+///
+/// Note these *band-bin* sums are strictly less than the **full MDCT
+/// size** `frame_samples` (`120` / `240` / `480` / `960`): Table 55's
+/// bands top out at the 20 kHz edge, so the high MDCT bins above the last
+/// band carry no coded content (the §4.3.7 inverse MDCT zero-pads them).
+/// The synthesis backend ([`crate::celt_synthesis`]) sizes its frequency
+/// buffer to the full MDCT size and fills only this coded prefix.
 ///
 /// These sums are not directly stated in the RFC; they are pure
 /// arithmetic over Table 55 and the §4.3 first-coded-band rule. They

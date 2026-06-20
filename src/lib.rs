@@ -707,6 +707,7 @@ pub mod celt_redundancy;
 pub mod celt_reservations;
 pub mod celt_spreading;
 pub mod celt_static_alloc;
+pub mod celt_synthesis;
 pub mod celt_tf_adjust;
 pub mod celt_tf_decode;
 pub mod celt_transitions;
