@@ -384,6 +384,63 @@ impl CeltSynthState {
 
         Ok(())
     }
+
+    /// Synthesize one CELT frame across every channel and return the
+    /// interleaved 48 kHz signed-16-bit PCM (`[c0_s0, c1_s0, c0_s1, …]`),
+    /// advancing each channel's overlap-add and de-emphasis state.
+    ///
+    /// `per_channel[c]` is channel `c`'s `(shapes, log2_energy)` pair (the
+    /// same arguments [`Self::synthesize_channel_into`] takes). The slice
+    /// length must equal [`Self::channels`]. Each channel's `N`
+    /// time-domain samples are clamped to `[-1.0, 1.0]`, scaled by `32767`,
+    /// and rounded to `i16` — the same conversion the decoder applies to
+    /// the SILK path so CELT and SILK output share one amplitude
+    /// convention. Returns `channels * N` interleaved samples.
+    ///
+    /// # Errors
+    ///
+    /// * [`CeltSynthError::ChannelCountMismatch`] if `per_channel.len()`
+    ///   does not equal [`Self::channels`].
+    /// * The per-channel errors from [`Self::synthesize_channel_into`].
+    pub fn synthesize_frame_interleaved_i16(
+        &mut self,
+        per_channel: &[(&[&[f64]], &[f64])],
+    ) -> Result<Vec<i16>, CeltSynthError> {
+        if per_channel.len() != self.channels.len() {
+            return Err(CeltSynthError::ChannelCountMismatch {
+                expected: self.channels.len(),
+                got: per_channel.len(),
+            });
+        }
+        let n = self.n;
+        let ch_count = self.channels.len();
+        // Synthesize each channel into its own scratch buffer first, then
+        // interleave (the per-channel state borrows are sequential).
+        let mut planar: Vec<Vec<f64>> = Vec::with_capacity(ch_count);
+        for (c, (shapes, energies)) in per_channel.iter().enumerate() {
+            let mut buf = vec![0.0_f64; n];
+            self.synthesize_channel_into(c, shapes, energies, &mut buf)?;
+            planar.push(buf);
+        }
+        let mut out = vec![0_i16; ch_count * n];
+        for (s, slot) in out.chunks_exact_mut(ch_count).enumerate() {
+            for (c, dst) in slot.iter_mut().enumerate() {
+                *dst = celt_sample_to_i16(planar[c][s]);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Convert one §4.3.7.2-domain time sample to signed 16-bit PCM, matching
+/// the decoder's SILK conversion: clamp to `[-1.0, 1.0]`, scale by
+/// `32767`, round to nearest. A free function so the conversion is shared
+/// and unit-testable.
+#[inline]
+#[must_use]
+fn celt_sample_to_i16(v: f64) -> i16 {
+    let scaled = (v.clamp(-1.0, 1.0) * 32767.0).round();
+    scaled as i16
 }
 
 #[cfg(test)]
@@ -595,5 +652,70 @@ mod tests {
             "higher band energy must yield more output power"
         );
         assert!(low > 0.0, "a nonzero shape at L=0 must be audible");
+    }
+
+    #[test]
+    fn sample_to_i16_matches_decoder_convention() {
+        // The shared conversion: clamp to ±1, ×32767, round.
+        assert_eq!(celt_sample_to_i16(0.0), 0);
+        assert_eq!(celt_sample_to_i16(1.0), 32767);
+        assert_eq!(celt_sample_to_i16(-1.0), -32767);
+        // Clamp beyond range.
+        assert_eq!(celt_sample_to_i16(2.5), 32767);
+        assert_eq!(celt_sample_to_i16(-3.0), -32767);
+        // Rounding to nearest.
+        assert_eq!(celt_sample_to_i16(0.5 / 32767.0 + 0.5), 16384);
+    }
+
+    #[test]
+    fn interleaved_silent_frame_is_all_zero_i16() {
+        let mut st = CeltSynthState::new(CeltFrameSize::Ms20, false, 2).unwrap();
+        let (shapes, energies) = zero_frame(CeltFrameSize::Ms20, false);
+        let refs = shape_refs(&shapes);
+        let per_channel: Vec<(&[&[f64]], &[f64])> = vec![
+            (refs.as_slice(), energies.as_slice()),
+            (refs.as_slice(), energies.as_slice()),
+        ];
+        let pcm = st.synthesize_frame_interleaved_i16(&per_channel).unwrap();
+        assert_eq!(pcm.len(), 2 * st.transform_half_len());
+        assert!(pcm.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn interleaved_wrong_channel_count_rejected() {
+        let mut st = CeltSynthState::new(CeltFrameSize::Ms20, false, 2).unwrap();
+        let (shapes, energies) = zero_frame(CeltFrameSize::Ms20, false);
+        let refs = shape_refs(&shapes);
+        // Only one channel supplied to a stereo state.
+        let per_channel: Vec<(&[&[f64]], &[f64])> = vec![(refs.as_slice(), energies.as_slice())];
+        let err = st
+            .synthesize_frame_interleaved_i16(&per_channel)
+            .unwrap_err();
+        assert!(matches!(err, CeltSynthError::ChannelCountMismatch { .. }));
+    }
+
+    #[test]
+    fn interleaved_layout_places_channels_correctly() {
+        // Channel 0 carries audible content, channel 1 is silent: the
+        // interleaved output must have zeros at every odd index (channel 1)
+        // and at least one nonzero at an even index (channel 0).
+        let mut st = CeltSynthState::new(CeltFrameSize::Ms10, false, 2).unwrap();
+        let (mut a_shapes, mut a_energies) = zero_frame(CeltFrameSize::Ms10, false);
+        a_shapes[4][0] = 1.0;
+        a_energies[4] = 6.0;
+        let a_refs = shape_refs(&a_shapes);
+        let (z_shapes, z_energies) = zero_frame(CeltFrameSize::Ms10, false);
+        let z_refs = shape_refs(&z_shapes);
+        let per_channel: Vec<(&[&[f64]], &[f64])> = vec![
+            (a_refs.as_slice(), a_energies.as_slice()),
+            (z_refs.as_slice(), z_energies.as_slice()),
+        ];
+        let pcm = st.synthesize_frame_interleaved_i16(&per_channel).unwrap();
+        let n = st.transform_half_len();
+        assert_eq!(pcm.len(), 2 * n);
+        // Odd indices = channel 1 (silent) → all zero.
+        assert!(pcm.iter().skip(1).step_by(2).all(|&s| s == 0));
+        // Even indices = channel 0 → at least one audible sample.
+        assert!(pcm.iter().step_by(2).any(|&s| s != 0));
     }
 }
