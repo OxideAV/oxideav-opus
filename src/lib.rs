@@ -694,6 +694,7 @@ pub mod celt_deemphasis;
 pub mod celt_denormalise;
 pub mod celt_e_prob_model;
 pub mod celt_fine_energy;
+pub mod celt_frame_prefix;
 pub mod celt_header;
 pub mod celt_imdct;
 pub mod celt_laplace;
@@ -783,6 +784,7 @@ pub use celt_e_prob_model::{
     E_PROB_MODEL_MODE_INTRA, E_PROB_MODEL_TOTAL_BYTES, INTER_PRED_ALPHA_Q15, INTER_PRED_BETA_Q15,
     INTRA_PRED_ALPHA_Q15, INTRA_PRED_BETA_Q15, Q15_ONE,
 };
+pub use celt_frame_prefix::{decode_celt_frame_prefix, CeltFramePrefix, CeltPostFilterParams};
 pub use celt_header::{CeltHeaderPrefix, CeltPostFilter};
 pub use celt_laplace::{
     ec_laplace_decode, LAPLACE_DECAY_UNIT, LAPLACE_LOG_MINP, LAPLACE_MINP, LAPLACE_NMIN,
