@@ -131,6 +131,18 @@ pub enum FrameDecodeStatus {
     /// (a malformed / truncated frame). Silence of the correct length was
     /// emitted in its place per the §4.6 floor.
     SilkDecodeError,
+    /// A CELT-only frame whose §4.3.7.1 silence flag was set: the real
+    /// range-coded frame prefix (silence + post-filter group) was decoded
+    /// and the §4.3.6→§4.3.7.2 synthesis backend was advanced with
+    /// all-zero band shapes / energies, emitting silence PCM while
+    /// carrying the MDCT overlap-add and de-emphasis state forward for the
+    /// next frame. (Distinct from [`Self::LayerNotWired`]: the bitstream
+    /// is actually consumed and the synthesis state is real, not stubbed.)
+    CeltSilence,
+    /// A CELT-only frame whose §4.3.7.1 prefix decode latched a range-coder
+    /// error (a malformed / truncated frame). Silence of the correct length
+    /// was emitted in its place per the §4.6 floor.
+    CeltDecodeError,
 }
 
 /// The result of decoding one Opus frame: how many per-channel samples
@@ -206,6 +218,13 @@ pub struct OpusDecoder {
     /// before every SILK-only or Hybrid frame where the previous frame
     /// was CELT-only"). `None` before the first frame / after a reset.
     prev_mode: Option<OperatingMode>,
+    /// CELT synthesis backend state (the §4.3.7 MDCT overlap-add history
+    /// and §4.3.7.2 de-emphasis memory, per channel), carried across the
+    /// CELT frames of the stream. `None` until the first CELT-layer frame
+    /// is synthesized; re-created when the CELT frame size or channel
+    /// count changes (a §4.5.2-style reset, since the overlap geometry
+    /// depends on the frame size).
+    celt_synth: Option<crate::celt_synthesis::CeltSynthState>,
 }
 
 impl OpusDecoder {
@@ -742,20 +761,125 @@ impl OpusDecoder {
         Ok((left, right, bandwidth))
     }
 
-    /// Decode one CELT-only Opus frame (§4.3). Currently emits silence;
-    /// the §4.3.2.1 coarse-energy Laplace decode (the first range-coded
-    /// CELT field) is the documented gating gap.
+    /// Decode one CELT-only Opus frame (§4.3).
+    ///
+    /// Decodes the §4.3.7.1 range-coded frame prefix (silence flag +
+    /// post-filter group + transient + intra) from the real range coder.
+    /// When the **silence** flag is set, the frame is fully wired
+    /// end-to-end: the §4.3.6→§4.3.7.2 synthesis backend
+    /// ([`crate::celt_synthesis::CeltSynthState`]) is advanced with
+    /// all-zero band shapes and energies, producing silence PCM at the
+    /// 48 kHz output rate while carrying the MDCT overlap-add and
+    /// de-emphasis state forward for subsequent frames
+    /// ([`FrameDecodeStatus::CeltSilence`]). The synthesis state is
+    /// (re)built whenever the CELT frame size or channel count changes.
+    ///
+    /// Non-silent CELT frames still emit silence flagged
+    /// [`FrameDecodeStatus::LayerNotWired`]: the §4.3.2.1 coarse-energy
+    /// reconstruction recurrence (the 2-D predictor accumulation and its
+    /// per-band mean baseline) is not yet available in the clean-room
+    /// `docs/` material, so the band-energy envelope cannot be rebuilt.
+    /// The Laplace symbol decoder ([`crate::celt_laplace`]) and the prefix
+    /// decoder are in place; the missing piece is the reconstruction
+    /// arithmetic feeding the per-band `log2_energy`.
     fn decode_celt_only_frame(
         &mut self,
-        _frame: &[u8],
+        frame: &[u8],
         routing: &OpusFrameRouting,
         pcm: &mut Vec<i16>,
     ) -> FrameOutcome {
+        use crate::celt_band_layout::CeltFrameSize;
+
         let per_channel = output_samples_per_channel(routing.frame_size_tenths_ms);
-        push_silence(pcm, per_channel, routing.channel_count());
-        FrameOutcome {
-            samples_per_channel: per_channel,
-            status: FrameDecodeStatus::LayerNotWired(OperatingMode::CeltOnly),
+        let channels = routing.channel_count();
+        let pcm_start = pcm.len();
+        push_silence(pcm, per_channel, channels);
+
+        // The CELT layer needs a Table-55 frame size; a 40/60 ms frame
+        // can never route here (those are SILK-only), so a `None` is a
+        // routing invariant violation — fall back to the unwired floor.
+        let Some(celt_size) =
+            CeltFrameSize::from_frame_tenths_ms(routing.frame_size_tenths_ms as u32)
+        else {
+            return FrameOutcome {
+                samples_per_channel: per_channel,
+                status: FrameDecodeStatus::LayerNotWired(OperatingMode::CeltOnly),
+            };
+        };
+
+        // §4.3.7.1 frame prefix from the real range coder.
+        let mut rd = crate::range_decoder::RangeDecoder::new(frame);
+        let prefix = crate::celt_frame_prefix::decode_celt_frame_prefix(&mut rd);
+        if rd.has_error() {
+            return FrameOutcome {
+                samples_per_channel: per_channel,
+                status: FrameDecodeStatus::CeltDecodeError,
+            };
+        }
+
+        if !prefix.silence {
+            // The band-data path (coarse energy → bands → residual) is
+            // not yet reconstructable from docs/; emit the floor.
+            return FrameOutcome {
+                samples_per_channel: per_channel,
+                status: FrameDecodeStatus::LayerNotWired(OperatingMode::CeltOnly),
+            };
+        }
+
+        // Silence frame: drive the synthesis backend with all-zero bands.
+        // (Re)build the CELT synthesis state if absent or if its geometry
+        // no longer matches this frame's size / channel count.
+        let needs_rebuild = match &self.celt_synth {
+            Some(s) => {
+                s.channels() != channels as usize
+                    || s.transform_half_len() != (celt_size.to_frame_tenths_ms() as usize * 48) / 10
+            }
+            None => true,
+        };
+        if needs_rebuild {
+            match crate::celt_synthesis::CeltSynthState::new(celt_size, false, channels as usize) {
+                Ok(s) => self.celt_synth = Some(s),
+                Err(_) => {
+                    return FrameOutcome {
+                        samples_per_channel: per_channel,
+                        status: FrameDecodeStatus::CeltDecodeError,
+                    };
+                }
+            }
+        }
+        let synth = self.celt_synth.as_mut().expect("just built");
+
+        // All-zero per-band shapes and energies: one zero shape slice per
+        // coded band (each of its Table-55 bin length) and a matching
+        // zero-energy vector, for every channel.
+        let coded_bands = synth.coded_bands();
+        let first = synth.first_coded_band();
+        let mut shape_storage: Vec<Vec<f64>> = Vec::with_capacity(coded_bands);
+        for band in first..(first + coded_bands) {
+            let bins = crate::celt_band_layout::celt_band_bins_per_channel(band, celt_size)
+                .unwrap_or(0) as usize;
+            shape_storage.push(vec![0.0_f64; bins]);
+        }
+        let shape_refs: Vec<&[f64]> = shape_storage.iter().map(Vec::as_slice).collect();
+        let energies = vec![0.0_f64; coded_bands];
+        let per_channel_args: Vec<(&[&[f64]], &[f64])> = (0..channels as usize)
+            .map(|_| (shape_refs.as_slice(), energies.as_slice()))
+            .collect();
+
+        match synth.synthesize_frame_interleaved_i16(&per_channel_args) {
+            Ok(pcm_frame) => {
+                let region = &mut pcm[pcm_start..pcm_start + per_channel * channels as usize];
+                let n = region.len().min(pcm_frame.len());
+                region[..n].copy_from_slice(&pcm_frame[..n]);
+                FrameOutcome {
+                    samples_per_channel: per_channel,
+                    status: FrameDecodeStatus::CeltSilence,
+                }
+            }
+            Err(_) => FrameOutcome {
+                samples_per_channel: per_channel,
+                status: FrameDecodeStatus::CeltDecodeError,
+            },
         }
     }
 
@@ -1357,5 +1481,106 @@ mod tests {
             // buffer; every sample is a valid i16 (no panic / overflow).
             assert_eq!(out.pcm.len(), 960);
         }
+    }
+
+    /// Search for a CELT body whose §4.3.7.1 prefix decodes silence = 1
+    /// with the post-filter off, so the frame takes the fully-wired
+    /// silence synthesis path. Returns the body bytes appended after the
+    /// TOC. The search is deterministic (fixed candidate set), so the
+    /// chosen body is stable across runs.
+    fn find_celt_silence_body() -> Vec<u8> {
+        use crate::celt_frame_prefix::decode_celt_frame_prefix;
+        use crate::range_decoder::RangeDecoder;
+        // The silence flag is the {32767,1}/32768 "1" branch (probability
+        // 2^-15), so a silent frame is rare in random bytes; sweep the
+        // first two bytes (with a trailing zero run that keeps the
+        // post-filter off) to find one deterministically.
+        for b0 in 0u16..=255 {
+            for b1 in 0u16..=255 {
+                let buf = [b0 as u8, b1 as u8, 0, 0, 0, 0];
+                let mut rd = RangeDecoder::new(&buf);
+                let p = decode_celt_frame_prefix(&mut rd);
+                if p.silence && p.post_filter.is_none() && !rd.has_error() {
+                    return buf.to_vec();
+                }
+            }
+        }
+        panic!("no CELT silence body found in the candidate set");
+    }
+
+    #[test]
+    fn celt_only_silence_frame_decodes_end_to_end() {
+        // config 17 = CELT-only mono, 5 ms (Table-55 second column) →
+        // 240 samples/channel at 48 kHz.
+        let body = find_celt_silence_body();
+        let pkt = code0_packet(17, false, &body);
+        let mut dec = OpusDecoder::new();
+        let out = dec.decode_packet(&pkt).expect("decode");
+        assert_eq!(out.channels, 1);
+        assert_eq!(out.samples_per_channel(), 240);
+        assert_eq!(
+            out.frame_outcomes[0].status,
+            FrameDecodeStatus::CeltSilence,
+            "silence-flagged CELT frame must take the wired synthesis path"
+        );
+        // The frame is silent: every emitted sample is zero (a zero-energy
+        // band envelope synthesizes to a zero time-domain block, and the
+        // overlap-add / de-emphasis of an all-zero history stays zero).
+        assert_eq!(out.pcm.len(), 240);
+        assert!(
+            out.pcm.iter().all(|&s| s == 0),
+            "silence frame must be all zero"
+        );
+    }
+
+    #[test]
+    fn celt_silence_advances_synthesis_state() {
+        // Two consecutive CELT silence frames both decode through the
+        // wired path; the second reuses the carried CeltSynthState (no
+        // rebuild), and both emit silence of the correct length.
+        let body = find_celt_silence_body();
+        let pkt = code0_packet(17, false, &body);
+        let mut dec = OpusDecoder::new();
+        let first = dec.decode_packet(&pkt).expect("decode");
+        let second = dec.decode_packet(&pkt).expect("decode");
+        assert_eq!(
+            first.frame_outcomes[0].status,
+            FrameDecodeStatus::CeltSilence
+        );
+        assert_eq!(
+            second.frame_outcomes[0].status,
+            FrameDecodeStatus::CeltSilence
+        );
+        assert!(second.pcm.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn celt_non_silent_frame_reports_layer_not_wired() {
+        // A CELT body whose silence flag is clear takes the
+        // band-data path, which is not yet reconstructable from docs/;
+        // it must report LayerNotWired (not panic, not a decode error)
+        // and emit silence of the correct length.
+        use crate::celt_frame_prefix::decode_celt_frame_prefix;
+        use crate::range_decoder::RangeDecoder;
+        // Find a body with silence = 0 and no range-coder error.
+        let mut chosen: Option<Vec<u8>> = None;
+        for b0 in 0u16..=255 {
+            let buf = [b0 as u8, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a];
+            let mut rd = RangeDecoder::new(&buf);
+            let p = decode_celt_frame_prefix(&mut rd);
+            if !p.silence && !rd.has_error() {
+                chosen = Some(buf.to_vec());
+                break;
+            }
+        }
+        let body = chosen.expect("a non-silent CELT body exists in the candidate set");
+        let pkt = code0_packet(17, false, &body);
+        let mut dec = OpusDecoder::new();
+        let out = dec.decode_packet(&pkt).expect("decode");
+        assert_eq!(
+            out.frame_outcomes[0].status,
+            FrameDecodeStatus::LayerNotWired(OperatingMode::CeltOnly)
+        );
+        assert_eq!(out.pcm.len(), 240);
     }
 }
