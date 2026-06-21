@@ -9,7 +9,7 @@
 //!    overlap-add / de-emphasis state (§4.5.1).
 //! 2. **post-filter** — one bit (`logp = 1`). If set, four further
 //!    parameters follow (§4.3.7.1):
-//!    - **octave** — uniform in `0..=6` (`ec_dec_uint(6)`).
+//!    - **octave** — uniform in `0..=6` (7 values, `ec_dec_uint(7)`).
 //!    - **period** — `4 + octave` raw bits; final pitch period
 //!      `T = (16 << octave) + fine_pitch - 1`, bounded `15..=1022`.
 //!    - **gain** — 3 raw bits; `G = 3*(int_gain+1)/32`.
@@ -105,8 +105,12 @@ pub fn decode_celt_frame_prefix(
     // 2. post-filter group — the on/off bit and, when on, its four
     //    parameters. Coded right after the silence flag (§4.3.7.1).
     let post_filter = if rd.dec_bit_logp(POST_FILTER_LOGP) == 1 {
-        // octave — uniform in 0..=6: ec_dec_uint(6) draws 0..6.
-        let octave = rd.dec_uint(6).unwrap_or(0);
+        // octave — "an integer value between 0 and 6 of uniform
+        // probability" (§4.3.7.1), i.e. 7 equiprobable values. The range
+        // coder's ec_dec_uint(ft) returns [0, ft-1], so ft = 7 yields the
+        // 0..=6 octave range. (Table 56's "uniform (6)" names the maximum
+        // octave value, not ft.)
+        let octave = rd.dec_uint(7).unwrap_or(0);
         // period — 4 + octave raw bits, then T = (16<<octave)+fine-1.
         let fine_pitch = rd.dec_bits(4 + octave);
         let period = (16u32 << octave) + fine_pitch - 1;
@@ -204,6 +208,31 @@ mod tests {
         assert_eq!(INTRA_ICDF, [1, 0]);
         // tapset {2,1,1}/4: fh = [2,3,4] → icdf = [2,1,0].
         assert_eq!(TAPSET_ICDF, [2, 1, 0]);
+    }
+
+    /// The post-filter octave is uniform over the 7 values 0..=6
+    /// (§4.3.7.1). Sweeping the leading bytes, every decoded octave (when
+    /// the post-filter is on) must fall in 0..=6, and the maximum value 6
+    /// must be reachable — confirming the ec_dec_uint(7) range (a
+    /// ec_dec_uint(6) call could never yield 6).
+    #[test]
+    fn post_filter_octave_in_range_and_reaches_six() {
+        let mut max_octave = 0u32;
+        let mut saw_post_filter = false;
+        for b0 in 0u16..=255 {
+            for b1 in 0u16..=255 {
+                let buf = [b0 as u8, b1 as u8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80];
+                let mut rd = RangeDecoder::new(&buf);
+                let p = decode_celt_frame_prefix(&mut rd);
+                if let Some(pf) = p.post_filter {
+                    saw_post_filter = true;
+                    assert!(pf.octave <= 6, "octave {} out of range", pf.octave);
+                    max_octave = max_octave.max(pf.octave);
+                }
+            }
+        }
+        assert!(saw_post_filter, "no post-filter frame in the sweep");
+        assert_eq!(max_octave, 6, "octave 6 must be reachable (ec_dec_uint(7))");
     }
 
     /// Non-silent prefix: feed a buffer that decodes silence = 0 and walk
