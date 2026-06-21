@@ -696,6 +696,7 @@ pub mod celt_e_prob_model;
 pub mod celt_fine_energy;
 pub mod celt_header;
 pub mod celt_imdct;
+pub mod celt_laplace;
 pub mod celt_log2_frac_table;
 pub mod celt_mdct_window;
 pub mod celt_overlap_add;
@@ -783,6 +784,10 @@ pub use celt_e_prob_model::{
     INTRA_PRED_ALPHA_Q15, INTRA_PRED_BETA_Q15, Q15_ONE,
 };
 pub use celt_header::{CeltHeaderPrefix, CeltPostFilter};
+pub use celt_laplace::{
+    ec_laplace_decode, LAPLACE_DECAY_UNIT, LAPLACE_LOG_MINP, LAPLACE_MINP, LAPLACE_NMIN,
+    LAPLACE_TOTAL,
+};
 pub use celt_log2_frac_table::{
     log2_frac, log2_frac_row, Log2FracError, LOG2_FRAC_TABLE, LOG2_FRAC_TABLE_LEN,
     Q3_BITS_PER_WHOLE_BIT,
