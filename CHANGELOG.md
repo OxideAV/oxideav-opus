@@ -6,6 +6,29 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- §4.3.2.1 *CELT coarse-energy Laplace symbol decode*
+  (`celt_laplace::ec_laplace_decode`): the 15-bit Laplace path the
+  coarse-energy decoder uses — draw a 15-bit cumulative position, walk
+  the decaying body until the per-magnitude mass reaches the
+  `LAPLACE_MINP` floor, cover the flat tail with one division, resolve
+  the sign, and report the consumed `[fl, min(fl+fs, 32768))` interval
+  back to the range coder. Constants + the `prob<<7` / `decay<<6`
+  Q-scalings + the `get_freq1` first-magnitude helper from
+  `docs/audio/celt/spec/celt-laplace-decode.md`.
+- §4.3.7.1 *CELT frame-prefix symbol decode* (`celt_frame_prefix`):
+  decodes the fixed range-coded prefix every CELT frame opens with in
+  RFC 6716 Table-56 order — silence (`{32767,1}/32768`), the post-filter
+  group (on/off bit + `uniform(6)` octave + `4+octave` raw pitch bits +
+  3 raw gain bits + `{2,1,1}/4` tapset, with `T=(16<<octave)+fine-1` and
+  `G=3*(int_gain+1)/32`), then transient and intra (`{7,1}/8` each).
+- *CELT-only silence frame wired end-to-end* (`decoder`): a CELT frame
+  whose §4.3.7.1 silence flag is set now decodes through the real range
+  coder and drives the §4.3.6→§4.3.7.2 synthesis backend with all-zero
+  bands, emitting silence PCM while carrying the MDCT overlap-add +
+  de-emphasis state forward (`FrameDecodeStatus::CeltSilence`). The
+  `CeltSynthState` is carried on `OpusDecoder` and rebuilt on a frame
+  size / channel count change. Non-silent CELT frames still report
+  `LayerNotWired` pending the coarse-energy reconstruction recurrence.
 - §4.3.6 / §4.3.7 / §4.3.7.2 *CELT synthesis backend composition*
   (`celt_synthesis`): a new `CeltSynthState` composes the
   individually-tested §4.3.6 denormalise → §4.3.7 inverse MDCT → §4.3.7

@@ -35,17 +35,25 @@ turns already-decoded per-band shapes + `log2` energies into time-domain
 PCM through §4.3.6 denormalise → §4.3.7 inverse MDCT → §4.3.7 weighted
 overlap-add → §4.3.7.2 de-emphasis, threading the cross-frame overlap and
 de-emphasis state (the CELT analogue of `silk_synthesis`), and emits
-interleaved 48 kHz i16 via `synthesize_frame_interleaved_i16`. The
-remaining CELT decode milestone is the §4.3.2 entropy *front half*
-(coarse-energy / PVQ bitstream decode) that feeds this backend — its
-§4.3.2.1 coarse-energy Laplace step (`ec_laplace_decode`) is an open
-clean-room gap, so CELT-only and Hybrid frames still emit correct-length
+interleaved 48 kHz i16 via `synthesize_frame_interleaved_i16`. A
+**CELT-only silence frame now decodes end-to-end to real PCM**: the
+§4.3.7.1 range-coded frame prefix (silence flag + post-filter group +
+transient + intra) is decoded from the real range coder by
+`celt_frame_prefix`, and a set silence flag drives the synthesis backend
+with all-zero bands, emitting zero PCM while advancing the overlap-add /
+de-emphasis state (`FrameDecodeStatus::CeltSilence`). The §4.3.2.1
+coarse-energy Laplace symbol decoder (`celt_laplace::ec_laplace_decode`,
+the 15-bit path) is in place. The remaining gating milestone is the
+§4.3.2 entropy *front half* feeding the backend: the coarse-energy
+*reconstruction recurrence* (the 2-D predictor accumulation + per-band
+mean baseline) is not yet available in the clean-room `docs/` material,
+so non-silent CELT-only and Hybrid frames still emit correct-length
 silence flagged via `FrameDecodeStatus` until that lands. The §4.4
 packet-loss concealment is also outstanding (the RFC defines PLC as a
 non-normative decoder feature with no bitstream algorithm; lost / DTX
 frames currently emit the §4.6 silence floor). The crate ships a large,
 individually unit-tested set of SILK and CELT decode building blocks
-(1178 lib tests + a CELT synthesis-backend integration suite). Per-stage
+(1191 lib tests + a CELT synthesis-backend integration suite). Per-stage
 progress lives in `CHANGELOG.md`.
 
 ## What works
