@@ -42,18 +42,31 @@ transient + intra) is decoded from the real range coder by
 `celt_frame_prefix`, and a set silence flag drives the synthesis backend
 with all-zero bands, emitting zero PCM while advancing the overlap-add /
 de-emphasis state (`FrameDecodeStatus::CeltSilence`). The §4.3.2.1
-coarse-energy Laplace symbol decoder (`celt_laplace::ec_laplace_decode`,
-the 15-bit path) is in place. The remaining gating milestone is the
-§4.3.2 entropy *front half* feeding the backend: the coarse-energy
-*reconstruction recurrence* (the 2-D predictor accumulation + per-band
-mean baseline) is not yet available in the clean-room `docs/` material,
-so non-silent CELT-only and Hybrid frames still emit correct-length
-silence flagged via `FrameDecodeStatus` until that lands. The §4.4
+coarse-energy *front half* now decodes for non-silent CELT-only frames:
+the Laplace symbol decoder (`celt_laplace::ec_laplace_decode`, the
+15-bit path) feeds the new `celt_coarse_energy` *reconstruction
+recurrence*, which runs the §4.3.2.1 2-D prediction filter
+`A(z_l, z_b)` in reverse (the frequency accumulator `pred_freq[b+1] =
+pred_freq[b] + (1-beta)*R[b]` and `E[b][l] = alpha*E[b][l-1] +
+pred_freq[b] + R[b]`, derived algebraically from the RFC z-transform),
+adds back the §4.3 `e_means` Q4 baseline, and threads the cross-frame
+`E[b][l-1]` predictor state on `OpusDecoder` (reset on an intra frame /
+SILK→CELT transition). A non-silent CELT-only frame thus consumes its
+prefix + coarse energy from the real range coder and advances the
+synthesis state, reporting `FrameDecodeStatus::CeltCoarseEnergyDecoded`.
+The remaining CELT band-data stages — §4.3.3 bit allocation (boost /
+trim / reservations / interpolation), §4.3.4 PVQ band shapes, and
+§4.3.2.2 fine energy — are still pending, so the band shapes are
+all-zero and these frames emit correct-length silence until those land.
+The one residual coarse-energy seam is the RFC's "clamped internally"
+bound, which is not in the normative body (only in reference code) and
+is left as a documented identity in `celt_coarse_energy` — exact for
+every in-range bitstream — pending a clean-room docs trace. The §4.4
 packet-loss concealment is also outstanding (the RFC defines PLC as a
 non-normative decoder feature with no bitstream algorithm; lost / DTX
 frames currently emit the §4.6 silence floor). The crate ships a large,
 individually unit-tested set of SILK and CELT decode building blocks
-(1191 lib tests + a CELT synthesis-backend integration suite). Per-stage
+(1200 lib tests + a CELT synthesis-backend integration suite). Per-stage
 progress lives in `CHANGELOG.md`.
 
 ## What works
