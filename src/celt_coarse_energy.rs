@@ -75,9 +75,8 @@
 //! internally so that fixed-point implementations with limited dynamic
 //! range always remain in the same state as floating point
 //! implementations", but the RFC body does **not** give the numeric
-//! clamp bounds — those live only in `unquant_coarse_energy()`
-//! (`quant_bands.c`), which is reference *code*, not data, and is off
-//! limits under the clean-room policy. This module therefore implements
+//! clamp bounds, and they are not present in the staged clean-room
+//! `docs/` material either. This module therefore implements
 //! the spec-derived recurrence exactly (the z-transform is fully
 //! normative) and leaves the clamp as an explicit, documented seam: it
 //! does **not** invent a clamp constant. The recurrence is bit-stable
