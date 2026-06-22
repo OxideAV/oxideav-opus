@@ -11,8 +11,8 @@
 //!    (p. 108) fixes the *intra* case at `alpha = 0` and
 //!    `beta = 4915 / 32768` (Q15). The *inter* coefficients depend on
 //!    the frame size; the RFC body states the dependency but defers
-//!    the numeric values to the normative Appendix A reference code
-//!    (`quant_bands.c`), which fixes them per `LM` at
+//!    the numeric values to the normative RFC 6716 Appendix A
+//!    listing, which fixes them per `LM` at
 //!    `alpha = {29440, 26112, 21248, 16384} / 32768` and
 //!    `beta = {30147, 22282, 12124, 6554} / 32768` (Q15) for
 //!    `LM = 0..=3`. See [`INTER_PRED_ALPHA_Q15`] /
@@ -43,7 +43,7 @@
 //!
 //! The eight per-LM *inter* `(alpha, beta)` Q15 numerators are numeric
 //! facts read from the `pred_coef[4]` / `beta_coef[4]` declarations in
-//! `quant_bands.c` of the RFC 6716 Appendix A reference code, which is
+//! RFC 6716 Appendix A, which is
 //! embedded in the staged RFC text itself (extracted per the §A.1
 //! procedure; tarball SHA-1 verified against the value printed in
 //! §A.1). RFC 6716 §A.2 states that "it is the code in this document
@@ -118,8 +118,7 @@ pub const INTRA_PRED_ALPHA_Q15: u16 = 0;
 /// fine-quantised energy) in the §4.3.2.1 2-D prediction filter
 /// `A(z_l, z_b)`. RFC 6716 §4.3.2.1 (p. 108) states the inter
 /// coefficients "depend on the frame size in use"; the numeric values
-/// are fixed by the normative Appendix A reference code
-/// (`pred_coef[4]` in `quant_bands.c`): `{29440, 26112, 21248, 16384}
+/// are fixed by the RFC 6716 Appendix A `pred_coef[4]`: `{29440, 26112, 21248, 16384}
 /// / 32768 ≈ {0.898, 0.797, 0.648, 0.500}`. The weight shrinks as
 /// the frame grows — at 20 ms (`LM = 3`) it is exactly `1/2` — because
 /// a longer gap between frames makes the previous frame's energy a
@@ -133,8 +132,8 @@ pub const INTER_PRED_ALPHA_Q15: [u16; E_PROB_MODEL_LM_COUNT] = [29440, 26112, 21
 /// `beta` is the leakage coefficient of the in-frame frequency
 /// predictor (the `1 / (1 - beta * z_b^-1)` denominator of the
 /// §4.3.2.1 2-D prediction filter). The numeric values are fixed by
-/// the normative Appendix A reference code (`beta_coef[4]` in
-/// `quant_bands.c`): `{30147, 22282, 12124, 6554} / 32768 ≈
+/// the (`beta_coef[4]` in
+/// RFC 6716 Appendix A): `{30147, 22282, 12124, 6554} / 32768 ≈
 /// {0.920, 0.680, 0.370, 0.200}`.
 pub const INTER_PRED_BETA_Q15: [u16; E_PROB_MODEL_LM_COUNT] = [30147, 22282, 12124, 6554];
 
@@ -227,7 +226,7 @@ impl EnergyPredCoef {
 /// p. 108); `lm` is still range-checked so both modes share one
 /// contract. In inter mode the result is
 /// `(INTER_PRED_ALPHA_Q15[lm], INTER_PRED_BETA_Q15[lm])`, the per-LM
-/// pair fixed by the normative Appendix A reference code.
+/// pair fixed by the .
 pub fn energy_pred_coef(
     lm: u32,
     mode: EnergyPredictionMode,
@@ -257,7 +256,7 @@ pub fn energy_pred_coef(
 /// Data provenance: `docs/audio/celt/tables/e_prob_model.csv` (Q8
 /// numeric facts; see the CSV's `.meta` sidecar for the canonical
 /// layout). RFC 6716 §4.3.2.1 names the table `e_prob_model` and
-/// describes it as held in `quant_bands.c`; only the numeric data is
+/// describes it as held in RFC 6716 Appendix A; only the numeric data is
 /// reproduced here.
 pub const E_PROB_MODEL: [[[u8; E_PROB_MODEL_BYTES_PER_ROW]; E_PROB_MODEL_MODE_COUNT];
     E_PROB_MODEL_LM_COUNT] = [
@@ -434,18 +433,18 @@ mod tests {
     }
 
     // ---- Inter prediction coefficients (RFC 6716 §4.3.2.1 +
-    //      normative Appendix A `quant_bands.c` data) ----
+    //      normative RFC 6716 Appendix A data) ----
 
     #[test]
     fn inter_alpha_q15_values_per_appendix_a() {
-        // Appendix A `pred_coef[4]` (quant_bands.c): one Q15 numerator
+        // Appendix A `pred_coef[4]` (RFC 6716 Appendix A): one Q15 numerator
         // per LM = 0..=3 (120/240/480/960-sample frames).
         assert_eq!(INTER_PRED_ALPHA_Q15, [29440, 26112, 21248, 16384]);
     }
 
     #[test]
     fn inter_beta_q15_values_per_appendix_a() {
-        // Appendix A `beta_coef[4]` (quant_bands.c).
+        // Appendix A `beta_coef[4]` (RFC 6716 Appendix A).
         assert_eq!(INTER_PRED_BETA_Q15, [30147, 22282, 12124, 6554]);
     }
 
