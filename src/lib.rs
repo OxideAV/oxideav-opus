@@ -690,6 +690,7 @@ pub mod celt_band_boost;
 pub mod celt_band_layout;
 pub mod celt_band_thresh;
 pub mod celt_cache_caps50;
+pub mod celt_coarse_energy;
 pub mod celt_deemphasis;
 pub mod celt_denormalise;
 pub mod celt_e_prob_model;

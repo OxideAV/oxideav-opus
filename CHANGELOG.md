@@ -6,6 +6,23 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- §4.3.2.1 *CELT coarse-energy reconstruction recurrence*
+  (`celt_coarse_energy`): turns the per-band Laplace prediction-error
+  symbols into the reconstructed base-2-log band energies by running the
+  §4.3.2.1 2-D prediction filter `A(z_l, z_b)` in reverse. The
+  recurrence is derived algebraically from the RFC's z-transform: the
+  in-frame frequency accumulator updates as `pred_freq[b+1] =
+  pred_freq[b] + (1-beta)*R[b]` and the reconstruction is `E[b][l] =
+  alpha*E[b][l-1] + pred_freq[b] + R[b]`, with the cross-frame history
+  `E[b][l-1]` threaded on a `CoarseEnergyState` (reset on a SILK→CELT
+  transition / intra frame). The §4.3 `e_means` Q4 baseline is added
+  back only for the reported energy that feeds denormalise. Inter / intra
+  `(alpha, beta)` come from `celt_e_prob_model`; the `e_means` data is the
+  25-value numeric table from `docs/audio/celt/tables/e_means.csv`. The
+  RFC's "clamped internally" bound is not in the normative body (it lives
+  only in reference code), so the clamp is left as a documented identity
+  seam — exact for every in-range bitstream — pending a clean-room docs
+  trace of the bound.
 - §4.3.2.1 *CELT coarse-energy Laplace symbol decode*
   (`celt_laplace::ec_laplace_decode`): the 15-bit Laplace path the
   coarse-energy decoder uses — draw a 15-bit cumulative position, walk
