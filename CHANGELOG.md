@@ -44,8 +44,18 @@ All notable changes to `oxideav-opus` are recorded here.
   bands, emitting silence PCM while carrying the MDCT overlap-add +
   de-emphasis state forward (`FrameDecodeStatus::CeltSilence`). The
   `CeltSynthState` is carried on `OpusDecoder` and rebuilt on a frame
-  size / channel count change. Non-silent CELT frames still report
-  `LayerNotWired` pending the coarse-energy reconstruction recurrence.
+  size / channel count change.
+- *CELT-only non-silent coarse-energy decode wired into the decoder*
+  (`decoder`): a CELT-only frame whose §4.3.7.1 silence flag is clear now
+  decodes its §4.3.2.1 coarse energy from the real range coder via
+  `celt_coarse_energy::CoarseEnergyState`, threaded on `OpusDecoder`
+  (`celt_coarse`), reset on an intra frame / SILK→CELT transition. The
+  reconstructed per-band log-energy envelope is consumed and the
+  cross-frame predictor state advances; the synthesis backend is driven
+  with all-zero bands (the §4.3.3 allocation / §4.3.4 PVQ band shapes /
+  §4.3.2.2 fine energy are still pending), so the frame still emits the
+  §4.6 floor but reports the new `FrameDecodeStatus::CeltCoarseEnergyDecoded`
+  — the coarse-energy *front half* of the CELT entropy decode is now real.
 - §4.3.6 / §4.3.7 / §4.3.7.2 *CELT synthesis backend composition*
   (`celt_synthesis`): a new `CeltSynthState` composes the
   individually-tested §4.3.6 denormalise → §4.3.7 inverse MDCT → §4.3.7
