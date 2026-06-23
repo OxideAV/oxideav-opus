@@ -6,6 +6,22 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- *First end-to-end SILK fixture-decode validation*
+  (`tests/silk_fixture_decode.rs`): decodes the in-project
+  `docs/audio/opus/fixtures/{silk-nb-mono-16kbps, silk-wb-stereo-20kbps,
+  silk-mb-60ms-mono-20kbps}` Opus streams packet-by-packet through the
+  top-level `OpusDecoder::decode_packet` path and asserts (1) §3.1 TOC
+  routing (mode / bandwidth / channels) per packet, (2) whole-stream
+  decode with no error status — every audio packet takes a real SILK
+  path across mono / stereo and NB / MB / WB and 20 ms / 60 ms frames,
+  (3) §3 sample-count accounting on the 48 kHz interleaved output, and
+  (4) a Goertzel probe confirming the 440 Hz NB sine fixture is decoded
+  to a 440 Hz-dominant signal. A minimal **test-only** Ogg page de-laker
+  recovers the raw Opus packets from the `.opus` fixtures (the codec
+  crate itself owns no container parsing); validation is signal- /
+  structure-based rather than bit-exact because the §4.2.9 SILK→48 kHz
+  resampler is non-normative. This is the first whole-stream exercise of
+  the SILK decode pipeline on real libopus-encoded data.
 - §4.3.2.1 *CELT coarse-energy reconstruction recurrence*
   (`celt_coarse_energy`): turns the per-band Laplace prediction-error
   symbols into the reconstructed base-2-log band energies by running the
