@@ -21,7 +21,7 @@ All notable changes to `oxideav-opus` are recorded here.
   crate itself owns no container parsing); validation is signal- /
   structure-based rather than bit-exact because the §4.2.9 SILK→48 kHz
   resampler is non-normative. This is the first whole-stream exercise of
-  the SILK decode pipeline on real libopus-encoded data. The `.opus`
+  the SILK decode pipeline on real reference-encoder-produced data. The `.opus`
   streams are embedded in `tests/fixtures/` (copied from the project's
   `docs/audio/opus/fixtures/` corpus) so the suite runs in the crate's
   standalone CI without the umbrella `docs/` submodule.

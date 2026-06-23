@@ -27,7 +27,7 @@
 //! RFC 6716 §4.2.9 makes the SILK→48 kHz resampler **non-normative**
 //! ("the resampler itself is non-normative, and a decoder can use any
 //! method it wants"). This crate uses plain linear interpolation while the
-//! `opusdec`/libopus reference that produced `expected.wav` uses a
+//! reference decoder that produced `expected.wav` uses a
 //! polyphase resampler, so a *bit-exact* PCM comparison against
 //! `expected.wav` is not a meaningful conformance target for SILK output.
 //! These tests therefore validate:
@@ -50,7 +50,7 @@
 use oxideav_opus::{Bandwidth, ChannelMapping, FrameDecodeStatus, Mode, OpusDecoder, OpusTocByte};
 
 /// The three SILK fixture streams, embedded at compile time. Each is an
-/// Ogg-Opus file produced by libopus (a black-box validator) from a known
+/// Ogg-Opus file produced by a reference encoder (a black-box validator) from a known
 /// synthetic source; see `docs/audio/opus/fixtures/<name>/notes.md`.
 const FIXTURE_NB_MONO: &[u8] = include_bytes!("fixtures/silk-nb-mono-16kbps.opus");
 const FIXTURE_WB_STEREO: &[u8] = include_bytes!("fixtures/silk-wb-stereo-20kbps.opus");

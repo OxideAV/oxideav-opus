@@ -116,7 +116,7 @@ progress lives in `CHANGELOG.md`.
   20/60 ms), §3 sample-count accounting, and 440 Hz dominance on the NB
   sine fixture. Validation is signal- / structure-based, not bit-exact:
   the §4.2.9 SILK→48 kHz resampler is non-normative, so the decoded
-  envelope differs from the polyphase-resampled `opusdec` reference.
+  envelope differs from the polyphase-resampled reference decoder.
 
 **Range coder (RFC 6716 §4.1):** `RangeDecoder` — the shared entropy
 primitive consumed by both layers, including the §4.1.2 two-step
