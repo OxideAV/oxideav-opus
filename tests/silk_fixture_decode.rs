@@ -42,12 +42,29 @@
 //!    probe confirms the decoded output is dominated by the 440 Hz tone
 //!    (robust to the resampler / envelope differences noted above).
 //!
-//! All fixtures and references live under `docs/audio/opus/fixtures/`; no
-//! external library source is consulted.
-
-use std::path::PathBuf;
+//! The `.opus` fixture streams are committed in `tests/fixtures/` (copied
+//! from the project's `docs/audio/opus/fixtures/` corpus) so the suite is
+//! self-contained and runs in the crate's standalone CI without the
+//! umbrella `docs/` submodule. No external library source is consulted.
 
 use oxideav_opus::{Bandwidth, ChannelMapping, FrameDecodeStatus, Mode, OpusDecoder, OpusTocByte};
+
+/// The three SILK fixture streams, embedded at compile time. Each is an
+/// Ogg-Opus file produced by libopus (a black-box validator) from a known
+/// synthetic source; see `docs/audio/opus/fixtures/<name>/notes.md`.
+const FIXTURE_NB_MONO: &[u8] = include_bytes!("fixtures/silk-nb-mono-16kbps.opus");
+const FIXTURE_WB_STEREO: &[u8] = include_bytes!("fixtures/silk-wb-stereo-20kbps.opus");
+const FIXTURE_MB_60MS_MONO: &[u8] = include_bytes!("fixtures/silk-mb-60ms-mono-20kbps.opus");
+
+/// Map a fixture name to its embedded bytes.
+fn fixture_bytes(name: &str) -> &'static [u8] {
+    match name {
+        "silk-nb-mono-16kbps" => FIXTURE_NB_MONO,
+        "silk-wb-stereo-20kbps" => FIXTURE_WB_STEREO,
+        "silk-mb-60ms-mono-20kbps" => FIXTURE_MB_60MS_MONO,
+        other => panic!("unknown fixture {other}"),
+    }
+}
 
 /// Recover the raw Opus packets from an Ogg-Opus byte stream.
 ///
@@ -88,12 +105,7 @@ fn ogg_packets(data: &[u8]) -> Vec<Vec<u8>> {
 /// The audio packets of a fixture (every logical packet after the two
 /// RFC 7845 header packets).
 fn fixture_audio_packets(name: &str) -> Vec<Vec<u8>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/audio/opus/fixtures")
-        .join(name)
-        .join("input.opus");
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-    let mut packets = ogg_packets(&bytes);
+    let mut packets = ogg_packets(fixture_bytes(name));
     assert!(
         packets.len() >= 2,
         "{name}: expected at least OpusHead + OpusTags header packets"
