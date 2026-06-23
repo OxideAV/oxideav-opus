@@ -3,7 +3,7 @@
 //!
 //! These tests are the first whole-stream exercise of the
 //! [`oxideav_opus::OpusDecoder::decode_packet`] path on real,
-//! libopus-encoded data. Until now the crate's tests covered the decode
+//! reference-encoder-produced data. Until now the crate's tests covered the decode
 //! building blocks individually and the CELT synthesis backend in
 //! isolation; here a complete Ogg-Opus stream is decoded packet-by-packet
 //! and the resulting 48 kHz PCM is checked for structural correctness and
