@@ -36,6 +36,7 @@ use oxideav_opus::{FecDecodeStatus, OpusDecoder};
 
 const FIXTURE_FEC: &[u8] = include_bytes!("fixtures/fec-on.opus");
 const FIXTURE_NB_MONO: &[u8] = include_bytes!("fixtures/silk-nb-mono-16kbps.opus");
+const FIXTURE_WB_STEREO: &[u8] = include_bytes!("fixtures/silk-wb-stereo-20kbps.opus");
 
 /// Recover the raw Opus packets from an Ogg-Opus byte stream (the same
 /// minimal, test-only page de-laker used by `silk_fixture_decode.rs`).
@@ -156,6 +157,39 @@ fn fec_on_non_fec_stream_reports_no_lbrr_or_recovered() {
         );
         if matches!(fec.status, FecDecodeStatus::NoLbrr) {
             assert!(fec.pcm.iter().all(|&s| s == 0), "NoLbrr must emit silence");
+        }
+    }
+}
+
+#[test]
+fn fec_on_stereo_stream_routes_cleanly() {
+    // The WB stereo fixture has no FEC, but the stereo FEC routing
+    // (`decode_silk_fec_stereo`) must run without panicking and report a
+    // clean status with the correct 2-channel, full-length silence on the
+    // NoLbrr path.
+    let packets = ogg_audio_packets(FIXTURE_WB_STEREO);
+    let mut dec = OpusDecoder::new();
+    for pkt in &packets {
+        let fec = dec
+            .decode_packet_fec(pkt)
+            .expect("stereo fec decode must not error");
+        assert_eq!(fec.channels, 2);
+        assert_eq!(fec.sample_rate_hz, 48_000);
+        // Stereo 20 ms = 960 per channel, interleaved => 1920 samples.
+        assert_eq!(fec.pcm.len(), 1920);
+        assert!(
+            matches!(
+                fec.status,
+                FecDecodeStatus::NoLbrr | FecDecodeStatus::Recovered
+            ),
+            "stereo SILK packet must route cleanly: {:?}",
+            fec.status
+        );
+        if matches!(fec.status, FecDecodeStatus::NoLbrr) {
+            assert!(
+                fec.pcm.iter().all(|&s| s == 0),
+                "NoLbrr stereo must emit interleaved silence"
+            );
         }
     }
 }
