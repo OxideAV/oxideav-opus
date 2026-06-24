@@ -8,10 +8,9 @@
 //!
 //! `fec-on.opus` is a mono WB SILK Ogg-Opus stream encoded with in-band
 //! FEC enabled (`-fec 1 -packet_loss 10`), so most packets carry an LBRR
-//! copy of the prior 20 ms frame. It was produced by a black-box validator
-//! (libopus / ffmpeg — only its output bytes are used, never its source)
-//! from a 440 Hz synthetic source; see
-//! `docs/audio/opus/fixtures/fec-on/notes.md`.
+//! copy of the prior 20 ms frame. It comes from the project's clean-room
+//! Opus fixture corpus (a black-box encoder produced its bytes from a
+//! 440 Hz synthetic source); see `docs/audio/opus/fixtures/fec-on/notes.md`.
 //!
 //! ## What is validated
 //!

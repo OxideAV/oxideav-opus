@@ -8,9 +8,9 @@ here (via `include_bytes!`) so the test runs in the crate's standalone CI,
 which checks out only this repository and not the umbrella `docs/`
 submodule.
 
-Each was produced by libopus / ffmpeg (a **black-box validator** — only its
-output bytes are used, never its source) from a known synthetic source. The
-generation commands and per-stream notes live alongside the originals in
+Each was produced by a **black-box encoder** (only its output bytes are
+embedded) from a known synthetic source. The generation commands and
+per-stream notes live alongside the originals in
 `docs/audio/opus/fixtures/<name>/notes.md`.
 
 | File                              | Config | Mode | Bandwidth | Channels | Frame    |
