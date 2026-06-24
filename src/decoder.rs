@@ -193,6 +193,51 @@ impl DecodedAudio {
     }
 }
 
+/// Why an in-band FEC ([`OpusDecoder::decode_packet_fec`]) recovery
+/// produced the samples it did (RFC 6716 §2.1.7 / §4.2.5).
+///
+/// In-band FEC works by re-encoding the signal of the frame *prior* to a
+/// packet at a lower bitrate and carrying it as one or more §4.2.5 LBRR
+/// frames inside that packet. When a packet is lost, the decoder can
+/// recover the lost frame's audio from the LBRR frame(s) in the *next*
+/// successfully received packet (`decode_packet_fec`), rather than
+/// emitting pure silence / running pitch-based concealment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FecDecodeStatus {
+    /// The packet carried §4.2.5 LBRR frame(s) for the lost prior frame,
+    /// and they were decoded in Table-5 order and synthesized through the
+    /// §4.2.7.9 LTP / LPC filters into real recovered audio at 48 kHz. For
+    /// a stereo packet the recovered mid/side LBRR frames were unmixed via
+    /// §4.2.8.
+    Recovered,
+    /// The packet has no LBRR frame for the requested channel(s) (the
+    /// §4.2.4 LBRR flags are clear), so no FEC data is available. Silence
+    /// of the requested duration was emitted; the caller should fall back
+    /// to its own packet-loss concealment.
+    NoLbrr,
+    /// The packet is not a SILK-bearing mode (CELT-only carries no LBRR),
+    /// so FEC recovery is not possible. Silence was emitted.
+    NotSilk,
+    /// The packet's §4.2 LBRR bitstream was malformed / truncated. Silence
+    /// of the requested duration was emitted in its place.
+    DecodeError,
+}
+
+/// The result of an in-band FEC recovery for one lost packet
+/// ([`OpusDecoder::decode_packet_fec`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FecRecovered {
+    /// Interleaved signed 16-bit PCM at 48 kHz, same layout as
+    /// [`DecodedAudio::pcm`]. Length is `samples_per_channel * channels`.
+    pub pcm: Vec<i16>,
+    /// Number of audio channels (1 for mono, 2 for stereo).
+    pub channels: u8,
+    /// Output sample rate in Hz (always [`OUTPUT_SAMPLE_RATE_HZ`]).
+    pub sample_rate_hz: u32,
+    /// Why the samples were produced (real recovery vs silence and why).
+    pub status: FecDecodeStatus,
+}
+
 /// Stateful Opus packet → PCM decoder.
 ///
 /// One [`OpusDecoder`] is fed Opus packets in stream order via
@@ -934,6 +979,364 @@ impl OpusDecoder {
                 status: FrameDecodeStatus::CeltDecodeError,
             },
         }
+    }
+
+    /// Recover the audio of a **lost** Opus frame from the in-band FEC
+    /// (§4.2.5 LBRR) data carried in the *next* successfully received
+    /// packet (RFC 6716 §2.1.7).
+    ///
+    /// In-band FEC encodes a low-bitrate redundant copy of the signal
+    /// immediately *prior* to a packet as one or more §4.2.5 LBRR frames
+    /// inside that packet. When the application detects a packet loss and
+    /// has the following packet in hand, it calls this method on that
+    /// following packet to reconstruct the lost frame's audio instead of
+    /// relying solely on silence / pitch-based concealment.
+    ///
+    /// The recovered PCM is returned at the 48 kHz output rate. The packet
+    /// passed here is the one *after* the loss; only its §4.2.5 LBRR
+    /// frames are decoded and synthesized (the packet's own regular frames
+    /// are decoded later by an ordinary [`Self::decode_packet`] call).
+    ///
+    /// On success ([`FecDecodeStatus::Recovered`]) the SILK synthesis
+    /// history is advanced to the recovered frame's state, so a subsequent
+    /// [`Self::decode_packet`] on the same packet continues smoothly from
+    /// the reconstructed signal. When the packet carries no LBRR data
+    /// ([`FecDecodeStatus::NoLbrr`]), is CELT-only
+    /// ([`FecDecodeStatus::NotSilk`]), or is malformed
+    /// ([`FecDecodeStatus::DecodeError`]), silence of the lost frame's
+    /// duration is returned and the caller falls back to its own
+    /// concealment.
+    ///
+    /// Returns [`Error::EmptyPacket`] for a zero-length packet and
+    /// [`Error::MalformedPacket`] for a §3.2 framing violation in the
+    /// carrier packet.
+    pub fn decode_packet_fec(&mut self, packet: &[u8]) -> Result<FecRecovered, Error> {
+        let parsed = OpusPacket::parse(packet)?;
+        let routing = OpusFrameRouting::from_toc(parsed.toc);
+        let channels = routing.channel_count();
+        // §4.2.5: an LBRR frame has the same frame size / bandwidth /
+        // channel count as the carrier packet's regular frames, and covers
+        // the equivalent prior interval(s); the recovered duration matches
+        // the carrier's per-frame duration.
+        let per_channel = output_samples_per_channel(routing.frame_size_tenths_ms);
+        let mut pcm = vec![0i16; per_channel * channels as usize];
+
+        // FEC only exists for SILK-bearing modes (§2.1.7 re-encodes the
+        // SILK speech layer); a CELT-only packet carries no LBRR.
+        if !matches!(
+            routing.operating_mode,
+            OperatingMode::SilkOnly | OperatingMode::Hybrid
+        ) {
+            return Ok(FecRecovered {
+                pcm,
+                channels,
+                sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
+                status: FecDecodeStatus::NotSilk,
+            });
+        }
+
+        // The first Opus frame of the packet carries the §4.2.5 LBRR
+        // frames (LBRR frames precede the regular frames within a single
+        // SILK-bearing Opus frame; a code-1/2/3 packet's later frames have
+        // their own LBRR, but those cover intervals already adjacent to
+        // received audio, so the canonical "previous packet was lost"
+        // recovery uses the leading Opus frame's LBRR).
+        let Some(&frame) = parsed.frames().first() else {
+            return Ok(FecRecovered {
+                pcm,
+                channels,
+                sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
+                status: FecDecodeStatus::DecodeError,
+            });
+        };
+        if frame.is_empty() {
+            return Ok(FecRecovered {
+                pcm,
+                channels,
+                sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
+                status: FecDecodeStatus::NoLbrr,
+            });
+        }
+
+        let status = if channels == 2 {
+            match self.decode_silk_fec_stereo(frame, &routing) {
+                Ok(Some((left, right, bandwidth))) => {
+                    resample_stereo_to_output_i16(&left, &right, bandwidth, &mut pcm);
+                    FecDecodeStatus::Recovered
+                }
+                Ok(None) => FecDecodeStatus::NoLbrr,
+                Err(_) => FecDecodeStatus::DecodeError,
+            }
+        } else {
+            match self.decode_silk_fec_mono(frame, &routing) {
+                Ok(Some((internal, bandwidth))) => {
+                    resample_internal_to_output_i16(&internal, bandwidth, &mut pcm);
+                    FecDecodeStatus::Recovered
+                }
+                Ok(None) => FecDecodeStatus::NoLbrr,
+                Err(_) => FecDecodeStatus::DecodeError,
+            }
+        };
+
+        Ok(FecRecovered {
+            pcm,
+            channels,
+            sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
+            status,
+        })
+    }
+
+    /// Decode and synthesize the §4.2.5 mono LBRR frame(s) of one
+    /// SILK-bearing Opus frame into internal-rate recovered audio.
+    ///
+    /// Returns `Ok(Some((internal, bandwidth)))` with the recovered
+    /// signal when at least one mid LBRR frame is present, `Ok(None)` when
+    /// the §4.2.4 LBRR flags are all clear (no FEC data), or `Err` on a
+    /// malformed bitstream.
+    ///
+    /// Unlike [`Self::decode_silk_only_mono`], which only consumed the
+    /// LBRR bits to keep the range coder aligned, this path actually runs
+    /// the §4.2.7.9 synthesis on the LBRR parameters. Per §4.2.5 the LBRR
+    /// frames form their own independent sequence covering the prior
+    /// interval(s), so synthesis starts from a **fresh** state (the lost
+    /// frame's true history is, by definition, unavailable). On success
+    /// the decoder's carried mono synthesis state is replaced with the
+    /// recovered-frame history so the next real packet continues smoothly.
+    fn decode_silk_fec_mono(
+        &mut self,
+        frame: &[u8],
+        routing: &OpusFrameRouting,
+    ) -> Result<Option<(Vec<f32>, crate::toc::Bandwidth)>, Error> {
+        use crate::range_decoder::RangeDecoder;
+        use crate::silk_decode::{decode_silk_frame, SilkFrameConfig, SilkFrameDecoded};
+        use crate::silk_excitation::SilkFrameSize;
+        use crate::silk_header::SilkHeaderBits;
+        use crate::silk_synthesis::{synthesize_silk_frame, SilkSynthState};
+
+        let bandwidth = routing
+            .silk_bandwidth
+            .ok_or(Error::MalformedPacket)?
+            .to_bandwidth();
+        let num_silk_frames = routing
+            .silk_frames_per_channel
+            .ok_or(Error::MalformedPacket)?;
+        let frame_size = if routing.frame_size_tenths_ms == 100 {
+            SilkFrameSize::TenMs
+        } else {
+            SilkFrameSize::TwentyMs
+        };
+
+        let mut rd = RangeDecoder::new(frame);
+        let header = SilkHeaderBits::decode(&mut rd, num_silk_frames, false)?;
+
+        // No LBRR data → no FEC recovery is possible.
+        if !(0..num_silk_frames).any(|i| header.mid_has_lbrr(i)) {
+            return Ok(None);
+        }
+
+        // §4.2.5 LBRR frames are always active-coded and form their own
+        // inter-frame sequence; decode every present LBRR frame in
+        // interval order, threading the LBRR-local previous gain / lag /
+        // NLSF state (the same Table-5 inter-frame dependencies as regular
+        // frames, but over the LBRR sub-sequence).
+        let mut prev_gain: Option<u8> = None;
+        let mut prev_lag: Option<i32> = None;
+        let mut prev_nlsf: Option<[i16; crate::silk_lsf_stage2::D_LPC_MAX]> = None;
+        let mut prev_nlsf_len = 0usize;
+        let mut first = true;
+        let mut lbrr_frames: Vec<SilkFrameDecoded> = Vec::new();
+        for idx in 0..num_silk_frames {
+            if !header.mid_has_lbrr(idx) {
+                continue;
+            }
+            let cfg = SilkFrameConfig {
+                bandwidth,
+                frame_size,
+                voice_active: true, // §4.2.5: all LBRR frames are active.
+                first_subframe_independent: first || prev_gain.is_none(),
+                previous_log_gain: prev_gain,
+                previous_primary_lag: prev_lag,
+                ltp_scaling_present: first,
+                lsf_interp_after_reset: first || prev_nlsf.is_none(),
+                previous_nlsf_q15: prev_nlsf,
+                previous_nlsf_len: prev_nlsf_len,
+                stereo: None,
+            };
+            let decoded = decode_silk_frame(&mut rd, cfg)?;
+            prev_gain = Some(decoded.gains.last_log_gain());
+            prev_lag = Some(decoded.ltp.primary_lag());
+            prev_nlsf = Some(decoded.nlsf_q15);
+            prev_nlsf_len = decoded.d_lpc;
+            first = false;
+            lbrr_frames.push(decoded);
+        }
+
+        if rd.has_error() {
+            return Err(Error::MalformedPacket);
+        }
+        if lbrr_frames.is_empty() {
+            return Ok(None);
+        }
+
+        // §4.2.7.9 synthesis from a fresh state: the lost frame's true
+        // history is unavailable, so the recovered signal is reconstructed
+        // self-contained. The resulting history then becomes the carried
+        // mono synthesis state for the following real packet.
+        let mut state = SilkSynthState::new(bandwidth)?;
+        let mut internal = Vec::new();
+        for decoded in &lbrr_frames {
+            let frame_out = synthesize_silk_frame(bandwidth, frame_size, decoded, &mut state)?;
+            internal.extend_from_slice(&frame_out);
+        }
+        self.silk_synth_mono = Some(state);
+        Ok(Some((internal, bandwidth)))
+    }
+
+    /// Decode and synthesize the §4.2.5 **stereo** LBRR frame(s) of one
+    /// SILK-bearing Opus frame into internal-rate recovered L/R audio.
+    ///
+    /// Mirrors [`Self::decode_silk_fec_mono`] for stereo: the §4.2.5 LBRR
+    /// frames are interleaved (mid then side per 20 ms interval), each
+    /// channel is synthesized from a fresh state, and the pair is unmixed
+    /// to left/right via §4.2.8 with a fresh unmix history. The §4.2.7.1
+    /// stereo prediction weights ride on the mid LBRR frame; the §4.2.7.2
+    /// mid-only flag governs whether a side LBRR frame is present for the
+    /// interval (mirroring the regular stereo path).
+    ///
+    /// Returns `Ok(Some((left, right, bandwidth)))` on recovery,
+    /// `Ok(None)` when neither channel carries LBRR, or `Err` on a
+    /// malformed bitstream. On success the carried stereo synthesis +
+    /// unmix state is replaced with the recovered-frame state.
+    #[allow(clippy::type_complexity)]
+    fn decode_silk_fec_stereo(
+        &mut self,
+        frame: &[u8],
+        routing: &OpusFrameRouting,
+    ) -> Result<Option<(Vec<f32>, Vec<f32>, crate::toc::Bandwidth)>, Error> {
+        use crate::range_decoder::RangeDecoder;
+        use crate::silk_decode::{decode_silk_frame, SilkFrameDecoded, StereoHeaderContext};
+        use crate::silk_excitation::SilkFrameSize;
+        use crate::silk_header::SilkHeaderBits;
+        use crate::silk_stereo::{stereo_ms_to_lr, StereoUnmixState, StereoWeightsQ13};
+        use crate::silk_synthesis::{synthesize_silk_frame, SilkSynthState};
+
+        let bandwidth = routing
+            .silk_bandwidth
+            .ok_or(Error::MalformedPacket)?
+            .to_bandwidth();
+        let num_silk_frames = routing
+            .silk_frames_per_channel
+            .ok_or(Error::MalformedPacket)?;
+        let frame_size = if routing.frame_size_tenths_ms == 100 {
+            SilkFrameSize::TenMs
+        } else {
+            SilkFrameSize::TwentyMs
+        };
+
+        let mut rd = RangeDecoder::new(frame);
+        let header = SilkHeaderBits::decode(&mut rd, num_silk_frames, true)?;
+
+        let any_lbrr =
+            (0..num_silk_frames).any(|i| header.mid_has_lbrr(i) || header.side_has_lbrr(i));
+        if !any_lbrr {
+            return Ok(None);
+        }
+
+        // §4.2.5 interleaved LBRR decode: per 20 ms interval the mid LBRR
+        // frame (if present, carrying the §4.2.7.1 weights + §4.2.7.2
+        // mid-only flag) then the side LBRR frame (if present). Each
+        // channel threads its own LBRR-local inter-frame state.
+        let mut mid_state = ChannelDecodeState::new();
+        let mut side_state = ChannelDecodeState::new();
+        let mut mid_frames: Vec<SilkFrameDecoded> = Vec::new();
+        let mut side_frames: Vec<Option<SilkFrameDecoded>> = Vec::new();
+        let mut interval_weights: Vec<StereoWeightsQ13> = Vec::new();
+
+        for idx in 0..num_silk_frames {
+            let mid_lbrr = header.mid_has_lbrr(idx);
+            let side_lbrr = header.side_has_lbrr(idx);
+            if !mid_lbrr {
+                // §4.2.5 / §4.2.7.1: a side LBRR frame without a mid LBRR
+                // frame carries no stereo weights; record a zero-weight
+                // interval with the mid channel treated as silent.
+                if side_lbrr {
+                    let side_decoded = decode_silk_frame(
+                        &mut rd,
+                        side_state.config(bandwidth, frame_size, true, None),
+                    )?;
+                    side_state.advance(&side_decoded);
+                    // Without a mid LBRR frame there is no mid signal for
+                    // this interval; the unmixer treats the missing mid as
+                    // a hole (handled by skipping the interval in synthesis
+                    // below — we still consume the bits for alignment).
+                    let _ = side_decoded;
+                }
+                continue;
+            }
+            // §4.2.7.2: the mid-only flag is present on the mid LBRR frame
+            // iff the side LBRR frame for this interval is absent.
+            let stereo_ctx = StereoHeaderContext {
+                has_mid_only_flag: !side_lbrr,
+            };
+            let mid_decoded = decode_silk_frame(
+                &mut rd,
+                mid_state.config(bandwidth, frame_size, true, Some(stereo_ctx)),
+            )?;
+            let w = mid_decoded.stereo_pred.map(|p| StereoWeightsQ13 {
+                w0_q13: p.w0_q13,
+                w1_q13: p.w1_q13,
+            });
+            interval_weights.push(w.unwrap_or_default());
+            let side_coded = side_lbrr || mid_decoded.mid_only_flag == Some(false);
+            mid_state.advance(&mid_decoded);
+            mid_frames.push(mid_decoded);
+
+            if side_coded {
+                let side_decoded = decode_silk_frame(
+                    &mut rd,
+                    side_state.config(bandwidth, frame_size, true, None),
+                )?;
+                side_state.advance(&side_decoded);
+                side_frames.push(Some(side_decoded));
+            } else {
+                side_frames.push(None);
+            }
+        }
+
+        if rd.has_error() {
+            return Err(Error::MalformedPacket);
+        }
+        if mid_frames.is_empty() {
+            return Ok(None);
+        }
+
+        // §4.2.7.9 synthesis + §4.2.8 unmix from fresh state.
+        let mut mid_synth = SilkSynthState::new(bandwidth)?;
+        let mut side_synth = SilkSynthState::new(bandwidth)?;
+        let mut unmix = StereoUnmixState::new();
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for (idx, mid_frame) in mid_frames.iter().enumerate() {
+            let mid_out = synthesize_silk_frame(bandwidth, frame_size, mid_frame, &mut mid_synth)?;
+            let weights = interval_weights[idx];
+            let stereo = match &side_frames[idx] {
+                Some(side_frame) => {
+                    let side_out =
+                        synthesize_silk_frame(bandwidth, frame_size, side_frame, &mut side_synth)?;
+                    stereo_ms_to_lr(bandwidth, &mid_out, Some(&side_out), weights, &mut unmix)?
+                }
+                None => {
+                    side_synth.reset();
+                    stereo_ms_to_lr(bandwidth, &mid_out, None, weights, &mut unmix)?
+                }
+            };
+            left.extend_from_slice(&stereo.left);
+            right.extend_from_slice(&stereo.right);
+        }
+
+        self.silk_synth_stereo = Some((mid_synth, side_synth));
+        self.silk_stereo_unmix = Some(unmix);
+        Ok(Some((left, right, bandwidth)))
     }
 
     /// Decode one Hybrid Opus frame (§4.2 SILK + §4.3 CELT). Currently

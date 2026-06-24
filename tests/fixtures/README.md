@@ -18,3 +18,8 @@ generation commands and per-stream notes live alongside the originals in
 | `silk-nb-mono-16kbps.opus`        | 1      | SILK | NB        | mono     | 20 ms    |
 | `silk-wb-stereo-20kbps.opus`      | 9      | SILK | WB        | stereo   | 20 ms    |
 | `silk-mb-60ms-mono-20kbps.opus`   | 7      | SILK | MB        | mono     | 60 ms    |
+| `fec-on.opus`                     | 9      | SILK | WB        | mono     | 20 ms    |
+
+`fec-on.opus` was encoded with in-band FEC enabled (`-fec 1
+-packet_loss 10`), so its SILK packets carry §4.2.5 LBRR redundancy of
+the prior frame; it drives the `tests/fec_decode.rs` recovery path.

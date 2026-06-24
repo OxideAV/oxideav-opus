@@ -6,6 +6,33 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- *In-band FEC (§4.2.5 LBRR) recovery — `OpusDecoder::decode_packet_fec`*
+  (RFC 6716 §2.1.7 / §4.2.5): a new public entry point that reconstructs a
+  **lost** frame's audio from the Low Bit-Rate Redundancy carried in the
+  *next* received packet. In-band FEC re-encodes the signal immediately
+  prior to a packet at a lower bitrate as one or more §4.2.5 LBRR frames;
+  when the application detects a loss and holds the following packet, it
+  calls `decode_packet_fec` on that packet to recover the missing frame
+  rather than emitting pure silence. The method decodes the §4.2.4 LBRR
+  flags + the §4.2.5 LBRR frame(s) (mono, or interleaved mid/side for
+  stereo) in Table-5 order, runs the full §4.2.7.9 LTP / LPC synthesis from
+  a fresh state (the lost frame's true history is, by definition,
+  unavailable), unmixes a stereo recovery via §4.2.8, and resamples to
+  48 kHz. Until now the LBRR frames were parsed only to keep the range
+  coder aligned and then discarded; they now produce **real recovered
+  PCM**. The outcome is reported through the new `FecDecodeStatus`
+  (`Recovered` / `NoLbrr` / `NotSilk` / `DecodeError`) on a `FecRecovered`
+  result, and on success the carried SILK synthesis (and stereo unmix)
+  state advances to the recovered frame so a subsequent `decode_packet`
+  continues smoothly. Per §4.2.5 all LBRR frames are active-coded; a
+  CELT-only carrier reports `NotSilk` (no LBRR exists). The new
+  `tests/fec_decode.rs` drives the path against the `fec-on` fixture (a
+  mono WB SILK stream encoded with `-fec 1`), asserting (1) at least one
+  frame is recovered from LBRR, (2) the recovered 440 Hz audio is
+  non-silent, (3) a recovered frame yields the carrier's per-frame 48 kHz
+  sample count, (4) a no-FEC stream cleanly reports `NoLbrr` + silence, and
+  (5) a regular decode continues correctly after a FEC recovery. The
+  `fec-on.opus` fixture is embedded in `tests/fixtures/`.
 - *First end-to-end SILK fixture-decode validation*
   (`tests/silk_fixture_decode.rs`): decodes three SILK Opus streams
   (`silk-nb-mono-16kbps`, `silk-wb-stereo-20kbps`,

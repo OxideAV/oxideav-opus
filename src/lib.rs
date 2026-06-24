@@ -852,8 +852,8 @@ pub use celt_trim_offsets::{
     TRIM_OFFSETS_WIDTH_ONE_BINS_PER_CHANNEL, TRIM_OFFSETS_WIDTH_ONE_PER_CHANNEL_EIGHTH_BITS,
 };
 pub use decoder::{
-    channel_count, output_samples_per_channel, DecodedAudio, FrameDecodeStatus, FrameOutcome,
-    OpusDecoder, OUTPUT_SAMPLES_PER_MS, OUTPUT_SAMPLE_RATE_HZ,
+    channel_count, output_samples_per_channel, DecodedAudio, FecDecodeStatus, FecRecovered,
+    FrameDecodeStatus, FrameOutcome, OpusDecoder, OUTPUT_SAMPLES_PER_MS, OUTPUT_SAMPLE_RATE_HZ,
 };
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
 pub use framing::{OperatingMode, OpusFrameRouting, SilkBandwidth};

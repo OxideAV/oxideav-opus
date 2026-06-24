@@ -128,7 +128,13 @@ reconstruction → stabilization → interpolation → NLSF→LPC →
 bandwidth-expansion → prediction-gain limiting, §4.2.7.5.2–§4.2.7.5.8),
 LTP parameters (§4.2.7.6), LCG seed (§4.2.7.7), excitation
 (§4.2.7.8), LTP + LPC synthesis filters (§4.2.7.9), stereo unmixing
-(§4.2.8), and the §4.2.9 resampler delay budget.
+(§4.2.8), the §4.2.9 resampler delay budget, and **in-band FEC
+recovery** (§2.1.7 / §4.2.5): `OpusDecoder::decode_packet_fec`
+reconstructs a lost frame's audio from the Low Bit-Rate Redundancy
+(LBRR) frames carried in the next received packet — decoding the §4.2.5
+LBRR frame(s) (mono, or interleaved mid/side for stereo), running the
+full §4.2.7.9 synthesis from a fresh state, unmixing a stereo recovery
+via §4.2.8, and resampling to 48 kHz, reported through `FecDecodeStatus`.
 
 **CELT (RFC 6716 §4.3 / §4.5):** the §4.3 band layout (Table 55), the
 pre-band header symbols (silence / post-filter / transient / intra),
