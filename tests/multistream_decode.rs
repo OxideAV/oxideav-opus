@@ -22,6 +22,7 @@
 use oxideav_opus::{ChannelMappingTable, MultistreamDecoder, OpusHead, OpusTocByte};
 
 const FIXTURE_NB_MONO: &[u8] = include_bytes!("fixtures/silk-nb-mono-16kbps.opus");
+const FIXTURE_MB_60MS: &[u8] = include_bytes!("fixtures/silk-mb-60ms-mono-20kbps.opus");
 
 /// Minimal test-only Ogg page de-laker (see `silk_fixture_decode.rs` for
 /// the rationale): recovers the logical packets so we can pull real Opus
@@ -59,6 +60,13 @@ fn fixture_head_bytes() -> Vec<u8> {
 /// The fixture's audio packets (after OpusHead + OpusTags).
 fn fixture_audio_packets() -> Vec<Vec<u8>> {
     let mut p = ogg_packets(FIXTURE_NB_MONO);
+    p.drain(..2);
+    p
+}
+
+/// The 60 ms MB fixture's audio packets.
+fn mb_audio_packets() -> Vec<Vec<u8>> {
+    let mut p = ogg_packets(FIXTURE_MB_60MS);
     p.drain(..2);
     p
 }
@@ -162,6 +170,27 @@ fn two_mono_streams_map_to_distinct_output_channels() {
         assert_eq!(out.pcm[s * 2], a.pcm[s], "left channel sample {s}");
         assert_eq!(out.pcm[s * 2 + 1], b.pcm[s], "right channel sample {s}");
     }
+}
+
+#[test]
+fn mismatched_stream_durations_rejected() {
+    // RFC 7845 §3: every stream in an Ogg packet MUST have the same
+    // duration. Pair a 20 ms NB stream with a 60 ms MB stream → reject.
+    let nb = fixture_audio_packets();
+    let mb = mb_audio_packets();
+    let mut multistream_packet = self_delimit_code0(&nb[5]); // 20 ms
+    multistream_packet.extend_from_slice(&mb[3]); // 60 ms
+
+    let mapping = ChannelMappingTable {
+        stream_count: 2,
+        coupled_count: 0,
+        mapping: vec![0, 1],
+    };
+    let mut ms = MultistreamDecoder::new(mapping);
+    assert!(
+        ms.decode_packet(&multistream_packet).is_err(),
+        "mismatched stream durations must be rejected"
+    );
 }
 
 #[test]

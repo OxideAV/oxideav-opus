@@ -191,13 +191,20 @@ impl MultistreamDecoder {
             decoded.push((audio.pcm, audio.channels));
         }
 
-        // Every stream shares the same per-channel sample count (§3). Use
-        // the first stream's to size the output; defend against a stream
-        // returning fewer samples by clamping reads.
+        // RFC 7845 §3: "All of the Opus packets in a single Ogg packet
+        // MUST be constrained to have the same duration." A stream whose
+        // per-channel sample count differs from the first is treated as
+        // malformed (the channel assembly below relies on equal lengths).
         let samples_per_channel = decoded
             .first()
             .map(|(pcm, ch)| pcm.len() / (*ch).max(1) as usize)
             .unwrap_or(0);
+        for (pcm, ch) in &decoded[1..] {
+            let spc = pcm.len() / (*ch).max(1) as usize;
+            if spc != samples_per_channel {
+                return Err(Error::MalformedPacket);
+            }
+        }
 
         let c = self.mapping.output_channels() as usize;
         let mut out = vec![0i16; samples_per_channel * c];
