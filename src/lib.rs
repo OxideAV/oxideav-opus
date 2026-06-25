@@ -861,7 +861,9 @@ pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
 pub use framing::{OperatingMode, OpusFrameRouting, SilkBandwidth};
 pub use framing_self_delim::{parse_self_delimited, SelfDelimitedParse};
 pub use mode_transition_reset::{decide_state_resets, CeltResetPlacement, StateReset};
-pub use multistream::{split_multistream_packet, StreamPacket};
+pub use multistream::{
+    split_multistream_packet, MultistreamAudio, MultistreamDecoder, StreamPacket,
+};
 pub use opus_head::{
     ChannelMappingTable, OpusHead, OpusHeadError, OPUS_HEAD_MAGIC, OPUS_HEAD_MAX_VERSION,
     OPUS_HEAD_MIN_LEN,

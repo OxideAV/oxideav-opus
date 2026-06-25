@@ -30,6 +30,7 @@
 //! library source is consulted.
 
 use crate::framing_self_delim::parse_self_delimited;
+use crate::opus_head::{ChannelMappingTable, OpusHead};
 use crate::Error;
 
 /// One stream's raw Opus packet bytes within a multistream packet.
@@ -100,6 +101,160 @@ pub fn split_multistream_packet(
     });
 
     Ok(streams)
+}
+
+/// A stateful multistream (multichannel) Opus decoder — RFC 7845 §3 +
+/// §5.1.1.
+///
+/// Wraps `N` independent [`crate::decoder::OpusDecoder`] instances (one
+/// per coded stream) and the [`ChannelMappingTable`] that ties their
+/// outputs to the stream's `C` output channels. Each Ogg packet is split
+/// by [`split_multistream_packet`], every sub-stream is decoded by its
+/// own decoder (so each carries its own inter-frame state), and the
+/// per-stream PCM is assembled into the `C`-channel interleaved output
+/// per the §5.1.1 mapping rule:
+///
+/// * `index < 2*M` → output is decoded channel `index` of coupled
+///   (stereo) stream `index / 2` — left if `index` even, right if odd.
+/// * `2*M ≤ index < 255` → output is mono stream `index − M`.
+/// * `index == 255` → pure silence.
+///
+/// The same decoded channel MAY be routed to several output channels;
+/// some decoded channels MAY be unused — the §5.1.1 mapping is arbitrary.
+#[derive(Debug)]
+pub struct MultistreamDecoder {
+    mapping: ChannelMappingTable,
+    /// One decoder per coded stream (length `N`). The first `M` are
+    /// coupled (stereo) streams; the rest are mono.
+    decoders: Vec<crate::decoder::OpusDecoder>,
+}
+
+impl MultistreamDecoder {
+    /// Build a decoder for the given §5.1.1 channel-mapping table.
+    pub fn new(mapping: ChannelMappingTable) -> Self {
+        let n = mapping.stream_count as usize;
+        let decoders = (0..n).map(|_| crate::decoder::OpusDecoder::new()).collect();
+        MultistreamDecoder { mapping, decoders }
+    }
+
+    /// Build a multistream decoder straight from a parsed
+    /// [`OpusHead`] identification header.
+    pub fn from_head(head: &OpusHead) -> Self {
+        Self::new(head.mapping.clone())
+    }
+
+    /// The §5.1.1 channel-mapping table this decoder was built with.
+    pub fn mapping(&self) -> &ChannelMappingTable {
+        &self.mapping
+    }
+
+    /// Number of output channels `C`.
+    pub fn output_channels(&self) -> u8 {
+        self.mapping.output_channels()
+    }
+
+    /// Reset every per-stream decoder (the §4.5.2 decoder reset, e.g.
+    /// after a container seek).
+    pub fn reset(&mut self) {
+        for d in &mut self.decoders {
+            d.reset();
+        }
+    }
+
+    /// Decode one multistream Ogg packet into `C`-channel interleaved
+    /// 48 kHz PCM.
+    ///
+    /// Splits the packet into its `N` per-stream Opus packets, decodes
+    /// each through its own decoder, and assembles the `C` output
+    /// channels per the §5.1.1 mapping. Index-255 output channels are
+    /// filled with silence.
+    ///
+    /// Returns [`Error::MalformedPacket`] if the split fails or if a
+    /// sub-stream decode fails; the output sample count is taken from the
+    /// first stream (RFC 7845 §3 requires every stream in a packet to
+    /// have the same duration).
+    pub fn decode_packet(&mut self, packet: &[u8]) -> Result<MultistreamAudio, Error> {
+        let streams = split_multistream_packet(packet, self.mapping.stream_count)?;
+        let coupled = self.mapping.coupled_count as usize;
+
+        // Decode every stream. `decoded[s]` is the interleaved PCM of
+        // stream `s` together with its channel count.
+        let mut decoded: Vec<(Vec<i16>, u8)> = Vec::with_capacity(streams.len());
+        for (s, stream) in streams.iter().enumerate() {
+            let dec = &mut self.decoders[s];
+            let audio = if stream.self_delimited {
+                dec.decode_self_delimited_packet(stream.bytes)
+            } else {
+                dec.decode_packet(stream.bytes)
+            }
+            .map_err(|_| Error::MalformedPacket)?;
+            decoded.push((audio.pcm, audio.channels));
+        }
+
+        // Every stream shares the same per-channel sample count (§3). Use
+        // the first stream's to size the output; defend against a stream
+        // returning fewer samples by clamping reads.
+        let samples_per_channel = decoded
+            .first()
+            .map(|(pcm, ch)| pcm.len() / (*ch).max(1) as usize)
+            .unwrap_or(0);
+
+        let c = self.mapping.output_channels() as usize;
+        let mut out = vec![0i16; samples_per_channel * c];
+
+        for (out_ch, &index) in self.mapping.mapping.iter().enumerate() {
+            if index == 255 {
+                // §5.1.1: pure silence; `out` already zeroed.
+                continue;
+            }
+            // Resolve (stream, channel-within-stream) from the index per
+            // §5.1.1: index < 2*M selects coupled (stereo) stream index/2
+            // with L/R by parity; 2*M ≤ index < 255 selects mono stream
+            // index − M.
+            let (stream_idx, chan_in_stream) = if (index as usize) < 2 * coupled {
+                (index as usize / 2, index as usize % 2)
+            } else {
+                ((index as usize) - coupled, 0usize)
+            };
+            let (pcm, ch) = &decoded[stream_idx];
+            // The decoder's interleave width. A coupled stream whose
+            // packet decoded internally mono returns a single channel; in
+            // that case fall back to channel 0 for the requested L/R.
+            let src_channels = (*ch as usize).max(1);
+            let src_chan = if chan_in_stream < src_channels {
+                chan_in_stream
+            } else {
+                0
+            };
+            for sample in 0..samples_per_channel {
+                let src_idx = sample * src_channels + src_chan;
+                let v = pcm.get(src_idx).copied().unwrap_or(0);
+                out[sample * c + out_ch] = v;
+            }
+        }
+
+        Ok(MultistreamAudio {
+            pcm: out,
+            channels: self.mapping.output_channels(),
+            sample_rate_hz: crate::decoder::OUTPUT_SAMPLE_RATE_HZ,
+            samples_per_channel,
+        })
+    }
+}
+
+/// Decoded audio for one multistream Ogg packet: `C`-channel interleaved
+/// 48 kHz PCM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultistreamAudio {
+    /// Interleaved signed 16-bit PCM at 48 kHz, `C` channels. Length is
+    /// `samples_per_channel * channels`.
+    pub pcm: Vec<i16>,
+    /// Output channel count `C`.
+    pub channels: u8,
+    /// Output sample rate (always 48 kHz).
+    pub sample_rate_hz: u32,
+    /// Per-channel 48 kHz sample count.
+    pub samples_per_channel: usize,
 }
 
 #[cfg(test)]

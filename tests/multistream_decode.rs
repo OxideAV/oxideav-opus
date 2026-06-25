@@ -1,0 +1,214 @@
+//! End-to-end multistream (multichannel) Opus decode validation — RFC
+//! 7845 §3 + §5.1.1.
+//!
+//! These tests exercise the [`oxideav_opus::MultistreamDecoder`] path on
+//! real, reference-encoder-produced SILK packets. A multistream Ogg
+//! packet glues N independent Opus packets together (the first N−1 with
+//! RFC 6716 Appendix-B self-delimited framing, the last with regular
+//! framing); the decoder splits them, decodes each through its own
+//! stateful sub-decoder, and assembles the C output channels per the
+//! §5.1.1 channel-mapping rule.
+//!
+//! There is no committed multichannel fixture, so the multistream
+//! packets here are *constructed* from the single-stream SILK fixtures by
+//! wrapping their packets in the self-delimited framing — the same
+//! framing a real multichannel encoder would use. The point is to
+//! validate the split + per-stream decode + channel-map assembly, all of
+//! which are codec-level operations independent of any container.
+//!
+//! No external library source is consulted; the only inputs are RFC 7845
+//! §3 / §5.1.1, RFC 6716 §3.2 / Appendix B, and the committed fixtures.
+
+use oxideav_opus::{ChannelMappingTable, MultistreamDecoder, OpusHead, OpusTocByte};
+
+const FIXTURE_NB_MONO: &[u8] = include_bytes!("fixtures/silk-nb-mono-16kbps.opus");
+
+/// Minimal test-only Ogg page de-laker (see `silk_fixture_decode.rs` for
+/// the rationale): recovers the logical packets so we can pull real Opus
+/// audio packets out of the fixture.
+fn ogg_packets(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut off = 0usize;
+    let mut packets: Vec<Vec<u8>> = Vec::new();
+    let mut cur: Vec<u8> = Vec::new();
+    while off + 27 <= data.len() {
+        assert_eq!(&data[off..off + 4], b"OggS");
+        let nseg = data[off + 26] as usize;
+        let seg_table_end = off + 27 + nseg;
+        assert!(seg_table_end <= data.len());
+        let segtab = &data[off + 27..seg_table_end];
+        let mut p = seg_table_end;
+        for &s in segtab {
+            let seg_end = p + s as usize;
+            assert!(seg_end <= data.len());
+            cur.extend_from_slice(&data[p..seg_end]);
+            p = seg_end;
+            if s < 255 {
+                packets.push(std::mem::take(&mut cur));
+            }
+        }
+        off = p;
+    }
+    packets
+}
+
+/// The raw OpusHead bytes of the fixture (Ogg packet 0).
+fn fixture_head_bytes() -> Vec<u8> {
+    ogg_packets(FIXTURE_NB_MONO).remove(0)
+}
+
+/// The fixture's audio packets (after OpusHead + OpusTags).
+fn fixture_audio_packets() -> Vec<Vec<u8>> {
+    let mut p = ogg_packets(FIXTURE_NB_MONO);
+    p.drain(..2);
+    p
+}
+
+/// Wrap a regular code-0 mono Opus packet (TOC byte + frame body) in the
+/// RFC 6716 Appendix-B self-delimited framing: TOC | §3.2.1 length |
+/// frame body. The fixture is config 1 (SILK/NB/20 ms), code 0, so each
+/// audio packet is exactly TOC + one frame.
+fn self_delimit_code0(packet: &[u8]) -> Vec<u8> {
+    let toc = OpusTocByte::from_byte(packet[0]);
+    // Confirm the assumption (single-frame, code 0): frame body is the
+    // tail after the TOC byte.
+    assert_eq!(toc.frame_count_range(), (1, 1), "fixture is code 0");
+    let body = &packet[1..];
+    let mut out = vec![packet[0]];
+    // §3.2.1 one/two-byte length encoding of the body length.
+    let len = body.len();
+    if len < 252 {
+        out.push(len as u8);
+    } else {
+        out.push((252 + (len - 252) % 4) as u8);
+        out.push(((len - 252) / 4) as u8);
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+#[test]
+fn fixture_opus_head_parses() {
+    let head = OpusHead::parse(&fixture_head_bytes()).unwrap();
+    // config 1 ⇒ SILK/NB; the fixture header is mono, family 0.
+    assert_eq!(head.version, 1);
+    assert_eq!(head.channel_count, 1);
+    assert_eq!(head.mapping_family, 0);
+    assert_eq!(head.mapping.stream_count, 1);
+    assert_eq!(head.mapping.coupled_count, 0);
+    assert_eq!(head.mapping.mapping, vec![0]);
+    // The fixture's SILK NB input rate is 8 kHz; pre-skip is 312 samples.
+    assert_eq!(head.input_sample_rate, 8000);
+    assert_eq!(head.pre_skip, 312);
+}
+
+#[test]
+fn single_stream_family0_matches_plain_decode() {
+    // A family-0 mono OpusHead ⇒ N = 1: the multistream decoder must
+    // produce exactly what a plain decoder does.
+    let head = OpusHead::parse(&fixture_head_bytes()).unwrap();
+    let mut ms = MultistreamDecoder::from_head(&head);
+    assert_eq!(ms.output_channels(), 1);
+
+    let mut plain = oxideav_opus::OpusDecoder::new();
+    for pk in fixture_audio_packets() {
+        let ms_out = ms.decode_packet(&pk).unwrap();
+        let plain_out = plain.decode_packet(&pk).unwrap();
+        assert_eq!(ms_out.channels, 1);
+        assert_eq!(
+            ms_out.pcm, plain_out.pcm,
+            "N=1 multistream must equal plain decode"
+        );
+    }
+}
+
+#[test]
+fn two_mono_streams_map_to_distinct_output_channels() {
+    // Build a synthetic 2-stream packet: stream 0 = self-delimited mono
+    // packet A, stream 1 = regular mono packet B (a *different* audio
+    // packet so the two channels carry different signal). Map them to a
+    // 2-channel output: out[0] ← stream 0, out[1] ← stream 1.
+    //
+    // Channel-mapping table: N = 2, M = 0 (both mono). Per §5.1.1, mono
+    // stream s is index `s` (2*M = 0). So mapping [0, 1] routes stream 0
+    // to the left channel and stream 1 to the right.
+    let audio = fixture_audio_packets();
+    let pkt_a = &audio[5];
+    let pkt_b = &audio[40];
+
+    let mut multistream_packet = self_delimit_code0(pkt_a);
+    multistream_packet.extend_from_slice(pkt_b);
+
+    let mapping = ChannelMappingTable {
+        stream_count: 2,
+        coupled_count: 0,
+        mapping: vec![0, 1],
+    };
+    let mut ms = MultistreamDecoder::new(mapping);
+    assert_eq!(ms.output_channels(), 2);
+
+    let out = ms.decode_packet(&multistream_packet).unwrap();
+    assert_eq!(out.channels, 2);
+    assert_eq!(out.pcm.len(), out.samples_per_channel * 2);
+    assert_eq!(out.samples_per_channel, 960); // 20 ms @ 48 kHz
+
+    // Cross-check the two output channels against decoding each stream on
+    // its own. The left output channel must equal a plain decode of
+    // packet A; the right must equal a plain decode of packet B.
+    let mut da = oxideav_opus::OpusDecoder::new();
+    let mut db = oxideav_opus::OpusDecoder::new();
+    let a = da.decode_packet(pkt_a).unwrap();
+    let b = db.decode_packet(pkt_b).unwrap();
+    for s in 0..out.samples_per_channel {
+        assert_eq!(out.pcm[s * 2], a.pcm[s], "left channel sample {s}");
+        assert_eq!(out.pcm[s * 2 + 1], b.pcm[s], "right channel sample {s}");
+    }
+}
+
+#[test]
+fn silence_index_255_yields_zero_channel() {
+    // A 3-channel output where channel 2 is the reserved silence index
+    // 255; channels 0 and 1 come from two mono streams.
+    let audio = fixture_audio_packets();
+    let mut multistream_packet = self_delimit_code0(&audio[5]);
+    multistream_packet.extend_from_slice(&audio[40]);
+
+    let mapping = ChannelMappingTable {
+        stream_count: 2,
+        coupled_count: 0,
+        mapping: vec![0, 1, 255],
+    };
+    let mut ms = MultistreamDecoder::new(mapping);
+    let out = ms.decode_packet(&multistream_packet).unwrap();
+    assert_eq!(out.channels, 3);
+    // The 255-mapped channel (output channel 2) is pure silence.
+    for s in 0..out.samples_per_channel {
+        assert_eq!(out.pcm[s * 3 + 2], 0, "silence channel sample {s}");
+    }
+    // ...while the other two carry the (non-trivially-routed) signal.
+    let any_nonzero_left = (0..out.samples_per_channel).any(|s| out.pcm[s * 3] != 0);
+    assert!(any_nonzero_left, "left channel should carry signal");
+}
+
+#[test]
+fn duplicate_index_routes_same_stream_to_two_outputs() {
+    // §5.1.1 permits a decoded channel to feed several output channels.
+    // Map a single mono stream to BOTH output channels of a 2-channel
+    // output (N = 1, mapping [0, 0]).
+    let audio = fixture_audio_packets();
+    let mapping = ChannelMappingTable {
+        stream_count: 1,
+        coupled_count: 0,
+        mapping: vec![0, 0],
+    };
+    let mut ms = MultistreamDecoder::new(mapping);
+    let out = ms.decode_packet(&audio[10]).unwrap();
+    assert_eq!(out.channels, 2);
+    // Both channels identical (same decoded channel duplicated).
+    for s in 0..out.samples_per_channel {
+        assert_eq!(
+            out.pcm[s * 2],
+            out.pcm[s * 2 + 1],
+            "duplicated channel sample {s}"
+        );
+    }
+}
