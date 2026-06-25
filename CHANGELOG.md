@@ -6,6 +6,33 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- *Multistream / multichannel decode subsystem (RFC 7845 §3 / §5.1 /
+  §5.1.1).* A complete new path for multichannel Opus:
+  - `OpusHead` parses and fully validates the §5.1 identification header
+    (version, output channel count, pre-skip, input sample rate, output
+    gain, mapping family) and the §5.1.1 channel-mapping table (stream
+    count N, coupled count M, per-output mapping indices), enforcing every
+    MUST in the two sections (non-zero counts, per-family channel ranges,
+    `M ≤ N`, `M + N ≤ 255`, `< M+N`/255 index bound; family 0 synthesizes
+    the table from RFC-pinned defaults).
+  - `split_multistream_packet` recovers the N per-stream Opus packets from
+    one multistream packet (§3): the first `N − 1` via RFC 6716 Appendix-B
+    self-delimited framing, the last as the undelimited remainder.
+  - `MultistreamDecoder` wraps one stateful `OpusDecoder` per coded stream
+    and assembles the `C` output channels by the §5.1.1 index rule
+    (coupled-stream L/R by parity, mono streams, index-255 silence,
+    decoded channels routed to multiple outputs), enforcing the §3
+    equal-duration constraint. `decode_packet` /
+    `decode_self_delimited_packet` on `OpusDecoder` share one decode body
+    so both framing variants thread identical layer state.
+  - `apply_output_gain` / `OpusHead::apply_gain` apply the §5.1 Q7.8 dB
+    output gain (i16-saturating); `PreSkip` accumulates the §5.1 pre-skip
+    across packets.
+  - End-to-end validated on the real SILK fixtures: an `N = 1` family-0
+    decode is byte-identical to a plain `OpusDecoder`; a coupled-stream
+    L/R split reproduces a plain stereo decode exactly; mono-pair,
+    swapped, silence, and duplicate channel maps all route correctly; a
+    mismatched-duration packet is rejected.
 - *In-band FEC (§4.2.5 LBRR) recovery — `OpusDecoder::decode_packet_fec`*
   (RFC 6716 §2.1.7 / §4.2.5): a new public entry point that reconstructs a
   **lost** frame's audio from the Low Bit-Rate Redundancy carried in the

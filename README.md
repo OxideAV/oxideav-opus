@@ -66,8 +66,10 @@ packet-loss concealment is also outstanding (the RFC defines PLC as a
 non-normative decoder feature with no bitstream algorithm; lost / DTX
 frames currently emit the §4.6 silence floor). The crate ships a large,
 individually unit-tested set of SILK and CELT decode building blocks
-(1200 lib tests + a CELT synthesis-backend integration suite). Per-stage
-progress lives in `CHANGELOG.md`.
+plus a complete RFC 7845 multistream / multichannel decode subsystem
+(1228 lib tests + SILK-fixture, multistream, FEC, and CELT
+synthesis-backend integration suites). Per-stage progress lives in
+`CHANGELOG.md`.
 
 ## What works
 
@@ -117,6 +119,33 @@ progress lives in `CHANGELOG.md`.
   sine fixture. Validation is signal- / structure-based, not bit-exact:
   the §4.2.9 SILK→48 kHz resampler is non-normative, so the decoded
   envelope differs from the polyphase-resampled reference decoder.
+
+**Multistream / multichannel (RFC 7845 §3 / §5.1 / §5.1.1):**
+
+- `OpusHead` — the §5.1 identification-header parser: version (with the
+  major-nibble compatibility bound), output channel count, pre-skip,
+  input sample rate, output gain, mapping family, and the §5.1.1
+  channel-mapping table (stream count N, coupled count M, per-output
+  mapping indices). Enforces every MUST in §5.1 / §5.1.1 (non-zero
+  channel/stream counts, per-family channel ranges, `M ≤ N`,
+  `M + N ≤ 255`, and the `< M+N` / 255 mapping-index bound). Family 0
+  synthesizes the table from the RFC-pinned defaults.
+- `split_multistream_packet` — the §3 N-packet split: the first `N − 1`
+  streams via Appendix-B self-delimited framing, the final stream as the
+  undelimited remainder.
+- `MultistreamDecoder` — the multichannel decode: one stateful
+  sub-decoder per coded stream, decoding each split packet and
+  assembling the `C` output channels by the §5.1.1 index rule
+  (coupled-stream L/R by parity, mono streams, index-255 silence, a
+  decoded channel routed to multiple outputs), with the §3 equal-duration
+  constraint enforced. Validated end-to-end against the real SILK
+  fixtures: an `N = 1` family-0 decode is byte-identical to a plain
+  `OpusDecoder`, a coupled-stream L/R split reproduces a plain stereo
+  decode exactly, and mono-pair / swapped / silence / duplicate maps all
+  route correctly.
+- `apply_output_gain` / `PreSkip` — the §5.1 post-decode output-gain
+  application (Q7.8 dB, i16-saturating) and the cross-packet pre-skip
+  accumulator.
 
 **Range coder (RFC 6716 §4.1):** `RangeDecoder` — the shared entropy
 primitive consumed by both layers, including the §4.1.2 two-step
