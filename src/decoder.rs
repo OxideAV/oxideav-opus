@@ -315,6 +315,24 @@ impl OpusDecoder {
     /// [`Error::MalformedPacket`] for any §3.2 framing violation.
     pub fn decode_packet(&mut self, packet: &[u8]) -> Result<DecodedAudio, Error> {
         let parsed = OpusPacket::parse(packet)?;
+        self.decode_parsed_packet(parsed)
+    }
+
+    /// Decode one complete Opus packet that uses RFC 6716 Appendix-B
+    /// self-delimited framing (the framing the first `N − 1` streams of
+    /// a multistream packet use, RFC 7845 §3). Behaves exactly like
+    /// [`Self::decode_packet`] otherwise — the only difference is how the
+    /// frame slices are recovered from the packet bytes.
+    pub fn decode_self_delimited_packet(&mut self, packet: &[u8]) -> Result<DecodedAudio, Error> {
+        let parsed = crate::framing_self_delim::parse_self_delimited(packet)?.packet;
+        self.decode_parsed_packet(parsed)
+    }
+
+    /// Shared decode body for both the regular ([`Self::decode_packet`])
+    /// and self-delimited ([`Self::decode_self_delimited_packet`]) entry
+    /// points: applies the §4.5.2 cross-packet state resets, then runs
+    /// the §4.5 multi-frame loop over the already-sliced frames.
+    fn decode_parsed_packet(&mut self, parsed: OpusPacket<'_>) -> Result<DecodedAudio, Error> {
         let routing = OpusFrameRouting::from_toc(parsed.toc);
         let channels = routing.channel_count();
         let per_frame_samples = output_samples_per_channel(routing.frame_size_tenths_ms);
