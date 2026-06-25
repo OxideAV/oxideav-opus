@@ -60,7 +60,7 @@
 //! bit-exact"; we follow the spec's floating-point formulation in `f32`.
 //!
 //! All truth is taken from RFC 6716 §4.2.8 (and §4.2.7.1 for the weight
-//! decode). No external library source is consulted.
+//! decode).
 
 use crate::toc::Bandwidth;
 use crate::Error;

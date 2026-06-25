@@ -35,7 +35,6 @@
 //! family-0 / family-1 / family-255 allowed-channel rules and every MUST
 //! validation (`Version`, `Output Channel Count`, `Stream Count`,
 //! `Coupled Stream Count`, and the `M + N ≤ 255` decoded-channel bound).
-//! No external library source is consulted.
 
 /// The fixed 8-octet magic signature `"OpusHead"` (RFC 7845 §5.1, item
 /// 1). A valid identification header begins with exactly these bytes.
