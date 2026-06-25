@@ -720,6 +720,7 @@ pub mod frames;
 pub mod framing;
 pub mod framing_self_delim;
 pub mod mode_transition_reset;
+pub mod opus_head;
 pub mod range_decoder;
 pub mod redundancy_decode_params;
 pub mod silk_decode;
@@ -859,6 +860,10 @@ pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
 pub use framing::{OperatingMode, OpusFrameRouting, SilkBandwidth};
 pub use framing_self_delim::{parse_self_delimited, SelfDelimitedParse};
 pub use mode_transition_reset::{decide_state_resets, CeltResetPlacement, StateReset};
+pub use opus_head::{
+    ChannelMappingTable, OpusHead, OpusHeadError, OPUS_HEAD_MAGIC, OPUS_HEAD_MAX_VERSION,
+    OPUS_HEAD_MIN_LEN,
+};
 pub use range_decoder::RangeDecoder;
 pub use redundancy_decode_params::{
     apply_mb_to_wb_override, redundant_frame_params, CrossLapPlacement, RedundantFrameParams,
