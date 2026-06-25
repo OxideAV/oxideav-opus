@@ -23,6 +23,7 @@ use oxideav_opus::{ChannelMappingTable, MultistreamDecoder, OpusHead, OpusTocByt
 
 const FIXTURE_NB_MONO: &[u8] = include_bytes!("fixtures/silk-nb-mono-16kbps.opus");
 const FIXTURE_MB_60MS: &[u8] = include_bytes!("fixtures/silk-mb-60ms-mono-20kbps.opus");
+const FIXTURE_WB_STEREO: &[u8] = include_bytes!("fixtures/silk-wb-stereo-20kbps.opus");
 
 /// Minimal test-only Ogg page de-laker (see `silk_fixture_decode.rs` for
 /// the rationale): recovers the logical packets so we can pull real Opus
@@ -67,6 +68,13 @@ fn fixture_audio_packets() -> Vec<Vec<u8>> {
 /// The 60 ms MB fixture's audio packets.
 fn mb_audio_packets() -> Vec<Vec<u8>> {
     let mut p = ogg_packets(FIXTURE_MB_60MS);
+    p.drain(..2);
+    p
+}
+
+/// The WB stereo fixture's audio packets.
+fn wb_stereo_audio_packets() -> Vec<Vec<u8>> {
+    let mut p = ogg_packets(FIXTURE_WB_STEREO);
     p.drain(..2);
     p
 }
@@ -216,6 +224,65 @@ fn silence_index_255_yields_zero_channel() {
     // ...while the other two carry the (non-trivially-routed) signal.
     let any_nonzero_left = (0..out.samples_per_channel).any(|s| out.pcm[s * 3] != 0);
     assert!(any_nonzero_left, "left channel should carry signal");
+}
+
+#[test]
+fn coupled_stereo_stream_splits_to_left_right() {
+    // A single coupled (stereo) stream: N = 1, M = 1. Per §5.1.1 the
+    // two output channels are indices 0 (left) and 1 (right) of stream 0
+    // (2*M = 2). The multistream output must be byte-identical to a plain
+    // stereo decode of the same packet.
+    let stereo = wb_stereo_audio_packets();
+    let pkt = &stereo[5];
+
+    let mapping = ChannelMappingTable {
+        stream_count: 1,
+        coupled_count: 1,
+        mapping: vec![0, 1],
+    };
+    let mut ms = MultistreamDecoder::new(mapping);
+    assert_eq!(ms.output_channels(), 2);
+    let out = ms.decode_packet(pkt).unwrap();
+    assert_eq!(out.channels, 2);
+
+    let mut plain = oxideav_opus::OpusDecoder::new();
+    let plain_out = plain.decode_packet(pkt).unwrap();
+    assert_eq!(plain_out.channels, 2);
+    // The coupled-stream L/R extraction must reproduce the plain stereo
+    // interleave exactly.
+    assert_eq!(out.pcm, plain_out.pcm);
+}
+
+#[test]
+fn coupled_stream_swapped_channel_map() {
+    // §5.1.1 mappings are arbitrary: map the coupled stream's right
+    // channel to output 0 and its left to output 1 (a channel swap).
+    let stereo = wb_stereo_audio_packets();
+    let pkt = &stereo[7];
+
+    let mapping = ChannelMappingTable {
+        stream_count: 1,
+        coupled_count: 1,
+        mapping: vec![1, 0], // swapped
+    };
+    let mut ms = MultistreamDecoder::new(mapping);
+    let out = ms.decode_packet(pkt).unwrap();
+
+    let mut plain = oxideav_opus::OpusDecoder::new();
+    let plain_out = plain.decode_packet(pkt).unwrap();
+    for s in 0..out.samples_per_channel {
+        // out[0] is plain right, out[1] is plain left.
+        assert_eq!(
+            out.pcm[s * 2],
+            plain_out.pcm[s * 2 + 1],
+            "swapped left sample {s}"
+        );
+        assert_eq!(
+            out.pcm[s * 2 + 1],
+            plain_out.pcm[s * 2],
+            "swapped right sample {s}"
+        );
+    }
 }
 
 #[test]
