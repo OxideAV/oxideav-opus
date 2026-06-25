@@ -865,8 +865,8 @@ pub use multistream::{
     split_multistream_packet, MultistreamAudio, MultistreamDecoder, StreamPacket,
 };
 pub use opus_head::{
-    ChannelMappingTable, OpusHead, OpusHeadError, OPUS_HEAD_MAGIC, OPUS_HEAD_MAX_VERSION,
-    OPUS_HEAD_MIN_LEN,
+    apply_output_gain, ChannelMappingTable, OpusHead, OpusHeadError, PreSkip, OPUS_HEAD_MAGIC,
+    OPUS_HEAD_MAX_VERSION, OPUS_HEAD_MIN_LEN,
 };
 pub use range_decoder::RangeDecoder;
 pub use redundancy_decode_params::{

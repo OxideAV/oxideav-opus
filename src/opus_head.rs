@@ -350,6 +350,86 @@ impl OpusHead {
     pub fn output_gain_linear(&self) -> f64 {
         10f64.powf(self.output_gain_q7_8 as f64 / (20.0 * 256.0))
     }
+
+    /// Apply this header's §5.1 output gain in place to a buffer of
+    /// interleaved 48 kHz PCM. A zero gain is a no-op; otherwise every
+    /// sample is scaled by [`Self::output_gain_linear`] and saturated to
+    /// the `i16` range. See [`apply_output_gain`].
+    pub fn apply_gain(&self, pcm: &mut [i16]) {
+        apply_output_gain(pcm, self.output_gain_q7_8);
+    }
+}
+
+/// Apply a §5.1 output gain (raw Q7.8 dB value) in place to a buffer of
+/// PCM samples, saturating to the `i16` range.
+///
+/// RFC 7845 §5.1 item 6 defines the gain as a Q7.8 fixed-point dB value
+/// and gives the application formula
+/// `sample *= pow(10, output_gain / (20.0 * 256))`. "Players and media
+/// frameworks SHOULD apply it by default." A gain of 0 leaves the buffer
+/// untouched (the common case — muxers SHOULD write zero and bake any
+/// gain into the encode).
+pub fn apply_output_gain(pcm: &mut [i16], gain_q7_8: i16) {
+    if gain_q7_8 == 0 {
+        return;
+    }
+    let scale = 10f64.powf(gain_q7_8 as f64 / (20.0 * 256.0));
+    for s in pcm.iter_mut() {
+        let scaled = (*s as f64 * scale).round();
+        *s = scaled.clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+    }
+}
+
+/// Pre-skip accumulator (RFC 7845 §5.1 item 4 / §4.2 trimming).
+///
+/// The §5.1 pre-skip is the number of 48 kHz samples (per channel) to
+/// discard from the *start* of the decoded output, giving the decoder's
+/// internal filters time to converge before audible playback begins.
+/// This helper threads the remaining pre-skip count across packets: feed
+/// it each decoded packet's per-channel sample count and it reports how
+/// many leading per-channel samples of that packet to drop.
+///
+/// Trimming is applied to the per-channel sample stream; for interleaved
+/// PCM with `C` channels, multiply the returned count by `C` to get the
+/// number of interleaved samples to drop from the front of the buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreSkip {
+    remaining: u32,
+}
+
+impl PreSkip {
+    /// Construct a pre-skip accumulator with `pre_skip` per-channel
+    /// samples still to discard.
+    pub fn new(pre_skip: u16) -> Self {
+        PreSkip {
+            remaining: pre_skip as u32,
+        }
+    }
+
+    /// Build the pre-skip accumulator for a parsed [`OpusHead`].
+    pub fn from_head(head: &OpusHead) -> Self {
+        Self::new(head.pre_skip)
+    }
+
+    /// Per-channel samples still to discard.
+    pub fn remaining(&self) -> u32 {
+        self.remaining
+    }
+
+    /// `true` once the pre-skip region has been fully consumed.
+    pub fn is_done(&self) -> bool {
+        self.remaining == 0
+    }
+
+    /// Register `samples_per_channel` newly-decoded per-channel samples
+    /// and return how many of them (from the front) fall inside the
+    /// pre-skip region and must be discarded. The remaining count is
+    /// advanced accordingly.
+    pub fn consume(&mut self, samples_per_channel: usize) -> usize {
+        let drop = (samples_per_channel as u32).min(self.remaining);
+        self.remaining -= drop;
+        drop as usize
+    }
 }
 
 #[cfg(test)]
@@ -552,5 +632,75 @@ mod tests {
         h[16..18].copy_from_slice(&g.to_le_bytes());
         let head = OpusHead::parse(&h).unwrap();
         assert!(head.output_gain_linear() > 1.9 && head.output_gain_linear() < 2.1);
+    }
+
+    #[test]
+    fn apply_output_gain_zero_is_noop() {
+        let mut pcm = vec![100i16, -200, 32767, -32768];
+        let before = pcm.clone();
+        apply_output_gain(&mut pcm, 0);
+        assert_eq!(pcm, before);
+    }
+
+    #[test]
+    fn apply_output_gain_doubles_at_plus_6db() {
+        // +6.02 dB ≈ Q7.8 1536 → ×2.
+        let mut pcm = vec![100i16, -100, 50];
+        apply_output_gain(&mut pcm, 1536);
+        assert_eq!(pcm[0], 200);
+        assert_eq!(pcm[1], -200);
+        assert_eq!(pcm[2], 100);
+    }
+
+    #[test]
+    fn apply_output_gain_saturates() {
+        // A large positive gain pushes a mid-scale sample past i16::MAX;
+        // it must clamp, not wrap.
+        let mut pcm = vec![20000i16, -20000];
+        apply_output_gain(&mut pcm, 1536); // ×2 → 40000 > 32767
+        assert_eq!(pcm[0], i16::MAX);
+        assert_eq!(pcm[1], i16::MIN);
+    }
+
+    #[test]
+    fn apply_gain_via_head() {
+        let mut h = family0_header(1);
+        h[16..18].copy_from_slice(&1536i16.to_le_bytes());
+        let head = OpusHead::parse(&h).unwrap();
+        let mut pcm = vec![10i16, -10];
+        head.apply_gain(&mut pcm);
+        assert_eq!(pcm, vec![20, -20]);
+    }
+
+    #[test]
+    fn pre_skip_consumes_across_packets() {
+        // 312-sample pre-skip (the fixture value) spread across 20 ms
+        // packets of 960 samples each: the first packet drops all 312,
+        // subsequent packets drop none.
+        let mut ps = PreSkip::new(312);
+        assert!(!ps.is_done());
+        assert_eq!(ps.remaining(), 312);
+        assert_eq!(ps.consume(960), 312);
+        assert!(ps.is_done());
+        assert_eq!(ps.consume(960), 0);
+    }
+
+    #[test]
+    fn pre_skip_spanning_multiple_packets() {
+        // A pre-skip larger than one packet drains over several.
+        let mut ps = PreSkip::new(1500);
+        assert_eq!(ps.consume(960), 960);
+        assert_eq!(ps.remaining(), 540);
+        assert_eq!(ps.consume(960), 540);
+        assert!(ps.is_done());
+        assert_eq!(ps.consume(960), 0);
+    }
+
+    #[test]
+    fn pre_skip_from_head() {
+        let head = OpusHead::parse(&family0_header(1)).unwrap();
+        // family0_header sets pre-skip 3840.
+        let ps = PreSkip::from_head(&head);
+        assert_eq!(ps.remaining(), 3840);
     }
 }
