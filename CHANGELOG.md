@@ -6,6 +6,29 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- *CELT §4.3.4.5 time-frequency Hadamard transform (`celt_tf_hadamard`).*
+  Consumes a band's `TfDirection` (from `celt_tf_decode` /
+  `celt_tf_adjust`) and reshapes its interleaved short-MDCT shape
+  vector: `IncreaseFrequency` applies the across-block orthonormal
+  Walsh–Hadamard transform in natural order; `IncreaseTime` applies the
+  same butterfly in sequency (Walsh) order ("input vector is sorted in
+  time"), via the bit-reverse + inverse-Gray permutation; `Unchanged`
+  is identity. The orthonormal (1/√2) butterfly preserves the band's
+  unit-norm shape energy exactly (the invariant the §4.3.6
+  denormalisation relies on) and is its own inverse. Partial-level
+  transforms split each `B`-block group into consecutive `2**levels`
+  sub-runs. 14 unit tests.
+- *CELT §4.3.4 per-band shape decode orchestrator (`celt_band_shape`).*
+  `decode_band_shape{,_into}` composes the three fully-specified §4.3.4
+  steps — §4.3.4.2 PVQ decode → §4.3.4.3 spreading → §4.3.4.5 TF
+  Hadamard — given a band's `(N, K, spread, tf_adjust, nb_blocks)`,
+  producing the normalized time-frequency shape ready for §4.3.6
+  denormalisation. Each step is norm-preserving; `K = 0` yields an
+  all-zero band. The §4.3.4.4 recursive split path (codebooks > 32
+  bits, gain precision "derived from the current allocation") is
+  deliberately not composed — its derivation is reference-only and
+  absent from the RFC narrative. 9 unit tests.
+
 - *Multistream / multichannel decode subsystem (RFC 7845 §3 / §5.1 /
   §5.1.1).* A complete new path for multichannel Opus:
   - `OpusHead` parses and fully validates the §5.1 identification header
