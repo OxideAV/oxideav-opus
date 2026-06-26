@@ -713,6 +713,7 @@ pub mod celt_static_alloc;
 pub mod celt_synthesis;
 pub mod celt_tf_adjust;
 pub mod celt_tf_decode;
+pub mod celt_tf_hadamard;
 pub mod celt_transitions;
 pub mod celt_trim_offsets;
 pub mod decoder;
