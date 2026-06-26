@@ -688,6 +688,7 @@ pub mod celt_alloc_search;
 pub mod celt_alloc_trim;
 pub mod celt_band_boost;
 pub mod celt_band_layout;
+pub mod celt_band_shape;
 pub mod celt_band_thresh;
 pub mod celt_cache_caps50;
 pub mod celt_coarse_energy;
