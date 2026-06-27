@@ -54,8 +54,21 @@ adds back the §4.3 `e_means` Q4 baseline, and threads the cross-frame
 SILK→CELT transition). A non-silent CELT-only frame thus consumes its
 prefix + coarse energy from the real range coder and advances the
 synthesis state, reporting `FrameDecodeStatus::CeltCoarseEnergyDecoded`.
-The remaining CELT band-data stages — §4.3.3 bit allocation (boost /
-trim / reservations / interpolation), §4.3.4 PVQ band shapes, and
+On top of the coarse energy, a non-silent frame now also decodes the
+§4.3.3 allocation *header* — the signalled part of the bit allocation —
+from the same range coder in §4.3.3 order: the band boosts
+(`celt_band_boost`, walked over the `start..end` coding window with the
+per-band `cap[]` from `celt_cache_caps50` and the per-channel MDCT-bin
+counts), the allocation trim (`celt_alloc_trim`, gated on the running
+`ec_tell_frac`), and the §4.3.3 anti-collapse / skip / intensity-stereo
+/ dual-stereo reservations (`celt_reservations`). This advances the
+entropy decoder through everything the bitstream explicitly carries
+before the implicit interpolation, leaving the coder positioned exactly
+where the §4.3.4 PVQ shape decode resumes, and the frame reports
+`FrameDecodeStatus::CeltAllocationDecoded`. The remaining CELT band-data
+stages — the §4.3.3 *implicit* allocation (`interp_bits2pulses`, the
+per-band pulse / fine-energy split, which is reference-code-only and
+absent from the RFC narrative body), §4.3.4 PVQ band shapes, and
 §4.3.2.2 fine energy — are still pending, so the band shapes are
 all-zero and these frames emit correct-length silence until those land.
 The one residual coarse-energy seam is the RFC's "clamped internally"
