@@ -863,44 +863,55 @@ impl OpusDecoder {
         Ok((left, right, bandwidth))
     }
 
-    /// Decode the §4.3.3 CELT allocation *header* — the part of the bit
-    /// allocation the bitstream explicitly signals — from the live range
-    /// coder, in §4.3.3 order:
+    /// Decode the Table-56 CELT symbols that sit between the §4.3.2.1
+    /// coarse energy and the §4.3.4 residual: the §4.3.1 time-frequency
+    /// resolution, the §4.3.4.3 spread parameter, and the §4.3.3
+    /// signalled allocation header. All are read from the live range
+    /// coder in exact Table-56 order:
     ///
-    /// 1. **Band boosts** (`celt_band_boost::decode_band_boosts`): the
-    ///    per-band dynamic-allocation boost symbols, entropy coded at a
-    ///    low probability, walked over the §4.3.3 coding window
-    ///    `start..end`. Needs the per-band cap vector `cap[]`
+    /// 1. **`tf_change` / `tf_select`** (§4.3.1, `celt_tf_decode::decode_tf`):
+    ///    the per-band time-frequency resolution flags and the gated
+    ///    `tf_select` bit. These come immediately after coarse energy in
+    ///    Table 56 and *must* be consumed before the allocation, or every
+    ///    subsequent symbol reads from the wrong bitstream position.
+    /// 2. **`spread`** (§4.3.4.3, `celt_spreading::decode_spread`): the
+    ///    2-bit spread symbol (PDF `{7,2,21,2}/32`), Table-56-ordered
+    ///    right before the dynamic allocation.
+    /// 3. **Band boosts** (§4.3.3, `celt_band_boost::decode_band_boosts`):
+    ///    the per-band dynamic-allocation boost symbols over the coding
+    ///    window `start..end`, fed the per-band cap vector `cap[]`
     ///    ([`crate::celt_cache_caps50::cap_for_band_bits`]) and the
     ///    per-band MDCT-bin counts.
-    /// 2. **Allocation trim** (`celt_alloc_trim::decode_alloc_trim`): the
-    ///    single trim symbol, gated on whether 6 bits still fit after the
-    ///    boosts.
-    /// 3. **Reservations** (`celt_reservations::reserve_block`): the
-    ///    §4.3.3 anti-collapse / skip / intensity-stereo / dual-stereo
+    /// 4. **Allocation trim** (§4.3.3, `celt_alloc_trim::decode_alloc_trim`):
+    ///    the single trim symbol, gated on whether 6 bits still fit after
+    ///    the boosts.
+    /// 5. **Reservations** (§4.3.3, `celt_reservations::reserve_block`):
+    ///    the §4.3.3 anti-collapse / skip / intensity-stereo / dual-stereo
     ///    bit reservations. (`reserve_block` only *computes* the reserved
     ///    eighth-bit counts; the anti-collapse / skip / intensity / dual
-    ///    *bits* themselves are decoded later in §4.3.3 / §4.3.5, after
-    ///    the implicit allocation, so nothing is read from the coder
-    ///    here — but the reservation computation reads `ec_tell_frac` at
-    ///    exactly this point and must run now to stay faithful to the
-    ///    §4.3.3 ordering and to validate the running budget.)
+    ///    *bits* themselves are decoded later in Table-56 order, after the
+    ///    implicit allocation + residual, so nothing is read from the
+    ///    coder here — but the reservation computation reads
+    ///    `ec_tell_frac` at exactly this point and must run now to stay
+    ///    faithful to the §4.3.3 ordering and to validate the running
+    ///    budget.)
     ///
-    /// Returns `Ok(())` once the signalled header is consumed (the caller
-    /// then checks `rd.has_error()` for a truncation that the symbol
-    /// reads latched), or `Err(())` on a caller-side bookkeeping error
+    /// Returns the decoded [`crate::celt_tf_decode::TfDecode`] and the
+    /// `spread` value (both needed by the pending §4.3.4 band-shape
+    /// decode) on success, or `Err(())` on a caller-side bookkeeping error
     /// from one of the sub-decoders (a band-window / length mismatch,
     /// never a malformed-bitstream signal — that surfaces through the
-    /// range coder's sticky error flag).
+    /// range coder's sticky error flag, which the caller checks via
+    /// `rd.has_error()`).
     ///
     /// The §4.3.3 *implicit* allocation (the reference-only
     /// `interp_bits2pulses` per-band pulse / fine-energy split) is **not**
     /// performed here: it reads nothing further from the range coder, so
-    /// stopping at the signalled header leaves the coder positioned
-    /// exactly where the §4.3.4 PVQ shape decode will resume once that
+    /// stopping after the reservation block leaves the coder positioned
+    /// exactly where the §4.3.4 PVQ residual decode will resume once that
     /// (currently docs-gapped) interpolation lands.
     #[allow(clippy::too_many_arguments)]
-    fn decode_celt_allocation_header(
+    fn decode_celt_tf_spread_allocation(
         rd: &mut crate::range_decoder::RangeDecoder<'_>,
         celt_size: crate::celt_band_layout::CeltFrameSize,
         is_transient: bool,
@@ -908,7 +919,7 @@ impl OpusDecoder {
         start: usize,
         end: usize,
         frame_size_bytes: u32,
-    ) -> Result<(), ()> {
+    ) -> Result<(crate::celt_tf_decode::TfDecode, u8), ()> {
         use crate::celt_cache_caps50::CacheCapsStereo;
 
         let is_stereo = channels == 2;
@@ -919,6 +930,15 @@ impl OpusDecoder {
         };
         let lm = celt_size.column_index() as u32;
         let band_count = end - start;
+
+        // §4.3.1 (Table 56): tf_change / tf_select come immediately after
+        // coarse energy. Decode them from the live coder so the band
+        // boosts below read from the correct bitstream position.
+        let tf = crate::celt_tf_decode::decode_tf(rd, celt_size, is_transient, start, end);
+
+        // §4.3.4.3 (Table 56): the spread symbol is next, right before the
+        // dynamic allocation.
+        let spread = crate::celt_spreading::decode_spread(rd);
 
         // §4.3.3 per-band cap[] and per-channel MDCT-bin counts over the
         // coding window. Both are indexed by `band - start`.
@@ -975,7 +995,7 @@ impl OpusDecoder {
         )
         .map_err(|_| ())?;
 
-        Ok(())
+        Ok((tf, spread))
     }
 
     /// Decode one CELT-only Opus frame (§4.3).
@@ -1062,14 +1082,16 @@ impl OpusDecoder {
                             status: FrameDecodeStatus::CeltDecodeError,
                         };
                     }
-                    // §4.3.3 allocation *header*: the signalled part of
-                    // the bit allocation (band boosts, allocation trim,
-                    // and the anti-collapse / skip / intensity / dual
-                    // reservations), decoded in §4.3.3 order from the
+                    // §4.3.1 TF + §4.3.4.3 spread + §4.3.3 allocation
+                    // header: the Table-56 symbols between coarse energy
+                    // and the §4.3.4 residual (tf_change / tf_select,
+                    // spread, band boosts, allocation trim, and the
+                    // anti-collapse / skip / intensity / dual
+                    // reservations), decoded in Table-56 order from the
                     // same range coder. This advances the entropy decode
                     // through everything the bitstream explicitly carries
                     // before the (reference-only) implicit interpolation.
-                    match Self::decode_celt_allocation_header(
+                    match Self::decode_celt_tf_spread_allocation(
                         &mut rd,
                         celt_size,
                         prefix.transient,
@@ -1078,7 +1100,7 @@ impl OpusDecoder {
                         end,
                         frame.len() as u32,
                     ) {
-                        Ok(()) => {
+                        Ok((_tf, _spread)) => {
                             if rd.has_error() {
                                 return FrameOutcome {
                                     samples_per_channel: per_channel,
@@ -2343,12 +2365,13 @@ mod tests {
     }
 
     #[test]
-    fn celt_allocation_header_advances_tell_past_coarse_energy() {
-        // Direct exercise of the §4.3.3 allocation-header decoder: it must
-        // advance the range coder strictly past where the §4.3.2.1 coarse
-        // energy left it (the boost/trim symbols consume real bits), and
-        // it must not panic or report a caller-side bookkeeping error for
-        // a well-formed band window.
+    fn celt_tf_spread_allocation_advances_tell_past_coarse_energy() {
+        // Direct exercise of the §4.3.1 TF + §4.3.4.3 spread + §4.3.3
+        // allocation-header decoder: it must advance the range coder
+        // strictly past where the §4.3.2.1 coarse energy left it (the
+        // tf_change / spread / boost symbols consume real bits), and it
+        // must not panic or report a caller-side bookkeeping error for a
+        // well-formed band window.
         use crate::celt_band_layout::{celt_end_coded_band, celt_first_coded_band, CeltFrameSize};
         use crate::celt_coarse_energy::CoarseEnergyState;
         use crate::celt_frame_prefix::decode_celt_frame_prefix;
@@ -2374,7 +2397,7 @@ mod tests {
             .expect("coarse energy decodes");
         let tell_after_coarse = rd.tell_frac();
 
-        OpusDecoder::decode_celt_allocation_header(
+        let (tf, spread) = OpusDecoder::decode_celt_tf_spread_allocation(
             &mut rd,
             celt_size,
             prefix.transient,
@@ -2383,15 +2406,19 @@ mod tests {
             end,
             body.len() as u32,
         )
-        .expect("allocation header decodes without a bookkeeping error");
+        .expect("tf/spread/allocation header decodes without a bookkeeping error");
         let tell_after_alloc = rd.tell_frac();
 
-        // The band-boost loop alone reads at least one symbol per coded
-        // band (the terminating zero), and the trim gate typically reads
-        // its symbol too, so the tell must strictly advance.
+        // The TF decode produces one tf_change per coded band; the spread
+        // symbol is one of the four §4.3.4.3 values.
+        assert_eq!(tf.tf_change.len(), end - start);
+        assert!(spread <= crate::celt_spreading::SPREAD_MAX);
+
+        // The TF + spread + band-boost symbols all read real bits, so the
+        // tell must strictly advance past where coarse energy left it.
         assert!(
-            tell_after_alloc >= tell_after_coarse,
-            "alloc tell {tell_after_alloc} must not precede coarse tell {tell_after_coarse}"
+            tell_after_alloc > tell_after_coarse,
+            "alloc tell {tell_after_alloc} must advance past coarse tell {tell_after_coarse}"
         );
     }
 }

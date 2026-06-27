@@ -55,8 +55,12 @@ SILK→CELT transition). A non-silent CELT-only frame thus consumes its
 prefix + coarse energy from the real range coder and advances the
 synthesis state, reporting `FrameDecodeStatus::CeltCoarseEnergyDecoded`.
 On top of the coarse energy, a non-silent frame now also decodes the
-§4.3.3 allocation *header* — the signalled part of the bit allocation —
-from the same range coder in §4.3.3 order: the band boosts
+full run of Table-56 symbols between coarse energy and the §4.3.4
+residual, from the same range coder in exact Table-56 order: the §4.3.1
+per-band `tf_change` flags and gated `tf_select` bit (`celt_tf_decode`),
+the §4.3.4.3 `spread` symbol (`celt_spreading`), then the §4.3.3
+allocation *header* — the signalled part of the bit allocation: the band
+boosts
 (`celt_band_boost`, walked over the `start..end` coding window with the
 per-band `cap[]` from `celt_cache_caps50` and the per-channel MDCT-bin
 counts), the allocation trim (`celt_alloc_trim`, gated on the running

@@ -6,28 +6,36 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
-- *CELT §4.3.3 allocation-header decode wired into the CELT-only frame
-  path (`decoder::OpusDecoder::decode_celt_allocation_header`).* A
-  non-silent CELT-only frame now consumes the entire *signalled* part of
-  the §4.3.3 bit allocation from the live range coder, immediately after
-  the §4.3.2.1 coarse energy and in §4.3.3 order: the band boosts
+- *CELT §4.3.1 TF + §4.3.4.3 spread + §4.3.3 allocation-header decode
+  wired into the CELT-only frame path
+  (`decoder::OpusDecoder::decode_celt_tf_spread_allocation`).* A
+  non-silent CELT-only frame now consumes the full run of Table-56
+  symbols between the §4.3.2.1 coarse energy and the §4.3.4 residual,
+  from the live range coder and in exact Table-56 order: the §4.3.1
+  per-band `tf_change` flags and gated `tf_select` bit
+  (`celt_tf_decode::decode_tf`), the §4.3.4.3 `spread` symbol
+  (`celt_spreading::decode_spread`), then the entire *signalled* part of
+  the §4.3.3 bit allocation — band boosts
   (`celt_band_boost::decode_band_boosts`, walking the `start..end` coding
   window with the per-band `cap[]` from `celt_cache_caps50::cap_for_band_bits`
   and the per-channel MDCT-bin counts), the allocation trim
   (`celt_alloc_trim::decode_alloc_trim`, gated on the running
   `ec_tell_frac`), and the anti-collapse / skip / intensity-stereo /
-  dual-stereo reservations (`celt_reservations::reserve_block`). This
-  advances the entropy decoder through everything the bitstream
-  explicitly carries before the (reference-code-only, docs-gapped)
-  implicit `interp_bits2pulses` interpolation, leaving the coder
-  positioned exactly where the §4.3.4 PVQ shape decode will resume. A
-  frame that reaches this point reports the new
-  `FrameDecodeStatus::CeltAllocationDecoded`; the §4.3.3 implicit
-  allocation, §4.3.4 PVQ band shapes, and §4.3.2.2 fine energy remain
-  pending, so the synthesis backend is still advanced with all-zero bands
-  and correct-length silence is emitted. 2 new decode-path tests
-  (allocation header reachable end-to-end; the header strictly advances
-  the range-coder tell past coarse energy).
+  dual-stereo reservations (`celt_reservations::reserve_block`).
+  Consuming `tf_change` / `tf_select` / `spread` *before* the allocation
+  is required by Table 56: every subsequent symbol would otherwise read
+  from the wrong bitstream position. This advances the entropy decoder
+  through everything the bitstream explicitly carries before the
+  (reference-code-only, docs-gapped) implicit `interp_bits2pulses`
+  interpolation, leaving the coder positioned exactly where the §4.3.4
+  PVQ residual decode will resume. A frame that reaches this point
+  reports the new `FrameDecodeStatus::CeltAllocationDecoded`; the §4.3.3
+  implicit allocation, §4.3.4 PVQ band shapes, and §4.3.2.2 fine energy
+  remain pending, so the synthesis backend is still advanced with
+  all-zero bands and correct-length silence is emitted. 2 new decode-path
+  tests (the TF+spread+allocation header reachable end-to-end; it
+  strictly advances the range-coder tell past coarse energy and yields a
+  `tf_change` per coded band plus an in-range `spread`).
 
 - *CELT §4.3.4.5 time-frequency Hadamard transform (`celt_tf_hadamard`).*
   Consumes a band's `TfDirection` (from `celt_tf_decode` /
