@@ -50,7 +50,8 @@
 //!   of the §4.1.3.3 leading-zero offset.
 
 use oxideav_opus::{
-    OpusPacket, OpusTocByte, RangeDecoder, SilkHeaderBits, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES,
+    FrameDecodeStatus, OpusDecoder, OpusPacket, OpusTocByte, RangeDecoder, SilkHeaderBits,
+    MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES,
 };
 
 /// RFC 6716 §3.4 [R1]: a well-formed Opus packet has at least one
@@ -577,4 +578,67 @@ fn max_frame_bytes_constant_matches_section_3_2_1() {
 #[test]
 fn max_frames_per_packet_constant_matches_r5() {
     assert_eq!(MAX_FRAMES_PER_PACKET, 48);
+}
+
+/// §4.1.4 / §4.3 CELT decode-path truncation safety. The CELT-only
+/// frame decode now consumes a long run of range-coded symbols past the
+/// §4.3.7.1 prefix — §4.3.2.1 coarse energy, §4.3.1 tf_change /
+/// tf_select, §4.3.4.3 spread, and the §4.3.3 signalled allocation
+/// header (boosts / trim / reservations). Every one of those reads must
+/// fail safely on a buffer that runs out mid-decode: the §4.1 range
+/// coder latches its sticky error flag and the frame falls back to the
+/// §4.6 silence floor.
+///
+/// For a config-19 (20 ms CELT-only mono) packet built from a fixed
+/// pseudo-random body, decode every truncation length from 1 byte up to
+/// the full body. None may panic; each must yield exactly the 20 ms
+/// 48 kHz per-channel sample count (960) and a real CELT outcome (never
+/// the not-wired placeholder, never a SILK status).
+#[test]
+fn celt_only_decode_truncation_never_panics() {
+    // A 20 ms CELT-only mono packet: TOC config 19 (CELT-only, 20 ms,
+    // mono), frame-count code 0 (one frame), body = pseudo-random bytes.
+    let toc = 19u8 << 3; // config 19, s = 0 (mono), c = 0.
+    let mut body = Vec::with_capacity(64);
+    let mut x: u32 = 0x1234_5678;
+    for _ in 0..64 {
+        // A tiny xorshift PRNG — deterministic, no external deps.
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        body.push((x & 0xff) as u8);
+    }
+
+    for trunc in 1..=body.len() {
+        let mut pkt = Vec::with_capacity(1 + trunc);
+        pkt.push(toc);
+        pkt.extend_from_slice(&body[..trunc]);
+
+        let mut dec = OpusDecoder::new();
+        let out = dec
+            .decode_packet(&pkt)
+            .expect("a well-framed CELT packet decodes (silence on truncation)");
+
+        // Exactly one Opus frame, 20 ms = 960 samples/channel at 48 kHz,
+        // mono ⇒ pcm length 960.
+        assert_eq!(out.channels, 1, "len {trunc}");
+        assert_eq!(out.frame_outcomes.len(), 1, "len {trunc}");
+        assert_eq!(out.pcm.len(), 960, "len {trunc}");
+        assert_eq!(out.samples_per_channel(), 960, "len {trunc}");
+
+        // The status must be a real CELT outcome reflecting an
+        // actually-consumed (or cleanly-truncated) bitstream — never a
+        // SILK status, never the not-wired placeholder.
+        assert!(
+            matches!(
+                out.frame_outcomes[0].status,
+                FrameDecodeStatus::CeltSilence
+                    | FrameDecodeStatus::CeltCoarseEnergyDecoded
+                    | FrameDecodeStatus::CeltAllocationDecoded
+                    | FrameDecodeStatus::CeltDecodeError
+            ),
+            "len {trunc}: got {:?}",
+            out.frame_outcomes[0].status
+        );
+    }
 }

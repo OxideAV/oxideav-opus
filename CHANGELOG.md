@@ -6,6 +6,16 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- *CELT-only decode-path truncation-safety test (`malformed_input`).*
+  The CELT-only frame decode now consumes a long run of range-coded
+  symbols past the §4.3.7.1 prefix (coarse energy, tf_change / tf_select,
+  spread, and the §4.3.3 signalled allocation header), so a new test
+  decodes a config-19 (20 ms CELT-only mono) packet at every truncation
+  length from 1 byte to the full body. Every length must decode without
+  panicking, emit exactly the 960-sample 20 ms output, and report a real
+  CELT outcome — verifying the §4.1 range coder's sticky-error fallback
+  to the §4.6 silence floor across the whole new decode path.
+
 - *CELT §4.3.1 TF + §4.3.4.3 spread + §4.3.3 allocation-header decode
   wired into the CELT-only frame path
   (`decoder::OpusDecoder::decode_celt_tf_spread_allocation`).* A
