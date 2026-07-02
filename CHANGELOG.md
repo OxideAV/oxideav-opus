@@ -6,6 +6,21 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- *Cargo-fuzz harness suite restored (`fuzz/`).* The scheduled Fuzz
+  workflow had been failing since the orphan rebuild dropped the old
+  `fuzz/` directory while the workflow survived. Four coverage-guided
+  libfuzzer targets now back it: `decode_packet` (the top-level
+  packet → PCM path fed multiple consecutive carved packets on one
+  stateful decoder, plus the Appendix-B self-delimited entry),
+  `decode_packet_fec` (the §4.2.5 LBRR recovery entry interleaved with
+  regular decodes), `multistream_decode` (RFC 7845 §5.1 OpusHead parse
+  + §3 packet split + multichannel assembly), and `range_roundtrip`
+  (differential testing of the new §5.1 range encoder: the fuzz input
+  is a symbol script encoded through `RangeEncoder` and decoded back
+  through `RangeDecoder`, every symbol asserted equal). The stale
+  workflow comment describing a dropped oracle harness was rewritten
+  to match the new target inventory.
+
 - *Range encoder (RFC 6716 §5.1) — `range_encoder::RangeEncoder`.* The
   first encode-side subsystem: a bit-exact clean-room transcription of
   the §5.1 range coder, the shared entropy back end both the SILK and

@@ -1,10 +1,13 @@
 name: Fuzz
 
 # Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Splits the
-# 30-minute total budget across the 3 targets (~10 min each). The
-# `opus_oracle_decode` harness `dlopen`s libopus at runtime via
-# libloading; the CI runner needs `libopus0` + `libopus-dev` so it
-# actually validates instead of `[oracle skip]`-printing and no-opping.
+# 30-minute total budget across the auto-discovered targets (see
+# fuzz/Cargo.toml for the target inventory: the packet → PCM decode
+# path, the §4.2.5 in-band-FEC recovery entry, the RFC 7845
+# multistream subsystem, and the §5.1 range encoder ↔ §4.1 range
+# decoder differential roundtrip). `opus-tools` is installed so future
+# harnesses can shell out to the black-box `opusdec` / `opusenc`
+# validator binaries.
 
 on:
   schedule:
@@ -15,6 +18,6 @@ jobs:
   fuzz:
     uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
     with:
-      extra_packages_apt: "libopus0 libopus-dev opus-tools"
+      extra_packages_apt: "opus-tools"
       time_budget_seconds: 1800
     secrets: inherit

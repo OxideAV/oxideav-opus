@@ -1,0 +1,71 @@
+[package]
+name = "oxideav-opus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Coverage-guided libfuzzer harnesses for the clean-room Opus decoder.
+# The in-tree `tests/malformed_input.rs` audit hand-enumerates the
+# RFC 6716 §3.4 R1-R7 malformation classes and per-path truncation
+# sweeps; these targets add coverage-guided exploration of the same
+# surfaces so the corpus minimiser can find branches the hand-built
+# cases don't reach:
+#
+# - `decode_packet` — the top-level packet → PCM path (TOC parse, §3.2
+#   frame split, §4.5 multi-frame loop, SILK / CELT / Hybrid routing)
+#   on a stateful mono or stereo decoder fed multiple consecutive
+#   packets carved from the fuzz input.
+# - `decode_packet_fec` — the §4.2.5 LBRR in-band-FEC recovery entry
+#   point, interleaved with regular decodes on the same decoder state.
+# - `multistream_decode` — the RFC 7845 §5.1 OpusHead parse + §3
+#   multistream packet split + multichannel assembly.
+# - `range_roundtrip` — differential testing of the §5.1 range encoder:
+#   the fuzz input is interpreted as a symbol script (icdf / bit_logp /
+#   uint / raw-bit writes), encoded with `RangeEncoder`, decoded back
+#   with `RangeDecoder`, and every symbol asserted equal.
+#
+# A crash in any target is a structural bug in the decoder (or an
+# encoder/decoder mismatch), never an acceptable "malformed input"
+# outcome: every byte sequence must produce Ok(..) or Err(..) without
+# panicking, overflowing, or indexing out of bounds.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-opus]
+path = ".."
+
+# Prevent the cargo-fuzz crate from being pulled into the umbrella
+# workspace; libfuzzer-sys needs nightly + has its own deps that
+# don't belong in the umbrella resolve graph.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_packet"
+path = "fuzz_targets/decode_packet.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_packet_fec"
+path = "fuzz_targets/decode_packet_fec.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "multistream_decode"
+path = "fuzz_targets/multistream_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "range_roundtrip"
+path = "fuzz_targets/range_roundtrip.rs"
+test = false
+doc = false
