@@ -31,7 +31,33 @@ All notable changes to `oxideav-opus` are recorded here.
   exhaustive test, replacing the previous spot-checks that had missed
   the bad rows.
 
+### Fixed
+
+- *10 ms MB SILK frames failed to synthesize.* §4.2.7.8 codes a 10 ms
+  MB frame as 8 shell blocks (128 excitation samples) of which only
+  the first 120 are used; `synthesize_silk_frame` rejected the longer
+  parsed excitation outright, so every 10 ms MB SILK packet decoded to
+  `SilkDecodeError` silence. The synthesis now uses the frame-length
+  prefix and discards the parsed tail, per the §4.2.7.8 preamble.
+  Surfaced by the new packet-encoder end-to-end sweep.
+
 ### Added
+
+- *SILK-only mono Opus **packet** encoder —
+  `silk_packet_encode::encode_silk_only_packet_mono` (§3.1 / §4.2.2-
+  §4.2.6).* Produces complete decoder-ready packets: the §3.1 TOC
+  byte (via the new `OpusTocByte::compose_byte`, the Table-2 inverse
+  of `from_byte`), the §4.2.3 / §4.2.4 header bits (via the new
+  `SilkHeaderBits::encode` write-side mirror: per-frame VAD bits
+  derived from each frame type, LBRR off, Table-4 per-frame LBRR
+  validation), and 1-3 regular SILK frames (10/20/40/60 ms) written
+  in Table-5 order with the carried state (previous gain / lag /
+  NLSF) threaded exactly the way the packet decoder threads it.
+  Validated end-to-end: 120 random packets across every bandwidth ×
+  duration decode through a fresh `OpusDecoder::decode_packet` to
+  real SILK PCM (`SilkParamsDecoded`, exact §3 sample counts), and a
+  parallel `decode_silk_frame` walk reconstructs the encoder's
+  per-frame `SilkFrameDecoded` predictions field-for-field.
 
 - *`encode_silk_frame` — the whole-frame Table-5 composition
   (§4.2.6 / §4.2.7), the write-side mirror of `decode_silk_frame`.*

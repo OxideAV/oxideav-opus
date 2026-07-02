@@ -742,6 +742,7 @@ pub mod silk_lsf_stage2;
 pub mod silk_lsf_to_lpc;
 pub mod silk_ltp;
 pub mod silk_ltp_synth;
+pub mod silk_packet_encode;
 pub mod silk_resampler;
 pub mod silk_stereo;
 pub mod silk_synthesis;
@@ -919,6 +920,7 @@ pub use silk_ltp_synth::{
     ltp_synth_commit_subframe, ltp_synthesis_subframe, LtpSynthState, LtpSynthSubframe,
     LTP_LPC_HISTORY_MAX, LTP_MAX_PITCH_LAG, LTP_OUT_HISTORY_MAX, LTP_SCALE_FRESH_Q14,
 };
+pub use silk_packet_encode::encode_silk_only_packet_mono;
 pub use silk_resampler::{
     is_supported_output_rate, silk_frame_samples_at_output, silk_frame_samples_internal,
     silk_internal_rate_hz, silk_resampler_delay_ms, silk_resampler_delay_samples_at,

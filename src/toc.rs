@@ -157,6 +157,35 @@ impl OpusTocByte {
         }
     }
 
+    /// Compose the TOC byte for a `(mode, bandwidth, frame size)`
+    /// triple plus the channel flag and frame-count code — the inverse
+    /// of [`Self::from_byte`] (RFC 6716 §3.1).
+    ///
+    /// Returns [`Error::MalformedPacket`] when the triple does not
+    /// correspond to any Table-2 `config` row (e.g. SILK-only SWB, or
+    /// a CELT-only 40 ms frame).
+    pub fn compose_byte(
+        mode: Mode,
+        bandwidth: Bandwidth,
+        frame_size_tenths_ms: u16,
+        stereo: bool,
+        frame_count_code: FrameCountCode,
+    ) -> Result<u8, Error> {
+        // Table 2 is small; find the config row by exhaustive match
+        // against the decode mapping (correct by construction).
+        let config = (0u8..32)
+            .find(|&c| decode_config(c) == (mode, bandwidth, frame_size_tenths_ms))
+            .ok_or(Error::MalformedPacket)?;
+        let s = u8::from(stereo);
+        let c = match frame_count_code {
+            FrameCountCode::One => 0u8,
+            FrameCountCode::TwoEqual => 1,
+            FrameCountCode::TwoUnequal => 2,
+            FrameCountCode::Arbitrary => 3,
+        };
+        Ok((config << 3) | (s << 2) | c)
+    }
+
     /// Minimum and maximum frame count the TOC byte implies *without*
     /// consulting subsequent bytes. Codes 0/1/2 have a known frame
     /// count; code 3 needs the §3.2.5 frame-count byte to resolve and

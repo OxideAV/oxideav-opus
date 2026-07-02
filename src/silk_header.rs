@@ -206,6 +206,81 @@ impl SilkHeaderBits {
         })
     }
 
+    /// Encode this header-bit set into `re` — the exact write-side
+    /// mirror of [`Self::decode`] (§4.2.3 / §4.2.4 bitstream order).
+    ///
+    /// Validates internal consistency: `num_silk_frames ∈ 1..=3`,
+    /// VAD bitmaps confined to the low `num_silk_frames` bits, and —
+    /// when `num_silk_frames >= 2` — a per-frame LBRR bitmap that is
+    /// non-zero iff the channel's global LBRR flag is set (Table 4
+    /// excludes the all-zero value). For `num_silk_frames == 1` the
+    /// per-frame bitmap must equal the global flag (no symbol is
+    /// written; §4.2.4).
+    pub fn encode(&self, re: &mut crate::range_encoder::RangeEncoder) -> Result<(), Error> {
+        let n = self.num_silk_frames;
+        if !(1..=3).contains(&n) {
+            return Err(Error::MalformedPacket);
+        }
+        let mask = (1u8 << n) - 1;
+
+        let encode_channel = |re: &mut crate::range_encoder::RangeEncoder,
+                              ch: &SilkChannelHeader|
+         -> Result<(), Error> {
+            if ch.vad_flags & !mask != 0 {
+                return Err(Error::MalformedPacket);
+            }
+            for i in 0..n {
+                re.enc_bit_logp((ch.vad_flags >> i) & 1 == 1, 1);
+            }
+            re.enc_bit_logp(ch.lbrr_flag, 1);
+            Ok(())
+        };
+
+        // §4.2.3 step 1 — mid channel VAD bits + LBRR flag.
+        encode_channel(re, &self.mid)?;
+        // §4.2.3 step 2 — side channel (stereo only).
+        if let Some(side) = &self.side {
+            encode_channel(re, side)?;
+        }
+
+        // §4.2.4 — per-frame LBRR flag sets.
+        let encode_per_frame = |re: &mut crate::range_encoder::RangeEncoder,
+                                global: bool,
+                                bits: u8|
+         -> Result<(), Error> {
+            if n == 1 {
+                // No symbol: the global flag IS the per-frame flag.
+                if bits != u8::from(global) {
+                    return Err(Error::MalformedPacket);
+                }
+                return Ok(());
+            }
+            if !global {
+                if bits != 0 {
+                    return Err(Error::MalformedPacket);
+                }
+                return Ok(());
+            }
+            if bits == 0 || bits & !mask != 0 {
+                // Table 4 excludes 0 (the global flag guarantees at
+                // least one frame has LBRR).
+                return Err(Error::MalformedPacket);
+            }
+            re.enc_icdf((bits - 1) as usize, per_frame_lbrr_pdf(n), 8);
+            Ok(())
+        };
+        encode_per_frame(re, self.mid.lbrr_flag, self.per_frame_lbrr.mid)?;
+        match &self.side {
+            Some(side) => encode_per_frame(re, side.lbrr_flag, self.per_frame_lbrr.side)?,
+            None => {
+                if self.per_frame_lbrr.side != 0 {
+                    return Err(Error::MalformedPacket);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Whether SILK frame `idx` in the mid channel was coded as
     /// active speech (its §4.2.3 VAD flag is set).
     ///

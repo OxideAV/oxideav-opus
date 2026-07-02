@@ -176,11 +176,17 @@ pub fn synthesize_silk_frame(
         matches!(frame_size, SilkFrameSize::TwentyMs) && decoded.lpc_first_half.is_some();
 
     // The excitation for the whole SILK frame (Q23), partitioned into
-    // per-subframe windows below.
+    // per-subframe windows below. §4.2.7.8: a 10 ms MB frame codes 8
+    // shell blocks (128 samples) of which only the first 120 are used
+    // — the parsed excitation may therefore be LONGER than the frame's
+    // sample count, and the tail is discarded (a round-382 find: this
+    // was previously rejected, making every 10 ms MB SILK packet fail
+    // to synthesize).
     let e_q23 = decoded.excitation.e_q23();
-    if e_q23.len() != n * num_subframes {
+    if e_q23.len() < n * num_subframes {
         return Err(Error::MalformedPacket);
     }
+    let e_q23 = &e_q23[..n * num_subframes];
 
     // The voiced LTP parameters (pitch lags + 5-tap filters). Empty for
     // unvoiced frames; the LTP-synth path consults them only when voiced.
