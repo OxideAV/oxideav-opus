@@ -81,12 +81,42 @@ is left as a documented identity in `celt_coarse_energy` — exact for
 every in-range bitstream — pending a clean-room docs trace. The §4.4
 packet-loss concealment is also outstanding (the RFC defines PLC as a
 non-normative decoder feature with no bitstream algorithm; lost / DTX
-frames currently emit the §4.6 silence floor). The crate ships a large,
-individually unit-tested set of SILK and CELT decode building blocks
-plus a complete RFC 7845 multistream / multichannel decode subsystem
-(1228 lib tests + SILK-fixture, multistream, FEC, and CELT
-synthesis-backend integration suites). Per-stage progress lives in
-`CHANGELOG.md`.
+frames currently emit the §4.6 silence floor).
+
+The crate now also carries the start of the **encode side**: the
+bit-exact §5.1 range *encoder* (`RangeEncoder` — the §5.1.1 symbol
+update, §5.1.1.2 carry propagation, the §5.1.2 division-free variants
+sharing the decoder's `icdf[]` tables, §5.1.3 raw bits, §5.1.4
+uniform integers, §5.1.5 finalization, §5.1.6 `tell`/`tell_frac`
+matching the decoder bit-for-bit), write-side mirrors of **every**
+SILK §4.2.7 decode stage (header / gains with a deterministic
+quantizer / LSF stage-1 + stage-2 / interpolation index / LTP / seed
+/ excitation, each returning the value the decoder will
+reconstruct), the whole-frame Table-5 composition
+(`encode_silk_frame`), and a **SILK-only mono packet encoder**
+(`encode_silk_only_packet_mono`: TOC byte + §4.2.3/§4.2.4 header
+bits + 1–3 SILK frames at 10/20/40/60 ms) whose packets decode
+end-to-end through a fresh `OpusDecoder::decode_packet` to real SILK
+PCM, with every per-frame parameter verified equal to the encoder's
+prediction. What the encoder does *not* yet have is the §5.2.3
+analysis front end (signal → symbol quantization beyond gains), the
+stereo mid/side packet interleave, and LBRR emission.
+
+Differential encoder/decoder testing and a restored cargo-fuzz suite
+(4 coverage-guided targets, incl. an encoder↔decoder range-coder
+roundtrip) have also hardened the decoder: five mis-transcribed rows
+in the §4.2.7.8.3 split tables (now verified cell-by-cell against the
+RFC across all 64 rows), a `dec_bits(32)` shift overflow, a
+§4.2.7.5.8 recurrence i64 overflow on adversarial input, and the
+§4.2.7.8 10 ms-MB 128-vs-120-sample special case (previously every
+10 ms MB SILK packet failed to synthesize) are all fixed with
+regression tests.
+
+The crate ships a large, individually unit-tested set of SILK and
+CELT building blocks plus a complete RFC 7845 multistream /
+multichannel decode subsystem (1273 lib tests + SILK-fixture,
+multistream, FEC, and CELT synthesis-backend integration suites).
+Per-stage progress lives in `CHANGELOG.md`.
 
 ## What works
 
@@ -164,9 +194,26 @@ synthesis-backend integration suites). Per-stage progress lives in
   application (Q7.8 dB, i16-saturating) and the cross-packet pre-skip
   accumulator.
 
-**Range coder (RFC 6716 §4.1):** `RangeDecoder` — the shared entropy
-primitive consumed by both layers, including the §4.1.2 two-step
-`ec_decode` / `ec_dec_update` path and the Laplace / iCDF helpers.
+**Range coder (RFC 6716 §4.1 / §5.1):** `RangeDecoder` — the shared
+entropy primitive consumed by both layers, including the §4.1.2
+two-step `ec_decode` / `ec_dec_update` path and the Laplace / iCDF
+helpers — and `RangeEncoder`, its bit-exact §5.1 write-side mirror
+(validated by per-primitive roundtrips, `tell`/`tell_frac` lockstep,
+a 5000-seed mixed-symbol fuzz roundtrip, and a coverage-guided
+libfuzzer differential target).
+
+**SILK encode side (RFC 6716 §5.2 bitstream back end):** write-side
+mirrors of every §4.2.7 stage sharing the decode tables
+(`SilkFrameHeader::encode_pre_gains` / `encode_lsf_stage1`,
+`SubframeGains::encode`/`quantize`, `LsfStage2::encode`,
+`LsfInterpolated::encode_index`, `encode_lcg_seed`,
+`LtpParameters::encode`, `Excitation::encode`), the Table-5
+whole-frame composition `encode_silk_frame`, the §4.2.3/§4.2.4
+header-bit writer `SilkHeaderBits::encode`, the §3.1 TOC composer
+`OpusTocByte::compose_byte`, and the packet-level
+`encode_silk_only_packet_mono` — every layer roundtrip-verified
+against the decoder, up to whole packets decoding end-to-end through
+`OpusDecoder::decode_packet`.
 
 **SILK (RFC 6716 §4.2):** frame-header decode (§4.2.7.1–§4.2.7.5.1),
 subframe gains (§4.2.7.4), the full LSF chain (stage-2 residual → NLSF
