@@ -14,9 +14,13 @@
 //! the per-frame `SilkFrameDecoded` predictions returned to the
 //! caller equal what the decoder reconstructs.
 //!
-//! Scope: **mono**, no LBRR (the §4.2.3 LBRR flag is written as 0).
-//! The stereo mid/side interleave (§4.2.2) and LBRR emission reuse the
-//! same per-frame encoder and land on top of this entry.
+//! Scope: **mono**. LBRR (in-band FEC, §4.2.5) emission is supported
+//! via [`encode_silk_only_packet_mono_with_lbrr`]: LBRR frames are
+//! written ahead of the regular frames with their own independent
+//! carried state, exactly mirroring the decode-side LBRR walk, and the
+//! §4.2.3 / §4.2.4 LBRR flags are derived from which intervals carry a
+//! redundancy script. The stereo mid/side interleave (§4.2.2) reuses
+//! the same per-frame encoder and lands on top of this entry.
 
 use crate::range_encoder::RangeEncoder;
 use crate::silk_decode::{encode_silk_frame, SilkFrameConfig, SilkFrameDecoded, SilkFrameSymbols};
@@ -46,8 +50,41 @@ pub fn encode_silk_only_packet_mono(
     frame_size_tenths_ms: u16,
     frames: &[SilkFrameSymbols<'_>],
 ) -> Result<(Vec<u8>, Vec<SilkFrameDecoded>), Error> {
+    let n = silk_frame_count(frame_size_tenths_ms).ok_or(Error::MalformedPacket)? as usize;
+    let no_lbrr = vec![None; n];
+    let (packet, regular, _) =
+        encode_silk_only_packet_mono_with_lbrr(bandwidth, frame_size_tenths_ms, frames, &no_lbrr)?;
+    Ok((packet, regular))
+}
+
+/// [`encode_silk_only_packet_mono`] with §4.2.5 LBRR (in-band FEC)
+/// emission: `lbrr[idx]` optionally carries a redundancy script for
+/// SILK frame `idx`'s time interval (a re-encode of the interval the
+/// *previous* packet covered, per §2.1.7). LBRR frames are written
+/// ahead of the regular frames with their own independent carried
+/// state, exactly the way the packet decoder walks them; each LBRR
+/// script's frame type must be active (`2..=5`, §4.2.7.3), its first
+/// gain independent only on the first coded LBRR frame, and its LTP
+/// scaling present only on the first coded LBRR frame.
+///
+/// Returns the packet bytes, the regular per-frame predictions, and
+/// the LBRR per-frame predictions.
+#[allow(clippy::type_complexity)]
+pub fn encode_silk_only_packet_mono_with_lbrr(
+    bandwidth: Bandwidth,
+    frame_size_tenths_ms: u16,
+    frames: &[SilkFrameSymbols<'_>],
+    lbrr: &[Option<SilkFrameSymbols<'_>>],
+) -> Result<
+    (
+        Vec<u8>,
+        Vec<SilkFrameDecoded>,
+        Vec<Option<SilkFrameDecoded>>,
+    ),
+    Error,
+> {
     let num_silk_frames = silk_frame_count(frame_size_tenths_ms).ok_or(Error::MalformedPacket)?;
-    if frames.len() != num_silk_frames as usize {
+    if frames.len() != num_silk_frames as usize || lbrr.len() != num_silk_frames as usize {
         return Err(Error::MalformedPacket);
     }
     let frame_size = if frame_size_tenths_ms == 100 {
@@ -68,23 +105,69 @@ pub fn encode_silk_only_packet_mono(
     let mut re = RangeEncoder::new();
 
     // §4.2.3 / §4.2.4 header bits: VAD per frame from the frame type,
-    // LBRR off.
+    // LBRR flags from which intervals carry a redundancy script.
     let mut vad_flags = 0u8;
     for (idx, f) in frames.iter().enumerate() {
         if f.header.frame_type >= 2 {
             vad_flags |= 1 << idx;
         }
     }
+    let mut lbrr_bits = 0u8;
+    for (idx, l) in lbrr.iter().enumerate() {
+        if l.is_some() {
+            lbrr_bits |= 1 << idx;
+        }
+    }
     let header = SilkHeaderBits {
         num_silk_frames,
         mid: SilkChannelHeader {
             vad_flags,
-            lbrr_flag: false,
+            lbrr_flag: lbrr_bits != 0,
         },
         side: None,
-        per_frame_lbrr: PerFrameLbrr { mid: 0, side: 0 },
+        per_frame_lbrr: PerFrameLbrr {
+            mid: lbrr_bits,
+            side: 0,
+        },
     };
     header.encode(&mut re)?;
+
+    // §4.2.5 LBRR frames: written ahead of the regular frames, with
+    // their own independent carried state (they form their own
+    // sequence), mirroring the decoder's LBRR walk. Per §4.2.7.3 every
+    // LBRR frame is active-coded.
+    let mut lbrr_prev_gain: Option<u8> = None;
+    let mut lbrr_prev_lag: Option<i32> = None;
+    let mut lbrr_first = true;
+    let mut lbrr_predictions: Vec<Option<SilkFrameDecoded>> = Vec::with_capacity(lbrr.len());
+    for entry in lbrr.iter() {
+        let Some(symbols) = entry else {
+            lbrr_predictions.push(None);
+            continue;
+        };
+        if symbols.header.frame_type < 2 {
+            // §4.2.7.3: LBRR frames use the active PDF.
+            return Err(Error::MalformedPacket);
+        }
+        let cfg = SilkFrameConfig {
+            bandwidth,
+            frame_size,
+            voice_active: true,
+            first_subframe_independent: lbrr_first || lbrr_prev_gain.is_none(),
+            previous_log_gain: lbrr_prev_gain,
+            previous_primary_lag: lbrr_prev_lag,
+            ltp_scaling_present: lbrr_first,
+            lsf_interp_after_reset: lbrr_first,
+            previous_nlsf_q15: None,
+            previous_nlsf_len: 0,
+            stereo: None,
+        };
+        let decoded = encode_silk_frame(&mut re, cfg, symbols)?;
+        lbrr_prev_gain = Some(decoded.gains.last_log_gain());
+        lbrr_prev_lag = Some(decoded.ltp.primary_lag());
+        lbrr_first = false;
+        lbrr_predictions.push(Some(decoded));
+    }
 
     // §4.2.6 regular SILK frames with the carried state threaded the
     // same way the packet decoder threads it (fresh-decoder start).
@@ -123,7 +206,7 @@ pub fn encode_silk_only_packet_mono(
     let mut packet = Vec::with_capacity(1 + body.len());
     packet.push(toc);
     packet.extend_from_slice(&body);
-    Ok((packet, predictions))
+    Ok((packet, predictions, lbrr_predictions))
 }
 
 #[cfg(test)]
@@ -379,6 +462,121 @@ mod tests {
             }
             assert!(!rd.has_error());
         }
+    }
+
+    /// LBRR emission closes the FEC loop: a packet carrying §4.2.5
+    /// redundancy scripts still decodes its regular frames end-to-end
+    /// (the LBRR bits shift every later symbol, so this pins the
+    /// range-coder alignment), `decode_packet_fec` recovers real audio
+    /// (`Recovered`), and a no-LBRR packet reports `NoLbrr`.
+    #[test]
+    fn packet_encode_with_lbrr_fec_roundtrip() {
+        use crate::decoder::FecDecodeStatus;
+        let mut rng = Lcg(0xFEC0_0382);
+        for round in 0..60 {
+            let bandwidth = match rng.below(3) {
+                0 => Bandwidth::Nb,
+                1 => Bandwidth::Mb,
+                _ => Bandwidth::Wb,
+            };
+            let fs_tenths: u16 = [100u16, 200, 400, 600][rng.below(4) as usize];
+            let frame_size = if fs_tenths == 100 {
+                SilkFrameSize::TenMs
+            } else {
+                SilkFrameSize::TwentyMs
+            };
+            let n = silk_frame_count(fs_tenths).unwrap() as usize;
+            let bufs: Vec<ScriptBufs> = (0..n)
+                .map(|idx| random_frame_script(&mut rng, bandwidth, frame_size, idx == 0, idx > 0))
+                .collect();
+            let scripts: Vec<SilkFrameSymbols<'_>> = bufs.iter().map(symbols_of).collect();
+
+            // Random non-empty LBRR subset. LBRR scripts must be
+            // active-coded and follow the LBRR carried-state rules, so
+            // build them with the same generator but force an active
+            // frame type and first/subsequent shape per coded order.
+            let mut which = vec![false; n];
+            which[rng.below(n as u32) as usize] = true;
+            for w in which.iter_mut() {
+                if rng.below(2) == 0 {
+                    *w = true;
+                }
+            }
+            let mut lbrr_bufs: Vec<Option<ScriptBufs>> = Vec::with_capacity(n);
+            let mut coded_first = true;
+            for &w in &which {
+                if !w {
+                    lbrr_bufs.push(None);
+                    continue;
+                }
+                let mut b =
+                    random_frame_script(&mut rng, bandwidth, frame_size, coded_first, !coded_first);
+                // Force an active frame type (§4.2.7.3: LBRR is
+                // active-coded) while keeping the generator's LTP shape
+                // consistent with it.
+                if b.header.frame_type < 2 {
+                    b.header.frame_type += 2; // 0/1 -> 2/3 (unvoiced, no LTP)
+                }
+                lbrr_bufs.push(Some(b));
+                coded_first = false;
+            }
+            let lbrr_scripts: Vec<Option<SilkFrameSymbols<'_>>> = lbrr_bufs
+                .iter()
+                .map(|b| b.as_ref().map(symbols_of))
+                .collect();
+
+            let (packet, regular, lbrr_pred) = encode_silk_only_packet_mono_with_lbrr(
+                bandwidth,
+                fs_tenths,
+                &scripts,
+                &lbrr_scripts,
+            )
+            .expect("packet encode with lbrr");
+            assert_eq!(regular.len(), n);
+            assert_eq!(
+                lbrr_pred.iter().filter(|p| p.is_some()).count(),
+                which.iter().filter(|&&w| w).count()
+            );
+
+            // Regular decode still lands (range-coder alignment past
+            // the LBRR frames).
+            let mut dec = OpusDecoder::new();
+            let out = dec.decode_packet(&packet).expect("packet decode");
+            assert_eq!(
+                out.frame_outcomes[0].status,
+                FrameDecodeStatus::SilkParamsDecoded,
+                "round {round} bw={bandwidth:?} fs={fs_tenths}"
+            );
+
+            // FEC recovery from the LBRR we emitted.
+            let mut fec_dec = OpusDecoder::new();
+            let rec = fec_dec.decode_packet_fec(&packet).expect("fec decode");
+            assert_eq!(
+                rec.status,
+                FecDecodeStatus::Recovered,
+                "round {round} bw={bandwidth:?} fs={fs_tenths}"
+            );
+            assert_eq!(
+                rec.pcm.len() as u32,
+                48_000 * fs_tenths as u32 / 10_000,
+                "round {round}"
+            );
+        }
+
+        // A no-LBRR packet reports NoLbrr.
+        let bufs = random_frame_script(
+            &mut rng,
+            Bandwidth::Nb,
+            SilkFrameSize::TwentyMs,
+            true,
+            false,
+        );
+        let script = symbols_of(&bufs);
+        let (packet, _) =
+            encode_silk_only_packet_mono(Bandwidth::Nb, 200, &[script]).expect("encode");
+        let mut dec = OpusDecoder::new();
+        let rec = dec.decode_packet_fec(&packet).expect("fec decode");
+        assert_eq!(rec.status, FecDecodeStatus::NoLbrr);
     }
 
     /// Frame-count / duration mismatches are rejected.

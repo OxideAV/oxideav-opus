@@ -43,6 +43,21 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- *LBRR (in-band FEC) emission —
+  `encode_silk_only_packet_mono_with_lbrr` (§2.1.7 / §4.2.5).* The
+  packet encoder can now carry per-interval redundancy scripts: the
+  §4.2.3 / §4.2.4 LBRR flags are derived from which intervals carry
+  one, and the LBRR frames are written ahead of the regular frames
+  with their own independent carried state, exactly mirroring the
+  decode-side LBRR walk (active-coded per §4.2.7.3, first-coded-frame
+  independence and LTP-scaling rules enforced). This closes the FEC
+  loop end-to-end: 60 random LBRR-bearing packets across every
+  bandwidth × duration still decode their regular frames to real SILK
+  PCM (pinning the range-coder alignment across the LBRR bits), and
+  `decode_packet_fec` recovers real audio from the emitted redundancy
+  (`FecDecodeStatus::Recovered`, exact §3 sample counts), while a
+  redundancy-free packet reports `NoLbrr`.
+
 - *SILK-only mono Opus **packet** encoder —
   `silk_packet_encode::encode_silk_only_packet_mono` (§3.1 / §4.2.2-
   §4.2.6).* Produces complete decoder-ready packets: the §3.1 TOC
