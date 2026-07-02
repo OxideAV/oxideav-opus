@@ -4,7 +4,72 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- *Two decoder crashes found by the restored fuzz suite's first CI
+  run (both reproduced as in-tree regression tests).* (1) §4.1.4 raw
+  bits: `RangeDecoder::dec_bits(32)` overflowed its u32 window's
+  shifts (both the refill concatenation and the consume shift); the
+  working window is now u64, making the documented full-32-bit read
+  well-defined (`roundtrip_raw_bits_32_wide`). (2) §4.2.7.5.8
+  prediction-gain recurrence: adversarial LSF coefficients whose Q24
+  widening escapes the spec's "all intermediate results fit in 32
+  bits" envelope overflowed the recurrence's i64 products; the
+  recurrence now classifies any value escaping the 32-bit envelope as
+  unstable (triggering the §4.2.7.5.8 bandwidth-expansion round)
+  instead of overflowing — checked at row initialization, at
+  `num_Q24`, and at the next-row store. The verbatim 18-byte crash
+  artifact is pinned in `tests/malformed_input.rs`.
+
+- *Five mis-transcribed rows in the §4.2.7.8.3 pulse-count split
+  tables, surfaced by differential encoder/decoder testing:* Table 47
+  rows 9 and 11, Table 48 row 9, and Table 49 rows 7 and 16 all had
+  wrong tail cells (Table 49 row 16's final cell read 0 instead of 1,
+  making a fully-left-concentrated 16-pulse split undecodable and
+  hanging the new encoder). All 64 rows of Tables 47-50 are now
+  verified cell-by-cell against the RFC 6716 PDF text by a single
+  exhaustive test, replacing the previous spot-checks that had missed
+  the bad rows.
+
 ### Added
+
+- *SILK encode-side symbol writers for the complete §4.2.7 regular
+  frame stack — the write-side mirrors of every SILK decode stage.*
+  Each encoder shares the decode module's PDF tables and normative
+  reconstruction formulas, and returns the value the decoder will
+  reconstruct so the caller can carry quantization feedback:
+  - `SilkFrameHeader::encode_pre_gains` / `encode_lsf_stage1`
+    (§4.2.7.1 stereo-weight quintuple via `StereoWeightSymbols`, the
+    §4.2.7.2 mid-only flag, the §4.2.7.3 frame type from the
+    kind-selected Table 9 PDF, and the §4.2.7.5.1 Table 14 index),
+    with the §4.2.7.1 weight reconstruction extracted into
+    `StereoWeightSymbols::weights` and shared by both directions.
+  - `SubframeGains::encode` (§4.2.7.4: independent MSB+LSB pair or
+    Table 13 delta per `GainSymbol`) plus `SubframeGains::quantize`,
+    a deterministic locally-optimal gain-plan quantizer (argmin over
+    the 41 delta symbols with the decode-side clamp reproduced).
+  - `LsfStage2::encode` (§4.2.7.5.2: per-coefficient base symbol from
+    the I1-selected Table 15/16 codebook, the forced Table 19
+    extension for `|I2| >= 4`), with the backwards-prediction inverse
+    shared via `compute_res_q10`.
+  - `LsfInterpolated::encode_index` (§4.2.7.5.5) and
+    `encode_lcg_seed` (§4.2.7.7).
+  - `LtpParameters::encode` (§4.2.7.6: absolute / relative /
+    relative-fallback primary lag via `LagSymbols`, Table 32 contour,
+    periodicity + per-subframe filter indices, Table 42 LTP scaling)
+    consuming an `LtpSymbols` script.
+  - `Excitation::encode` (§4.2.7.8: Table 45 rate level, the
+    17-escape LSB-depth chain over Table 46, the §4.2.7.8.3 preorder
+    split tree, §4.2.7.8.4 MSB-first LSB refinement bits, §4.2.7.8.5
+    signs) consuming an `ExcitationSymbols` script (the quantized
+    signed `e_raw[]` plus per-block LSB depths), with the §4.2.7.8.6
+    LCG reconstruction shared via `reconstruct_e_q23`.
+  Every stage is validated by seeded randomized encode → decode
+  roundtrips against the real range coder (500-800 scripts per stage
+  covering all bandwidths / frame sizes / signal types) plus
+  bad-input rejection tests; the range encoder itself gained a
+  zero-probability-cell debug assertion.
+
 
 - *Cargo-fuzz harness suite restored (`fuzz/`).* The scheduled Fuzz
   workflow had been failing since the orphan rebuild dropped the old

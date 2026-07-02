@@ -170,6 +170,34 @@ impl LsfInterpolated {
         })
     }
 
+    /// Encode the §4.2.7.5.5 interpolation factor into `re` — the
+    /// write-side mirror of the bitstream part of [`Self::decode`].
+    ///
+    /// For the two 20 ms contexts `w_q2` must be `Some(0..=4)` and is
+    /// written from the Table 26 PDF (even in the
+    /// [`LsfInterpContext::TwentyMsAfterResetOrUncoded`] context, where
+    /// the decoder discards the value and substitutes 4 — the symbol
+    /// still occupies the bitstream to keep the range coder in sync).
+    /// For [`LsfInterpContext::TenMs`] the factor is absent and `w_q2`
+    /// must be `None`.
+    pub fn encode_index(
+        re: &mut crate::range_encoder::RangeEncoder,
+        context: LsfInterpContext,
+        w_q2: Option<u8>,
+    ) -> Result<(), Error> {
+        match (context, w_q2) {
+            (LsfInterpContext::TenMs, None) => Ok(()),
+            (
+                LsfInterpContext::TwentyMs | LsfInterpContext::TwentyMsAfterResetOrUncoded,
+                Some(w),
+            ) if w <= 4 => {
+                re.enc_icdf(w as usize, LSF_INTERP_ICDF, 8);
+                Ok(())
+            }
+            _ => Err(Error::MalformedPacket),
+        }
+    }
+
     /// The decoded Q2 interpolation factor in `0..=4`, or `None` for a
     /// 10 ms frame where no factor is present.
     ///

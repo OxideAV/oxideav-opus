@@ -879,19 +879,21 @@ pub use redundancy_decode_params::{
 };
 pub use silk_decode::{decode_silk_frame, SilkFrameConfig, SilkFrameDecoded};
 pub use silk_excitation::{
-    quantization_offset_q23, shell_block_count, Excitation, ExcitationConfig, SilkFrameSize,
-    MAX_EXCITATION_SAMPLES, MAX_SHELL_BLOCKS, SHELL_BLOCK_SAMPLES,
+    quantization_offset_q23, shell_block_count, Excitation, ExcitationConfig, ExcitationSymbols,
+    SilkFrameSize, MAX_EXCITATION_SAMPLES, MAX_SHELL_BLOCKS, SHELL_BLOCK_SAMPLES,
 };
 pub use silk_frame::{
     FrameKind, QuantizationOffsetType, SignalType, SilkFrameHeader, SilkFrameHeaderConfig,
-    SilkHeaderPreGains, StereoPredictionWeights,
+    SilkHeaderPreGains, SilkHeaderSymbols, StereoPredictionWeights, StereoWeightSymbols,
 };
-pub use silk_gains::{SubframeGain, SubframeGains, SubframeGainsConfig, SILK_MAX_SUBFRAMES};
+pub use silk_gains::{
+    GainSymbol, SubframeGain, SubframeGains, SubframeGainsConfig, SILK_MAX_SUBFRAMES,
+};
 pub use silk_header::{
     per_frame_lbrr_pdf, silk_frame_count, PerFrameLbrr, SilkChannelHeader, SilkHeaderBits,
     SILK_MAX_FRAMES_PER_CHANNEL,
 };
-pub use silk_lcg_seed::decode_lcg_seed;
+pub use silk_lcg_seed::{decode_lcg_seed, encode_lcg_seed};
 pub use silk_log2lin::{
     silk_gains_dequant, silk_log2lin, SILK_GAIN_Q16_MAX, SILK_GAIN_Q16_MIN, SILK_LOG_GAIN_BIAS,
     SILK_LOG_GAIN_MULTIPLIER,
@@ -908,8 +910,8 @@ pub use silk_lsf_stage2::{
 };
 pub use silk_lsf_to_lpc::{nlsf_to_c_q17, ordering, LpcQ12, LpcQ17};
 pub use silk_ltp::{
-    LagCoding, LtpConfig, LtpParameters, LTP_FILTER_TAPS, LTP_MAX_SUBFRAMES,
-    LTP_SCALING_DEFAULT_Q14,
+    LagCoding, LagSymbols, LtpConfig, LtpParameters, LtpSymbols, LTP_FILTER_TAPS,
+    LTP_MAX_SUBFRAMES, LTP_SCALING_DEFAULT_Q14,
 };
 pub use silk_ltp_synth::{
     ltp_synth_commit_subframe, ltp_synthesis_subframe, LtpSynthState, LtpSynthSubframe,

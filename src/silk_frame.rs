@@ -27,6 +27,7 @@
 //! on.
 
 use crate::range_decoder::RangeDecoder;
+use crate::range_encoder::RangeEncoder;
 use crate::toc::Bandwidth;
 use crate::Error;
 
@@ -425,16 +426,143 @@ impl SilkFrameHeader {
     /// Table 6, respectively, and let i2 and i3 be two more indices
     /// decoded with the stage-2 and stage-3 PDFs, all in that order."
     fn decode_stereo_pred(rd: &mut RangeDecoder<'_>) -> StereoPredictionWeights {
-        let n = rd.dec_icdf(STEREO_STAGE1_ICDF, 8) as i32;
-        let i0 = rd.dec_icdf(STEREO_STAGE2_ICDF, 8) as i32;
-        let i1 = rd.dec_icdf(STEREO_STAGE3_ICDF, 8) as i32;
-        let i2 = rd.dec_icdf(STEREO_STAGE2_ICDF, 8) as i32;
-        let i3 = rd.dec_icdf(STEREO_STAGE3_ICDF, 8) as i32;
+        let n = rd.dec_icdf(STEREO_STAGE1_ICDF, 8) as u8;
+        let i0 = rd.dec_icdf(STEREO_STAGE2_ICDF, 8) as u8;
+        let i1 = rd.dec_icdf(STEREO_STAGE3_ICDF, 8) as u8;
+        let i2 = rd.dec_icdf(STEREO_STAGE2_ICDF, 8) as u8;
+        let i3 = rd.dec_icdf(STEREO_STAGE3_ICDF, 8) as u8;
+        StereoWeightSymbols { n, i0, i1, i2, i3 }.weights()
+    }
 
+    // ----- §4.2.7.1–§4.2.7.5.1 encode-side mirrors ------------------
+
+    /// Encode the §4.2.7.1 stereo prediction weights, §4.2.7.2 mid-only
+    /// flag, and §4.2.7.3 frame type — the exact write-side mirror of
+    /// [`Self::decode_pre_gains`].
+    ///
+    /// `symbols` supplies the raw symbol choices; `cfg` must describe
+    /// the same conditions the decoder will use, and the two must be
+    /// consistent (stereo weight symbols present iff `cfg.stereo &&
+    /// cfg.stereo_mid_channel`, a mid-only flag present iff
+    /// `cfg.has_mid_only_flag`, and a frame type inside the support of
+    /// the `cfg.kind`-selected Table 9 PDF). Returns the
+    /// [`SilkHeaderPreGains`] the decoder will reconstruct.
+    pub fn encode_pre_gains(
+        re: &mut RangeEncoder,
+        cfg: SilkFrameHeaderConfig,
+        symbols: &SilkHeaderSymbols,
+    ) -> Result<SilkHeaderPreGains, Error> {
+        // -------- §4.2.7.1 Stereo Prediction Weights --------
+        let want_stereo = cfg.stereo && cfg.stereo_mid_channel;
+        if want_stereo != symbols.stereo.is_some() {
+            return Err(Error::MalformedPacket);
+        }
+        let stereo_pred = match &symbols.stereo {
+            Some(s) => {
+                if s.n > 24 || s.i0 > 2 || s.i1 > 4 || s.i2 > 2 || s.i3 > 4 {
+                    return Err(Error::MalformedPacket);
+                }
+                re.enc_icdf(s.n as usize, STEREO_STAGE1_ICDF, 8);
+                re.enc_icdf(s.i0 as usize, STEREO_STAGE2_ICDF, 8);
+                re.enc_icdf(s.i1 as usize, STEREO_STAGE3_ICDF, 8);
+                re.enc_icdf(s.i2 as usize, STEREO_STAGE2_ICDF, 8);
+                re.enc_icdf(s.i3 as usize, STEREO_STAGE3_ICDF, 8);
+                Some(s.weights())
+            }
+            None => None,
+        };
+
+        // -------- §4.2.7.2 Mid-Only Flag --------
+        if cfg.has_mid_only_flag != symbols.mid_only_flag.is_some() {
+            return Err(Error::MalformedPacket);
+        }
+        if let Some(flag) = symbols.mid_only_flag {
+            re.enc_icdf(flag as usize, MID_ONLY_ICDF, 8);
+        }
+
+        // -------- §4.2.7.3 Frame Type --------
+        match cfg.kind {
+            FrameKind::RegularInactive => {
+                if symbols.frame_type > 1 {
+                    return Err(Error::MalformedPacket);
+                }
+                re.enc_icdf(symbols.frame_type as usize, FRAME_TYPE_INACTIVE_ICDF, 8);
+            }
+            FrameKind::RegularActive | FrameKind::Lbrr => {
+                if !(2..=5).contains(&symbols.frame_type) {
+                    return Err(Error::MalformedPacket);
+                }
+                re.enc_icdf((symbols.frame_type - 2) as usize, FRAME_TYPE_ACTIVE_ICDF, 8);
+            }
+        }
+        let (signal_type, qoff_type) = frame_type_to_signal_qoff(symbols.frame_type);
+
+        Ok(SilkHeaderPreGains {
+            stereo_pred,
+            mid_only_flag: symbols.mid_only_flag,
+            frame_type: symbols.frame_type,
+            signal_type,
+            qoff_type,
+        })
+    }
+
+    /// Encode the §4.2.7.5.1 normalized LSF stage-1 index `I1 ∈ 0..32`
+    /// — the write-side mirror of [`Self::decode_lsf_stage1`]. The PDF
+    /// is selected by `(bandwidth, signal_type)` per Table 14.
+    pub fn encode_lsf_stage1(
+        re: &mut RangeEncoder,
+        bandwidth: Bandwidth,
+        signal_type: SignalType,
+        lsf_stage1: u8,
+    ) -> Result<(), Error> {
+        if lsf_stage1 >= 32 {
+            return Err(Error::MalformedPacket);
+        }
+        let lsf_icdf: &[u8] = match (bandwidth, signal_type) {
+            (Bandwidth::Nb | Bandwidth::Mb, SignalType::Inactive | SignalType::Unvoiced) => {
+                &LSF_STAGE1_ICDF_NB_MB_INACTIVE
+            }
+            (Bandwidth::Nb | Bandwidth::Mb, SignalType::Voiced) => &LSF_STAGE1_ICDF_NB_MB_VOICED,
+            (Bandwidth::Wb, SignalType::Inactive | SignalType::Unvoiced) => {
+                &LSF_STAGE1_ICDF_WB_INACTIVE
+            }
+            (Bandwidth::Wb, SignalType::Voiced) => &LSF_STAGE1_ICDF_WB_VOICED,
+            _ => return Err(Error::MalformedPacket),
+        };
+        re.enc_icdf(lsf_stage1 as usize, lsf_icdf, 8);
+        Ok(())
+    }
+}
+
+/// The raw §4.2.7.1 stereo-weight symbol quintuple `(n, i0, i1, i2,
+/// i3)` — the five Table-6 indices that jointly select the Q13
+/// prediction-weight pair. Used by the encode-side
+/// [`SilkFrameHeader::encode_pre_gains`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StereoWeightSymbols {
+    /// Stage-1 joint index, `0..=24`.
+    pub n: u8,
+    /// First stage-2 index, `0..=2`.
+    pub i0: u8,
+    /// First stage-3 index, `0..=4`.
+    pub i1: u8,
+    /// Second stage-2 index, `0..=2`.
+    pub i2: u8,
+    /// Second stage-3 index, `0..=4`.
+    pub i3: u8,
+}
+
+impl StereoWeightSymbols {
+    /// Compose the §4.2.7.1 weight pair from the five indices — the
+    /// normative reconstruction shared by the decode and encode paths.
+    pub fn weights(&self) -> StereoPredictionWeights {
+        let n = self.n as i32;
+        let i1 = self.i1 as i32;
+        let i3 = self.i3 as i32;
         // §4.2.7.1: wi0 = i0 + 3*(n/5), wi1 = i2 + 3*(n%5); both fall
         // in 0..=14.
-        let wi0 = (i0 + 3 * (n / 5)) as usize;
-        let wi1 = (i2 + 3 * (n % 5)) as usize;
+        let wi0 = (self.i0 as i32 + 3 * (n / 5)) as usize;
+        let wi1 = (self.i2 as i32 + 3 * (n % 5)) as usize;
         // Defensive clamp: the spec guarantees wi* <= 14 for any
         // (n, i0, i2) tuple, but we still saturate to keep the
         // STEREO_WEIGHT_Q13[wi+1] lookup in-bounds even on a
@@ -453,6 +581,24 @@ impl SilkFrameHeader {
         let w0_q13 = STEREO_WEIGHT_Q13[wi0] + step0 - w1_q13;
         StereoPredictionWeights { w0_q13, w1_q13 }
     }
+}
+
+/// The raw pre-gains header symbol choices consumed by the encode-side
+/// [`SilkFrameHeader::encode_pre_gains`] — the §4.2.7.1 stereo-weight
+/// quintuple (mid channel of a stereo frame only), the §4.2.7.2
+/// mid-only flag (when signalled), and the §4.2.7.3 frame-type symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SilkHeaderSymbols {
+    /// §4.2.7.1 stereo-weight indices; must be `Some` iff the config
+    /// has `stereo && stereo_mid_channel`.
+    pub stereo: Option<StereoWeightSymbols>,
+    /// §4.2.7.2 mid-only flag; must be `Some` iff the config has
+    /// `has_mid_only_flag`.
+    pub mid_only_flag: Option<bool>,
+    /// §4.2.7.3 frame-type symbol in `0..=5`; `0..=1` for
+    /// [`FrameKind::RegularInactive`], `2..=5` for
+    /// [`FrameKind::RegularActive`] / [`FrameKind::Lbrr`].
+    pub frame_type: u8,
 }
 
 /// Map a frame-type symbol (0..=5) to `(signal_type, qoff_type)` per
@@ -793,5 +939,157 @@ mod tests {
                 pred.w1_q13
             );
         }
+    }
+
+    // ----- §4.2.7.1–§4.2.7.5.1 encode-side mirrors ------------------
+
+    /// A tiny deterministic LCG for the encode/decode roundtrip sweeps.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 32) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.next_u32() % n
+        }
+    }
+
+    /// encode_pre_gains → decode_pre_gains roundtrip over random symbol
+    /// scripts covering mono / stereo-mid / mid-only-flag / all frame
+    /// kinds: the decoder must reconstruct exactly the header the
+    /// encoder predicted.
+    #[test]
+    fn header_encode_decode_roundtrip_random_scripts() {
+        use crate::range_encoder::RangeEncoder;
+        let mut rng = Lcg(0x00AC_E0F5_EED5);
+        for _ in 0..500 {
+            let stereo_mid = rng.below(2) == 0;
+            let has_mid_only = stereo_mid && rng.below(2) == 0;
+            let kind = match rng.below(3) {
+                0 => FrameKind::RegularInactive,
+                1 => FrameKind::RegularActive,
+                _ => FrameKind::Lbrr,
+            };
+            let bandwidth = match rng.below(3) {
+                0 => Bandwidth::Nb,
+                1 => Bandwidth::Mb,
+                _ => Bandwidth::Wb,
+            };
+            let cfg = SilkFrameHeaderConfig {
+                stereo_mid_channel: stereo_mid,
+                stereo: stereo_mid,
+                has_mid_only_flag: has_mid_only,
+                kind,
+                bandwidth,
+            };
+            let symbols = SilkHeaderSymbols {
+                stereo: stereo_mid.then(|| StereoWeightSymbols {
+                    n: rng.below(25) as u8,
+                    i0: rng.below(3) as u8,
+                    i1: rng.below(5) as u8,
+                    i2: rng.below(3) as u8,
+                    i3: rng.below(5) as u8,
+                }),
+                mid_only_flag: has_mid_only.then(|| rng.below(2) == 1),
+                frame_type: match kind {
+                    FrameKind::RegularInactive => rng.below(2) as u8,
+                    _ => 2 + rng.below(4) as u8,
+                },
+            };
+            let lsf_stage1 = rng.below(32) as u8;
+
+            let mut re = RangeEncoder::new();
+            let predicted =
+                SilkFrameHeader::encode_pre_gains(&mut re, cfg, &symbols).expect("encode");
+            SilkFrameHeader::encode_lsf_stage1(
+                &mut re,
+                bandwidth,
+                predicted.signal_type,
+                lsf_stage1,
+            )
+            .expect("encode lsf1");
+            let bytes = re.finish();
+
+            let mut rd = RangeDecoder::new(&bytes);
+            let decoded = SilkFrameHeader::decode_pre_gains(&mut rd, cfg).expect("decode");
+            assert_eq!(decoded, predicted, "symbols={symbols:?}");
+            let got_lsf1 =
+                SilkFrameHeader::decode_lsf_stage1(&mut rd, bandwidth, decoded.signal_type)
+                    .expect("decode lsf1");
+            assert_eq!(got_lsf1, lsf_stage1);
+            assert!(!rd.has_error());
+        }
+    }
+
+    /// The encode path rejects symbol/config mismatches and
+    /// out-of-support values.
+    #[test]
+    fn header_encode_rejects_bad_symbols() {
+        use crate::range_encoder::RangeEncoder;
+        let mono_cfg = SilkFrameHeaderConfig {
+            stereo_mid_channel: false,
+            stereo: false,
+            has_mid_only_flag: false,
+            kind: FrameKind::RegularActive,
+            bandwidth: Bandwidth::Nb,
+        };
+        let stereo_syms = SilkHeaderSymbols {
+            stereo: Some(StereoWeightSymbols {
+                n: 0,
+                i0: 0,
+                i1: 0,
+                i2: 0,
+                i3: 0,
+            }),
+            mid_only_flag: None,
+            frame_type: 4,
+        };
+        // Stereo symbols on a mono config.
+        let mut re = RangeEncoder::new();
+        assert!(SilkFrameHeader::encode_pre_gains(&mut re, mono_cfg, &stereo_syms).is_err());
+        // Inactive frame type on an active kind.
+        let mut re = RangeEncoder::new();
+        let bad_type = SilkHeaderSymbols {
+            stereo: None,
+            mid_only_flag: None,
+            frame_type: 1,
+        };
+        assert!(SilkFrameHeader::encode_pre_gains(&mut re, mono_cfg, &bad_type).is_err());
+        // Out-of-range stereo indices.
+        let mut re = RangeEncoder::new();
+        let stereo_cfg = SilkFrameHeaderConfig {
+            stereo_mid_channel: true,
+            stereo: true,
+            has_mid_only_flag: false,
+            kind: FrameKind::RegularActive,
+            bandwidth: Bandwidth::Nb,
+        };
+        let bad_stereo = SilkHeaderSymbols {
+            stereo: Some(StereoWeightSymbols {
+                n: 25,
+                i0: 0,
+                i1: 0,
+                i2: 0,
+                i3: 0,
+            }),
+            mid_only_flag: None,
+            frame_type: 4,
+        };
+        assert!(SilkFrameHeader::encode_pre_gains(&mut re, stereo_cfg, &bad_stereo).is_err());
+        // Out-of-range LSF stage-1 index / SWB bandwidth.
+        let mut re = RangeEncoder::new();
+        assert!(
+            SilkFrameHeader::encode_lsf_stage1(&mut re, Bandwidth::Nb, SignalType::Voiced, 32)
+                .is_err()
+        );
+        let mut re = RangeEncoder::new();
+        assert!(
+            SilkFrameHeader::encode_lsf_stage1(&mut re, Bandwidth::Swb, SignalType::Voiced, 0)
+                .is_err()
+        );
     }
 }

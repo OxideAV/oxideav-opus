@@ -9,6 +9,7 @@
 //! SILK frame and is consumed by the [`crate::silk_excitation`] module.
 
 use crate::range_decoder::RangeDecoder;
+use crate::Error;
 
 /// Table 43 — uniform 4-entry PDF for the LCG seed.
 ///
@@ -23,6 +24,16 @@ pub(crate) const LCG_SEED_ICDF: &[u8] = &[192, 128, 64, 0];
 /// first use.
 pub fn decode_lcg_seed(rd: &mut RangeDecoder<'_>) -> u8 {
     rd.dec_icdf(LCG_SEED_ICDF, 8) as u8
+}
+
+/// Encode the §4.2.7.7 LCG seed into `re` — the write-side mirror of
+/// [`decode_lcg_seed`]. `seed` must be in `0..=3`.
+pub fn encode_lcg_seed(re: &mut crate::range_encoder::RangeEncoder, seed: u8) -> Result<(), Error> {
+    if seed > 3 {
+        return Err(Error::MalformedPacket);
+    }
+    re.enc_icdf(seed as usize, LCG_SEED_ICDF, 8);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -31,6 +31,7 @@
 //! LTP stages come online in a later round.
 
 use crate::range_decoder::RangeDecoder;
+use crate::range_encoder::RangeEncoder;
 use crate::silk_frame::SignalType;
 use crate::Error;
 
@@ -250,6 +251,157 @@ impl SubframeGains {
         out
     }
 
+    /// Encode `symbols` (one per subframe) into `re`, per RFC 6716
+    /// §4.2.7.4 — the exact write-side mirror of [`Self::decode`].
+    ///
+    /// `cfg` must describe the same conditions the decoder will use:
+    /// the symbol at subframe 0 must be [`GainSymbol::Independent`] iff
+    /// `cfg.first_subframe_is_independent`, and every later subframe
+    /// must be [`GainSymbol::Delta`]. Returns the [`SubframeGains`] the
+    /// decoder will reconstruct from this bitstream (computed with the
+    /// same §4.2.7.4 clamp / delta formulas), so the caller can carry
+    /// the quantization feedback (e.g. [`Self::last_log_gain`] into the
+    /// next frame's `previous_log_gain`).
+    ///
+    /// Returns `Error::MalformedPacket` on an invalid subframe count, a
+    /// symbol-kind mismatch, or an out-of-range index (independent
+    /// `gain_index > 63`, `delta_gain_index > 40`).
+    pub fn encode(
+        re: &mut RangeEncoder,
+        cfg: SubframeGainsConfig,
+        symbols: &[GainSymbol],
+    ) -> Result<Self, Error> {
+        if cfg.num_subframes != 2 && cfg.num_subframes != 4 {
+            return Err(Error::MalformedPacket);
+        }
+        let num = cfg.num_subframes as usize;
+        if symbols.len() != num {
+            return Err(Error::MalformedPacket);
+        }
+        let mut gains = [SubframeGain { log_gain: 0 }; SILK_MAX_SUBFRAMES];
+        let mut prev: Option<u8> = cfg.previous_log_gain;
+
+        for (k, (slot, &sym)) in gains.iter_mut().zip(symbols.iter()).enumerate().take(num) {
+            let want_independent = k == 0 && cfg.first_subframe_is_independent;
+            let log_gain = match sym {
+                GainSymbol::Independent(gain_index) => {
+                    if !want_independent || gain_index > 63 {
+                        return Err(Error::MalformedPacket);
+                    }
+                    // §4.2.7.4 independent path: MSB from the Table 11
+                    // signal-type PDF, LSB from the uniform Table 12 PDF.
+                    re.enc_icdf(
+                        (gain_index >> 3) as usize,
+                        Self::icdf_for_signal_type(cfg.signal_type),
+                        8,
+                    );
+                    re.enc_icdf((gain_index & 0x07) as usize, GAIN_LSB_ICDF, 8);
+                    // The decoder applies the clamp; reproduce it so the
+                    // returned gains match the decode exactly.
+                    match prev {
+                        Some(p) => gain_index.max(p.saturating_sub(16)),
+                        None => gain_index,
+                    }
+                }
+                GainSymbol::Delta(delta) => {
+                    if want_independent || delta > 40 {
+                        return Err(Error::MalformedPacket);
+                    }
+                    let p = match prev {
+                        Some(v) => v,
+                        None => return Err(Error::MalformedPacket),
+                    };
+                    re.enc_icdf(delta as usize, GAIN_DELTA_ICDF, 8);
+                    Self::delta_log_gain(delta, p)
+                }
+            };
+            *slot = SubframeGain { log_gain };
+            prev = Some(log_gain);
+        }
+
+        Ok(Self {
+            gains,
+            len: cfg.num_subframes,
+        })
+    }
+
+    /// Quantize a desired per-subframe `log_gain` plan into the
+    /// [`GainSymbol`]s that best reproduce it through the §4.2.7.4
+    /// decode formulas, together with the [`SubframeGains`] the decoder
+    /// will actually reconstruct.
+    ///
+    /// The symbol-selection strategy is an encoder-side choice (RFC
+    /// 6716 §5.2 leaves it free); this one is deterministic and locally
+    /// optimal per subframe: the independent index is the desired value
+    /// itself (the §4.2.7.4 clamp may still raise the decoded gain),
+    /// and each delta index minimizes the absolute error of the decoded
+    /// gain against the desired one, ties toward the smaller index
+    /// (fewer large-delta symbols).
+    ///
+    /// `desired.len()` must equal `cfg.num_subframes`, every desired
+    /// value must be `<= 63`.
+    pub fn quantize(
+        cfg: SubframeGainsConfig,
+        desired: &[u8],
+    ) -> Result<(Vec<GainSymbol>, Self), Error> {
+        if cfg.num_subframes != 2 && cfg.num_subframes != 4 {
+            return Err(Error::MalformedPacket);
+        }
+        let num = cfg.num_subframes as usize;
+        if desired.len() != num || desired.iter().any(|&g| g > 63) {
+            return Err(Error::MalformedPacket);
+        }
+        let mut symbols = Vec::with_capacity(num);
+        let mut gains = [SubframeGain { log_gain: 0 }; SILK_MAX_SUBFRAMES];
+        let mut prev: Option<u8> = cfg.previous_log_gain;
+
+        for (k, (&want, slot)) in desired.iter().zip(gains.iter_mut()).enumerate().take(num) {
+            let independent = k == 0 && cfg.first_subframe_is_independent;
+            let (sym, decoded) = if independent {
+                let decoded = match prev {
+                    Some(p) => want.max(p.saturating_sub(16)),
+                    None => want,
+                };
+                (GainSymbol::Independent(want), decoded)
+            } else {
+                let p = match prev {
+                    Some(v) => v,
+                    None => return Err(Error::MalformedPacket),
+                };
+                // Deterministic argmin over the 41 delta symbols.
+                let mut best = (0u8, Self::delta_log_gain(0, p));
+                for delta in 1..=40u8 {
+                    let g = Self::delta_log_gain(delta, p);
+                    if (g as i32 - want as i32).abs() < (best.1 as i32 - want as i32).abs() {
+                        best = (delta, g);
+                    }
+                }
+                (GainSymbol::Delta(best.0), best.1)
+            };
+            symbols.push(sym);
+            *slot = SubframeGain { log_gain: decoded };
+            prev = Some(decoded);
+        }
+
+        Ok((
+            symbols,
+            Self {
+                gains,
+                len: cfg.num_subframes,
+            },
+        ))
+    }
+
+    /// The §4.2.7.4 delta-path reconstruction
+    /// `log_gain = clamp(0, max(2*delta - 16, prev + delta - 4), 63)`,
+    /// shared by the decode, encode, and quantize paths.
+    fn delta_log_gain(delta: u8, previous_log_gain: u8) -> u8 {
+        let delta = delta as i32;
+        let a = 2 * delta - 16;
+        let b = previous_log_gain as i32 + delta - 4;
+        a.max(b).clamp(0, 63) as u8
+    }
+
     fn icdf_for_signal_type(signal_type: SignalType) -> &'static [u8] {
         match signal_type {
             SignalType::Inactive => GAIN_MSB_ICDF_INACTIVE,
@@ -285,15 +437,25 @@ impl SubframeGains {
     ///
     /// Returns the clamped `log_gain` in 0..=63.
     fn decode_delta(rd: &mut RangeDecoder<'_>, previous_log_gain: u8) -> u8 {
-        let delta = rd.dec_icdf(GAIN_DELTA_ICDF, 8) as i32;
-        let prev = previous_log_gain as i32;
+        let delta = rd.dec_icdf(GAIN_DELTA_ICDF, 8) as u8;
         // §4.2.7.4: log_gain = clamp(0, max(2*delta - 16, prev + delta
         // - 4), 63).
-        let a = 2 * delta - 16;
-        let b = prev + delta - 4;
-        let inner = a.max(b);
-        inner.clamp(0, 63) as u8
+        Self::delta_log_gain(delta.min(40), previous_log_gain)
     }
+}
+
+/// One subframe's gain symbol on the encode side — the §4.2.7.4 coding
+/// choice [`SubframeGains::encode`] writes for that subframe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GainSymbol {
+    /// Independent (Table 11 + 12) coding: the 6-bit `gain_index` in
+    /// `0..=63`, written as a 3-bit MSB + 3-bit LSB pair. Only valid
+    /// for subframe 0 when
+    /// [`SubframeGainsConfig::first_subframe_is_independent`] is set.
+    Independent(u8),
+    /// Delta (Table 13) coding: the `delta_gain_index` in `0..=40`,
+    /// folded into the previous subframe gain by the §4.2.7.4 formula.
+    Delta(u8),
 }
 
 #[cfg(test)]
@@ -697,6 +859,172 @@ mod tests {
             let expected = crate::silk_log2lin::silk_gains_dequant(log_gain);
             assert_eq!(*val, expected, "subframe {} mismatch", k);
         }
+    }
+
+    // ----- §4.2.7.4 encode-side mirror ------------------------------
+
+    /// A tiny deterministic LCG for the encode/decode roundtrip sweeps.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 32) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.next_u32() % n
+        }
+    }
+
+    /// encode → decode roundtrip: for random symbol scripts across all
+    /// signal types / subframe counts / prev contexts, the decoder must
+    /// reconstruct exactly the gains the encoder returned.
+    #[test]
+    fn encode_decode_roundtrip_random_scripts() {
+        let mut rng = Lcg(0x0BAD_5EED);
+        for _ in 0..500 {
+            let signal_type = match rng.below(3) {
+                0 => SignalType::Inactive,
+                1 => SignalType::Unvoiced,
+                _ => SignalType::Voiced,
+            };
+            let num_subframes = if rng.below(2) == 0 { 2u8 } else { 4 };
+            let first_independent = rng.below(2) == 0;
+            let previous_log_gain = if first_independent && rng.below(2) == 0 {
+                None
+            } else {
+                Some(rng.below(64) as u8)
+            };
+            let cfg = SubframeGainsConfig {
+                signal_type,
+                num_subframes,
+                first_subframe_is_independent: first_independent,
+                previous_log_gain,
+            };
+            let symbols: Vec<GainSymbol> = (0..num_subframes as usize)
+                .map(|k| {
+                    if k == 0 && first_independent {
+                        GainSymbol::Independent(rng.below(64) as u8)
+                    } else {
+                        GainSymbol::Delta(rng.below(41) as u8)
+                    }
+                })
+                .collect();
+
+            let mut re = RangeEncoder::new();
+            let predicted = SubframeGains::encode(&mut re, cfg, &symbols).expect("encode");
+            let bytes = re.finish();
+
+            let mut rd = RangeDecoder::new(&bytes);
+            let decoded = SubframeGains::decode(&mut rd, cfg).expect("decode");
+            assert!(!rd.has_error());
+            assert_eq!(decoded, predicted, "cfg={cfg:?} symbols={symbols:?}");
+        }
+    }
+
+    /// quantize → encode → decode: the decoded gains equal the
+    /// quantizer's prediction, and (where reachable) track the desired
+    /// plan closely.
+    #[test]
+    fn quantize_encode_decode_consistency() {
+        let mut rng = Lcg(0x5EED_CAFE);
+        for _ in 0..500 {
+            let cfg = SubframeGainsConfig {
+                signal_type: SignalType::Voiced,
+                num_subframes: 4,
+                first_subframe_is_independent: true,
+                previous_log_gain: if rng.below(2) == 0 {
+                    None
+                } else {
+                    Some(rng.below(64) as u8)
+                },
+            };
+            let desired: Vec<u8> = (0..4).map(|_| rng.below(64) as u8).collect();
+            let (symbols, predicted) = SubframeGains::quantize(cfg, &desired).expect("quantize");
+
+            let mut re = RangeEncoder::new();
+            let encoded = SubframeGains::encode(&mut re, cfg, &symbols).expect("encode");
+            assert_eq!(encoded, predicted);
+
+            let bytes = re.finish();
+            let mut rd = RangeDecoder::new(&bytes);
+            let decoded = SubframeGains::decode(&mut rd, cfg).expect("decode");
+            assert_eq!(decoded, predicted);
+
+            // Delta-coded subframes 1..4 can always land within 4 of
+            // the desired value when the desired plan is monotone-ish;
+            // globally, every decoded gain is in range.
+            for g in decoded.as_slice() {
+                assert!(g.log_gain <= 63);
+            }
+        }
+    }
+
+    /// The delta symbol range covers enough motion that the quantizer
+    /// reproduces any reachable steady-state plan exactly: feeding the
+    /// decoder's own output back as the desired plan is a fixed point.
+    #[test]
+    fn quantize_is_fixed_point_on_reachable_plans() {
+        let mut rng = Lcg(0xF1DE_117E);
+        for _ in 0..200 {
+            let cfg = SubframeGainsConfig {
+                signal_type: SignalType::Unvoiced,
+                num_subframes: 4,
+                first_subframe_is_independent: true,
+                previous_log_gain: None,
+            };
+            let desired: Vec<u8> = (0..4).map(|_| rng.below(64) as u8).collect();
+            let (_, first_pass) = SubframeGains::quantize(cfg, &desired).expect("quantize");
+            let reachable: Vec<u8> = first_pass.as_slice().iter().map(|g| g.log_gain).collect();
+            let (_, second_pass) = SubframeGains::quantize(cfg, &reachable).expect("quantize");
+            assert_eq!(first_pass, second_pass, "desired={desired:?}");
+        }
+    }
+
+    /// Symbol-kind mismatches and out-of-range indices are rejected.
+    #[test]
+    fn encode_rejects_bad_symbols() {
+        let cfg = SubframeGainsConfig {
+            signal_type: SignalType::Voiced,
+            num_subframes: 2,
+            first_subframe_is_independent: true,
+            previous_log_gain: None,
+        };
+        // Delta where independent expected.
+        let mut re = RangeEncoder::new();
+        assert!(
+            SubframeGains::encode(&mut re, cfg, &[GainSymbol::Delta(3), GainSymbol::Delta(3)])
+                .is_err()
+        );
+        // Independent where delta expected.
+        let mut re = RangeEncoder::new();
+        assert!(SubframeGains::encode(
+            &mut re,
+            cfg,
+            &[GainSymbol::Independent(10), GainSymbol::Independent(10)]
+        )
+        .is_err());
+        // Out-of-range independent index.
+        let mut re = RangeEncoder::new();
+        assert!(SubframeGains::encode(
+            &mut re,
+            cfg,
+            &[GainSymbol::Independent(64), GainSymbol::Delta(3)]
+        )
+        .is_err());
+        // Out-of-range delta index.
+        let mut re = RangeEncoder::new();
+        assert!(SubframeGains::encode(
+            &mut re,
+            cfg,
+            &[GainSymbol::Independent(10), GainSymbol::Delta(41)]
+        )
+        .is_err());
+        // Wrong symbol count.
+        let mut re = RangeEncoder::new();
+        assert!(SubframeGains::encode(&mut re, cfg, &[GainSymbol::Independent(10)]).is_err());
     }
 
     #[test]

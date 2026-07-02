@@ -32,6 +32,7 @@
 //! source is consulted.
 
 use crate::range_decoder::RangeDecoder;
+use crate::range_encoder::RangeEncoder;
 use crate::silk_frame::{QuantizationOffsetType, SignalType};
 use crate::toc::Bandwidth;
 use crate::Error;
@@ -185,9 +186,9 @@ const SPLIT16_ICDF_5: &[u8] = &[249, 214, 130, 43, 6, 0];
 const SPLIT16_ICDF_6: &[u8] = &[252, 232, 173, 87, 24, 3, 0];
 const SPLIT16_ICDF_7: &[u8] = &[253, 241, 203, 131, 56, 14, 2, 0];
 const SPLIT16_ICDF_8: &[u8] = &[254, 246, 221, 167, 94, 35, 8, 1, 0];
-const SPLIT16_ICDF_9: &[u8] = &[254, 249, 232, 193, 130, 67, 25, 7, 1, 0];
+const SPLIT16_ICDF_9: &[u8] = &[254, 249, 232, 193, 130, 65, 23, 5, 1, 0];
 const SPLIT16_ICDF_10: &[u8] = &[255, 251, 239, 211, 162, 99, 45, 15, 4, 1, 0];
-const SPLIT16_ICDF_11: &[u8] = &[255, 251, 243, 223, 186, 131, 76, 35, 13, 5, 1, 0];
+const SPLIT16_ICDF_11: &[u8] = &[255, 251, 243, 223, 186, 131, 74, 33, 11, 3, 1, 0];
 const SPLIT16_ICDF_12: &[u8] = &[255, 252, 245, 230, 202, 158, 105, 57, 24, 8, 2, 1, 0];
 const SPLIT16_ICDF_13: &[u8] = &[255, 253, 247, 235, 214, 179, 132, 84, 44, 19, 7, 2, 1, 0];
 const SPLIT16_ICDF_14: &[u8] = &[
@@ -232,7 +233,7 @@ const SPLIT8_ICDF_5: &[u8] = &[250, 215, 129, 41, 5, 0];
 const SPLIT8_ICDF_6: &[u8] = &[252, 232, 173, 86, 24, 3, 0];
 const SPLIT8_ICDF_7: &[u8] = &[253, 240, 200, 129, 56, 15, 2, 0];
 const SPLIT8_ICDF_8: &[u8] = &[253, 244, 217, 164, 94, 38, 10, 1, 0];
-const SPLIT8_ICDF_9: &[u8] = &[253, 245, 226, 189, 132, 75, 31, 11, 5, 0];
+const SPLIT8_ICDF_9: &[u8] = &[253, 245, 226, 189, 132, 71, 27, 7, 1, 0];
 const SPLIT8_ICDF_10: &[u8] = &[253, 246, 231, 203, 159, 105, 56, 23, 6, 1, 0];
 const SPLIT8_ICDF_11: &[u8] = &[255, 248, 235, 213, 179, 133, 85, 47, 19, 5, 1, 0];
 const SPLIT8_ICDF_12: &[u8] = &[255, 254, 243, 221, 194, 159, 117, 70, 37, 12, 2, 1, 0];
@@ -277,7 +278,7 @@ const SPLIT4_ICDF_3: &[u8] = &[236, 129, 20, 0];
 const SPLIT4_ICDF_4: &[u8] = &[245, 185, 72, 10, 0];
 const SPLIT4_ICDF_5: &[u8] = &[249, 213, 129, 42, 6, 0];
 const SPLIT4_ICDF_6: &[u8] = &[250, 226, 169, 87, 27, 4, 0];
-const SPLIT4_ICDF_7: &[u8] = &[251, 233, 194, 130, 66, 24, 8, 0];
+const SPLIT4_ICDF_7: &[u8] = &[251, 233, 194, 130, 62, 20, 4, 0];
 const SPLIT4_ICDF_8: &[u8] = &[250, 236, 207, 160, 99, 47, 17, 3, 0];
 const SPLIT4_ICDF_9: &[u8] = &[255, 240, 217, 182, 131, 81, 41, 11, 1, 0];
 const SPLIT4_ICDF_10: &[u8] = &[255, 254, 233, 201, 159, 107, 61, 20, 2, 1, 0];
@@ -291,7 +292,7 @@ const SPLIT4_ICDF_15: &[u8] = &[
     255, 253, 248, 237, 219, 194, 163, 128, 93, 62, 37, 19, 8, 3, 1, 0,
 ];
 const SPLIT4_ICDF_16: &[u8] = &[
-    255, 254, 250, 241, 226, 205, 177, 145, 111, 77, 49, 28, 13, 4, 1, 0, 0,
+    255, 254, 250, 241, 226, 205, 177, 145, 111, 79, 51, 30, 15, 6, 2, 1, 0,
 ];
 
 /// Table 49 indexed by `pulses - 1`.
@@ -521,7 +522,7 @@ pub struct ExcitationConfig {
 /// For 10 ms MB, this is 128 samples (8 shell blocks); the caller
 /// trims the trailing 8 samples to land on the nominal 120 (the spec
 /// notes this special case in the §4.2.7.8 preamble).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Excitation {
     e_q23: Vec<i32>,
     rate_level: u8,
@@ -669,39 +670,7 @@ impl Excitation {
         }
 
         // ----- §4.2.7.8.6 reconstruction with LCG -------------------
-        // For each sample:
-        //   e_raw     = signs[i] * magnitudes[i] (treating magnitude as signed)
-        //   e_Q23     = (e_raw << 8) - sign(e_raw)*20 + offset_Q23
-        //   seed      = 196314165 * seed + 907633515 (mod 2^32)
-        //   if (seed & 0x80000000): e_Q23 = -e_Q23
-        //   seed      = (seed + |e_raw|) & 0xFFFFFFFF   <-- §4.2.7.8.6 spec text
-        //   (the spec uses e_raw[i]; the unsigned magnitude == |e_raw|
-        //    when e_raw is signed; the wrap mask doesn't change it.)
-        let offset_q23 = quantization_offset_q23(cfg.signal_type, cfg.qoff_type);
-        let mut e_q23 = vec![0i32; total_samples];
-        let mut seed: u32 = cfg.lcg_seed as u32;
-        for i in 0..total_samples {
-            let mag = magnitudes[i] as i32;
-            let sign = signs[i];
-            // e_raw = sign * magnitude; if magnitude == 0 then e_raw == 0
-            // and sign() returns 0 (per §1.1.4) so the 20 term is not
-            // added.
-            let e_raw = sign * mag;
-            let sign_e = if mag == 0 { 0 } else { sign };
-            // e_Q23 = (e_raw << 8) - sign(e_raw)*20 + offset_Q23
-            let mut e = (e_raw << 8) - sign_e * 20 + offset_q23;
-            // seed = (196314165*seed + 907633515) & 0xFFFFFFFF
-            seed = seed.wrapping_mul(196_314_165).wrapping_add(907_633_515);
-            if (seed & 0x8000_0000) != 0 {
-                e = -e;
-            }
-            // seed = (seed + e_raw) & 0xFFFFFFFF  (the spec uses e_raw[i];
-            // wrapping_add handles the masking implicitly on a u32).
-            // e_raw can be negative; cast to u32 wraps mod 2^32 which is
-            // exactly what `& 0xFFFFFFFF` would do.
-            seed = seed.wrapping_add(e_raw as u32);
-            e_q23[i] = e;
-        }
+        let e_q23 = reconstruct_e_q23(&magnitudes, &signs, &cfg);
 
         Ok(Self {
             e_q23,
@@ -710,6 +679,197 @@ impl Excitation {
             pulses_per_block,
             lsb_count_per_block,
         })
+    }
+
+    /// Encode the §4.2.7.8 excitation into `re` — the exact write-side
+    /// mirror of [`Self::decode`].
+    ///
+    /// `symbols` carries the quantized signed excitation `e_raw[]`
+    /// (one entry per sample; `|e_raw[i]|` is the FINAL per-sample
+    /// magnitude after LSB refinement, the sign is applied when
+    /// non-zero) together with the frame's rate level and the
+    /// per-block extra-LSB counts. Everything the bitstream carries is
+    /// derived from these: the per-block pre-LSB pulse count is
+    /// `sum(|e_raw[i]| >> lsb_count)` over the block (must be
+    /// `<= 16`), the §4.2.7.8.3 split tree codes the pre-LSB
+    /// magnitudes, the §4.2.7.8.4 LSBs refine every coefficient of a
+    /// block with a non-zero LSB count, and the §4.2.7.8.5 signs cover
+    /// every non-zero final magnitude. Returns the [`Excitation`] the
+    /// decoder will reconstruct (including the §4.2.7.8.6 LCG
+    /// pseudorandom inversion, which consumes no bitstream symbols).
+    pub fn encode(
+        re: &mut RangeEncoder,
+        cfg: ExcitationConfig,
+        symbols: &ExcitationSymbols<'_>,
+    ) -> Result<Self, Error> {
+        if cfg.lcg_seed > 3 || symbols.rate_level > 8 {
+            return Err(Error::MalformedPacket);
+        }
+        let shell_blocks = shell_block_count(cfg.bandwidth, cfg.frame_size)?;
+        let total_samples = shell_blocks * SHELL_BLOCK_SAMPLES;
+        if symbols.lsb_counts.len() != shell_blocks
+            || symbols.e_raw.len() != total_samples
+            || symbols.lsb_counts.iter().any(|&l| l > 10)
+        {
+            return Err(Error::MalformedPacket);
+        }
+
+        // ----- §4.2.7.8.1 rate level --------------------------------
+        let rate_level_icdf = match cfg.signal_type {
+            SignalType::Inactive | SignalType::Unvoiced => RATE_LEVEL_ICDF_INACTIVE_UNVOICED,
+            SignalType::Voiced => RATE_LEVEL_ICDF_VOICED,
+        };
+        re.enc_icdf(symbols.rate_level as usize, rate_level_icdf, 8);
+
+        // Derive the final magnitudes / signs and the pre-LSB ("top")
+        // magnitudes per block.
+        let mut magnitudes = vec![0u32; total_samples];
+        let mut signs = vec![1i32; total_samples];
+        let mut top = vec![0u32; total_samples];
+        let mut pulses_per_block = vec![0u8; shell_blocks];
+        for (block, slot) in pulses_per_block.iter_mut().enumerate() {
+            let lsbs = symbols.lsb_counts[block] as u32;
+            let base = block * SHELL_BLOCK_SAMPLES;
+            let mut p: u32 = 0;
+            for i in base..base + SHELL_BLOCK_SAMPLES {
+                let raw = symbols.e_raw[i];
+                let mag = raw.unsigned_abs();
+                magnitudes[i] = mag;
+                signs[i] = if raw < 0 { -1 } else { 1 };
+                let t = mag >> lsbs;
+                top[i] = t;
+                p += t;
+            }
+            if p > 16 {
+                // The pre-LSB pulse count of a shell block is capped
+                // at 16 (Table 46); the caller must raise the block's
+                // LSB count to fit.
+                return Err(Error::MalformedPacket);
+            }
+            // Every coefficient's magnitude must be exactly
+            // representable as `top * 2^lsbs + lsb_bits`, which it is
+            // by construction (top = mag >> lsbs).
+            *slot = p as u8;
+        }
+
+        // ----- §4.2.7.8.2 pulses per shell block --------------------
+        // A block with `n` extra LSBs writes the 17 escape once from
+        // the rate-level PDF and `n - 1` more times from the level-9
+        // PDF; the actual pulse count then comes from the level-9 PDF
+        // (or level-10 when n == 10, whose cell 17 has zero
+        // probability, terminating the chain).
+        for (block, &pb) in pulses_per_block.iter().enumerate() {
+            let lsbs = symbols.lsb_counts[block] as u32;
+            let p = pb as usize;
+            if lsbs == 0 {
+                re.enc_icdf(p, PULSE_COUNT_ICDFS[symbols.rate_level as usize], 8);
+            } else {
+                re.enc_icdf(17, PULSE_COUNT_ICDFS[symbols.rate_level as usize], 8);
+                for _ in 1..lsbs {
+                    re.enc_icdf(17, PULSE_COUNT_ICDFS[9], 8);
+                }
+                if lsbs < 10 {
+                    re.enc_icdf(p, PULSE_COUNT_ICDFS[9], 8);
+                } else {
+                    re.enc_icdf(p, PULSE_COUNT_ICDFS[10], 8);
+                }
+            }
+        }
+
+        // ----- §4.2.7.8.3 pulse locations ---------------------------
+        for (block, &pb) in pulses_per_block.iter().enumerate() {
+            if pb == 0 {
+                continue;
+            }
+            let base = block * SHELL_BLOCK_SAMPLES;
+            Self::encode_pulse_locations(re, &top[base..base + SHELL_BLOCK_SAMPLES], 16)?;
+        }
+
+        // ----- §4.2.7.8.4 LSB encoding ------------------------------
+        for (block, &lc) in symbols.lsb_counts.iter().enumerate() {
+            let lsbs = lc as u32;
+            if lsbs == 0 {
+                continue;
+            }
+            let base = block * SHELL_BLOCK_SAMPLES;
+            for &mag in &magnitudes[base..base + SHELL_BLOCK_SAMPLES] {
+                // MSB-first refinement bits below the top magnitude.
+                for j in (0..lsbs).rev() {
+                    let bit = (mag >> j) & 1;
+                    re.enc_icdf(bit as usize, LSB_ICDF, 8);
+                }
+            }
+        }
+
+        // ----- §4.2.7.8.5 sign encoding -----------------------------
+        for (block, &pb) in pulses_per_block.iter().enumerate() {
+            let icdf = sign_icdf(cfg.signal_type, cfg.qoff_type, pb as u32);
+            let base = block * SHELL_BLOCK_SAMPLES;
+            for i in base..base + SHELL_BLOCK_SAMPLES {
+                if magnitudes[i] > 0 {
+                    // Symbol 0 = negative, 1 = positive.
+                    re.enc_icdf(if signs[i] < 0 { 0 } else { 1 }, icdf, 8);
+                }
+            }
+        }
+
+        // ----- §4.2.7.8.6 reconstruction with LCG -------------------
+        let e_q23 = reconstruct_e_q23(&magnitudes, &signs, &cfg);
+        let lsb_count_per_block = symbols.lsb_counts.to_vec();
+
+        Ok(Self {
+            e_q23,
+            rate_level: symbols.rate_level,
+            shell_blocks,
+            pulses_per_block,
+            lsb_count_per_block,
+        })
+    }
+
+    /// Recursive helper mirroring [`Self::decode_pulse_locations`]:
+    /// write the §4.2.7.8.3 left-half counts, preorder, for a
+    /// partition whose per-sample pre-LSB magnitudes are `top`.
+    ///
+    /// Defensively returns `Error::MalformedPacket` if a split were
+    /// to land on a zero-probability cell (encoding one would collapse
+    /// the range to zero width and hang the coder). The corrected
+    /// Table 47-50 transcriptions contain no zero cells, so every
+    /// distribution of `1..=16` pulses over a 16-sample block is
+    /// representable and this guard is unreachable in practice.
+    fn encode_pulse_locations(
+        re: &mut RangeEncoder,
+        top: &[u32],
+        partition_size: usize,
+    ) -> Result<(), Error> {
+        let pulses: u32 = top.iter().sum();
+        debug_assert!(pulses > 0);
+        if partition_size == 1 {
+            // Terminal: the count IS the magnitude; nothing coded.
+            return Ok(());
+        }
+        let half = partition_size / 2;
+        let left: u32 = top[..half].iter().sum();
+        let right = pulses - left;
+        let icdf = split_icdf(partition_size, pulses as u8);
+        // Reject zero-probability cells: encoding one would collapse
+        // the range to zero width (an invalid, undecodable stream).
+        let k = left as usize;
+        let width = if k == 0 {
+            256 - icdf[0] as u32
+        } else {
+            icdf[k - 1] as u32 - icdf[k] as u32
+        };
+        if width == 0 {
+            return Err(Error::MalformedPacket);
+        }
+        re.enc_icdf(k, icdf, 8);
+        if left > 0 {
+            Self::encode_pulse_locations(re, &top[..half], half)?;
+        }
+        if right > 0 {
+            Self::encode_pulse_locations(re, &top[half..], half)?;
+        }
+        Ok(())
     }
 
     /// Recursive helper for §4.2.7.8.3: distribute `pulses` pulses into
@@ -782,6 +942,59 @@ impl Excitation {
     pub fn lsb_count_per_block(&self) -> &[u8] {
         &self.lsb_count_per_block
     }
+}
+
+/// The §4.2.7.8 symbol script for one SILK frame on the encode side,
+/// consumed by [`Excitation::encode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExcitationSymbols<'a> {
+    /// §4.2.7.8.1 rate level, `0..=8`.
+    pub rate_level: u8,
+    /// §4.2.7.8.2 per-shell-block extra-LSB counts, `0..=10` each;
+    /// length must equal the frame's shell-block count (Table 44).
+    pub lsb_counts: &'a [u8],
+    /// The quantized signed excitation, one entry per sample
+    /// (`16 × shell_blocks`). `|e_raw[i]|` is the final per-sample
+    /// magnitude (after LSB refinement); the sign is coded for
+    /// non-zero magnitudes. Each block's pre-LSB pulse count
+    /// `sum(|e_raw[i]| >> lsb_count)` must be `<= 16`.
+    pub e_raw: &'a [i32],
+}
+
+/// The §4.2.7.8.6 reconstruction, shared by the decode and encode
+/// paths. For each sample:
+///
+/// ```text
+/// e_raw  = signs[i] * magnitudes[i]
+/// e_Q23  = (e_raw << 8) - sign(e_raw)*20 + offset_Q23
+/// seed   = (196314165*seed + 907633515) & 0xFFFFFFFF
+/// if (seed & 0x80000000): e_Q23 = -e_Q23
+/// seed   = (seed + e_raw) & 0xFFFFFFFF
+/// ```
+///
+/// where `sign()` returns 0 for a zero magnitude (§1.1.4), so the 20
+/// term is only applied to non-zero samples, and the LCG runs in
+/// 32-bit wrapping arithmetic seeded by the §4.2.7.7 seed.
+fn reconstruct_e_q23(magnitudes: &[u32], signs: &[i32], cfg: &ExcitationConfig) -> Vec<i32> {
+    let offset_q23 = quantization_offset_q23(cfg.signal_type, cfg.qoff_type);
+    let mut e_q23 = vec![0i32; magnitudes.len()];
+    let mut seed: u32 = cfg.lcg_seed as u32;
+    for i in 0..magnitudes.len() {
+        let mag = magnitudes[i] as i32;
+        let sign = signs[i];
+        let e_raw = sign * mag;
+        let sign_e = if mag == 0 { 0 } else { sign };
+        let mut e = (e_raw << 8) - sign_e * 20 + offset_q23;
+        seed = seed.wrapping_mul(196_314_165).wrapping_add(907_633_515);
+        if (seed & 0x8000_0000) != 0 {
+            e = -e;
+        }
+        // e_raw can be negative; the u32 cast wraps mod 2^32, which is
+        // exactly the spec's `& 0xFFFFFFFF`.
+        seed = seed.wrapping_add(e_raw as u32);
+        e_q23[i] = e;
+    }
+    e_q23
 }
 
 #[cfg(test)]
@@ -883,60 +1096,93 @@ mod tests {
         assert_eq!(PULSE_COUNT_ICDFS[10][17], 0);
     }
 
-    // --- Tables 47–50 split iCDFs (one spot-check per table) -------
+    // --- Tables 47-50 split iCDFs: exhaustive per-row verification -
+    //
+    // Every row of all four split tables is checked against the RFC
+    // 6716 PDF text (a round-382 sweep found five mis-transcribed rows
+    // in the original spot-checked transcription: Table 47 rows 9 and
+    // 11, Table 48 row 9, Table 49 rows 7 and 16).
 
     #[test]
-    fn table47_split16_one_pulse() {
-        // {126, 130}/256 -> iCDF [130, 0].
-        check_icdf(&[126, 130], SPLIT16_ICDF_1);
-    }
-
-    #[test]
-    fn table47_split16_eight_pulses() {
-        // {2, 8, 25, 54, 73, 59, 27, 7, 1}/256.
-        check_icdf(&[2, 8, 25, 54, 73, 59, 27, 7, 1], SPLIT16_ICDF_8);
-    }
-
-    #[test]
-    fn table48_split8_one_pulse() {
-        // {127, 129}/256 -> iCDF [129, 0].
-        check_icdf(&[127, 129], SPLIT8_ICDF_1);
-    }
-
-    #[test]
-    fn table48_split8_seven_pulses() {
-        // {3, 13, 40, 71, 73, 41, 13, 2}/256.
-        check_icdf(&[3, 13, 40, 71, 73, 41, 13, 2], SPLIT8_ICDF_7);
-    }
-
-    #[test]
-    fn table49_split4_one_pulse() {
-        // {127, 129}/256.
-        check_icdf(&[127, 129], SPLIT4_ICDF_1);
-    }
-
-    #[test]
-    fn table49_split4_eleven_pulses() {
-        // {1, 6, 16, 27, 36, 42, 42, 36, 27, 16, 6, 1}/256.
-        check_icdf(
+    fn tables_47_to_50_all_rows_match_rfc_pdfs() {
+        let table47: [&[u32]; 16] = [
+            &[126, 130],
+            &[56, 142, 58],
+            &[25, 101, 104, 26],
+            &[12, 60, 108, 64, 12],
+            &[7, 35, 84, 87, 37, 6],
+            &[4, 20, 59, 86, 63, 21, 3],
+            &[3, 12, 38, 72, 75, 42, 12, 2],
+            &[2, 8, 25, 54, 73, 59, 27, 7, 1],
+            &[2, 5, 17, 39, 63, 65, 42, 18, 4, 1],
+            &[1, 4, 12, 28, 49, 63, 54, 30, 11, 3, 1],
+            &[1, 4, 8, 20, 37, 55, 57, 41, 22, 8, 2, 1],
+            &[1, 3, 7, 15, 28, 44, 53, 48, 33, 16, 6, 1, 1],
+            &[1, 2, 6, 12, 21, 35, 47, 48, 40, 25, 12, 5, 1, 1],
+            &[1, 1, 4, 10, 17, 27, 37, 47, 43, 33, 21, 9, 4, 1, 1],
+            &[1, 1, 1, 8, 14, 22, 33, 40, 43, 38, 28, 16, 8, 1, 1, 1],
+            &[1, 1, 1, 1, 13, 18, 27, 36, 41, 41, 34, 24, 14, 1, 1, 1, 1],
+        ];
+        let table48: [&[u32]; 16] = [
+            &[127, 129],
+            &[53, 149, 54],
+            &[22, 105, 106, 23],
+            &[11, 61, 111, 63, 10],
+            &[6, 35, 86, 88, 36, 5],
+            &[4, 20, 59, 87, 62, 21, 3],
+            &[3, 13, 40, 71, 73, 41, 13, 2],
+            &[3, 9, 27, 53, 70, 56, 28, 9, 1],
+            &[3, 8, 19, 37, 57, 61, 44, 20, 6, 1],
+            &[3, 7, 15, 28, 44, 54, 49, 33, 17, 5, 1],
+            &[1, 7, 13, 22, 34, 46, 48, 38, 28, 14, 4, 1],
+            &[1, 1, 11, 22, 27, 35, 42, 47, 33, 25, 10, 1, 1],
+            &[1, 1, 6, 14, 26, 37, 43, 43, 37, 26, 14, 6, 1, 1],
+            &[1, 1, 4, 10, 20, 31, 40, 42, 40, 31, 20, 10, 4, 1, 1],
+            &[1, 1, 3, 8, 16, 26, 35, 38, 38, 35, 26, 16, 8, 3, 1, 1],
+            &[1, 1, 2, 6, 12, 21, 30, 36, 38, 36, 30, 21, 12, 6, 2, 1, 1],
+        ];
+        let table49: [&[u32]; 16] = [
+            &[127, 129],
+            &[49, 157, 50],
+            &[20, 107, 109, 20],
+            &[11, 60, 113, 62, 10],
+            &[7, 36, 84, 87, 36, 6],
+            &[6, 24, 57, 82, 60, 23, 4],
+            &[5, 18, 39, 64, 68, 42, 16, 4],
+            &[6, 14, 29, 47, 61, 52, 30, 14, 3],
+            &[1, 15, 23, 35, 51, 50, 40, 30, 10, 1],
+            &[1, 1, 21, 32, 42, 52, 46, 41, 18, 1, 1],
             &[1, 6, 16, 27, 36, 42, 42, 36, 27, 16, 6, 1],
-            SPLIT4_ICDF_11,
-        );
-    }
-
-    #[test]
-    fn table50_split2_one_pulse() {
-        // {128, 128}/256.
-        check_icdf(&[128, 128], SPLIT2_ICDF_1);
-    }
-
-    #[test]
-    fn table50_split2_thirteen_pulses() {
-        // {1, 5, 10, 17, 25, 32, 38, 38, 32, 25, 17, 10, 5, 1}/256.
-        check_icdf(
+            &[1, 5, 12, 21, 31, 38, 40, 38, 31, 21, 12, 5, 1],
+            &[1, 3, 9, 17, 26, 34, 38, 38, 34, 26, 17, 9, 3, 1],
+            &[1, 3, 7, 14, 22, 29, 34, 36, 34, 29, 22, 14, 7, 3, 1],
+            &[1, 2, 5, 11, 18, 25, 31, 35, 35, 31, 25, 18, 11, 5, 2, 1],
+            &[1, 1, 4, 9, 15, 21, 28, 32, 34, 32, 28, 21, 15, 9, 4, 1, 1],
+        ];
+        let table50: [&[u32]; 16] = [
+            &[128, 128],
+            &[42, 172, 42],
+            &[21, 107, 107, 21],
+            &[12, 60, 112, 61, 11],
+            &[8, 34, 86, 86, 35, 7],
+            &[8, 23, 55, 90, 55, 20, 5],
+            &[5, 15, 38, 72, 72, 36, 15, 3],
+            &[6, 12, 27, 52, 77, 47, 20, 10, 5],
+            &[6, 19, 28, 35, 40, 40, 35, 28, 19, 6],
+            &[4, 14, 22, 31, 37, 40, 37, 31, 22, 14, 4],
+            &[3, 10, 18, 26, 33, 38, 38, 33, 26, 18, 10, 3],
+            &[2, 8, 13, 21, 29, 36, 38, 36, 29, 21, 13, 8, 2],
             &[1, 5, 10, 17, 25, 32, 38, 38, 32, 25, 17, 10, 5, 1],
-            SPLIT2_ICDF_13,
-        );
+            &[1, 4, 7, 13, 21, 29, 35, 36, 35, 29, 21, 13, 7, 4, 1],
+            &[1, 2, 5, 10, 17, 25, 32, 36, 36, 32, 25, 17, 10, 5, 2, 1],
+            &[1, 2, 4, 7, 13, 21, 28, 34, 36, 34, 28, 21, 13, 7, 4, 2, 1],
+        ];
+        for p in 0..16 {
+            check_icdf(table47[p], SPLIT16_ICDFS[p]);
+            check_icdf(table48[p], SPLIT8_ICDFS[p]);
+            check_icdf(table49[p], SPLIT4_ICDFS[p]);
+            check_icdf(table50[p], SPLIT2_ICDFS[p]);
+        }
     }
 
     // --- Table 51 LSB iCDF -----------------------------------------
@@ -1344,5 +1590,219 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ----- §4.2.7.8 encode-side mirror ------------------------------
+
+    /// A tiny deterministic LCG for the encode/decode roundtrip sweeps
+    /// (test-harness only; unrelated to the §4.2.7.8.6 LCG).
+    struct TestLcg(u64);
+    impl TestLcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 32) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.next_u32() % n
+        }
+    }
+
+    /// encode → decode roundtrip over random excitation scripts across
+    /// every bandwidth / frame size / signal type / LSB depth: the
+    /// decoder must reconstruct exactly the `Excitation` (including
+    /// `e_q23`) the encoder predicted.
+    #[test]
+    fn excitation_encode_decode_roundtrip_random() {
+        use crate::range_encoder::RangeEncoder;
+        let mut rng = TestLcg(0xE8C1_7A71_0000_0001);
+        for round in 0..300 {
+            let bandwidth = match rng.below(3) {
+                0 => Bandwidth::Nb,
+                1 => Bandwidth::Mb,
+                _ => Bandwidth::Wb,
+            };
+            let frame_size = if rng.below(2) == 0 {
+                SilkFrameSize::TenMs
+            } else {
+                SilkFrameSize::TwentyMs
+            };
+            let signal_type = match rng.below(3) {
+                0 => SignalType::Inactive,
+                1 => SignalType::Unvoiced,
+                _ => SignalType::Voiced,
+            };
+            let qoff_type = if rng.below(2) == 0 {
+                QuantizationOffsetType::Low
+            } else {
+                QuantizationOffsetType::High
+            };
+            let cfg = ExcitationConfig {
+                bandwidth,
+                frame_size,
+                signal_type,
+                qoff_type,
+                lcg_seed: rng.below(4) as u8,
+            };
+            let blocks = shell_block_count(bandwidth, frame_size).unwrap();
+            let total = blocks * SHELL_BLOCK_SAMPLES;
+
+            // Random per-block LSB counts (mostly 0, sometimes 1..=3,
+            // rarely deep chains up to 10) and pulse budgets.
+            let mut lsb_counts = vec![0u8; blocks];
+            let mut e_raw = vec![0i32; total];
+            for (b, lc) in lsb_counts.iter_mut().enumerate() {
+                let lsbs = match rng.below(10) {
+                    0..=5 => 0u32,
+                    6 | 7 => 1 + rng.below(3),
+                    8 => 4 + rng.below(5),
+                    _ => 10,
+                };
+                *lc = lsbs as u8;
+                // Distribute up to 16 pre-LSB pulses over the block.
+                let budget = rng.below(17);
+                let base = b * SHELL_BLOCK_SAMPLES;
+                let mut spent = 0u32;
+                while spent < budget {
+                    let i = base + rng.below(16) as usize;
+                    let add = 1 + rng.below(budget - spent);
+                    e_raw[i] += (add << lsbs) as i32;
+                    spent += add;
+                }
+                // Random LSB refinement bits + random signs.
+                for slot in e_raw[base..base + SHELL_BLOCK_SAMPLES].iter_mut() {
+                    if lsbs > 0 {
+                        *slot += (rng.next_u32() & ((1 << lsbs) - 1)) as i32;
+                    }
+                    if *slot != 0 && rng.below(2) == 0 {
+                        *slot = -*slot;
+                    }
+                }
+            }
+
+            let symbols = ExcitationSymbols {
+                rate_level: rng.below(9) as u8,
+                lsb_counts: &lsb_counts,
+                e_raw: &e_raw,
+            };
+            let mut re = RangeEncoder::new();
+            let predicted = Excitation::encode(&mut re, cfg, &symbols).expect("encode");
+            let bytes = re.finish();
+
+            let mut rd = RangeDecoder::new(&bytes);
+            let decoded = Excitation::decode(&mut rd, cfg).expect("decode");
+            assert!(!rd.has_error(), "round {round}");
+            assert_eq!(decoded, predicted, "round {round} cfg={cfg:?}");
+        }
+    }
+
+    /// The encode path rejects an over-budget block (pre-LSB pulse
+    /// count > 16), bad lengths, and out-of-range parameters.
+    #[test]
+    fn excitation_encode_rejects_bad_inputs() {
+        use crate::range_encoder::RangeEncoder;
+        let cfg = ExcitationConfig {
+            bandwidth: Bandwidth::Nb,
+            frame_size: SilkFrameSize::TenMs,
+            signal_type: SignalType::Voiced,
+            qoff_type: QuantizationOffsetType::Low,
+            lcg_seed: 0,
+        };
+        let blocks = 5usize;
+        let total = blocks * SHELL_BLOCK_SAMPLES;
+        let lsb0 = vec![0u8; blocks];
+        // 17 pre-LSB pulses in one block.
+        let mut e = vec![0i32; total];
+        e[0] = 17;
+        let mut re = RangeEncoder::new();
+        assert!(Excitation::encode(
+            &mut re,
+            cfg,
+            &ExcitationSymbols {
+                rate_level: 0,
+                lsb_counts: &lsb0,
+                e_raw: &e,
+            }
+        )
+        .is_err());
+        // Rate level out of range.
+        let z = vec![0i32; total];
+        let mut re = RangeEncoder::new();
+        assert!(Excitation::encode(
+            &mut re,
+            cfg,
+            &ExcitationSymbols {
+                rate_level: 9,
+                lsb_counts: &lsb0,
+                e_raw: &z,
+            }
+        )
+        .is_err());
+        // Wrong lsb_counts length.
+        let mut re = RangeEncoder::new();
+        assert!(Excitation::encode(
+            &mut re,
+            cfg,
+            &ExcitationSymbols {
+                rate_level: 0,
+                lsb_counts: &lsb0[..4],
+                e_raw: &z,
+            }
+        )
+        .is_err());
+        // LSB count > 10.
+        let bad_lsb = vec![11u8; blocks];
+        let mut re = RangeEncoder::new();
+        assert!(Excitation::encode(
+            &mut re,
+            cfg,
+            &ExcitationSymbols {
+                rate_level: 0,
+                lsb_counts: &bad_lsb,
+                e_raw: &z,
+            }
+        )
+        .is_err());
+        // All 16 pulses concentrated on the left 2-sample half of a
+        // 4-sample partition: Table 49's `left = 16` cell has
+        // probability 1/256 (the round-382 table sweep fixed this
+        // row's transcription, which previously read 0 here and made
+        // the layout hang the encoder), so the extreme layout must
+        // encode AND decode back exactly.
+        let mut e = vec![0i32; total];
+        e[0] = 8;
+        e[1] = 8;
+        let mut re = RangeEncoder::new();
+        let predicted = Excitation::encode(
+            &mut re,
+            cfg,
+            &ExcitationSymbols {
+                rate_level: 0,
+                lsb_counts: &lsb0,
+                e_raw: &e,
+            },
+        )
+        .expect("extreme concentration must be encodable");
+        let bytes = re.finish();
+        let mut rd = RangeDecoder::new(&bytes);
+        let decoded = Excitation::decode(&mut rd, cfg).expect("decode");
+        assert_eq!(decoded, predicted);
+        // A 17-magnitude with one LSB is fine (top = 8).
+        let lsb1 = vec![1u8; blocks];
+        let mut e = vec![0i32; total];
+        e[0] = 17;
+        let mut re = RangeEncoder::new();
+        assert!(Excitation::encode(
+            &mut re,
+            cfg,
+            &ExcitationSymbols {
+                rate_level: 0,
+                lsb_counts: &lsb1,
+                e_raw: &e,
+            }
+        )
+        .is_ok());
     }
 }

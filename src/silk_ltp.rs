@@ -29,6 +29,7 @@
 //! library source is consulted.
 
 use crate::range_decoder::RangeDecoder;
+use crate::range_encoder::RangeEncoder;
 use crate::silk_frame::SignalType;
 use crate::toc::Bandwidth;
 use crate::Error;
@@ -451,6 +452,142 @@ impl LtpParameters {
         })
     }
 
+    /// Encode the §4.2.7.6 LTP parameters into `re` — the exact
+    /// write-side mirror of [`Self::decode`].
+    ///
+    /// For a non-voiced `cfg.signal_type`, `symbols` must be `None`: no
+    /// bits are written and the empty (`!is_voiced()`) result is
+    /// returned. For a voiced frame `symbols` must be `Some` and
+    /// supplies every §4.2.7.6 symbol choice; the lag symbol variant
+    /// must match `cfg.lag_coding` and every index must lie in its
+    /// table's support. Returns the [`LtpParameters`] the decoder will
+    /// reconstruct.
+    pub fn encode(
+        re: &mut RangeEncoder,
+        cfg: LtpConfig,
+        symbols: Option<&LtpSymbols>,
+    ) -> Result<Self, Error> {
+        if cfg.num_subframes != 2 && cfg.num_subframes != 4 {
+            return Err(Error::MalformedPacket);
+        }
+        let spec = lag_low_spec(cfg.bandwidth)?;
+        let num = cfg.num_subframes as usize;
+
+        if cfg.signal_type != SignalType::Voiced {
+            if symbols.is_some() {
+                return Err(Error::MalformedPacket);
+            }
+            return Ok(Self {
+                voiced: false,
+                primary_lag: 0,
+                contour_index: 0,
+                pitch_lags: [0; LTP_MAX_SUBFRAMES],
+                periodicity_index: 0,
+                filter_taps_q7: [[0; LTP_FILTER_TAPS]; LTP_MAX_SUBFRAMES],
+                filter_indices: [0; LTP_MAX_SUBFRAMES],
+                ltp_scaling_q14: LTP_SCALING_DEFAULT_Q14,
+                len: cfg.num_subframes,
+            });
+        }
+        let symbols = symbols.ok_or(Error::MalformedPacket)?;
+
+        // --- §4.2.7.6.1 primary pitch lag -----------------------------
+        // `lag_low` support is the Table 30 codebook size (== scale).
+        let lag_low_count = spec.scale as u8;
+        let encode_absolute =
+            |re: &mut RangeEncoder, lag_high: u8, lag_low: u8| -> Result<i32, Error> {
+                if lag_high > 31 || lag_low >= lag_low_count {
+                    return Err(Error::MalformedPacket);
+                }
+                re.enc_icdf(lag_high as usize, LAG_HIGH_ICDF, 8);
+                re.enc_icdf(lag_low as usize, spec.icdf, 8);
+                Ok(lag_high as i32 * spec.scale + lag_low as i32 + spec.lag_min)
+            };
+        let primary_lag = match (cfg.lag_coding, symbols.lag) {
+            (LagCoding::Absolute, LagSymbols::Absolute { lag_high, lag_low }) => {
+                encode_absolute(re, lag_high, lag_low)?
+            }
+            (LagCoding::Relative { previous_lag }, LagSymbols::RelativeDelta { delta_index }) => {
+                if delta_index == 0 || delta_index > 20 {
+                    // Index 0 is the absolute-coding fallback and must be
+                    // written via `RelativeFallback`.
+                    return Err(Error::MalformedPacket);
+                }
+                re.enc_icdf(delta_index as usize, LAG_DELTA_ICDF, 8);
+                previous_lag + (delta_index as i32 - 9)
+            }
+            (LagCoding::Relative { .. }, LagSymbols::RelativeFallback { lag_high, lag_low }) => {
+                re.enc_icdf(0, LAG_DELTA_ICDF, 8);
+                encode_absolute(re, lag_high, lag_low)?
+            }
+            _ => return Err(Error::MalformedPacket),
+        };
+
+        // --- §4.2.7.6.1 pitch contour → per-subframe lags -------------
+        // An iCDF table's terminating 0 entry is itself the last valid
+        // symbol, so the symbol count equals the table length.
+        let contour_cells = contour_icdf(cfg.bandwidth, num).len();
+        if symbols.contour_index as usize >= contour_cells {
+            return Err(Error::MalformedPacket);
+        }
+        re.enc_icdf(
+            symbols.contour_index as usize,
+            contour_icdf(cfg.bandwidth, num),
+            8,
+        );
+        let mut pitch_lags = [0i32; LTP_MAX_SUBFRAMES];
+        for (k, slot) in pitch_lags.iter_mut().enumerate().take(num) {
+            let offset = contour_offset(cfg.bandwidth, num, symbols.contour_index, k) as i32;
+            *slot = (primary_lag + offset).clamp(spec.lag_min, spec.lag_max);
+        }
+
+        // --- §4.2.7.6.2 LTP filter coefficients -----------------------
+        if symbols.periodicity_index > 2 {
+            return Err(Error::MalformedPacket);
+        }
+        re.enc_icdf(symbols.periodicity_index as usize, PERIODICITY_ICDF, 8);
+        let filter_icdf = ltp_filter_icdf(symbols.periodicity_index);
+        let filter_cells = filter_icdf.len();
+        let mut filter_indices = [0u8; LTP_MAX_SUBFRAMES];
+        let mut filter_taps_q7 = [[0i8; LTP_FILTER_TAPS]; LTP_MAX_SUBFRAMES];
+        for k in 0..num {
+            let idx = symbols.filter_indices[k];
+            if idx as usize >= filter_cells {
+                return Err(Error::MalformedPacket);
+            }
+            re.enc_icdf(idx as usize, filter_icdf, 8);
+            filter_indices[k] = idx;
+            filter_taps_q7[k] = ltp_filter_taps(symbols.periodicity_index, idx);
+        }
+
+        // --- §4.2.7.6.3 LTP scaling -----------------------------------
+        if cfg.ltp_scaling_present != symbols.ltp_scaling_index.is_some() {
+            return Err(Error::MalformedPacket);
+        }
+        let ltp_scaling_q14 = match symbols.ltp_scaling_index {
+            Some(s) => {
+                if s > 2 {
+                    return Err(Error::MalformedPacket);
+                }
+                re.enc_icdf(s as usize, LTP_SCALING_ICDF, 8);
+                LTP_SCALING_VALUES_Q14[s as usize]
+            }
+            None => LTP_SCALING_DEFAULT_Q14,
+        };
+
+        Ok(Self {
+            voiced: true,
+            primary_lag,
+            contour_index: symbols.contour_index,
+            pitch_lags,
+            periodicity_index: symbols.periodicity_index,
+            filter_taps_q7,
+            filter_indices,
+            ltp_scaling_q14,
+            len: cfg.num_subframes,
+        })
+    }
+
     /// Decode the §4.2.7.6.1 primary pitch lag. Absolute coding combines
     /// a Table 29 high part with a Table 30 low part; relative coding adds
     /// a Table 31 delta to `previous_lag`, falling back to absolute coding
@@ -553,6 +690,58 @@ impl LtpParameters {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+}
+
+/// The §4.2.7.6.1 primary-lag symbol choice on the encode side —
+/// which coding path [`LtpParameters::encode`] writes and its raw
+/// indices. The variant must match the frame's [`LagCoding`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LagSymbols {
+    /// Absolute coding ([`LagCoding::Absolute`]): the Table 29 high
+    /// part (`0..=31`) and the Table 30 bandwidth-dependent low part
+    /// (`0..lag_scale`).
+    Absolute {
+        /// Table 29 high part, `0..=31`.
+        lag_high: u8,
+        /// Table 30 low part, `0..lag_scale` (4 NB / 6 MB / 8 WB).
+        lag_low: u8,
+    },
+    /// Relative coding ([`LagCoding::Relative`]) with a non-zero
+    /// Table 31 delta index (`1..=20`); the decoded lag is
+    /// `previous_lag + (delta_index - 9)`.
+    RelativeDelta {
+        /// Table 31 delta index, `1..=20` (0 is the fallback and must
+        /// be written via [`LagSymbols::RelativeFallback`]).
+        delta_index: u8,
+    },
+    /// Relative coding falling back to absolute (§4.2.7.6.1: a zero
+    /// delta): the zero Table 31 symbol followed by the absolute pair.
+    RelativeFallback {
+        /// Table 29 high part, `0..=31`.
+        lag_high: u8,
+        /// Table 30 low part, `0..lag_scale`.
+        lag_low: u8,
+    },
+}
+
+/// The full §4.2.7.6 symbol script for one voiced SILK frame on the
+/// encode side, consumed by [`LtpParameters::encode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LtpSymbols {
+    /// §4.2.7.6.1 primary-lag coding choice.
+    pub lag: LagSymbols,
+    /// §4.2.7.6.1 pitch-contour VQ index into the Table 33–36 codebook
+    /// selected by `(bandwidth, num_subframes)`.
+    pub contour_index: u8,
+    /// §4.2.7.6.2 periodicity index, `0..=2`.
+    pub periodicity_index: u8,
+    /// §4.2.7.6.2 per-subframe filter indices into the periodicity's
+    /// Table 39–41 codebook; only the first `num_subframes` entries
+    /// are used.
+    pub filter_indices: [u8; LTP_MAX_SUBFRAMES],
+    /// §4.2.7.6.3 LTP-scaling index (`0..=2`); must be `Some` iff
+    /// [`LtpConfig::ltp_scaling_present`].
+    pub ltp_scaling_index: Option<u8>,
 }
 
 /// Table 32 contour PDF (as iCDF) for `(bandwidth, num_subframes)`.
@@ -1036,5 +1225,211 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ----- §4.2.7.6 encode-side mirror ------------------------------
+
+    /// A tiny deterministic LCG for the encode/decode roundtrip sweeps.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 32) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.next_u32() % n
+        }
+    }
+
+    /// encode → decode roundtrip over random LTP symbol scripts across
+    /// every bandwidth / frame size / lag-coding / scaling combination:
+    /// the decoder must reconstruct exactly the parameters the encoder
+    /// predicted.
+    #[test]
+    fn ltp_encode_decode_roundtrip_random() {
+        use crate::range_encoder::RangeEncoder;
+        let mut rng = Lcg(0x17B_CAFE);
+        for _ in 0..800 {
+            let bandwidth = match rng.below(3) {
+                0 => Bandwidth::Nb,
+                1 => Bandwidth::Mb,
+                _ => Bandwidth::Wb,
+            };
+            let num_subframes = if rng.below(2) == 0 { 2u8 } else { 4 };
+            let relative = rng.below(2) == 1;
+            let lag_coding = if relative {
+                LagCoding::Relative {
+                    previous_lag: 16 + rng.below(250) as i32,
+                }
+            } else {
+                LagCoding::Absolute
+            };
+            let ltp_scaling_present = rng.below(2) == 1;
+            let cfg = LtpConfig {
+                bandwidth,
+                signal_type: SignalType::Voiced,
+                num_subframes,
+                lag_coding,
+                ltp_scaling_present,
+            };
+
+            let lag_low_count = match bandwidth {
+                Bandwidth::Nb => 4u32,
+                Bandwidth::Mb => 6,
+                _ => 8,
+            };
+            let lag = if relative {
+                if rng.below(2) == 0 {
+                    LagSymbols::RelativeDelta {
+                        delta_index: 1 + rng.below(20) as u8,
+                    }
+                } else {
+                    LagSymbols::RelativeFallback {
+                        lag_high: rng.below(32) as u8,
+                        lag_low: rng.below(lag_low_count) as u8,
+                    }
+                }
+            } else {
+                LagSymbols::Absolute {
+                    lag_high: rng.below(32) as u8,
+                    lag_low: rng.below(lag_low_count) as u8,
+                }
+            };
+            let contour_cells = match (bandwidth, num_subframes) {
+                (Bandwidth::Nb, 2) => 3u32,
+                (Bandwidth::Nb, 4) => 11,
+                (_, 2) => 12,
+                _ => 34,
+            };
+            let periodicity_index = rng.below(3) as u8;
+            let filter_cells = [8u32, 16, 32][periodicity_index as usize];
+            let mut filter_indices = [0u8; LTP_MAX_SUBFRAMES];
+            for f in filter_indices.iter_mut().take(num_subframes as usize) {
+                *f = rng.below(filter_cells) as u8;
+            }
+            let symbols = LtpSymbols {
+                lag,
+                contour_index: rng.below(contour_cells) as u8,
+                periodicity_index,
+                filter_indices,
+                ltp_scaling_index: ltp_scaling_present.then(|| rng.below(3) as u8),
+            };
+
+            let mut re = RangeEncoder::new();
+            let predicted = LtpParameters::encode(&mut re, cfg, Some(&symbols)).expect("encode");
+            let bytes = re.finish();
+
+            let mut rd = RangeDecoder::new(&bytes);
+            let decoded = LtpParameters::decode(&mut rd, cfg).expect("decode");
+            assert!(!rd.has_error());
+            assert_eq!(decoded, predicted, "cfg={cfg:?} symbols={symbols:?}");
+        }
+    }
+
+    /// A non-voiced encode writes nothing and returns the empty result;
+    /// supplying symbols for a non-voiced frame is rejected.
+    #[test]
+    fn ltp_encode_non_voiced_writes_nothing() {
+        use crate::range_encoder::RangeEncoder;
+        let cfg = LtpConfig {
+            bandwidth: Bandwidth::Nb,
+            signal_type: SignalType::Unvoiced,
+            num_subframes: 4,
+            lag_coding: LagCoding::Absolute,
+            ltp_scaling_present: false,
+        };
+        let mut re = RangeEncoder::new();
+        let tell0 = re.tell();
+        let params = LtpParameters::encode(&mut re, cfg, None).expect("encode");
+        assert_eq!(re.tell(), tell0);
+        assert!(!params.is_voiced());
+        assert_eq!(params.ltp_scaling_q14(), LTP_SCALING_DEFAULT_Q14);
+
+        let mut re = RangeEncoder::new();
+        let symbols = LtpSymbols {
+            lag: LagSymbols::Absolute {
+                lag_high: 0,
+                lag_low: 0,
+            },
+            contour_index: 0,
+            periodicity_index: 0,
+            filter_indices: [0; LTP_MAX_SUBFRAMES],
+            ltp_scaling_index: None,
+        };
+        assert!(LtpParameters::encode(&mut re, cfg, Some(&symbols)).is_err());
+    }
+
+    /// The encode path rejects mismatched lag variants and
+    /// out-of-support indices.
+    #[test]
+    fn ltp_encode_rejects_bad_symbols() {
+        use crate::range_encoder::RangeEncoder;
+        let cfg_abs = LtpConfig {
+            bandwidth: Bandwidth::Nb,
+            signal_type: SignalType::Voiced,
+            num_subframes: 2,
+            lag_coding: LagCoding::Absolute,
+            ltp_scaling_present: false,
+        };
+        let ok = LtpSymbols {
+            lag: LagSymbols::Absolute {
+                lag_high: 3,
+                lag_low: 1,
+            },
+            contour_index: 0,
+            periodicity_index: 0,
+            filter_indices: [0; LTP_MAX_SUBFRAMES],
+            ltp_scaling_index: None,
+        };
+        // Relative delta on an absolute config.
+        let mut re = RangeEncoder::new();
+        let bad = LtpSymbols {
+            lag: LagSymbols::RelativeDelta { delta_index: 3 },
+            ..ok
+        };
+        assert!(LtpParameters::encode(&mut re, cfg_abs, Some(&bad)).is_err());
+        // Zero delta must use RelativeFallback.
+        let cfg_rel = LtpConfig {
+            lag_coding: LagCoding::Relative { previous_lag: 100 },
+            ..cfg_abs
+        };
+        let mut re = RangeEncoder::new();
+        let bad = LtpSymbols {
+            lag: LagSymbols::RelativeDelta { delta_index: 0 },
+            ..ok
+        };
+        assert!(LtpParameters::encode(&mut re, cfg_rel, Some(&bad)).is_err());
+        // lag_low out of range for NB (4 cells).
+        let mut re = RangeEncoder::new();
+        let bad = LtpSymbols {
+            lag: LagSymbols::Absolute {
+                lag_high: 0,
+                lag_low: 4,
+            },
+            ..ok
+        };
+        assert!(LtpParameters::encode(&mut re, cfg_abs, Some(&bad)).is_err());
+        // Contour index out of range (NB 10 ms has 3 cells).
+        let mut re = RangeEncoder::new();
+        let bad = LtpSymbols {
+            contour_index: 3,
+            ..ok
+        };
+        assert!(LtpParameters::encode(&mut re, cfg_abs, Some(&bad)).is_err());
+        // Filter index out of range for periodicity 0 (8 cells).
+        let mut re = RangeEncoder::new();
+        let mut bad = ok;
+        bad.filter_indices[1] = 8;
+        assert!(LtpParameters::encode(&mut re, cfg_abs, Some(&bad)).is_err());
+        // Scaling index present on a config without scaling.
+        let mut re = RangeEncoder::new();
+        let bad = LtpSymbols {
+            ltp_scaling_index: Some(1),
+            ..ok
+        };
+        assert!(LtpParameters::encode(&mut re, cfg_abs, Some(&bad)).is_err());
     }
 }

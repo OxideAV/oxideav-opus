@@ -35,6 +35,7 @@
 //! interpolation are deferred to round 7+.
 
 use crate::range_decoder::RangeDecoder;
+use crate::range_encoder::RangeEncoder;
 use crate::toc::Bandwidth;
 use crate::Error;
 
@@ -399,6 +400,81 @@ struct StageTables {
     weight_list_1: &'static [u8],
 }
 
+impl StageTables {
+    /// Pick the per-bandwidth tables for stage-1 index `I1 < 32`.
+    /// Hybrid is handled upstream by splitting the signal; the SILK
+    /// layer always sees Nb / Mb / Wb — SWB / FB are rejected.
+    fn for_bandwidth(bandwidth: Bandwidth, lsf_stage1: u8) -> Result<Self, Error> {
+        if lsf_stage1 >= 32 {
+            return Err(Error::MalformedPacket);
+        }
+        let i1 = lsf_stage1 as usize;
+        match bandwidth {
+            Bandwidth::Nb | Bandwidth::Mb => Ok(StageTables {
+                d_lpc: D_LPC_NB_MB,
+                qstep: QSTEP_NB_MB_Q16,
+                select_row: &NBMB_STAGE2_SELECT[i1][..],
+                icdf_lookup: nbmb_stage2_icdf,
+                pred_weight_select_row: &NBMB_PRED_WEIGHT_SELECT[i1][..],
+                weight_list_0: &NBMB_PRED_WEIGHT_A[..],
+                weight_list_1: &NBMB_PRED_WEIGHT_B[..],
+            }),
+            Bandwidth::Wb => Ok(StageTables {
+                d_lpc: D_LPC_WB,
+                qstep: QSTEP_WB_Q16,
+                select_row: &WB_STAGE2_SELECT[i1][..],
+                icdf_lookup: wb_stage2_icdf,
+                pred_weight_select_row: &WB_PRED_WEIGHT_SELECT[i1][..],
+                weight_list_0: &WB_PRED_WEIGHT_C[..],
+                weight_list_1: &WB_PRED_WEIGHT_D[..],
+            }),
+            _ => Err(Error::MalformedPacket),
+        }
+    }
+}
+
+/// The §4.2.7.5.2 backwards-prediction inverse, shared by the decode
+/// and encode paths:
+///
+/// ```text
+/// res_Q10[k] = (k+1 < d_LPC ? (res_Q10[k+1]*pred_Q8[k])>>8 : 0)
+///            + ((((I2[k]<<10) - sign(I2[k])*102) * qstep) >> 16)
+/// ```
+///
+/// The recursion runs `k = d_LPC-1` down to `0`. `pred_Q8[k]` is only
+/// defined for `0 <= k < d_LPC - 1`; for `k == d_LPC-1` the first term
+/// is zero (the `(k+1 < d_LPC)` guard).
+fn compute_res_q10(
+    i2: &[i8; D_LPC_MAX],
+    d_lpc: usize,
+    qstep: i32,
+    weight_lists: (&[u8], &[u8]),
+    pred_weight_select_row: &[u8],
+) -> [i32; D_LPC_MAX] {
+    let mut res_q10 = [0i32; D_LPC_MAX];
+    for k in (0..d_lpc).rev() {
+        // Coefficient-quantisation contribution.
+        let i2k = i2[k] as i32;
+        let sign = match i2k.cmp(&0) {
+            core::cmp::Ordering::Less => -1,
+            core::cmp::Ordering::Greater => 1,
+            core::cmp::Ordering::Equal => 0,
+        };
+        let q_contrib = (((i2k << 10) - sign * 102) * qstep) >> 16;
+
+        // Backwards-prediction contribution.
+        let pred_contrib = if k + 1 < d_lpc {
+            let pred_q8 = pred_weight(weight_lists, pred_weight_select_row, k);
+            (res_q10[k + 1] * pred_q8) >> 8
+        } else {
+            0
+        };
+
+        res_q10[k] = pred_contrib + q_contrib;
+    }
+    res_q10
+}
+
 /// Decoded stage-2 result for one SILK frame: the `d_LPC` signed indices
 /// `I2[k] ∈ [-10, 10]`, plus the Q10 backwards-prediction-undone residual
 /// `res_Q10[k]`. Round 6 stops here; round 7+ will feed `res_Q10[]` and
@@ -434,34 +510,7 @@ impl LsfStage2 {
         // signal_type is unused for stage-2; it only mattered at stage-1.
         // Kept off the signature so the caller doesn't need to thread it.
 
-        if lsf_stage1 >= 32 {
-            return Err(Error::MalformedPacket);
-        }
-        let i1 = lsf_stage1 as usize;
-
-        // Pick the per-bandwidth tables. Hybrid is handled upstream by
-        // splitting the signal; the SILK layer always sees Nb / Mb / Wb.
-        let tables = match bandwidth {
-            Bandwidth::Nb | Bandwidth::Mb => StageTables {
-                d_lpc: D_LPC_NB_MB,
-                qstep: QSTEP_NB_MB_Q16,
-                select_row: &NBMB_STAGE2_SELECT[i1][..],
-                icdf_lookup: nbmb_stage2_icdf,
-                pred_weight_select_row: &NBMB_PRED_WEIGHT_SELECT[i1][..],
-                weight_list_0: &NBMB_PRED_WEIGHT_A[..],
-                weight_list_1: &NBMB_PRED_WEIGHT_B[..],
-            },
-            Bandwidth::Wb => StageTables {
-                d_lpc: D_LPC_WB,
-                qstep: QSTEP_WB_Q16,
-                select_row: &WB_STAGE2_SELECT[i1][..],
-                icdf_lookup: wb_stage2_icdf,
-                pred_weight_select_row: &WB_PRED_WEIGHT_SELECT[i1][..],
-                weight_list_0: &WB_PRED_WEIGHT_C[..],
-                weight_list_1: &WB_PRED_WEIGHT_D[..],
-            },
-            _ => return Err(Error::MalformedPacket),
-        };
+        let tables = StageTables::for_bandwidth(bandwidth, lsf_stage1)?;
         let StageTables {
             d_lpc,
             qstep,
@@ -504,37 +553,81 @@ impl LsfStage2 {
             return Err(Error::MalformedPacket);
         }
 
-        // Pass 2 — backwards-prediction inverse over the `I2[k]`. Per
-        // §4.2.7.5.2:
-        //
-        //   res_Q10[k] = (k+1 < d_LPC ? (res_Q10[k+1]*pred_Q8[k])>>8 : 0)
-        //              + ((((I2[k]<<10) - sign(I2[k])*102) * qstep) >> 16)
-        //
-        // The recursion runs `k = d_LPC-1` down to `0`. `pred_Q8[k]`
-        // is only defined for `0 <= k < d_LPC - 1`; for k == d_LPC-1
-        // the first term is zero (the `(k+1 < d_LPC)` guard).
-        let mut res_q10 = [0i32; D_LPC_MAX];
-        for k in (0..d_lpc).rev() {
-            // Coefficient-quantisation contribution.
-            let i2k = i2[k] as i32;
-            let sign = match i2k.cmp(&0) {
-                core::cmp::Ordering::Less => -1,
-                core::cmp::Ordering::Greater => 1,
-                core::cmp::Ordering::Equal => 0,
-            };
-            let q_contrib = (((i2k << 10) - sign * 102) * qstep) >> 16;
+        // Pass 2 — backwards-prediction inverse over the `I2[k]`.
+        let res_q10 = compute_res_q10(
+            &i2,
+            d_lpc,
+            qstep,
+            (weight_list_0, weight_list_1),
+            pred_weight_select_row,
+        );
 
-            // Backwards-prediction contribution.
-            let pred_contrib = if k + 1 < d_lpc {
-                let pred_q8 =
-                    pred_weight((weight_list_0, weight_list_1), pred_weight_select_row, k);
-                (res_q10[k + 1] * pred_q8) >> 8
-            } else {
-                0
-            };
+        Ok(Self {
+            len: d_lpc as u8,
+            i2,
+            res_q10,
+        })
+    }
 
-            res_q10[k] = pred_contrib + q_contrib;
+    /// Encode `d_LPC` stage-2 indices `I2[k] ∈ [-10, 10]` into `re` —
+    /// the exact write-side mirror of [`Self::decode`].
+    ///
+    /// Each index with `|I2[k]| <= 3` is written as the single base
+    /// symbol `I2[k] + 4`; each index with `|I2[k]| >= 4` is written as
+    /// the saturated base symbol (`0` or `8`) followed by the Table 19
+    /// extension symbol `|I2[k]| - 4` — the §4.2.7.5.2 coding is
+    /// prefix-unique, so this choice is forced. Returns the
+    /// [`LsfStage2`] the decoder will reconstruct (identical `i2` plus
+    /// the derived `res_Q10[]`).
+    ///
+    /// `i2.len()` must equal the bandwidth's `d_LPC` (10 for NB / MB,
+    /// 16 for WB), every index must lie in `[-10, 10]`, and
+    /// `lsf_stage1` must be the same `I1 < 32` the decoder will use
+    /// (it selects the per-coefficient codebooks).
+    pub fn encode(
+        re: &mut RangeEncoder,
+        bandwidth: Bandwidth,
+        lsf_stage1: u8,
+        i2_in: &[i8],
+    ) -> Result<Self, Error> {
+        let tables = StageTables::for_bandwidth(bandwidth, lsf_stage1)?;
+        let StageTables {
+            d_lpc,
+            qstep,
+            select_row,
+            icdf_lookup,
+            pred_weight_select_row,
+            weight_list_0,
+            weight_list_1,
+        } = tables;
+
+        if i2_in.len() != d_lpc || i2_in.iter().any(|&v| !(-10..=10).contains(&v)) {
+            return Err(Error::MalformedPacket);
         }
+
+        let mut i2 = [0i8; D_LPC_MAX];
+        i2[..d_lpc].copy_from_slice(i2_in);
+
+        for (k, &idx) in i2_in.iter().enumerate() {
+            let icdf = icdf_lookup(select_row[k]);
+            let idx = idx as i32;
+            if idx.abs() >= 4 {
+                // Saturated base symbol + Table 19 extension.
+                let base = if idx > 0 { 8usize } else { 0 };
+                re.enc_icdf(base, icdf, 8);
+                re.enc_icdf((idx.abs() - 4) as usize, STAGE2_EXTENSION_ICDF, 8);
+            } else {
+                re.enc_icdf((idx + 4) as usize, icdf, 8);
+            }
+        }
+
+        let res_q10 = compute_res_q10(
+            &i2,
+            d_lpc,
+            qstep,
+            (weight_list_0, weight_list_1),
+            pred_weight_select_row,
+        );
 
         Ok(Self {
             len: d_lpc as u8,
@@ -1026,5 +1119,78 @@ mod tests {
         // 16 stage-2 reads plus (occasionally) some extension reads
         // must consume some bits.
         assert!(tell1 - tell0 > 0, "stage-2 decode should consume bits");
+    }
+
+    // ----- §4.2.7.5.2 encode-side mirror ----------------------------
+
+    /// A tiny deterministic LCG for the encode/decode roundtrip sweeps.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 32) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.next_u32() % n
+        }
+    }
+
+    /// encode → decode roundtrip over random index vectors across all
+    /// bandwidths and stage-1 selections, including the ±4..±10
+    /// extension range: the decoder must reconstruct exactly the
+    /// encoder's predicted `LsfStage2` (both `i2` and `res_Q10`).
+    #[test]
+    fn stage2_encode_decode_roundtrip_random() {
+        use crate::range_encoder::RangeEncoder;
+        let mut rng = Lcg(0x57A6_E2E2);
+        for _ in 0..600 {
+            let bandwidth = match rng.below(3) {
+                0 => Bandwidth::Nb,
+                1 => Bandwidth::Mb,
+                _ => Bandwidth::Wb,
+            };
+            let d_lpc = if bandwidth == Bandwidth::Wb {
+                D_LPC_WB
+            } else {
+                D_LPC_NB_MB
+            };
+            let i1 = rng.below(32) as u8;
+            let i2: Vec<i8> = (0..d_lpc).map(|_| rng.below(21) as i8 - 10).collect();
+
+            let mut re = RangeEncoder::new();
+            let predicted = LsfStage2::encode(&mut re, bandwidth, i1, &i2).expect("encode");
+            assert_eq!(predicted.i2(), &i2[..]);
+            let bytes = re.finish();
+
+            let mut rd = RangeDecoder::new(&bytes);
+            let decoded = LsfStage2::decode(&mut rd, bandwidth, i1).expect("decode");
+            assert!(!rd.has_error());
+            assert_eq!(decoded, predicted, "bw={bandwidth:?} i1={i1} i2={i2:?}");
+        }
+    }
+
+    /// The encode path rejects wrong lengths, out-of-range indices,
+    /// out-of-range stage-1, and SWB/FB bandwidths.
+    #[test]
+    fn stage2_encode_rejects_bad_inputs() {
+        use crate::range_encoder::RangeEncoder;
+        let ok10 = [0i8; 10];
+        // Wrong length for the bandwidth.
+        let mut re = RangeEncoder::new();
+        assert!(LsfStage2::encode(&mut re, Bandwidth::Wb, 0, &ok10).is_err());
+        // Out-of-range index.
+        let mut re = RangeEncoder::new();
+        let mut bad = [0i8; 10];
+        bad[3] = 11;
+        assert!(LsfStage2::encode(&mut re, Bandwidth::Nb, 0, &bad).is_err());
+        // Out-of-range stage-1 index.
+        let mut re = RangeEncoder::new();
+        assert!(LsfStage2::encode(&mut re, Bandwidth::Nb, 32, &ok10).is_err());
+        // SWB / FB rejected.
+        let mut re = RangeEncoder::new();
+        assert!(LsfStage2::encode(&mut re, Bandwidth::Swb, 0, &ok10).is_err());
     }
 }

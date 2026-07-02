@@ -219,6 +219,17 @@ impl RangeEncoder {
     /// then depends only on the `icdf[]` differences, so no total is
     /// needed.
     pub fn enc_icdf(&mut self, k: usize, icdf: &[u8], ftb: u32) {
+        // A zero-width symbol (fh == fl: a zero-probability PDF cell)
+        // would collapse `rng` to zero and make the stream undecodable;
+        // callers must never encode one.
+        debug_assert!(
+            if k == 0 {
+                (icdf[0] as u32) < (1u32 << ftb)
+            } else {
+                icdf[k - 1] > icdf[k]
+            },
+            "zero-probability icdf cell {k}"
+        );
         let r = self.rng >> ftb;
         if k > 0 {
             let hi = icdf[k - 1] as u32;
@@ -463,6 +474,27 @@ mod tests {
         let mut dec = RangeDecoder::new(&bytes);
         for (i, &bit) in bits.iter().enumerate() {
             assert_eq!(dec.dec_bit_logp(logps[i]) == 1, bit);
+        }
+        assert!(!dec.has_error());
+    }
+
+    /// §5.1.3 / §4.1.4: full-width 32-bit raw reads and writes are
+    /// defined (a round-382 fuzz find: the decoder's u32 raw-bit window
+    /// overflowed its shifts on a 32-bit read).
+    #[test]
+    fn roundtrip_raw_bits_32_wide() {
+        let vals: [u32; 5] = [0xFFFF_FFFF, 0, 0x8000_0001, 0xDEAD_BEEF, 0x0BAD_F00D];
+        let mut enc = RangeEncoder::new();
+        // A 3-bit write first so the 32-bit reads straddle byte seams.
+        enc.enc_bits(0b101, 3);
+        for &v in &vals {
+            enc.enc_bits(v, 32);
+        }
+        let bytes = enc.finish();
+        let mut dec = RangeDecoder::new(&bytes);
+        assert_eq!(dec.dec_bits(3), 0b101);
+        for &v in &vals {
+            assert_eq!(dec.dec_bits(32), v);
         }
         assert!(!dec.has_error());
     }
