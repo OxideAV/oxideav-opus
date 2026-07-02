@@ -98,9 +98,11 @@ reconstruct), the whole-frame Table-5 composition
 bits + 1–3 SILK frames at 10/20/40/60 ms) whose packets decode
 end-to-end through a fresh `OpusDecoder::decode_packet` to real SILK
 PCM, with every per-frame parameter verified equal to the encoder's
-prediction. What the encoder does *not* yet have is the §5.2.3
-analysis front end (signal → symbol quantization beyond gains), the
-stereo mid/side packet interleave, and LBRR emission.
+prediction. LBRR (in-band FEC, §4.2.5) emission is included and
+closes the FEC loop: `decode_packet_fec` recovers real audio from the
+encoder's own redundancy. What the encoder does *not* yet have is the
+§5.2.3 analysis front end (signal → symbol quantization beyond
+gains) and the stereo mid/side packet interleave.
 
 Differential encoder/decoder testing and a restored cargo-fuzz suite
 (4 coverage-guided targets, incl. an encoder↔decoder range-coder
@@ -211,9 +213,11 @@ mirrors of every §4.2.7 stage sharing the decode tables
 whole-frame composition `encode_silk_frame`, the §4.2.3/§4.2.4
 header-bit writer `SilkHeaderBits::encode`, the §3.1 TOC composer
 `OpusTocByte::compose_byte`, and the packet-level
-`encode_silk_only_packet_mono` — every layer roundtrip-verified
-against the decoder, up to whole packets decoding end-to-end through
-`OpusDecoder::decode_packet`.
+`encode_silk_only_packet_mono` (+ `_with_lbrr` for §4.2.5 in-band-FEC
+emission) — every layer roundtrip-verified against the decoder, up to
+whole packets decoding end-to-end through
+`OpusDecoder::decode_packet` and FEC recovery through
+`decode_packet_fec`.
 
 **SILK (RFC 6716 §4.2):** frame-header decode (§4.2.7.1–§4.2.7.5.1),
 subframe gains (§4.2.7.4), the full LSF chain (stage-2 residual → NLSF
