@@ -33,6 +33,24 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- *`encode_silk_frame` — the whole-frame Table-5 composition
+  (§4.2.6 / §4.2.7), the write-side mirror of `decode_silk_frame`.*
+  Consumes a `SilkFrameSymbols` script (header / gains / LSF stage-1
+  + stage-2 / interpolation index / LTP / seed / excitation), writes
+  every symbol in exact Table-5 order through the per-stage encoders,
+  runs the same non-bitstream §4.2.7.5.3-§4.2.7.5.8 LSF → LPC chain
+  as the decoder (the §4.2.7.5.5 interpolation tail factored into
+  `LsfInterpolated::from_decoded_index` and shared by both
+  directions), and returns the `SilkFrameDecoded` the decoder will
+  reconstruct — so an encoder can carry cross-frame state
+  (`last_log_gain`, `nlsf_q15`, `primary_lag`) exactly as a decoder
+  would. Validated by the capstone roundtrip: 250 random full-frame
+  scripts across every bandwidth / frame size / signal type /
+  stereo-mid context / carried-state combination encode and decode
+  back to a field-for-field identical `SilkFrameDecoded`, including
+  the derived stable Q12 LPC filters and the LCG-reconstructed Q23
+  excitation. LTP-presence/frame-type mismatches are rejected.
+
 - *SILK encode-side symbol writers for the complete §4.2.7 regular
   frame stack — the write-side mirrors of every SILK decode stage.*
   Each encoder shares the decode module's PDF tables and normative

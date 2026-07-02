@@ -112,7 +112,6 @@ impl LsfInterpolated {
         context: LsfInterpContext,
     ) -> Result<Self, Error> {
         let d_lpc = n2.len();
-        let n2_q15 = n2.nlsf_q15();
 
         if let Some(n0) = n0_q15 {
             if n0.len() != d_lpc {
@@ -134,6 +133,23 @@ impl LsfInterpolated {
         // 20 ms frames: the factor is always read from the bitstream so
         // the range coder stays in sync.
         let decoded_w_q2 = rd.dec_icdf(LSF_INTERP_ICDF, 8) as u8;
+        Ok(Self::from_decoded_index(decoded_w_q2, n2, n0_q15, context))
+    }
+
+    /// The non-bitstream tail of the §4.2.7.5.5 interpolation for a
+    /// 20 ms frame: apply the already-known Table 26 factor
+    /// `decoded_w_q2` (as [`Self::decode`] would after reading it) and
+    /// compute the first-half vector. Shared by the decode path and
+    /// the encode-side frame composition, which knows the factor it is
+    /// writing.
+    pub fn from_decoded_index(
+        decoded_w_q2: u8,
+        n2: &NlsfStabilized,
+        n0_q15: Option<&[i16]>,
+        context: LsfInterpContext,
+    ) -> Self {
+        let d_lpc = n2.len();
+        let n2_q15 = n2.nlsf_q15();
 
         // After a reset / uncoded side-channel frame, or when there is no
         // prior-frame history at all, the decoded value is discarded and 4
@@ -162,12 +178,12 @@ impl LsfInterpolated {
             }
         }
 
-        Ok(Self {
+        Self {
             w_q2: Some(decoded_w_q2),
             len: d_lpc as u8,
             n1_q15,
             has_first_half: true,
-        })
+        }
     }
 
     /// Encode the §4.2.7.5.5 interpolation factor into `re` — the

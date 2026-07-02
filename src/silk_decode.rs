@@ -52,18 +52,20 @@
 //! symbols enabled and is wired once the stereo unmixing back half lands.
 
 use crate::range_decoder::RangeDecoder;
-use crate::silk_excitation::{Excitation, ExcitationConfig, SilkFrameSize};
+use crate::range_encoder::RangeEncoder;
+use crate::silk_excitation::{Excitation, ExcitationConfig, ExcitationSymbols, SilkFrameSize};
 use crate::silk_frame::{
     FrameKind, QuantizationOffsetType, SignalType, SilkFrameHeader, SilkFrameHeaderConfig,
+    SilkHeaderSymbols,
 };
-use crate::silk_gains::{SubframeGains, SubframeGainsConfig};
-use crate::silk_lcg_seed::decode_lcg_seed;
+use crate::silk_gains::{GainSymbol, SubframeGains, SubframeGainsConfig};
+use crate::silk_lcg_seed::{decode_lcg_seed, encode_lcg_seed};
 use crate::silk_lsf_interp::{LsfInterpContext, LsfInterpolated};
 use crate::silk_lsf_recon::NlsfReconstructed;
 use crate::silk_lsf_stabilize::NlsfStabilized;
 use crate::silk_lsf_stage2::LsfStage2;
 use crate::silk_lsf_to_lpc::LpcQ12;
-use crate::silk_ltp::{LagCoding, LtpConfig, LtpParameters};
+use crate::silk_ltp::{LagCoding, LtpConfig, LtpParameters, LtpSymbols};
 use crate::toc::Bandwidth;
 use crate::Error;
 
@@ -134,7 +136,7 @@ pub struct StereoHeaderContext {
 
 /// One fully decoded regular SILK frame: every Table-5 bitstream symbol
 /// consumed and the §4.2.7.5 LSF → LPC chain run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SilkFrameDecoded {
     /// §4.2.7.3 signal type.
     pub signal_type: SignalType,
@@ -316,6 +318,197 @@ pub fn decode_silk_frame(
     })
 }
 
+/// The complete Table-5 symbol script for one regular SILK frame on
+/// the encode side, consumed by [`encode_silk_frame`]. Each field is
+/// the per-stage symbol input of the matching stage encoder; see the
+/// per-stage types for the index domains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SilkFrameSymbols<'a> {
+    /// Steps 1-3: §4.2.7.1 stereo weights / §4.2.7.2 mid-only flag /
+    /// §4.2.7.3 frame type. Presence of the stereo / mid-only parts
+    /// must match the frame's [`SilkFrameConfig::stereo`] context, and
+    /// the frame type must lie in the support selected by
+    /// [`SilkFrameConfig::voice_active`].
+    pub header: SilkHeaderSymbols,
+    /// Step 4: §4.2.7.4 per-subframe gain symbols (2 or 4 entries,
+    /// matching the frame size).
+    pub gains: &'a [GainSymbol],
+    /// Step 5: §4.2.7.5.1 LSF stage-1 index `I1 ∈ 0..32`.
+    pub lsf_stage1: u8,
+    /// Step 6: §4.2.7.5.2 signed stage-2 indices `I2[k] ∈ [-10, 10]`
+    /// (10 entries NB/MB, 16 WB).
+    pub lsf_stage2_i2: &'a [i8],
+    /// Step 7: §4.2.7.5.5 interpolation index; must be `Some(0..=4)`
+    /// for a 20 ms frame and `None` for a 10 ms frame.
+    pub lsf_interp_w_q2: Option<u8>,
+    /// Step 8: §4.2.7.6 LTP symbols; must be `Some` iff the frame
+    /// type is voiced.
+    pub ltp: Option<LtpSymbols>,
+    /// Step 9: §4.2.7.7 LCG seed, `0..=3`.
+    pub lcg_seed: u8,
+    /// Step 10: §4.2.7.8 excitation symbols (rate level, per-block
+    /// LSB depths, quantized signed `e_raw[]`).
+    pub excitation: ExcitationSymbols<'a>,
+}
+
+/// Encode one regular **mono** SILK frame into `re`, writing every
+/// Table-5 bitstream symbol in order — the exact write-side mirror of
+/// [`decode_silk_frame`] — and running the same non-bitstream
+/// §4.2.7.5.3-§4.2.7.5.8 LSF → LPC chain.
+///
+/// Returns the [`SilkFrameDecoded`] the decoder will reconstruct from
+/// this bitstream, so the caller can carry the cross-frame state
+/// (`gains.last_log_gain()`, `nlsf_q15`, `ltp.primary_lag()`) exactly
+/// as a decoder would, and drive the §4.2.7.9 synthesis for local
+/// monitoring.
+///
+/// Returns [`Error::MalformedPacket`] on any symbol/config mismatch or
+/// out-of-support index (see the per-stage encoders), or if the LSF
+/// chain rejects the indices.
+pub fn encode_silk_frame(
+    re: &mut RangeEncoder,
+    cfg: SilkFrameConfig,
+    symbols: &SilkFrameSymbols<'_>,
+) -> Result<SilkFrameDecoded, Error> {
+    let num_subframes: u8 = match cfg.frame_size {
+        SilkFrameSize::TenMs => 2,
+        SilkFrameSize::TwentyMs => 4,
+    };
+
+    // ---- Steps 1-3: §4.2.7.1 / §4.2.7.2 / §4.2.7.3. ----
+    let header_cfg = SilkFrameHeaderConfig {
+        stereo_mid_channel: cfg.stereo.is_some(),
+        stereo: cfg.stereo.is_some(),
+        has_mid_only_flag: cfg.stereo.is_some_and(|s| s.has_mid_only_flag),
+        kind: if cfg.voice_active {
+            FrameKind::RegularActive
+        } else {
+            FrameKind::RegularInactive
+        },
+        bandwidth: cfg.bandwidth,
+    };
+    let pre = SilkFrameHeader::encode_pre_gains(re, header_cfg, &symbols.header)?;
+
+    // ---- Step 4: §4.2.7.4 subframe gains. ----
+    let gains = SubframeGains::encode(
+        re,
+        SubframeGainsConfig {
+            signal_type: pre.signal_type,
+            num_subframes,
+            first_subframe_is_independent: cfg.first_subframe_independent,
+            previous_log_gain: cfg.previous_log_gain,
+        },
+        symbols.gains,
+    )?;
+
+    // ---- Step 5: §4.2.7.5.1 LSF stage-1 index. ----
+    SilkFrameHeader::encode_lsf_stage1(re, cfg.bandwidth, pre.signal_type, symbols.lsf_stage1)?;
+
+    // ---- Step 6: §4.2.7.5.2 LSF stage-2 residual. ----
+    let stage2 = LsfStage2::encode(re, cfg.bandwidth, symbols.lsf_stage1, symbols.lsf_stage2_i2)?;
+
+    // §4.2.7.5.3 / §4.2.7.5.4 (non-bitstream) — identical to decode.
+    let recon =
+        NlsfReconstructed::from_stage1_and_stage2(cfg.bandwidth, symbols.lsf_stage1, &stage2)?;
+    let stabilized = NlsfStabilized::from_reconstructed(cfg.bandwidth, &recon)?;
+    let d_lpc = stabilized.len();
+    let mut nlsf_q15 = [0i16; crate::silk_lsf_stage2::D_LPC_MAX];
+    nlsf_q15[..d_lpc].copy_from_slice(stabilized.nlsf_q15());
+
+    // ---- Step 7: §4.2.7.5.5 LSF interpolation weight (20 ms only). ----
+    let interp_context = match cfg.frame_size {
+        SilkFrameSize::TenMs => LsfInterpContext::TenMs,
+        SilkFrameSize::TwentyMs => {
+            if cfg.lsf_interp_after_reset || cfg.previous_nlsf_q15.is_none() {
+                LsfInterpContext::TwentyMsAfterResetOrUncoded
+            } else {
+                LsfInterpContext::TwentyMs
+            }
+        }
+    };
+    LsfInterpolated::encode_index(re, interp_context, symbols.lsf_interp_w_q2)?;
+    let n0_slice: Option<&[i16]> = match (&cfg.previous_nlsf_q15, cfg.frame_size) {
+        (Some(prev), SilkFrameSize::TwentyMs) if cfg.previous_nlsf_len == d_lpc => {
+            Some(&prev[..d_lpc])
+        }
+        _ => None,
+    };
+    let interp = match (cfg.frame_size, symbols.lsf_interp_w_q2) {
+        (SilkFrameSize::TwentyMs, Some(w)) => {
+            LsfInterpolated::from_decoded_index(w, &stabilized, n0_slice, interp_context)
+        }
+        // `encode_index` already rejected every other combination
+        // except the valid 10 ms / None pairing.
+        _ => LsfInterpolated::decode(
+            &mut RangeDecoder::new(&[]),
+            &stabilized,
+            n0_slice,
+            LsfInterpContext::TenMs,
+        )?,
+    };
+    let lsf_interp_q2 = interp.w_q2();
+
+    // §4.2.7.5.6-§4.2.7.5.8 (non-bitstream) — identical to decode.
+    let lpc_second_half = nlsf_to_stable_lpc(cfg.bandwidth, &nlsf_q15[..d_lpc])?;
+    let lpc_first_half = match interp.n1_q15() {
+        Some(n1) => Some(nlsf_to_stable_lpc(cfg.bandwidth, n1)?),
+        None => None,
+    };
+
+    // ---- Step 8: §4.2.7.6 LTP (voiced only). ----
+    if (pre.signal_type == SignalType::Voiced) != symbols.ltp.is_some() {
+        return Err(Error::MalformedPacket);
+    }
+    let lag_coding = match cfg.previous_primary_lag {
+        Some(previous_lag) => LagCoding::Relative { previous_lag },
+        None => LagCoding::Absolute,
+    };
+    let ltp = LtpParameters::encode(
+        re,
+        LtpConfig {
+            bandwidth: cfg.bandwidth,
+            signal_type: pre.signal_type,
+            num_subframes,
+            lag_coding,
+            ltp_scaling_present: cfg.ltp_scaling_present,
+        },
+        symbols.ltp.as_ref(),
+    )?;
+
+    // ---- Step 9: §4.2.7.7 LCG seed. ----
+    encode_lcg_seed(re, symbols.lcg_seed)?;
+
+    // ---- Step 10: §4.2.7.8 quantized excitation. ----
+    let excitation = Excitation::encode(
+        re,
+        ExcitationConfig {
+            bandwidth: cfg.bandwidth,
+            frame_size: cfg.frame_size,
+            signal_type: pre.signal_type,
+            qoff_type: pre.qoff_type,
+            lcg_seed: symbols.lcg_seed,
+        },
+        &symbols.excitation,
+    )?;
+
+    Ok(SilkFrameDecoded {
+        signal_type: pre.signal_type,
+        qoff_type: pre.qoff_type,
+        gains,
+        lsf_stage1: symbols.lsf_stage1,
+        nlsf_q15,
+        d_lpc,
+        lsf_interp_q2,
+        lpc_second_half,
+        lpc_first_half,
+        ltp,
+        lcg_seed: symbols.lcg_seed,
+        excitation,
+        stereo_pred: pre.stereo_pred,
+        mid_only_flag: pre.mid_only_flag,
+    })
+}
+
 /// Run the §4.2.7.5.6–§4.2.7.5.8 NLSF → stable Q12 LPC chain for one
 /// normalized-LSF vector: NLSF→LPC (`silk_NLSF2A`), the §4.2.7.5.7
 /// range-limiting bandwidth expansion, and the §4.2.7.5.8
@@ -487,5 +680,252 @@ mod tests {
             // The flag is a real bool (0 or 1), decoded from Table 8.
             assert!(matches!(decoded.mid_only_flag, Some(false) | Some(true)));
         }
+    }
+
+    // ----- Whole-frame encode → decode roundtrip --------------------
+
+    /// A tiny deterministic LCG for the whole-frame roundtrip sweep.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 32) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.next_u32() % n
+        }
+    }
+
+    /// The capstone roundtrip: random full Table-5 symbol scripts across
+    /// every bandwidth / frame size / signal type / stereo-context /
+    /// carried-state combination, written by `encode_silk_frame` and read
+    /// back by `decode_silk_frame`. The decoded `SilkFrameDecoded` —
+    /// every field, including the derived LSF → LPC chain, the LTP
+    /// parameters, and the LCG-reconstructed Q23 excitation — must equal
+    /// the encoder's prediction exactly.
+    #[test]
+    fn whole_frame_encode_decode_roundtrip_random() {
+        use crate::range_encoder::RangeEncoder;
+        use crate::silk_excitation::{shell_block_count, SHELL_BLOCK_SAMPLES};
+        use crate::silk_frame::StereoWeightSymbols;
+        use crate::silk_gains::GainSymbol;
+        use crate::silk_ltp::{LagSymbols, LtpSymbols, LTP_MAX_SUBFRAMES};
+
+        let mut rng = Lcg(0xF8A3_0382);
+        let mut done = 0u32;
+        while done < 250 {
+            let bandwidth = match rng.below(3) {
+                0 => Bandwidth::Nb,
+                1 => Bandwidth::Mb,
+                _ => Bandwidth::Wb,
+            };
+            let frame_size = if rng.below(2) == 0 {
+                SilkFrameSize::TenMs
+            } else {
+                SilkFrameSize::TwentyMs
+            };
+            let num_subframes = if frame_size == SilkFrameSize::TenMs {
+                2u8
+            } else {
+                4
+            };
+            let voice_active = rng.below(2) == 1;
+            let stereo_mid = rng.below(3) == 0;
+            let has_mid_only = stereo_mid && rng.below(2) == 0;
+            let first_independent = rng.below(2) == 0;
+            let previous_log_gain = if first_independent && rng.below(2) == 0 {
+                None
+            } else {
+                Some(rng.below(64) as u8)
+            };
+            let previous_primary_lag = if rng.below(2) == 0 {
+                Some(20 + rng.below(200) as i32)
+            } else {
+                None
+            };
+            let cfg = SilkFrameConfig {
+                bandwidth,
+                frame_size,
+                voice_active,
+                first_subframe_independent: first_independent,
+                previous_log_gain,
+                previous_primary_lag,
+                ltp_scaling_present: rng.below(2) == 1,
+                lsf_interp_after_reset: rng.below(2) == 1,
+                previous_nlsf_q15: None,
+                previous_nlsf_len: 0,
+                stereo: stereo_mid.then_some(StereoHeaderContext {
+                    has_mid_only_flag: has_mid_only,
+                }),
+            };
+
+            // ---- Build a random valid symbol script. ----
+            let frame_type = if voice_active {
+                2 + rng.below(4) as u8
+            } else {
+                rng.below(2) as u8
+            };
+            let voiced = frame_type >= 4;
+            let header = SilkHeaderSymbols {
+                stereo: stereo_mid.then(|| StereoWeightSymbols {
+                    n: rng.below(25) as u8,
+                    i0: rng.below(3) as u8,
+                    i1: rng.below(5) as u8,
+                    i2: rng.below(3) as u8,
+                    i3: rng.below(5) as u8,
+                }),
+                mid_only_flag: has_mid_only.then(|| rng.below(2) == 1),
+                frame_type,
+            };
+            let gains: Vec<GainSymbol> = (0..num_subframes as usize)
+                .map(|k| {
+                    if k == 0 && first_independent {
+                        GainSymbol::Independent(rng.below(64) as u8)
+                    } else {
+                        GainSymbol::Delta(rng.below(41) as u8)
+                    }
+                })
+                .collect();
+            let lsf_stage1 = rng.below(32) as u8;
+            let d_lpc = if bandwidth == Bandwidth::Wb { 16 } else { 10 };
+            let i2: Vec<i8> = (0..d_lpc).map(|_| rng.below(21) as i8 - 10).collect();
+            let lsf_interp_w_q2 =
+                (frame_size == SilkFrameSize::TwentyMs).then(|| rng.below(5) as u8);
+            let ltp = voiced.then(|| {
+                let lag_low_count = match bandwidth {
+                    Bandwidth::Nb => 4u32,
+                    Bandwidth::Mb => 6,
+                    _ => 8,
+                };
+                let lag = if previous_primary_lag.is_some() {
+                    if rng.below(2) == 0 {
+                        LagSymbols::RelativeDelta {
+                            delta_index: 1 + rng.below(20) as u8,
+                        }
+                    } else {
+                        LagSymbols::RelativeFallback {
+                            lag_high: rng.below(32) as u8,
+                            lag_low: rng.below(lag_low_count) as u8,
+                        }
+                    }
+                } else {
+                    LagSymbols::Absolute {
+                        lag_high: rng.below(32) as u8,
+                        lag_low: rng.below(lag_low_count) as u8,
+                    }
+                };
+                let contour_cells = match (bandwidth, num_subframes) {
+                    (Bandwidth::Nb, 2) => 3u32,
+                    (Bandwidth::Nb, 4) => 11,
+                    (_, 2) => 12,
+                    _ => 34,
+                };
+                let periodicity_index = rng.below(3) as u8;
+                let filter_cells = [8u32, 16, 32][periodicity_index as usize];
+                let mut filter_indices = [0u8; LTP_MAX_SUBFRAMES];
+                for f in filter_indices.iter_mut().take(num_subframes as usize) {
+                    *f = rng.below(filter_cells) as u8;
+                }
+                LtpSymbols {
+                    lag,
+                    contour_index: rng.below(contour_cells) as u8,
+                    periodicity_index,
+                    filter_indices,
+                    ltp_scaling_index: cfg.ltp_scaling_present.then(|| rng.below(3) as u8),
+                }
+            });
+            let blocks = shell_block_count(bandwidth, frame_size).unwrap();
+            let total = blocks * SHELL_BLOCK_SAMPLES;
+            let mut lsb_counts = vec![0u8; blocks];
+            let mut e_raw = vec![0i32; total];
+            for (b, lc) in lsb_counts.iter_mut().enumerate() {
+                let lsbs = if rng.below(4) == 0 {
+                    1 + rng.below(2)
+                } else {
+                    0
+                };
+                *lc = lsbs as u8;
+                let budget = rng.below(17);
+                let base = b * SHELL_BLOCK_SAMPLES;
+                let mut spent = 0u32;
+                while spent < budget {
+                    let i = base + rng.below(16) as usize;
+                    let add = 1 + rng.below(budget - spent);
+                    e_raw[i] += (add << lsbs) as i32;
+                    spent += add;
+                }
+                for slot in e_raw[base..base + SHELL_BLOCK_SAMPLES].iter_mut() {
+                    if lsbs > 0 {
+                        *slot += (rng.next_u32() & ((1 << lsbs) - 1)) as i32;
+                    }
+                    if *slot != 0 && rng.below(2) == 0 {
+                        *slot = -*slot;
+                    }
+                }
+            }
+            let symbols = SilkFrameSymbols {
+                header,
+                gains: &gains,
+                lsf_stage1,
+                lsf_stage2_i2: &i2,
+                lsf_interp_w_q2,
+                ltp,
+                lcg_seed: rng.below(4) as u8,
+                excitation: crate::silk_excitation::ExcitationSymbols {
+                    rate_level: rng.below(9) as u8,
+                    lsb_counts: &lsb_counts,
+                    e_raw: &e_raw,
+                },
+            };
+
+            let mut re = RangeEncoder::new();
+            let predicted = encode_silk_frame(&mut re, cfg, &symbols).expect("encode");
+            let bytes = re.finish();
+
+            let mut rd = RangeDecoder::new(&bytes);
+            let decoded = decode_silk_frame(&mut rd, cfg).expect("decode");
+            assert!(!rd.has_error());
+            assert_eq!(decoded, predicted, "cfg={cfg:?}");
+            done += 1;
+        }
+    }
+
+    /// LTP presence must match the frame type: a voiced script without
+    /// LTP symbols (or vice versa) is rejected before any partial write
+    /// beyond the header.
+    #[test]
+    fn whole_frame_encode_rejects_ltp_mismatch() {
+        use crate::range_encoder::RangeEncoder;
+        let cfg = fresh_cfg(Bandwidth::Nb, SilkFrameSize::TenMs, true);
+        let gains = [
+            crate::silk_gains::GainSymbol::Independent(30),
+            crate::silk_gains::GainSymbol::Delta(4),
+        ];
+        let i2 = [0i8; 10];
+        let lsb = [0u8; 5];
+        let e = [0i32; 80];
+        let symbols = SilkFrameSymbols {
+            header: SilkHeaderSymbols {
+                stereo: None,
+                mid_only_flag: None,
+                frame_type: 4, // voiced
+            },
+            gains: &gains,
+            lsf_stage1: 0,
+            lsf_stage2_i2: &i2,
+            lsf_interp_w_q2: None, // 10 ms
+            ltp: None,             // missing for a voiced frame
+            lcg_seed: 0,
+            excitation: crate::silk_excitation::ExcitationSymbols {
+                rate_level: 0,
+                lsb_counts: &lsb,
+                e_raw: &e,
+            },
+        };
+        let mut re = RangeEncoder::new();
+        assert!(encode_silk_frame(&mut re, cfg, &symbols).is_err());
     }
 }

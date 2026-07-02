@@ -877,7 +877,9 @@ pub use redundancy_decode_params::{
     apply_mb_to_wb_override, redundant_frame_params, CrossLapPlacement, RedundantFrameParams,
     REDUNDANT_CROSS_LAP_TENTHS_MS, REDUNDANT_FRAME_TENTHS_MS,
 };
-pub use silk_decode::{decode_silk_frame, SilkFrameConfig, SilkFrameDecoded};
+pub use silk_decode::{
+    decode_silk_frame, encode_silk_frame, SilkFrameConfig, SilkFrameDecoded, SilkFrameSymbols,
+};
 pub use silk_excitation::{
     quantization_offset_q23, shell_block_count, Excitation, ExcitationConfig, ExcitationSymbols,
     SilkFrameSize, MAX_EXCITATION_SAMPLES, MAX_SHELL_BLOCKS, SHELL_BLOCK_SAMPLES,
