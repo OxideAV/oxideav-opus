@@ -510,6 +510,15 @@ fn is_lpc_stable(a32_q12: &[i32]) -> bool {
     for k in 0..d_lpc {
         // a32_Q24[d_LPC-1][n] = a32_Q12[n] << 12.
         row[k] = (a32_q12[k] as i64) << 12;
+        // §4.2.7.5.8's arithmetic envelope has every a32_Q24 value fit
+        // in 32 bits. A Q12 coefficient large enough to escape that
+        // envelope (adversarial input ahead of sufficient bandwidth
+        // expansion; a round-382 fuzz find) describes a wildly unstable
+        // filter — classify it as such instead of overflowing the
+        // recurrence's i64 products.
+        if i32::try_from(row[k]).is_err() {
+            return false;
+        }
     }
     let mut inv_gain_q30: i64 = 1 << 30;
 
@@ -557,7 +566,22 @@ fn is_lpc_stable(a32_q12: &[i32]) -> bool {
             let round_b1 = 1i64 << (b1 - 1);
             for n in 0..k {
                 let num_q24 = cur[n] - (((cur[k - n - 1] * rc_q31) + (1i64 << 30)) >> 31);
-                row[n] = ((num_q24 * gain_qb1) + round_b1) >> b1;
+                // §4.2.7.5.8: "otherwise all intermediate results fit
+                // in 32 bits or less". A value escaping that envelope
+                // can only arise for a filter outside the procedure's
+                // guaranteed domain (an adversarial coefficient set a
+                // round-382 fuzz run produced overflowed the next
+                // product here) — classify it unstable so the caller
+                // applies another round of bandwidth expansion instead
+                // of overflowing.
+                if i32::try_from(num_q24).is_err() {
+                    return false;
+                }
+                let next = ((num_q24 * gain_qb1) + round_b1) >> b1;
+                if i32::try_from(next).is_err() {
+                    return false;
+                }
+                row[n] = next;
             }
         }
     }
@@ -1522,5 +1546,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// §4.2.7.5.8 arithmetic-envelope hardening (round-382 fuzz find):
+    /// adversarial Q12 coefficients large enough to escape the spec's
+    /// "all intermediate results fit in 32 bits" envelope must classify
+    /// as unstable — never overflow the recurrence's i64 products.
+    #[test]
+    fn is_lpc_stable_survives_extreme_coefficients() {
+        // Alternating-sign extremes keep DC_resp <= 4096 (the first
+        // check) while each Q24 widening escapes 32 bits.
+        let mut a = [0i32; 16];
+        for (k, c) in a.iter_mut().enumerate() {
+            *c = if k % 2 == 0 {
+                i32::MAX >> 5
+            } else {
+                -(i32::MAX >> 5)
+            };
+        }
+        assert!(!is_lpc_stable(&a));
+
+        // A moderately extreme set that passes the initial-row check
+        // but can blow up mid-recurrence must also terminate cleanly
+        // (either verdict is fine; no panic).
+        let mut b = [0i32; 16];
+        for (k, c) in b.iter_mut().enumerate() {
+            *c = if k % 2 == 0 { 80_000 } else { -80_000 };
+        }
+        let _ = is_lpc_stable(&b);
     }
 }

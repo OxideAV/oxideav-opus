@@ -224,7 +224,12 @@ impl<'a> RangeDecoder<'a> {
             self.error = true;
             return 0;
         }
-        let mut window = self.back_window;
+        // Work in a 64-bit window: serving a full 32-bit read may hold
+        // up to 39 bits in flight (7 residual + 4 fresh bytes), and the
+        // final `>> bits` must be defined for `bits == 32` (a round-382
+        // fuzz find: the previous u32 window overflowed both the refill
+        // shift and the consume shift on a 32-bit read).
+        let mut window = self.back_window as u64;
         let mut avail = self.back_bits_avail;
         // Refill the window until it holds enough bits to service the
         // requested read.
@@ -238,13 +243,18 @@ impl<'a> RangeDecoder<'a> {
             self.back = self.back.saturating_add(1);
             // Concatenate the new byte ABOVE the existing window so the
             // intra-byte LSB-first packing is preserved.
-            window |= (byte as u32) << avail;
+            window |= (byte as u64) << avail;
             avail += 8;
         }
-        let mask: u32 = if bits == 32 { !0 } else { (1u32 << bits) - 1 };
-        let result = window & mask;
-        // Consume the served bits.
-        self.back_window = window >> bits;
+        let mask: u64 = if bits >= 32 {
+            0xFFFF_FFFF
+        } else {
+            (1u64 << bits) - 1
+        };
+        let result = (window & mask) as u32;
+        // Consume the served bits; fewer than 8 bits remain after any
+        // serve, so the truncation back to the u32 field is lossless.
+        self.back_window = (window >> bits) as u32;
         self.back_bits_avail = avail - bits;
         self.nbits_raw += bits;
         result

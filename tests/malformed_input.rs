@@ -642,3 +642,24 @@ fn celt_only_decode_truncation_never_panics() {
         );
     }
 }
+
+/// Round-382 fuzz-crash regression: an 18-byte input the coverage-guided
+/// `decode_packet` harness found that drove the §4.2.7.5.8 prediction-gain
+/// recurrence into an i64 overflow (adversarial LSF coefficients whose Q24
+/// widening escapes the spec's 32-bit envelope). The decoder must classify
+/// the filter unstable and keep decoding — never panic.
+#[test]
+fn fuzz_crash_regression_lpc_recurrence_overflow() {
+    // Verbatim crash artifact from the round-382 fuzz run, replayed
+    // exactly the way the harness feeds it (first byte selects the
+    // packet split; the remainder is decoded on one stateful decoder,
+    // then re-fed through the self-delimited entry).
+    let data: [u8; 18] = [
+        0x00, 0x08, 0x08, 0x31, 0xa1, 0x5e, 0xa1, 0x31, 0xfd, 0x67, 0x52, 0x26, 0xff, 0x6c, 0x25,
+        0xff, 0xa1, 0x00,
+    ];
+    let body = &data[1..];
+    let mut dec = OpusDecoder::new();
+    let _ = dec.decode_packet(body);
+    let _ = dec.decode_self_delimited_packet(body);
+}
