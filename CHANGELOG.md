@@ -6,6 +6,33 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- *Range encoder (RFC 6716 §5.1) — `range_encoder::RangeEncoder`.* The
+  first encode-side subsystem: a bit-exact clean-room transcription of
+  the §5.1 range coder, the shared entropy back end both the SILK and
+  CELT layers of an Opus encoder write every coded symbol through. The
+  §5.1 state four-tuple `(val, rng, rem, ext)` is carried directly, with
+  the §5.1.1 `ec_encode` symbol update, §5.1.1.1 renormalization,
+  §5.1.1.2 carry propagation / output buffering (the deferred 255-run
+  `ext` scheme), the §5.1.2.1–§5.1.2.3 division-free variants
+  (`encode_bin`, `enc_bit_logp`, and `enc_icdf` — the latter consuming
+  the decoder's `icdf[]` tables verbatim), §5.1.3 raw bits packed
+  back-to-front at the buffer tail, §5.1.4 `enc_uint` (range-coded top-8
+  bits + raw remainder), §5.1.5 stream finalization (the
+  maximal-trailing-zeros terminating value `end`, the carry-buffer
+  flush, and the raw-bit tail layout), and §5.1.6 `tell` / `tell_frac`
+  bit-usage accounting that matches the decoder's value bit-for-bit
+  after the same symbols. Every write path is validated by decoding
+  back through the crate's §4.1 `RangeDecoder`: per-primitive roundtrip
+  tests (icdf / bit_logp / raw bits / uint / generic `ec_encode`),
+  §5.1.6 `tell` / `tell_frac` lockstep symbol-for-symbol, and a
+  5000-seed mixed-symbol fuzz roundtrip interleaving all four symbol
+  kinds. When raw bits are present, `finish` isolates them from the
+  range data with a zero pad one range-window deep so the decoder's
+  forward lookahead never consumes a raw byte (a fixed-frame-size
+  `finish` that byte-shares per §5.1.5 can layer on once the CELT
+  encode-side bit allocation exists to guarantee the §5.1.6 budget
+  invariant). 8 new unit tests.
+
 - *CELT-only decode-path truncation-safety test (`malformed_input`).*
   The CELT-only frame decode now consumes a long run of range-coded
   symbols past the §4.3.7.1 prefix (coarse energy, tf_change / tf_select,

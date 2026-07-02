@@ -725,6 +725,7 @@ pub mod mode_transition_reset;
 pub mod multistream;
 pub mod opus_head;
 pub mod range_decoder;
+pub mod range_encoder;
 pub mod redundancy_decode_params;
 pub mod silk_decode;
 pub mod silk_excitation;
@@ -871,6 +872,7 @@ pub use opus_head::{
     OPUS_HEAD_MAX_VERSION, OPUS_HEAD_MIN_LEN,
 };
 pub use range_decoder::RangeDecoder;
+pub use range_encoder::RangeEncoder;
 pub use redundancy_decode_params::{
     apply_mb_to_wb_override, redundant_frame_params, CrossLapPlacement, RedundantFrameParams,
     REDUNDANT_CROSS_LAP_TENTHS_MS, REDUNDANT_FRAME_TENTHS_MS,
