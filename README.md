@@ -117,11 +117,25 @@ CBR/VBR, §3.2.5 padding chains, parser-validated R2/R3/R5/R6) and
 the **RFC 7845 write side** (`OpusHead::compose`, byte-identical on
 reparse, and `assemble_multistream_packet`, roundtripped against the
 splitter and decoded sample-identically through
-`MultistreamDecoder`). What the encoder does *not* yet have is the
-§5.2.3 signal analysis that picks the SILK symbols themselves
-(pitch/LTP analysis, LSF fitting, excitation quantization from
-residual PCM beyond the gains quantizer) — packets are encoded from
-symbol scripts, not yet from raw PCM.
+`MultistreamDecoder`). On top of it all now sits the **§5.2.3 SILK
+signal analysis** — `encode(pcm)` is real: `SilkEncoderMono` /
+`SilkEncoderStereo` derive every Table-5 symbol from 20 ms of
+internal-rate PCM per packet. The chain is Burg's-method LPC
+(§5.2.3.4.2.1) → analysis-direction LPC→NLSF conversion (deflated
+line-spectral root search, verified as the exact inverse of the
+§4.2.7.5.6 fixed-point reconstruction) → exhaustive stage-1
+analysis-by-synthesis NLSF quantisation scored on the real decode
+chain → whitened-domain §5.2.3.2 pitch analysis with joint
+(primary-lag × Table 33-36 contour) quantisation → §5.2.3.6
+exact-distortion LTP codebook search → per-subframe residual-energy
+gain selection through the §4.2.7.4 quantizer (cross-packet
+clamp-safe) → a closed-loop excitation quantiser (the §5.2.3.8 role)
+that rounds each pulse against the prediction the decoder will
+actually form, LCG sign inversion included, and updates the carried
+state through the real §4.2.7.9 synthesis chain. Sine, pulse-train
+(voiced), and amplitude-panned stereo inputs all decode back through
+the real streaming `OpusDecoder` at >10 dB tone-projection SNR on
+the 48 kHz output, with stereo panning preserved.
 
 Differential encoder/decoder testing and a restored cargo-fuzz suite
 (4 coverage-guided targets, incl. an encoder↔decoder range-coder
@@ -131,11 +145,17 @@ RFC across all 64 rows), a `dec_bits(32)` shift overflow, a
 §4.2.7.5.8 recurrence i64 overflow on adversarial input, and the
 §4.2.7.8 10 ms-MB 128-vs-120-sample special case (previously every
 10 ms MB SILK packet failed to synthesize) are all fixed with
-regression tests.
+regression tests. The round-388 encoder work exposed one more
+long-standing decode bug: the §4.2.7.5.6 P/Q recurrence dropped the
+"p_Q16[k][k+2] = p_Q16[k][k]" symmetric-mirror boundary condition at
+the j = k+1 read (substituting 0), producing badly wrong LPC filters
+that burned up to 12 prediction-gain-limiter rounds on perfectly
+stable codebook vectors — now fixed and pinned by an analytic
+closed-form regression over all 64 NB/WB stage-1 codebook entries.
 
 The crate ships a large, individually unit-tested set of SILK and
 CELT building blocks plus a complete RFC 7845 multistream /
-multichannel decode subsystem (1296 lib tests + SILK-fixture,
+multichannel decode subsystem (1340 lib tests + SILK-fixture,
 multistream, FEC, and CELT synthesis-backend integration suites).
 Per-stage progress lives in `CHANGELOG.md`.
 
