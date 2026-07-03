@@ -6,6 +6,30 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- *§3.2 / Appendix-B packet-framing **writers** —
+  `packet_compose::{compose_packet, compose_packet_code3,
+  compose_self_delimited, encode_length}`.* The write-side mirror of
+  the §3.2 parser and the Appendix-B self-delimited parser: the
+  §3.2.1 one/two-byte length writer (roundtripped against the shared
+  decoder for every legal length 0..=1275), code 0/1/2 framing,
+  code-3 CBR/VBR framing with the §3.2.5 frame-count byte and the
+  255-chained padding-length header (CBR auto-selected for uniform
+  lengths, VBR/padding forceable), and the Appendix-B Figures 25-29
+  self-delimited variants for chaining streams inside a multistream
+  payload. Every parser-enforced requirement is validated before
+  writing (R2 frame-length cap, R3 code-1 equality, R5 120 ms
+  duration bound, M ∈ 1..=48, R6 CBR uniformity). Verified: 200
+  random compose→parse roundtrips across all four codes, VBR/padding
+  roundtrips including chained padding lengths, self-delimited
+  roundtrips with exact byte consumption plus a three-packet
+  back-to-back chain, a shape-violation rejection audit, and an
+  end-to-end §4.5 check where two independently encoded 20 ms SILK
+  frame bodies packed as code-1 / code-2 / code-3-VBR packets decode
+  through `OpusDecoder::decode_packet` as two real SILK frames. The
+  stereo packet-encode subsystem's public surface (stereo packet
+  encoders, downmix, framing writers) is now re-exported at the crate
+  root.
+
 - *Encode-side stereo downmix — `silk_stereo::stereo_lr_to_ms`, the
   exact algebraic inverse of the §4.2.8 unmixer.* Solving the §4.2.8
   reconstruction for `mid` and `side` gives the frame-aligned inverse

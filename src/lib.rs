@@ -724,6 +724,7 @@ pub mod framing_self_delim;
 pub mod mode_transition_reset;
 pub mod multistream;
 pub mod opus_head;
+pub mod packet_compose;
 pub mod range_decoder;
 pub mod range_encoder;
 pub mod redundancy_decode_params;
@@ -872,6 +873,9 @@ pub use opus_head::{
     apply_output_gain, ChannelMappingTable, OpusHead, OpusHeadError, PreSkip, OPUS_HEAD_MAGIC,
     OPUS_HEAD_MAX_VERSION, OPUS_HEAD_MIN_LEN,
 };
+pub use packet_compose::{
+    compose_packet, compose_packet_code3, compose_self_delimited, encode_length,
+};
 pub use range_decoder::RangeDecoder;
 pub use range_encoder::RangeEncoder;
 pub use redundancy_decode_params::{
@@ -922,6 +926,8 @@ pub use silk_ltp_synth::{
 };
 pub use silk_packet_encode::{
     encode_silk_only_packet_mono, encode_silk_only_packet_mono_with_lbrr,
+    encode_silk_only_packet_stereo, encode_silk_only_packet_stereo_with_lbrr, StereoIntervalLbrr,
+    StereoIntervalScripts, StereoLbrrPredictions, StereoPacketPredictions,
 };
 pub use silk_resampler::{
     is_supported_output_rate, silk_frame_samples_at_output, silk_frame_samples_internal,
@@ -930,7 +936,8 @@ pub use silk_resampler::{
     SILK_RESAMPLER_DELAY_MS_WB, SUPPORTED_OUTPUT_RATES_HZ,
 };
 pub use silk_stereo::{
-    interp_phase_samples, stereo_ms_to_lr, StereoFrame, StereoUnmixState, StereoWeightsQ13,
+    interp_phase_samples, stereo_lr_to_ms, stereo_ms_to_lr, MidSideFrame, StereoDownmixState,
+    StereoFrame, StereoUnmixState, StereoWeightsQ13,
 };
 pub use toc::{Bandwidth, ChannelMapping, FrameCountCode, Mode, OpusTocByte};
 
