@@ -14,16 +14,25 @@
 //! the per-frame `SilkFrameDecoded` predictions returned to the
 //! caller equal what the decoder reconstructs.
 //!
-//! Scope: **mono**. LBRR (in-band FEC, §4.2.5) emission is supported
-//! via [`encode_silk_only_packet_mono_with_lbrr`]: LBRR frames are
-//! written ahead of the regular frames with their own independent
-//! carried state, exactly mirroring the decode-side LBRR walk, and the
-//! §4.2.3 / §4.2.4 LBRR flags are derived from which intervals carry a
-//! redundancy script. The stereo mid/side interleave (§4.2.2) reuses
-//! the same per-frame encoder and lands on top of this entry.
+//! Scope: **mono and stereo**. LBRR (in-band FEC, §4.2.5) emission is
+//! supported via [`encode_silk_only_packet_mono_with_lbrr`]: LBRR
+//! frames are written ahead of the regular frames with their own
+//! independent carried state, exactly mirroring the decode-side LBRR
+//! walk, and the §4.2.3 / §4.2.4 LBRR flags are derived from which
+//! intervals carry a redundancy script. The **stereo** mid/side
+//! interleave (§4.2.2) is provided by
+//! [`encode_silk_only_packet_stereo`]: per 20 ms interval the mid
+//! SILK frame (carrying the §4.2.7.1 stereo prediction weights and,
+//! when the interval's side channel is not active, the §4.2.7.2
+//! mid-only flag) is written, then the side SILK frame when coded,
+//! with two independent per-channel carried states threaded exactly
+//! the way [`crate::decoder::OpusDecoder`]'s stereo walk threads them.
 
+use crate::decoder::ChannelDecodeState;
 use crate::range_encoder::RangeEncoder;
-use crate::silk_decode::{encode_silk_frame, SilkFrameConfig, SilkFrameDecoded, SilkFrameSymbols};
+use crate::silk_decode::{
+    encode_silk_frame, SilkFrameConfig, SilkFrameDecoded, SilkFrameSymbols, StereoHeaderContext,
+};
 use crate::silk_excitation::SilkFrameSize;
 use crate::silk_header::{silk_frame_count, PerFrameLbrr, SilkChannelHeader, SilkHeaderBits};
 use crate::toc::{Bandwidth, FrameCountCode, Mode, OpusTocByte};
@@ -207,6 +216,311 @@ pub fn encode_silk_only_packet_mono_with_lbrr(
     packet.push(toc);
     packet.extend_from_slice(&body);
     Ok((packet, predictions, lbrr_predictions))
+}
+
+/// One 20 ms time interval's symbol scripts for a **stereo** SILK-only
+/// packet (§4.2.2): the mid-channel SILK frame plus, when the side
+/// channel is coded for this interval, the side-channel SILK frame.
+///
+/// Consistency rules enforced by [`encode_silk_only_packet_stereo`]
+/// (mirroring the decode-side §4.2.7.1 / §4.2.7.2 gating):
+///
+/// * `mid.header.stereo` must be `Some` (the §4.2.7.1 weights ride on
+///   every mid frame); `side.header.stereo` must be `None`.
+/// * The interval's **side VAD flag** is derived as "side coded with an
+///   active frame type (`2..=5`)". When it is set, the §4.2.7.2
+///   mid-only flag is *absent* (`mid.header.mid_only_flag == None`).
+///   When it is unset, the flag is *present* and must equal
+///   `side.is_none()`: `Some(true)` skips the side frame entirely,
+///   `Some(false)` codes an inactive side frame (frame type `0..=1`).
+#[derive(Debug, Clone, Copy)]
+pub struct StereoIntervalScripts<'a> {
+    /// The mid-channel frame script (carries the §4.2.7.1 weights and,
+    /// when signalled, the §4.2.7.2 mid-only flag).
+    pub mid: SilkFrameSymbols<'a>,
+    /// The side-channel frame script, or `None` when the side channel
+    /// is not coded for this interval (mid-only).
+    pub side: Option<SilkFrameSymbols<'a>>,
+}
+
+/// The per-frame predictions returned by
+/// [`encode_silk_only_packet_stereo`]: what a fresh
+/// [`crate::decoder::OpusDecoder`] will reconstruct for each channel.
+#[derive(Debug, Clone)]
+pub struct StereoPacketPredictions {
+    /// One decoded mid frame per 20 ms interval.
+    pub mid: Vec<SilkFrameDecoded>,
+    /// One decoded side frame per interval; `None` where the side
+    /// channel is not coded (§4.2.7.2 mid-only).
+    pub side: Vec<Option<SilkFrameDecoded>>,
+}
+
+/// Encode one **stereo, SILK-only, code-0** Opus packet from
+/// per-interval mid/side symbol scripts (§3.1 / §4.2.2-§4.2.6).
+///
+/// Per 20 ms interval (or the single 10 ms interval) the mid SILK frame
+/// is written, then — unless the interval is mid-only — the side SILK
+/// frame, in the §4.2.2 interleaved order, with two independent
+/// per-channel carried states (previous gain / lag / NLSF) threaded
+/// exactly the way the packet decoder threads them. The §4.2.3 header
+/// bits carry both channels' VAD flags: the mid VAD is derived from the
+/// mid frame type, the side VAD from "side coded with an active frame
+/// type" (see [`StereoIntervalScripts`]).
+///
+/// Returns the packet bytes plus the per-channel
+/// [`StereoPacketPredictions`].
+pub fn encode_silk_only_packet_stereo(
+    bandwidth: Bandwidth,
+    frame_size_tenths_ms: u16,
+    intervals: &[StereoIntervalScripts<'_>],
+) -> Result<(Vec<u8>, StereoPacketPredictions), Error> {
+    let n = silk_frame_count(frame_size_tenths_ms).ok_or(Error::MalformedPacket)? as usize;
+    let no_lbrr = vec![StereoIntervalLbrr::default(); n];
+    let (packet, regular, _) = encode_silk_only_packet_stereo_with_lbrr(
+        bandwidth,
+        frame_size_tenths_ms,
+        intervals,
+        &no_lbrr,
+    )?;
+    Ok((packet, regular))
+}
+
+/// One interval's §4.2.5 LBRR (in-band FEC) scripts for
+/// [`encode_silk_only_packet_stereo_with_lbrr`]: an optional mid-channel
+/// redundancy frame and an optional side-channel redundancy frame.
+///
+/// Consistency rules (mirroring the decode-side LBRR walk):
+///
+/// * Both scripts must be active-coded (frame type `2..=5`, §4.2.7.3).
+/// * An LBRR **mid** script carries the §4.2.7.1 weights
+///   (`header.stereo` must be `Some`) and, when the interval has no
+///   side LBRR frame, the §4.2.7.2 mid-only flag, which must be
+///   `Some(true)` (a coded side LBRR frame is forbidden by a set
+///   mid-only flag, and the header LBRR bits already say none follows).
+///   With a side LBRR present the flag is absent (`None`).
+/// * A **side-only** LBRR interval (mid `None`, side `Some`) is legal:
+///   no weights ride on a side frame (§4.2.7.1).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StereoIntervalLbrr<'a> {
+    /// Mid-channel LBRR script for this interval, if any.
+    pub mid: Option<SilkFrameSymbols<'a>>,
+    /// Side-channel LBRR script for this interval, if any.
+    pub side: Option<SilkFrameSymbols<'a>>,
+}
+
+/// [`encode_silk_only_packet_stereo`] with §4.2.5 LBRR (in-band FEC)
+/// emission: `lbrr[idx]` optionally carries mid / side redundancy
+/// scripts for interval `idx` (re-encodes of the interval the
+/// *previous* packet covered, per §2.1.7). LBRR frames are written
+/// ahead of the regular frames in the same §4.2.2 mid/side interleaved
+/// order, with their own independent per-channel carried states,
+/// exactly the way the packet decoder walks them.
+///
+/// Returns the packet bytes, the regular predictions, and the LBRR
+/// predictions.
+pub fn encode_silk_only_packet_stereo_with_lbrr(
+    bandwidth: Bandwidth,
+    frame_size_tenths_ms: u16,
+    intervals: &[StereoIntervalScripts<'_>],
+    lbrr: &[StereoIntervalLbrr<'_>],
+) -> Result<(Vec<u8>, StereoPacketPredictions, StereoLbrrPredictions), Error> {
+    let num_silk_frames = silk_frame_count(frame_size_tenths_ms).ok_or(Error::MalformedPacket)?;
+    if intervals.len() != num_silk_frames as usize || lbrr.len() != num_silk_frames as usize {
+        return Err(Error::MalformedPacket);
+    }
+    let frame_size = if frame_size_tenths_ms == 100 {
+        SilkFrameSize::TenMs
+    } else {
+        SilkFrameSize::TwentyMs
+    };
+
+    // §3.1 TOC byte: SILK-only, stereo, code 0 (one Opus frame).
+    let toc = OpusTocByte::compose_byte(
+        Mode::SilkOnly,
+        bandwidth,
+        frame_size_tenths_ms,
+        true,
+        FrameCountCode::One,
+    )?;
+
+    let mut re = RangeEncoder::new();
+
+    // §4.2.3 / §4.2.4 header bits. VAD per channel per interval:
+    // mid from the mid frame type; side from "side coded with an
+    // active frame type". LBRR bitmaps from which intervals carry
+    // redundancy scripts.
+    let mut mid_vad_flags = 0u8;
+    let mut side_vad_flags = 0u8;
+    for (idx, iv) in intervals.iter().enumerate() {
+        if iv.mid.header.frame_type >= 2 {
+            mid_vad_flags |= 1 << idx;
+        }
+        if let Some(side) = &iv.side {
+            if side.header.frame_type >= 2 {
+                side_vad_flags |= 1 << idx;
+            }
+        }
+    }
+    let mut mid_lbrr_bits = 0u8;
+    let mut side_lbrr_bits = 0u8;
+    for (idx, l) in lbrr.iter().enumerate() {
+        if l.mid.is_some() {
+            mid_lbrr_bits |= 1 << idx;
+        }
+        if l.side.is_some() {
+            side_lbrr_bits |= 1 << idx;
+        }
+    }
+    let header = SilkHeaderBits {
+        num_silk_frames,
+        mid: SilkChannelHeader {
+            vad_flags: mid_vad_flags,
+            lbrr_flag: mid_lbrr_bits != 0,
+        },
+        side: Some(SilkChannelHeader {
+            vad_flags: side_vad_flags,
+            lbrr_flag: side_lbrr_bits != 0,
+        }),
+        per_frame_lbrr: PerFrameLbrr {
+            mid: mid_lbrr_bits,
+            side: side_lbrr_bits,
+        },
+    };
+    header.encode(&mut re)?;
+
+    // §4.2.5 LBRR frames: per interval, mid (if present) then side (if
+    // present), interleaved per §4.2.2, ahead of every regular frame,
+    // with independent per-channel carried states — the exact mirror of
+    // the decoder's stereo LBRR walk.
+    let mut lbrr_mid_state = ChannelDecodeState::new();
+    let mut lbrr_side_state = ChannelDecodeState::new();
+    let mut lbrr_mid_pred: Vec<Option<SilkFrameDecoded>> = Vec::with_capacity(lbrr.len());
+    let mut lbrr_side_pred: Vec<Option<SilkFrameDecoded>> = Vec::with_capacity(lbrr.len());
+    for entry in lbrr.iter() {
+        let side_lbrr = entry.side.is_some();
+        if let Some(mid_sym) = &entry.mid {
+            if mid_sym.header.frame_type < 2 {
+                // §4.2.7.3: LBRR frames use the active PDF.
+                return Err(Error::MalformedPacket);
+            }
+            // §4.2.7.2: the mid-only flag is present on the mid LBRR
+            // frame iff the interval's side LBRR frame is not coded —
+            // and then it must be set (the header LBRR bits already
+            // promise no side frame follows; a cleared flag would
+            // contradict them).
+            if !side_lbrr && mid_sym.header.mid_only_flag != Some(true) {
+                return Err(Error::MalformedPacket);
+            }
+            let stereo_ctx = StereoHeaderContext {
+                has_mid_only_flag: !side_lbrr,
+            };
+            let decoded = encode_silk_frame(
+                &mut re,
+                lbrr_mid_state.config(bandwidth, frame_size, true, Some(stereo_ctx)),
+                mid_sym,
+            )?;
+            lbrr_mid_state.advance(&decoded);
+            lbrr_mid_pred.push(Some(decoded));
+        } else {
+            lbrr_mid_pred.push(None);
+        }
+        if let Some(side_sym) = &entry.side {
+            if side_sym.header.frame_type < 2 {
+                return Err(Error::MalformedPacket);
+            }
+            let decoded = encode_silk_frame(
+                &mut re,
+                lbrr_side_state.config(bandwidth, frame_size, true, None),
+                side_sym,
+            )?;
+            lbrr_side_state.advance(&decoded);
+            lbrr_side_pred.push(Some(decoded));
+        } else {
+            lbrr_side_pred.push(None);
+        }
+    }
+
+    // §4.2.6 regular SILK frames: per interval, the mid frame then
+    // (unless mid-only) the side frame, with per-channel carried state.
+    let mut mid_state = ChannelDecodeState::new();
+    let mut side_state = ChannelDecodeState::new();
+    let mut mid_pred: Vec<SilkFrameDecoded> = Vec::with_capacity(intervals.len());
+    let mut side_pred: Vec<Option<SilkFrameDecoded>> = Vec::with_capacity(intervals.len());
+    for (idx, iv) in intervals.iter().enumerate() {
+        let side_active = (side_vad_flags >> idx) & 1 == 1;
+        // §4.2.7.2: the mid-only flag is present iff the interval's side
+        // channel is not active; the script must match, and its value
+        // must agree with whether a side script is present.
+        match iv.mid.header.mid_only_flag {
+            Some(flag) => {
+                if side_active || flag != iv.side.is_none() {
+                    return Err(Error::MalformedPacket);
+                }
+            }
+            None => {
+                // No flag ⇒ side VAD must be set ⇒ side frame coded.
+                if !side_active || iv.side.is_none() {
+                    return Err(Error::MalformedPacket);
+                }
+            }
+        }
+        let stereo_ctx = StereoHeaderContext {
+            has_mid_only_flag: !side_active,
+        };
+        let mid_decoded = encode_silk_frame(
+            &mut re,
+            mid_state.config(
+                bandwidth,
+                frame_size,
+                (mid_vad_flags >> idx) & 1 == 1,
+                Some(stereo_ctx),
+            ),
+            &iv.mid,
+        )?;
+        mid_state.advance(&mid_decoded);
+        mid_pred.push(mid_decoded);
+
+        if let Some(side_sym) = &iv.side {
+            let side_decoded = encode_silk_frame(
+                &mut re,
+                side_state.config(bandwidth, frame_size, side_active, None),
+                side_sym,
+            )?;
+            side_state.advance(&side_decoded);
+            side_pred.push(Some(side_decoded));
+        } else {
+            // §4.2.7.2 / §4.5.2: an uncoded side frame leaves the side
+            // carried state untouched (the decoder does not advance it).
+            side_pred.push(None);
+        }
+    }
+
+    // §5.1.5 finalize; §3.2 code-0 framing.
+    let body = re.finish();
+    let mut packet = Vec::with_capacity(1 + body.len());
+    packet.push(toc);
+    packet.extend_from_slice(&body);
+    Ok((
+        packet,
+        StereoPacketPredictions {
+            mid: mid_pred,
+            side: side_pred,
+        },
+        StereoLbrrPredictions {
+            mid: lbrr_mid_pred,
+            side: lbrr_side_pred,
+        },
+    ))
+}
+
+/// The per-interval §4.2.5 LBRR predictions returned by
+/// [`encode_silk_only_packet_stereo_with_lbrr`].
+#[derive(Debug, Clone)]
+pub struct StereoLbrrPredictions {
+    /// One decoded mid LBRR frame per interval that carried one.
+    pub mid: Vec<Option<SilkFrameDecoded>>,
+    /// One decoded side LBRR frame per interval that carried one.
+    pub side: Vec<Option<SilkFrameDecoded>>,
 }
 
 #[cfg(test)]
@@ -577,6 +891,516 @@ mod tests {
         let mut dec = OpusDecoder::new();
         let rec = dec.decode_packet_fec(&packet).expect("fec decode");
         assert_eq!(rec.status, FecDecodeStatus::NoLbrr);
+    }
+
+    use crate::silk_frame::StereoWeightSymbols;
+
+    fn random_weights(rng: &mut Lcg) -> StereoWeightSymbols {
+        StereoWeightSymbols {
+            n: rng.below(25) as u8,
+            i0: rng.below(3) as u8,
+            i1: rng.below(5) as u8,
+            i2: rng.below(3) as u8,
+            i3: rng.below(5) as u8,
+        }
+    }
+
+    /// Per-interval side-channel coding pattern for the stereo sweeps.
+    #[derive(Clone, Copy, PartialEq)]
+    enum SidePattern {
+        /// Side coded with an active frame type (side VAD set, no
+        /// §4.2.7.2 mid-only flag on the mid frame).
+        Active,
+        /// Side coded but inactive (side VAD clear, mid-only flag
+        /// present and cleared).
+        InactiveCoded,
+        /// Side not coded (mid-only flag present and set).
+        MidOnly,
+    }
+
+    /// Build one stereo interval's (mid, side) script buffers.
+    ///
+    /// `mid_first` / `mid_has_prev_lag` describe the mid channel's
+    /// carried state; `side_first` / `side_has_prev_lag` the side
+    /// channel's (side state only advances on *coded* side frames).
+    #[allow(clippy::too_many_arguments)]
+    fn random_stereo_interval(
+        rng: &mut Lcg,
+        bandwidth: Bandwidth,
+        frame_size: SilkFrameSize,
+        pattern: SidePattern,
+        mid_first: bool,
+        mid_has_prev_lag: bool,
+        side_first: bool,
+        side_has_prev_lag: bool,
+    ) -> (ScriptBufs, Option<ScriptBufs>) {
+        let mut mid = random_frame_script(rng, bandwidth, frame_size, mid_first, mid_has_prev_lag);
+        mid.header.stereo = Some(random_weights(rng));
+        mid.header.mid_only_flag = match pattern {
+            SidePattern::Active => None,
+            SidePattern::InactiveCoded => Some(false),
+            SidePattern::MidOnly => Some(true),
+        };
+        let side = match pattern {
+            SidePattern::MidOnly => None,
+            SidePattern::Active => {
+                let mut s =
+                    random_frame_script(rng, bandwidth, frame_size, side_first, side_has_prev_lag);
+                if s.header.frame_type < 2 {
+                    // Force an active type without disturbing the
+                    // generator's LTP shape (0/1 → 2/3, still unvoiced).
+                    s.header.frame_type += 2;
+                }
+                Some(s)
+            }
+            SidePattern::InactiveCoded => {
+                let mut s =
+                    random_frame_script(rng, bandwidth, frame_size, side_first, side_has_prev_lag);
+                if s.header.frame_type >= 2 {
+                    // Force an inactive type; inactive frames carry no
+                    // §4.2.7.6 LTP.
+                    s.header.frame_type %= 2;
+                    s.ltp = None;
+                }
+                Some(s)
+            }
+        };
+        (mid, side)
+    }
+
+    /// End-to-end: random stereo SILK-only packets across every
+    /// bandwidth × duration × side-coding pattern decode through a fresh
+    /// `OpusDecoder::decode_packet` to real stereo SILK PCM with the
+    /// exact §3 sample count, and a parallel mid/side Table-5 walk
+    /// reconstructs both channels' predictions field-for-field.
+    #[test]
+    fn stereo_packet_encode_decodes_end_to_end() {
+        let mut rng = Lcg(0x57E2_E001);
+        for round in 0..120 {
+            let bandwidth = match rng.below(3) {
+                0 => Bandwidth::Nb,
+                1 => Bandwidth::Mb,
+                _ => Bandwidth::Wb,
+            };
+            let fs_tenths: u16 = [100u16, 200, 400, 600][rng.below(4) as usize];
+            let frame_size = if fs_tenths == 100 {
+                SilkFrameSize::TenMs
+            } else {
+                SilkFrameSize::TwentyMs
+            };
+            let n = silk_frame_count(fs_tenths).unwrap() as usize;
+
+            let mut interval_bufs: Vec<(ScriptBufs, Option<ScriptBufs>)> = Vec::with_capacity(n);
+            let mut patterns: Vec<SidePattern> = Vec::with_capacity(n);
+            let mut side_first = true;
+            let mut side_has_prev = false;
+            for idx in 0..n {
+                let pattern = match rng.below(3) {
+                    0 => SidePattern::Active,
+                    1 => SidePattern::InactiveCoded,
+                    _ => SidePattern::MidOnly,
+                };
+                let iv = random_stereo_interval(
+                    &mut rng,
+                    bandwidth,
+                    frame_size,
+                    pattern,
+                    idx == 0,
+                    idx > 0,
+                    side_first,
+                    side_has_prev,
+                );
+                if pattern != SidePattern::MidOnly {
+                    side_first = false;
+                    side_has_prev = true;
+                }
+                patterns.push(pattern);
+                interval_bufs.push(iv);
+            }
+            let intervals: Vec<StereoIntervalScripts<'_>> = interval_bufs
+                .iter()
+                .map(|(m, s)| StereoIntervalScripts {
+                    mid: symbols_of(m),
+                    side: s.as_ref().map(symbols_of),
+                })
+                .collect();
+
+            let (packet, predictions) =
+                encode_silk_only_packet_stereo(bandwidth, fs_tenths, &intervals)
+                    .expect("stereo packet encode");
+            assert_eq!(predictions.mid.len(), n);
+            assert_eq!(predictions.side.len(), n);
+
+            // The packet decodes end-to-end on a fresh decoder.
+            let mut dec = OpusDecoder::new();
+            let out = dec.decode_packet(&packet).expect("packet decode");
+            assert_eq!(out.channels, 2, "round {round}");
+            assert_eq!(
+                out.frame_outcomes[0].status,
+                FrameDecodeStatus::SilkStereoDecoded,
+                "round {round} bw={bandwidth:?} fs={fs_tenths}"
+            );
+            assert_eq!(
+                out.samples_per_channel() as u32,
+                48_000 * fs_tenths as u32 / 10_000,
+                "round {round}"
+            );
+            assert_eq!(
+                out.pcm.len() as u32,
+                2 * 48_000 * fs_tenths as u32 / 10_000,
+                "round {round}"
+            );
+
+            // Parallel mid/side Table-5 walk over the packet body
+            // reconstructs exactly the encoder's predictions.
+            let mut rd = RangeDecoder::new(&packet[1..]);
+            let header = SilkHeaderBits::decode(&mut rd, n as u8, true).expect("header bits");
+            assert!(!header.mid.lbrr_flag);
+            assert!(header.side.is_some_and(|s| !s.lbrr_flag));
+            let mut mid_state = crate::decoder::ChannelDecodeState::new();
+            let mut side_state = crate::decoder::ChannelDecodeState::new();
+            for (idx, pattern) in patterns.iter().enumerate() {
+                let side_active = header.side_vad(idx as u8);
+                assert_eq!(
+                    side_active,
+                    *pattern == SidePattern::Active,
+                    "round {round} interval {idx}"
+                );
+                let stereo_ctx = crate::silk_decode::StereoHeaderContext {
+                    has_mid_only_flag: !side_active,
+                };
+                let mid_decoded = decode_silk_frame(
+                    &mut rd,
+                    mid_state.config(
+                        bandwidth,
+                        frame_size,
+                        header.mid_vad(idx as u8),
+                        Some(stereo_ctx),
+                    ),
+                )
+                .expect("mid decode");
+                assert_eq!(
+                    &mid_decoded, &predictions.mid[idx],
+                    "round {round} mid {idx}"
+                );
+                let side_coded = side_active || mid_decoded.mid_only_flag == Some(false);
+                mid_state.advance(&mid_decoded);
+                if side_coded {
+                    let side_decoded = decode_silk_frame(
+                        &mut rd,
+                        side_state.config(bandwidth, frame_size, side_active, None),
+                    )
+                    .expect("side decode");
+                    assert_eq!(
+                        Some(&side_decoded),
+                        predictions.side[idx].as_ref(),
+                        "round {round} side {idx}"
+                    );
+                    side_state.advance(&side_decoded);
+                } else {
+                    assert!(predictions.side[idx].is_none(), "round {round} side {idx}");
+                }
+            }
+            assert!(!rd.has_error());
+        }
+    }
+
+    /// Stereo LBRR emission closes the stereo FEC loop: a packet
+    /// carrying §4.2.5 mid/side redundancy still decodes its regular
+    /// frames end-to-end (pinning the range-coder alignment across the
+    /// interleaved LBRR frames), and `decode_packet_fec` recovers real
+    /// two-channel audio from the emitted redundancy.
+    #[test]
+    fn stereo_packet_encode_with_lbrr_fec_roundtrip() {
+        use crate::decoder::FecDecodeStatus;
+        let mut rng = Lcg(0xFEC0_57E2);
+        for round in 0..60 {
+            let bandwidth = match rng.below(3) {
+                0 => Bandwidth::Nb,
+                1 => Bandwidth::Mb,
+                _ => Bandwidth::Wb,
+            };
+            let fs_tenths: u16 = [100u16, 200, 400, 600][rng.below(4) as usize];
+            let frame_size = if fs_tenths == 100 {
+                SilkFrameSize::TenMs
+            } else {
+                SilkFrameSize::TwentyMs
+            };
+            let n = silk_frame_count(fs_tenths).unwrap() as usize;
+
+            // Regular frames: keep the side always actively coded for
+            // this sweep (the pattern axis is covered by the other test).
+            let mut interval_bufs: Vec<(ScriptBufs, Option<ScriptBufs>)> = Vec::with_capacity(n);
+            for idx in 0..n {
+                interval_bufs.push(random_stereo_interval(
+                    &mut rng,
+                    bandwidth,
+                    frame_size,
+                    SidePattern::Active,
+                    idx == 0,
+                    idx > 0,
+                    idx == 0,
+                    idx > 0,
+                ));
+            }
+            let intervals: Vec<StereoIntervalScripts<'_>> = interval_bufs
+                .iter()
+                .map(|(m, s)| StereoIntervalScripts {
+                    mid: symbols_of(m),
+                    side: s.as_ref().map(symbols_of),
+                })
+                .collect();
+
+            // LBRR pattern per interval: none / mid-only / mid+side /
+            // side-only, at least one interval carrying something.
+            let mut kinds = vec![0u32; n];
+            kinds[rng.below(n as u32) as usize] = 1 + rng.below(3);
+            for k in kinds.iter_mut() {
+                if *k == 0 && rng.below(2) == 0 {
+                    *k = 1 + rng.below(3);
+                }
+            }
+            let mut lbrr_bufs: Vec<(Option<ScriptBufs>, Option<ScriptBufs>)> =
+                Vec::with_capacity(n);
+            let mut mid_first = true;
+            let mut mid_prev = false;
+            let mut side_first = true;
+            let mut side_prev = false;
+            for &kind in &kinds {
+                let want_mid = kind == 1 || kind == 2;
+                let want_side = kind == 2 || kind == 3;
+                let mid = want_mid.then(|| {
+                    let mut b =
+                        random_frame_script(&mut rng, bandwidth, frame_size, mid_first, mid_prev);
+                    if b.header.frame_type < 2 {
+                        b.header.frame_type += 2; // active-coded (§4.2.7.3)
+                    }
+                    b.header.stereo = Some(random_weights(&mut rng));
+                    b.header.mid_only_flag = (!want_side).then_some(true);
+                    mid_first = false;
+                    mid_prev = true;
+                    b
+                });
+                let side = want_side.then(|| {
+                    let mut b =
+                        random_frame_script(&mut rng, bandwidth, frame_size, side_first, side_prev);
+                    if b.header.frame_type < 2 {
+                        b.header.frame_type += 2;
+                    }
+                    side_first = false;
+                    side_prev = true;
+                    b
+                });
+                lbrr_bufs.push((mid, side));
+            }
+            let lbrr_scripts: Vec<StereoIntervalLbrr<'_>> = lbrr_bufs
+                .iter()
+                .map(|(m, s)| StereoIntervalLbrr {
+                    mid: m.as_ref().map(symbols_of),
+                    side: s.as_ref().map(symbols_of),
+                })
+                .collect();
+
+            let (packet, regular, lbrr_pred) = encode_silk_only_packet_stereo_with_lbrr(
+                bandwidth,
+                fs_tenths,
+                &intervals,
+                &lbrr_scripts,
+            )
+            .expect("stereo packet encode with lbrr");
+            assert_eq!(regular.mid.len(), n);
+            assert_eq!(
+                lbrr_pred.mid.iter().filter(|p| p.is_some()).count(),
+                kinds.iter().filter(|&&k| k == 1 || k == 2).count()
+            );
+            assert_eq!(
+                lbrr_pred.side.iter().filter(|p| p.is_some()).count(),
+                kinds.iter().filter(|&&k| k == 2 || k == 3).count()
+            );
+
+            // Regular decode still lands (range-coder alignment past the
+            // interleaved LBRR frames).
+            let mut dec = OpusDecoder::new();
+            let out = dec.decode_packet(&packet).expect("packet decode");
+            assert_eq!(
+                out.frame_outcomes[0].status,
+                FrameDecodeStatus::SilkStereoDecoded,
+                "round {round} bw={bandwidth:?} fs={fs_tenths} kinds={kinds:?}"
+            );
+
+            // FEC recovery from the emitted redundancy: real two-channel
+            // audio with the exact §3 sample count. The decoder's FEC
+            // policy needs at least one *mid* LBRR frame to reconstruct a
+            // stereo signal (a side-only redundancy set has no mid signal
+            // to unmix against), so an all-side-only pattern reports
+            // `NoLbrr` while every mid-bearing pattern recovers.
+            let any_mid_lbrr = kinds.iter().any(|&k| k == 1 || k == 2);
+            let mut fec_dec = OpusDecoder::new();
+            let rec = fec_dec.decode_packet_fec(&packet).expect("fec decode");
+            assert_eq!(
+                rec.status,
+                if any_mid_lbrr {
+                    FecDecodeStatus::Recovered
+                } else {
+                    FecDecodeStatus::NoLbrr
+                },
+                "round {round} bw={bandwidth:?} fs={fs_tenths} kinds={kinds:?}"
+            );
+            assert_eq!(rec.channels, 2, "round {round}");
+            assert_eq!(
+                rec.pcm.len() as u32,
+                2 * 48_000 * fs_tenths as u32 / 10_000,
+                "round {round}"
+            );
+        }
+    }
+
+    /// Stereo shape / consistency violations are rejected: wrong
+    /// interval count, missing §4.2.7.1 weights, mid-only flag
+    /// mismatches, an active side frame under a mid-only interval, and
+    /// inactive LBRR scripts.
+    #[test]
+    fn stereo_packet_encode_rejects_inconsistent_scripts() {
+        let mut rng = Lcg(0xBAD5_7E2E);
+        let (mid, side) = random_stereo_interval(
+            &mut rng,
+            Bandwidth::Wb,
+            SilkFrameSize::TwentyMs,
+            SidePattern::Active,
+            true,
+            false,
+            true,
+            false,
+        );
+        let side = side.unwrap();
+
+        // Wrong interval count for the duration.
+        let iv = StereoIntervalScripts {
+            mid: symbols_of(&mid),
+            side: Some(symbols_of(&side)),
+        };
+        assert!(encode_silk_only_packet_stereo(Bandwidth::Wb, 400, &[iv]).is_err());
+
+        // Missing stereo weights on the mid frame.
+        let mut mid_no_w = symbols_of(&mid);
+        mid_no_w.header.stereo = None;
+        let iv = StereoIntervalScripts {
+            mid: mid_no_w,
+            side: Some(symbols_of(&side)),
+        };
+        assert!(encode_silk_only_packet_stereo(Bandwidth::Wb, 200, &[iv]).is_err());
+
+        // Active side but a mid-only flag present on the mid frame.
+        let mut mid_bad_flag = symbols_of(&mid);
+        mid_bad_flag.header.mid_only_flag = Some(false);
+        let iv = StereoIntervalScripts {
+            mid: mid_bad_flag,
+            side: Some(symbols_of(&side)),
+        };
+        assert!(encode_silk_only_packet_stereo(Bandwidth::Wb, 200, &[iv]).is_err());
+
+        // Mid-only flag set but a side script supplied. The side script
+        // must be inactive for the "flag value vs side presence" check
+        // to be the failing condition (an active side sets side VAD,
+        // which is the previous case).
+        let (mid_mo, _) = random_stereo_interval(
+            &mut rng,
+            Bandwidth::Wb,
+            SilkFrameSize::TwentyMs,
+            SidePattern::MidOnly,
+            true,
+            false,
+            true,
+            false,
+        );
+        let mut side_inactive = random_frame_script(
+            &mut rng,
+            Bandwidth::Wb,
+            SilkFrameSize::TwentyMs,
+            true,
+            false,
+        );
+        if side_inactive.header.frame_type >= 2 {
+            side_inactive.header.frame_type %= 2;
+            side_inactive.ltp = None;
+        }
+        let iv = StereoIntervalScripts {
+            mid: symbols_of(&mid_mo),
+            side: Some(symbols_of(&side_inactive)),
+        };
+        assert!(encode_silk_only_packet_stereo(Bandwidth::Wb, 200, &[iv]).is_err());
+
+        // Stereo weights on a *side* frame are rejected by the
+        // per-frame encoder (want_stereo mismatch).
+        let mut side_with_w = symbols_of(&side);
+        side_with_w.header.stereo = Some(random_weights(&mut rng));
+        let iv = StereoIntervalScripts {
+            mid: symbols_of(&mid),
+            side: Some(side_with_w),
+        };
+        assert!(encode_silk_only_packet_stereo(Bandwidth::Wb, 200, &[iv]).is_err());
+
+        // Inactive LBRR mid script.
+        let (mid_ok, side_ok) = random_stereo_interval(
+            &mut rng,
+            Bandwidth::Wb,
+            SilkFrameSize::TwentyMs,
+            SidePattern::Active,
+            true,
+            false,
+            true,
+            false,
+        );
+        let side_ok = side_ok.unwrap();
+        let mut lbrr_mid = random_frame_script(
+            &mut rng,
+            Bandwidth::Wb,
+            SilkFrameSize::TwentyMs,
+            true,
+            false,
+        );
+        if lbrr_mid.header.frame_type >= 2 {
+            lbrr_mid.header.frame_type %= 2;
+            lbrr_mid.ltp = None;
+        }
+        lbrr_mid.header.stereo = Some(random_weights(&mut rng));
+        lbrr_mid.header.mid_only_flag = Some(true);
+        let iv = StereoIntervalScripts {
+            mid: symbols_of(&mid_ok),
+            side: Some(symbols_of(&side_ok)),
+        };
+        let lbrr = StereoIntervalLbrr {
+            mid: Some(symbols_of(&lbrr_mid)),
+            side: None,
+        };
+        assert!(
+            encode_silk_only_packet_stereo_with_lbrr(Bandwidth::Wb, 200, &[iv], &[lbrr]).is_err()
+        );
+
+        // LBRR mid with no side LBRR must carry mid_only == Some(true).
+        let mut lbrr_mid_bad = random_frame_script(
+            &mut rng,
+            Bandwidth::Wb,
+            SilkFrameSize::TwentyMs,
+            true,
+            false,
+        );
+        if lbrr_mid_bad.header.frame_type < 2 {
+            lbrr_mid_bad.header.frame_type += 2;
+        }
+        lbrr_mid_bad.header.stereo = Some(random_weights(&mut rng));
+        lbrr_mid_bad.header.mid_only_flag = Some(false);
+        let iv = StereoIntervalScripts {
+            mid: symbols_of(&mid_ok),
+            side: Some(symbols_of(&side_ok)),
+        };
+        let lbrr = StereoIntervalLbrr {
+            mid: Some(symbols_of(&lbrr_mid_bad)),
+            side: None,
+        };
+        assert!(
+            encode_silk_only_packet_stereo_with_lbrr(Bandwidth::Wb, 200, &[iv], &[lbrr]).is_err()
+        );
     }
 
     /// Frame-count / duration mismatches are rejected.

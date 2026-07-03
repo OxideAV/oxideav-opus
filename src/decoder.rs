@@ -1571,7 +1571,7 @@ fn push_silence(pcm: &mut Vec<i16>, per_channel: usize, channels: u8) {
 /// §4.2.7.5.5 previous NLSF base, and the "first SILK frame of this type"
 /// flag). One instance is used for the mid channel and one for the side
 /// channel (each channel's frames form an independent sequence).
-struct ChannelDecodeState {
+pub(crate) struct ChannelDecodeState {
     prev_gain: Option<u8>,
     prev_lag: Option<i32>,
     prev_nlsf: Option<[i16; crate::silk_lsf_stage2::D_LPC_MAX]>,
@@ -1580,7 +1580,7 @@ struct ChannelDecodeState {
 }
 
 impl ChannelDecodeState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             prev_gain: None,
             prev_lag: None,
@@ -1594,7 +1594,7 @@ impl ChannelDecodeState {
     /// frame in this channel's sequence, given the §4.2.4 VAD flag and the
     /// optional §4.2.7.1 / §4.2.7.2 stereo header context (present only on
     /// the mid channel).
-    fn config(
+    pub(crate) fn config(
         &self,
         bandwidth: crate::toc::Bandwidth,
         frame_size: crate::silk_excitation::SilkFrameSize,
@@ -1618,7 +1618,7 @@ impl ChannelDecodeState {
 
     /// Fold a freshly decoded SILK frame into the carried state, so the
     /// next frame in this channel's sequence predicts against it.
-    fn advance(&mut self, decoded: &crate::silk_decode::SilkFrameDecoded) {
+    pub(crate) fn advance(&mut self, decoded: &crate::silk_decode::SilkFrameDecoded) {
         self.prev_gain = Some(decoded.gains.last_log_gain());
         self.prev_lag = Some(decoded.ltp.primary_lag());
         self.prev_nlsf = Some(decoded.nlsf_q15);

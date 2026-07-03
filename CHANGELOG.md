@@ -4,6 +4,37 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- *Stereo SILK-only Opus **packet** encoder —
+  `silk_packet_encode::encode_silk_only_packet_stereo` (+
+  `_with_lbrr`), the §4.2.2 mid/side interleave writer.* Per 20 ms
+  interval the mid SILK frame is written (carrying the §4.2.7.1
+  stereo-prediction-weight quintuple and, when the interval's side
+  channel is not active, the §4.2.7.2 mid-only flag), then the side
+  SILK frame when coded, with two independent per-channel carried
+  states (previous gain / lag / NLSF) threaded exactly the way the
+  packet decoder's stereo walk threads them. All three side-coding
+  shapes are supported and validated: an active side frame (side VAD
+  set, no mid-only flag), an inactive coded side frame (mid-only flag
+  present and cleared), and a skipped side frame (flag set; the side
+  carried state is left untouched, mirroring the decoder). §4.2.5
+  stereo LBRR emission interleaves optional mid / side redundancy
+  frames ahead of the regular frames (mid LBRR carries weights; the
+  mid-only flag on a mid LBRR frame is present iff the interval has
+  no side LBRR frame and must then be set; side-only LBRR intervals
+  are legal), closing the stereo FEC loop. Validated end-to-end: 120
+  random stereo packets across every bandwidth × duration ×
+  side-pattern mix decode through a fresh `OpusDecoder::decode_packet`
+  to real stereo SILK PCM (`SilkStereoDecoded`, exact §3 interleaved
+  sample counts) with a parallel mid/side Table-5 walk reconstructing
+  both channels' predictions field-for-field, and 60 LBRR-bearing
+  packets keep their regular decode aligned while `decode_packet_fec`
+  recovers real two-channel audio (`Recovered`; an all-side-only
+  redundancy set reports `NoLbrr` per the decoder's mid-anchored FEC
+  policy). Inconsistent scripts (missing weights, mid-only flag
+  mismatches, weights on a side frame, inactive LBRR) are rejected.
+
 ### Fixed
 
 - *Two decoder crashes found by the restored fuzz suite's first CI
