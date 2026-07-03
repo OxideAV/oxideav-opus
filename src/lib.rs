@@ -737,6 +737,7 @@ pub mod silk_lcg_seed;
 pub mod silk_log2lin;
 pub mod silk_lpc_analysis;
 pub mod silk_lpc_synth;
+pub mod silk_lpc_to_nlsf;
 pub mod silk_lsf_interp;
 pub mod silk_lsf_recon;
 pub mod silk_lsf_stabilize;
