@@ -6,6 +6,26 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- *RFC 7845 write side — `OpusHead::compose` (§5.1 / §5.1.1) and
+  `multistream::assemble_multistream_packet` (§3).* `compose` is the
+  exact write-side mirror of `OpusHead::parse`: it validates every
+  MUST the parser enforces (version nibble, non-zero channel count,
+  per-family channel ranges, non-zero stream count, `M ≤ N`,
+  `M + N ≤ 255`, mapping-table length and index bounds; a family-0
+  header must hold the RFC-pinned synthesized default table since the
+  wire format omits it) and re-emits parsed headers byte-identically
+  — including the real fixture's family-0 header. The multistream
+  assembler packs `N` regular per-stream packets per §3: the first
+  `N − 1` re-framed through the new Appendix-B writer (code-3
+  padding preserved, CBR/VBR chosen from the parsed frame lengths),
+  the last appended verbatim, with the §3 equal-duration constraint
+  (same TOC config + frame count) enforced across inputs. Verified:
+  assemble→split roundtrips over mixed code-2/code-3 streams,
+  byte-identity with the integration suite's hand-built self-delimited
+  construction, and a whole-fixture write→read sweep where every
+  assembled 2-stream packet decodes through `MultistreamDecoder`
+  sample-identically to a plain stateful decode.
+
 - *§3.2 / Appendix-B packet-framing **writers** —
   `packet_compose::{compose_packet, compose_packet_code3,
   compose_self_delimited, encode_length}`.* The write-side mirror of

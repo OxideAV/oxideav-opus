@@ -103,6 +103,77 @@ pub fn split_multistream_packet(
     Ok(streams)
 }
 
+/// Assemble `N` regular (undelimited) per-stream Opus packets into one
+/// multistream packet — the write-side mirror of
+/// [`split_multistream_packet`] (RFC 7845 §3).
+///
+/// Per §3 the first `N − 1` packets are re-framed with the RFC 6716
+/// Appendix-B self-delimiting framing
+/// ([`crate::packet_compose::compose_self_delimited`]) and packed one
+/// after another; the final packet is appended verbatim with its
+/// regular framing. Each input must parse as a complete Opus packet;
+/// §3's equal-duration constraint ("the duration and TOC sequence …
+/// MUST be exactly the same") is enforced across the inputs (same TOC
+/// `config` and frame count).
+///
+/// A code-3 prefix packet is re-framed with its parsed padding
+/// preserved and CBR/VBR chosen from its frame lengths (uniform →
+/// CBR), so the self-delimited form is a valid §3.2-equivalent
+/// encoding of the same frames — byte-identity with the original
+/// code-3 header is not guaranteed for a VBR packet whose lengths
+/// happen to be uniform, but the parsed content always is identical.
+///
+/// Returns [`Error::MalformedPacket`] on an empty stream list, any
+/// unparsable input, or a duration/config mismatch.
+pub fn assemble_multistream_packet(packets: &[&[u8]]) -> Result<Vec<u8>, Error> {
+    use crate::frames::OpusPacket;
+    use crate::packet_compose::compose_self_delimited;
+
+    let n = packets.len();
+    if n == 0 {
+        return Err(Error::MalformedPacket);
+    }
+    // §3: every stream's packet must carry the same duration — pinned
+    // here as "same TOC config and same frame count" (the §3.2 layer
+    // determines the count; the config fixes the per-frame duration).
+    let mut shape: Option<(u8, usize)> = None;
+    let mut out = Vec::new();
+    for (idx, &packet) in packets.iter().enumerate() {
+        let parsed = OpusPacket::parse(packet)?;
+        let config = packet[0] >> 3;
+        let count = parsed.frame_count();
+        match shape {
+            None => shape = Some((config, count)),
+            Some(s) => {
+                if s != (config, count) {
+                    return Err(Error::MalformedPacket);
+                }
+            }
+        }
+        if idx + 1 < n {
+            // Prefix stream: re-frame self-delimited. CBR/VBR and
+            // padding only apply to a code-3 packet, chosen from its
+            // parsed frame lengths / padding.
+            let frames = parsed.frames();
+            let (vbr, padding) =
+                if parsed.toc.frame_count_code == crate::toc::FrameCountCode::Arbitrary {
+                    (
+                        frames.iter().any(|f| f.len() != frames[0].len()),
+                        parsed.padding,
+                    )
+                } else {
+                    (false, 0)
+                };
+            let sd = compose_self_delimited(packet[0], frames, vbr, padding)?;
+            out.extend_from_slice(&sd);
+        } else {
+            // Final stream: regular framing, verbatim.
+            out.extend_from_slice(packet);
+        }
+    }
+    Ok(out)
+}
+
 /// A stateful multistream (multichannel) Opus decoder — RFC 7845 §3 +
 /// §5.1.1.
 ///
@@ -368,6 +439,113 @@ mod tests {
         assert_eq!(
             split_multistream_packet(&bad, 2),
             Err(Error::MalformedPacket)
+        );
+    }
+
+    /// assemble → split roundtrip: three streams (a code-2 prefix, a
+    /// padded code-3 VBR prefix, and a code-3 final packet appended
+    /// verbatim) reassemble into per-stream packets whose parsed frames
+    /// and padding match the originals.
+    #[test]
+    fn assemble_split_roundtrip_mixed_codes() {
+        use crate::frames::OpusPacket;
+        use crate::framing_self_delim::parse_self_delimited;
+        use crate::packet_compose::{compose_packet, compose_packet_code3};
+        use crate::toc::{Bandwidth, FrameCountCode, Mode};
+
+        let toc2 = OpusTocByte::compose_byte(
+            Mode::SilkOnly,
+            Bandwidth::Nb,
+            200,
+            false,
+            FrameCountCode::TwoUnequal,
+        )
+        .unwrap();
+        let toc3 = OpusTocByte::compose_byte(
+            Mode::SilkOnly,
+            Bandwidth::Nb,
+            200,
+            true,
+            FrameCountCode::Arbitrary,
+        )
+        .unwrap();
+        let fa: &[u8] = &[1, 2, 3];
+        let fb: &[u8] = &[4, 5, 6, 7, 8];
+        let p0 = compose_packet(toc2, &[fa, fb]).unwrap();
+        let p1 = compose_packet_code3(toc3, &[fb, fa], true, 300).unwrap();
+        let p2 = compose_packet_code3(toc3, &[fa, fa], false, 0).unwrap();
+
+        let assembled = assemble_multistream_packet(&[&p0, &p1, &p2]).unwrap();
+        let streams = split_multistream_packet(&assembled, 3).unwrap();
+        assert_eq!(streams.len(), 3);
+        assert!(streams[0].self_delimited && streams[1].self_delimited);
+        assert!(!streams[2].self_delimited);
+
+        let s0 = parse_self_delimited(streams[0].bytes).unwrap();
+        assert_eq!(s0.packet.frames(), &[fa, fb]);
+        assert_eq!(s0.packet.padding, 0);
+        let s1 = parse_self_delimited(streams[1].bytes).unwrap();
+        assert_eq!(s1.packet.frames(), &[fb, fa]);
+        assert_eq!(s1.packet.padding, 300);
+        // Final stream is byte-verbatim.
+        assert_eq!(streams[2].bytes, p2.as_slice());
+        let s2 = OpusPacket::parse(streams[2].bytes).unwrap();
+        assert_eq!(s2.frames(), &[fa, fa]);
+    }
+
+    /// assemble rejects an empty stream list, a §3 duration/config
+    /// mismatch, a frame-count mismatch, and unparsable input.
+    #[test]
+    fn assemble_rejects_mismatch_and_garbage() {
+        use crate::packet_compose::compose_packet;
+        use crate::toc::{Bandwidth, FrameCountCode, Mode};
+
+        assert_eq!(
+            assemble_multistream_packet(&[]),
+            Err(Error::MalformedPacket)
+        );
+
+        let toc_20 = OpusTocByte::compose_byte(
+            Mode::SilkOnly,
+            Bandwidth::Nb,
+            200,
+            false,
+            FrameCountCode::One,
+        )
+        .unwrap();
+        let toc_40 = OpusTocByte::compose_byte(
+            Mode::SilkOnly,
+            Bandwidth::Nb,
+            400,
+            false,
+            FrameCountCode::One,
+        )
+        .unwrap();
+        let a = compose_packet(toc_20, &[&[1, 2][..]]).unwrap();
+        let b = compose_packet(toc_40, &[&[3, 4][..]]).unwrap();
+        // Config (duration) mismatch.
+        assert_eq!(
+            assemble_multistream_packet(&[&a, &b]),
+            Err(Error::MalformedPacket)
+        );
+        // Frame-count mismatch at equal config: code 0 vs code 1.
+        let toc_c1 = OpusTocByte::compose_byte(
+            Mode::SilkOnly,
+            Bandwidth::Nb,
+            200,
+            false,
+            FrameCountCode::TwoEqual,
+        )
+        .unwrap();
+        let c = compose_packet(toc_c1, &[&[1, 2][..], &[3, 4][..]]).unwrap();
+        assert_eq!(
+            assemble_multistream_packet(&[&a, &c]),
+            Err(Error::MalformedPacket)
+        );
+        // Unparsable input (empty inner packet → §3.4 R1 EmptyPacket).
+        assert_eq!(
+            assemble_multistream_packet(&[&a, &[][..]]),
+            Err(Error::EmptyPacket)
         );
     }
 }

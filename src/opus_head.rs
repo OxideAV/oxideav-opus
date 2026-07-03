@@ -344,6 +344,106 @@ impl OpusHead {
         })
     }
 
+    /// Compose the identification-header packet for this `OpusHead` —
+    /// the write-side mirror of [`Self::parse`] (RFC 7845 §5.1 +
+    /// §5.1.1).
+    ///
+    /// Validates the same MUSTs the parser enforces before emitting a
+    /// single byte: the version major-nibble bound, the non-zero
+    /// channel count and its per-family range, a mapping-table length
+    /// equal to the channel count, the non-zero stream count, `M ≤ N`,
+    /// `M + N ≤ 255`, and the per-output-channel mapping-index bound.
+    /// For **family 0** the on-wire header omits the table (§5.1.1.1),
+    /// so the held table must equal the RFC-pinned synthesized default
+    /// (`N = 1`, `M = C − 1`, identity map) or composition fails —
+    /// otherwise the parse of the produced bytes would not reconstruct
+    /// this value. Successful output always reparses equal.
+    pub fn compose(&self) -> Result<Vec<u8>, OpusHeadError> {
+        if self.version >> 4 > 0 {
+            return Err(OpusHeadError::IncompatibleVersion {
+                version: self.version,
+            });
+        }
+        if self.channel_count == 0 {
+            return Err(OpusHeadError::ZeroChannels);
+        }
+        let mut out = Vec::with_capacity(OPUS_HEAD_MIN_LEN + 2 + self.channel_count as usize);
+        out.extend_from_slice(OPUS_HEAD_MAGIC);
+        out.push(self.version);
+        out.push(self.channel_count);
+        out.extend_from_slice(&self.pre_skip.to_le_bytes());
+        out.extend_from_slice(&self.input_sample_rate.to_le_bytes());
+        out.extend_from_slice(&self.output_gain_q7_8.to_le_bytes());
+        out.push(self.mapping_family);
+
+        if self.mapping_family == 0 {
+            // §5.1.1.1: C ≤ 2, table omitted; the held table must be
+            // exactly the synthesized default.
+            if self.channel_count > 2 {
+                return Err(OpusHeadError::ChannelCountForFamily {
+                    family: 0,
+                    channels: self.channel_count,
+                });
+            }
+            let default = ChannelMappingTable {
+                stream_count: 1,
+                coupled_count: self.channel_count - 1,
+                mapping: (0..self.channel_count).collect(),
+            };
+            if self.mapping != default {
+                // A family-0 header cannot carry a non-default table;
+                // surface it as the family/channel mismatch it is.
+                return Err(OpusHeadError::ChannelCountForFamily {
+                    family: 0,
+                    channels: self.channel_count,
+                });
+            }
+        } else {
+            if self.mapping_family == 1 && self.channel_count > 8 {
+                return Err(OpusHeadError::ChannelCountForFamily {
+                    family: self.mapping_family,
+                    channels: self.channel_count,
+                });
+            }
+            if self.mapping.mapping.len() != self.channel_count as usize {
+                return Err(OpusHeadError::TooShort {
+                    got: OPUS_HEAD_MIN_LEN + 2 + self.mapping.mapping.len(),
+                    need: OPUS_HEAD_MIN_LEN + 2 + self.channel_count as usize,
+                });
+            }
+            if self.mapping.stream_count == 0 {
+                return Err(OpusHeadError::ZeroStreams);
+            }
+            if self.mapping.coupled_count > self.mapping.stream_count {
+                return Err(OpusHeadError::CoupledExceedsStreams {
+                    streams: self.mapping.stream_count,
+                    coupled: self.mapping.coupled_count,
+                });
+            }
+            if self.mapping.decoded_channels() > 255 {
+                return Err(OpusHeadError::TooManyDecodedChannels {
+                    streams: self.mapping.stream_count,
+                    coupled: self.mapping.coupled_count,
+                });
+            }
+            // `M + N ≤ 255` was checked above, so the u8 sum cannot wrap.
+            let decoded_channels = self.mapping.coupled_count + self.mapping.stream_count;
+            out.push(self.mapping.stream_count);
+            out.push(self.mapping.coupled_count);
+            for (c, &index) in self.mapping.mapping.iter().enumerate() {
+                if index != 255 && index >= decoded_channels {
+                    return Err(OpusHeadError::MappingIndexOutOfRange {
+                        output_channel: c as u8,
+                        index,
+                        decoded_channels,
+                    });
+                }
+                out.push(index);
+            }
+        }
+        Ok(out)
+    }
+
     /// Linear playback scale factor derived from the §5.1 output gain:
     /// `pow(10, output_gain / (20.0 * 256))`. A gain of 0 returns 1.0.
     pub fn output_gain_linear(&self) -> f64 {
@@ -682,6 +782,95 @@ mod tests {
         assert_eq!(ps.consume(960), 312);
         assert!(ps.is_done());
         assert_eq!(ps.consume(960), 0);
+    }
+
+    /// compose ∘ parse is the identity on header bytes: the family-0
+    /// mono/stereo defaults and the family-1 5.1 table all re-emit
+    /// byte-identically, and compose ∘ parse on a composed value
+    /// roundtrips the struct.
+    #[test]
+    fn compose_roundtrips_parse() {
+        for bytes in [family0_header(1), family0_header(2), family1_5_1_header()] {
+            let head = OpusHead::parse(&bytes).unwrap();
+            let composed = head.compose().unwrap();
+            assert_eq!(composed, bytes);
+            assert_eq!(OpusHead::parse(&composed).unwrap(), head);
+        }
+    }
+
+    /// compose enforces the same MUSTs as parse: bad version nibble,
+    /// zero channels, family-0 with a non-default table or > 2
+    /// channels, zero streams, M > N, oversized index space, mapping
+    /// length mismatch, and out-of-range mapping indices.
+    #[test]
+    fn compose_rejects_invalid_headers() {
+        let base = OpusHead::parse(&family1_5_1_header()).unwrap();
+
+        let mut h = base.clone();
+        h.version = 0x20;
+        assert!(matches!(
+            h.compose(),
+            Err(OpusHeadError::IncompatibleVersion { .. })
+        ));
+
+        let mut h = base.clone();
+        h.channel_count = 0;
+        assert_eq!(h.compose(), Err(OpusHeadError::ZeroChannels));
+
+        // Family 0 with a non-default table.
+        let mut h = OpusHead::parse(&family0_header(2)).unwrap();
+        h.mapping.mapping = vec![1, 0];
+        assert!(matches!(
+            h.compose(),
+            Err(OpusHeadError::ChannelCountForFamily { family: 0, .. })
+        ));
+
+        // Family 0 cannot carry more than 2 channels.
+        let mut h = OpusHead::parse(&family0_header(2)).unwrap();
+        h.channel_count = 3;
+        h.mapping.mapping = vec![0, 1, 2];
+        assert!(matches!(
+            h.compose(),
+            Err(OpusHeadError::ChannelCountForFamily { family: 0, .. })
+        ));
+
+        let mut h = base.clone();
+        h.mapping.stream_count = 0;
+        h.mapping.coupled_count = 0;
+        assert_eq!(h.compose(), Err(OpusHeadError::ZeroStreams));
+
+        let mut h = base.clone();
+        h.mapping.coupled_count = h.mapping.stream_count + 1;
+        assert!(matches!(
+            h.compose(),
+            Err(OpusHeadError::CoupledExceedsStreams { .. })
+        ));
+
+        let mut h = base.clone();
+        h.mapping.stream_count = 200;
+        h.mapping.coupled_count = 100;
+        assert!(matches!(
+            h.compose(),
+            Err(OpusHeadError::TooManyDecodedChannels { .. })
+        ));
+
+        // Mapping-table length must equal the channel count.
+        let mut h = base.clone();
+        h.mapping.mapping.pop();
+        assert!(matches!(h.compose(), Err(OpusHeadError::TooShort { .. })));
+
+        // Mapping index outside the decoded-channel space (and != 255).
+        let mut h = base.clone();
+        h.mapping.mapping[3] = 6; // decoded channels = M + N = 6 ⇒ max 5
+        assert!(matches!(
+            h.compose(),
+            Err(OpusHeadError::MappingIndexOutOfRange { .. })
+        ));
+        // ... while 255 (silence) is legal.
+        let mut h = base.clone();
+        h.mapping.mapping[3] = 255;
+        let bytes = h.compose().unwrap();
+        assert_eq!(OpusHead::parse(&bytes).unwrap(), h);
     }
 
     #[test]

@@ -308,3 +308,56 @@ fn duplicate_index_routes_same_stream_to_two_outputs() {
         );
     }
 }
+
+#[test]
+fn assemble_multistream_packet_matches_hand_construction() {
+    // The write-side assembler must produce, for a pair of code-0
+    // packets, exactly the bytes the hand construction above builds:
+    // self-delimited stream 0 followed by the verbatim final stream.
+    let audio = fixture_audio_packets();
+    let pkt_a = &audio[5];
+    let pkt_b = &audio[40];
+
+    let assembled = oxideav_opus::assemble_multistream_packet(&[pkt_a, pkt_b]).expect("assemble");
+    let mut hand = self_delimit_code0(pkt_a);
+    hand.extend_from_slice(pkt_b);
+    assert_eq!(assembled, hand);
+}
+
+#[test]
+fn assembled_stream_pair_decodes_like_plain_decoders() {
+    // Whole-stream write→read: assemble every consecutive fixture
+    // packet with itself as a 2-mono-stream packet, decode with a
+    // MultistreamDecoder, and require both output channels to equal a
+    // plain stateful decode of the fixture stream.
+    let audio = fixture_audio_packets();
+    let mapping = ChannelMappingTable {
+        stream_count: 2,
+        coupled_count: 0,
+        mapping: vec![0, 1],
+    };
+    let mut ms = MultistreamDecoder::new(mapping);
+    let mut plain = oxideav_opus::OpusDecoder::new();
+    for pk in &audio {
+        let assembled = oxideav_opus::assemble_multistream_packet(&[pk, pk]).expect("assemble");
+        let out = ms.decode_packet(&assembled).expect("multistream decode");
+        let reference = plain.decode_packet(pk).expect("plain decode");
+        assert_eq!(out.channels, 2);
+        assert_eq!(out.samples_per_channel, reference.pcm.len());
+        for s in 0..out.samples_per_channel {
+            assert_eq!(out.pcm[s * 2], reference.pcm[s], "left sample {s}");
+            assert_eq!(out.pcm[s * 2 + 1], reference.pcm[s], "right sample {s}");
+        }
+    }
+}
+
+#[test]
+fn fixture_opus_head_recomposes_byte_identically() {
+    // OpusHead::compose is the exact write-side mirror of parse: the
+    // fixture's real family-0 identification header re-emits
+    // byte-for-byte.
+    let bytes = fixture_head_bytes();
+    let head = OpusHead::parse(&bytes).unwrap();
+    let composed = head.compose().expect("compose");
+    assert_eq!(composed, bytes);
+}

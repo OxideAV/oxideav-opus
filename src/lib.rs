@@ -867,7 +867,8 @@ pub use framing::{OperatingMode, OpusFrameRouting, SilkBandwidth};
 pub use framing_self_delim::{parse_self_delimited, SelfDelimitedParse};
 pub use mode_transition_reset::{decide_state_resets, CeltResetPlacement, StateReset};
 pub use multistream::{
-    split_multistream_packet, MultistreamAudio, MultistreamDecoder, StreamPacket,
+    assemble_multistream_packet, split_multistream_packet, MultistreamAudio, MultistreamDecoder,
+    StreamPacket,
 };
 pub use opus_head::{
     apply_output_gain, ChannelMappingTable, OpusHead, OpusHeadError, PreSkip, OPUS_HEAD_MAGIC,
