@@ -747,6 +747,7 @@ pub mod silk_ltp;
 pub mod silk_ltp_synth;
 pub mod silk_nlsf_quantize;
 pub mod silk_packet_encode;
+pub mod silk_pitch;
 pub mod silk_resampler;
 pub mod silk_stereo;
 pub mod silk_synthesis;

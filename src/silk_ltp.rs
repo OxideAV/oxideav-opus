@@ -787,6 +787,81 @@ fn ltp_filter_taps(periodicity_index: u8, filter_index: u8) -> [i8; LTP_FILTER_T
     }
 }
 
+// =====================================================================
+// Encode-side (analysis) table accessors — §5.2.3.2 pitch analysis and
+// §5.2.3.6 LTP quantisation search the same normative tables the
+// decoder reads, so the codebook geometry is exposed read-only here.
+// =====================================================================
+
+/// The §4.2.7.6.1 primary-lag geometry for a SILK bandwidth:
+/// `(lag_min, lag_max, lag_scale)` from Table 30. Rejects SWB / FB.
+pub fn lag_range(bandwidth: Bandwidth) -> Result<(i32, i32, i32), Error> {
+    let spec = lag_low_spec(bandwidth)?;
+    Ok((spec.lag_min, spec.lag_max, spec.scale))
+}
+
+/// Number of entries in the Table 33-36 pitch-contour codebook for
+/// `(bandwidth, num_subframes)`. `num_subframes` must be 2 or 4;
+/// SWB / FB are rejected.
+pub fn contour_codebook_len(bandwidth: Bandwidth, num_subframes: usize) -> Result<usize, Error> {
+    if num_subframes != 2 && num_subframes != 4 {
+        return Err(Error::MalformedPacket);
+    }
+    lag_low_spec(bandwidth)?; // bandwidth validity
+    Ok(match (bandwidth, num_subframes) {
+        (Bandwidth::Nb, 2) => CONTOUR_NB_10MS.len(),
+        (Bandwidth::Nb, _) => CONTOUR_NB_20MS.len(),
+        (_, 2) => CONTOUR_MBWB_10MS.len(),
+        (_, _) => CONTOUR_MBWB_20MS.len(),
+    })
+}
+
+/// The Table 33-36 per-subframe lag offset for a contour codebook
+/// entry: `contour_offsets(bw, num, index)[k]` is what the decoder
+/// adds to the primary lag for subframe `k` (before the
+/// `[lag_min, lag_max]` clamp). Errors on an out-of-range index.
+pub fn contour_offsets(
+    bandwidth: Bandwidth,
+    num_subframes: usize,
+    index: u8,
+) -> Result<[i8; LTP_MAX_SUBFRAMES], Error> {
+    if index as usize >= contour_codebook_len(bandwidth, num_subframes)? {
+        return Err(Error::MalformedPacket);
+    }
+    let mut out = [0i8; LTP_MAX_SUBFRAMES];
+    for (k, slot) in out.iter_mut().enumerate().take(num_subframes) {
+        *slot = contour_offset(bandwidth, num_subframes, index, k);
+    }
+    Ok(out)
+}
+
+/// Number of entries in the Table 39-41 LTP filter codebook for a
+/// §4.2.7.6.2 periodicity index (8 / 16 / 32 coded entries; the
+/// §5.2.3.6 prose's "10, 20, and 40 vectors" describes average rates,
+/// not these normative table sizes). Errors when
+/// `periodicity_index > 2`.
+pub fn ltp_filter_codebook_len(periodicity_index: u8) -> Result<usize, Error> {
+    Ok(match periodicity_index {
+        0 => LTP_TAPS_P0.len(),
+        1 => LTP_TAPS_P1.len(),
+        2 => LTP_TAPS_P2.len(),
+        _ => return Err(Error::MalformedPacket),
+    })
+}
+
+/// The Table 39-41 5-tap Q7 filter vector for a
+/// `(periodicity_index, filter_index)` pair. Errors on out-of-range
+/// indices.
+pub fn ltp_filter_taps_q7(
+    periodicity_index: u8,
+    filter_index: u8,
+) -> Result<[i8; LTP_FILTER_TAPS], Error> {
+    if (filter_index as usize) >= ltp_filter_codebook_len(periodicity_index)? {
+        return Err(Error::MalformedPacket);
+    }
+    Ok(ltp_filter_taps(periodicity_index, filter_index))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
