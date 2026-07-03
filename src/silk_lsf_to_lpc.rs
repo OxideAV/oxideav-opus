@@ -217,11 +217,13 @@ fn find_poly(c_q17: &[i32], d_lpc: usize, parity: usize) -> [i64; D_LPC_MAX / 2 
     for k in 1..d2 {
         let c = c_q17[2 * k + parity] as i64;
         for j in 0..=k + 1 {
-            // Boundary p[k-1][j] for j out of range: prev[j] is 0 for j<0
-            // (we just clamp), and for j == k+1 we'd be reading prev[k+1]
-            // which was 0 on the previous iteration (prev only filled up
-            // to k for the prior k = k-1 step).
-            let pj0 = if j < prev.len() { prev[j] } else { 0 };
+            // Boundary conditions per §4.2.7.5.6: p[k-1][j] = 0 for
+            // j < 0, and — because row k-1 is the coefficient list of a
+            // SYMMETRIC product of degree 2k, stored only up to its
+            // middle coefficient j = k — the "assume p_Q16[k][k+2] =
+            // p_Q16[k][k]" rule mirrors the read past the middle:
+            // p[k-1][k+1] = p[k-1][k-1].
+            let pj0 = if j == k + 1 { prev[k - 1] } else { prev[j] };
             let pjm2 = if j >= 2 { prev[j - 2] } else { 0 };
             let pjm1 = if j >= 1 { prev[j - 1] } else { 0 };
             // The (*c * pjm1 + 32768) >> 16 rounding term matches the
@@ -229,19 +231,10 @@ fn find_poly(c_q17: &[i32], d_lpc: usize, parity: usize) -> [i64; D_LPC_MAX / 2 
             // precision can be required; i64 covers it.
             curr[j] = pj0 + pjm2 - ((c * pjm1 + 32768) >> 16);
         }
-        // Apply p[k][k+2] = p[k][k] symmetry implicitly by leaving entries
-        // beyond k+1 untouched for the next iteration's reads; we copy
-        // curr → prev wholesale and clear the trailing cell so the next
-        // iteration's "j = (k+1)+1 = k+2" read picks up prev[k] correctly.
-        // Per §4.2.7.5.6 only `j <= k+1` is computed, and the recurrence's
-        // next step only reads `prev[j-2]` for `j <= (k+1)+1 = k+2`,
-        // i.e. `prev[k]` at most — already in range.
+        // Row k is now the first k+2 coefficients of the symmetric
+        // degree-2(k+1) product; only j <= k+1 is ever stored, the
+        // mirror rule above supplies the rest.
         prev.copy_from_slice(&curr);
-        // Zero the cell beyond k+1 so it doesn't leak into the next row's
-        // computation through the j+1 path.
-        for cell in prev.iter_mut().skip(k + 2) {
-            *cell = 0;
-        }
     }
     prev
 }
@@ -910,7 +903,16 @@ mod tests {
             for k in 1..d2 {
                 let c = c_q17[2 * k + parity] as i64;
                 for j in 0..=k + 1 {
-                    let pj0 = p[k - 1][j];
+                    // §4.2.7.5.6 boundary condition: row k-1 is a
+                    // symmetric product stored up to its middle
+                    // coefficient j = k, so the read past the middle
+                    // mirrors back (p_Q16[k][k+2] = p_Q16[k][k], i.e.
+                    // p[k-1][k+1] = p[k-1][k-1]).
+                    let pj0 = if j == k + 1 {
+                        p[k - 1][k - 1]
+                    } else {
+                        p[k - 1][j]
+                    };
                     let pjm2 = if j >= 2 { p[k - 1][j - 2] } else { 0 };
                     let pjm1 = if j >= 1 { p[k - 1][j - 1] } else { 0 };
                     p[k][j] = pj0 + pjm2 - ((c * pjm1 + 32768) >> 16);
@@ -987,6 +989,78 @@ mod tests {
                     expected.as_slice(),
                     "production/oracle divergence: bw={bw:?} i1={i1}"
                 );
+            }
+        }
+    }
+
+    /// Structurally independent analytic cross-check: build A(z) in
+    /// f64 as the §4.2.7.5.6 closed form
+    /// `A = (P + Q)/2`, `P = (1+z^-1) * prod (1 - 2cos(w_2k) z^-1 + z^-2)`,
+    /// `Q = (1-z^-1) * prod (1 - 2cos(w_2k+1) z^-1 + z^-2)`
+    /// using the SAME table-interpolated cosines the fixed-point path
+    /// uses (`2*cos = c_Q17 / 2^16`), and require `a32_Q17 / 2^17` to
+    /// match within fixed-point rounding noise.
+    ///
+    /// Round-388 regression: the rolling-row recurrence dropped the
+    /// "p_Q16[k][k+2] = p_Q16[k][k]" symmetric-mirror boundary
+    /// condition at the j = k+1 read (it substituted 0), producing
+    /// badly wrong filters that then burned prediction-gain-limiter
+    /// rounds on perfectly stable codebook vectors. The former test
+    /// oracle transcribed the identical misreading, so only an
+    /// analytic reference exposes it.
+    #[test]
+    fn lpc_matches_analytic_polynomial_on_codebook_vectors() {
+        use crate::silk_lsf_recon::cb1_q8;
+        for bw in [Bandwidth::Nb, Bandwidth::Wb] {
+            for i1 in 0u8..32 {
+                let cb = cb1_q8(bw, i1).unwrap();
+                let nlsf: Vec<i16> = cb.iter().map(|&v| (v as i16) << 7).collect();
+                let d_lpc = nlsf.len();
+                let c = nlsf_to_c_q17(bw, &nlsf).unwrap();
+
+                // Analytic product in f64 over the un-reordered slots:
+                // parity-0 slots feed P, parity-1 slots feed Q.
+                let poly_mul_quad = |poly: &mut Vec<f64>, two_cos: f64| {
+                    let mut out = vec![0.0f64; poly.len() + 2];
+                    for (i, &pc) in poly.iter().enumerate() {
+                        out[i] += pc;
+                        out[i + 1] -= two_cos * pc;
+                        out[i + 2] += pc;
+                    }
+                    *poly = out;
+                };
+                let mut p = vec![1.0f64];
+                let mut q = vec![1.0f64];
+                for k in 0..d_lpc / 2 {
+                    poly_mul_quad(&mut p, c[2 * k] as f64 / 65536.0);
+                    poly_mul_quad(&mut q, c[2 * k + 1] as f64 / 65536.0);
+                }
+                // Trivial-root factors: P *= (1 + z^-1), Q *= (1 - z^-1).
+                let mul_lin = |poly: &Vec<f64>, r: f64| {
+                    let mut out = vec![0.0f64; poly.len() + 1];
+                    for (i, &pc) in poly.iter().enumerate() {
+                        out[i] += pc;
+                        out[i + 1] += r * pc;
+                    }
+                    out
+                };
+                let pf = mul_lin(&p, 1.0);
+                let qf = mul_lin(&q, -1.0);
+
+                let lpc = LpcQ17::from_nlsf(bw, &nlsf).unwrap();
+                for k in 0..d_lpc {
+                    let analytic = -(pf[k + 1] + qf[k + 1]) / 2.0;
+                    let fixed = lpc.a32_q17()[k] as f64 / 131072.0;
+                    assert!(
+                        (analytic - fixed).abs() < 2e-3,
+                        "bw={bw:?} I1={i1} k={k}: analytic {analytic} vs fixed {fixed}"
+                    );
+                }
+
+                // Stage-1 codebook centres are stable filters: the
+                // §4.2.7.5.8 limiter must not burn a single round.
+                let limited = lpc.range_limited().prediction_gain_limited();
+                assert_eq!(limited.rounds(), 0, "bw={bw:?} I1={i1} burned rounds");
             }
         }
     }
