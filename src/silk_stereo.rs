@@ -271,6 +271,150 @@ pub fn stereo_ms_to_lr(
     Ok(StereoFrame { left, right })
 }
 
+/// Cross-frame history for the encode-side [`stereo_lr_to_ms`] downmix:
+/// the one trailing mid sample (feeding the next frame's first `p0`)
+/// and the previous frame's weights (anchoring the §4.2.8 ramp).
+///
+/// Zero after an encoder reset, mirroring the decoder's
+/// [`StereoUnmixState`] reset semantics.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StereoDownmixState {
+    /// `mid[j-1]` for the upcoming frame.
+    prev_mid: f32,
+    /// The previous frame's `(w0_Q13, w1_Q13)`.
+    prev_weights: StereoWeightsQ13,
+}
+
+impl Default for StereoDownmixState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StereoDownmixState {
+    /// A freshly-reset state: zero mid history and zero previous
+    /// weights.
+    pub fn new() -> Self {
+        StereoDownmixState {
+            prev_mid: 0.0,
+            prev_weights: StereoWeightsQ13::default(),
+        }
+    }
+
+    /// Reset to the post-reset values (all zero).
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+/// One frame of encode-side mid/side output produced by
+/// [`stereo_lr_to_ms`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MidSideFrame {
+    /// Mid channel, length `n2`.
+    pub mid: Vec<f32>,
+    /// Side channel, same length.
+    pub side: Vec<f32>,
+}
+
+/// Convert one frame of left/right input into the mid/side pair the
+/// §4.2.8 unmixer will reconstruct it from — the exact algebraic
+/// inverse of [`stereo_ms_to_lr`], derived by solving the §4.2.8
+/// reconstruction for `mid` and `side`.
+///
+/// Adding and subtracting the two §4.2.8 output equations gives
+///
+/// ```text
+///   left[i] + right[i] = 2 * mid[i-1]
+///   left[i] - right[i] = 2 * (w1*mid[i-1] + side[i-1] + w0*p0)
+/// ```
+///
+/// so with the decoder's inherent one-sample delay embraced (the
+/// reconstruction reads `mid[i-1]` / `side[i-1]`, never `mid[i]`), the
+/// frame-aligned inverse is
+///
+/// ```text
+///        mid[k] = (left[k] + right[k]) / 2
+///       side[k] = (left[k] - right[k])/2 - w1(k+1)*mid[k] - w0(k+1)*p0(k+1)
+///   p0(k+1)     = (mid[k-1] + 2*mid[k] + mid[k+1]) / 4
+/// ```
+///
+/// where `w0(i)` / `w1(i)` follow the same §4.2.8 interpolation ramp
+/// the decoder applies (previous-frame weights → `weights` over the
+/// first `n1` samples). Feeding the result to [`stereo_ms_to_lr`] with
+/// the same weight sequence reproduces the input delayed by exactly
+/// one sample (the §4.2.8 delay), apart from the `[-1, 1]` output
+/// clamp, which is unreachable for in-range audio.
+///
+/// The final side sample's `p0` needs `mid[n2]` — the *next* frame's
+/// first mid sample, `(left[n2] + right[n2]) / 2`. Pass it via
+/// `next_lr` (the next frame's first left/right pair); at the end of
+/// the stream pass `None` and the last mid sample is held instead
+/// (the one-sided difference only perturbs the final side sample, and
+/// only when a next frame exists after all).
+///
+/// A SILK frame is always longer than the §4.2.8 interpolation phase
+/// (`n2 > n1` for every legal bandwidth / duration), which this
+/// inverse relies on: the last side sample is consumed by the *next*
+/// frame's first reconstruction, whose ramp starts at this frame's
+/// final weights. Errors on an empty frame or a SILK-illegal
+/// bandwidth, mirroring [`stereo_ms_to_lr`].
+pub fn stereo_lr_to_ms(
+    bandwidth: Bandwidth,
+    left: &[f32],
+    right: &[f32],
+    weights: StereoWeightsQ13,
+    next_lr: Option<(f32, f32)>,
+    state: &mut StereoDownmixState,
+) -> Result<MidSideFrame, Error> {
+    let n2 = left.len();
+    if n2 == 0 || right.len() != n2 {
+        return Err(Error::MalformedPacket);
+    }
+    let n1 = interp_phase_samples(bandwidth)?;
+
+    let prev = state.prev_weights;
+    let n1_f = n1 as f32;
+    let w0_base = prev.w0_q13 as f32 / 8192.0;
+    let w1_base = prev.w1_q13 as f32 / 8192.0;
+    let w0_step = (weights.w0_q13 - prev.w0_q13) as f32 / (8192.0 * n1_f);
+    let w1_step = (weights.w1_q13 - prev.w1_q13) as f32 / (8192.0 * n1_f);
+
+    // mid[k] = (left[k] + right[k]) / 2, frame-aligned.
+    let mid: Vec<f32> = left
+        .iter()
+        .zip(right)
+        .map(|(&l, &r)| (l + r) / 2.0)
+        .collect();
+    // mid[n2]: the next frame's first mid sample, or a hold at the
+    // stream end.
+    let mid_next = match next_lr {
+        Some((l, r)) => (l + r) / 2.0,
+        None => mid[n2 - 1],
+    };
+
+    let mut side = vec![0.0f32; n2];
+    for k in 0..n2 {
+        // side[k] is consumed by the reconstruction of output sample
+        // k+1 (this frame's ramp for k+1 < n2; the next frame's ramp
+        // *start* — which equals this frame's final weights — for the
+        // last sample, both covered by min(k+1, n1)).
+        let ramp = ((k + 1).min(n1)) as f32;
+        let w0 = w0_base + ramp * w0_step;
+        let w1 = w1_base + ramp * w1_step;
+
+        let m_km1 = if k >= 1 { mid[k - 1] } else { state.prev_mid };
+        let m_kp1 = if k + 1 < n2 { mid[k + 1] } else { mid_next };
+        let p0 = (m_km1 + 2.0 * mid[k] + m_kp1) / 4.0;
+        side[k] = (left[k] - right[k]) / 2.0 - w1 * mid[k] - w0 * p0;
+    }
+
+    state.prev_mid = mid[n2 - 1];
+    state.prev_weights = weights;
+
+    Ok(MidSideFrame { mid, side })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +631,179 @@ mod tests {
         approx(out2.right[0], -0.4);
         approx(out2.left[1], 0.5);
         approx(out2.right[1], -0.5);
+    }
+
+    /// A tiny deterministic LCG for the downmix roundtrips.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_f32(&mut self) -> f32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // Uniform in [-0.4, 0.4]: safely inside the §4.2.8 clamp
+            // for any codebook weight pair.
+            ((self.0 >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.8
+        }
+    }
+
+    /// The full-stream roundtrip: several frames of random L/R are
+    /// downmixed by `stereo_lr_to_ms` (with one-sample lookahead across
+    /// frame boundaries) and unmixed back by `stereo_ms_to_lr` with the
+    /// same per-frame weights; the reconstruction equals the input
+    /// delayed by exactly one sample (the §4.2.8 delay), the first
+    /// output sample reading the zeroed histories.
+    #[test]
+    fn lr_to_ms_roundtrips_through_ms_to_lr() {
+        for (bandwidth, n2) in [
+            (Bandwidth::Nb, 160usize),
+            (Bandwidth::Mb, 240),
+            (Bandwidth::Wb, 320),
+        ] {
+            let mut rng = Lcg(0xD0_1985 ^ n2 as u64);
+            let frames = 3usize;
+            let left: Vec<f32> = (0..frames * n2).map(|_| rng.next_f32()).collect();
+            let right: Vec<f32> = (0..frames * n2).map(|_| rng.next_f32()).collect();
+            // Distinct per-frame weights exercise the §4.2.8 ramp.
+            let frame_weights = [
+                StereoWeightsQ13 {
+                    w0_q13: -2950,
+                    w1_q13: 820,
+                },
+                StereoWeightsQ13 {
+                    w0_q13: 5000,
+                    w1_q13: -6500,
+                },
+                StereoWeightsQ13 {
+                    w0_q13: 820,
+                    w1_q13: 10050,
+                },
+            ];
+
+            let mut enc = StereoDownmixState::new();
+            let mut dec = StereoUnmixState::new();
+            let mut out_left = Vec::new();
+            let mut out_right = Vec::new();
+            for f in 0..frames {
+                let l = &left[f * n2..(f + 1) * n2];
+                let r = &right[f * n2..(f + 1) * n2];
+                let next_lr = if f + 1 < frames {
+                    Some((left[(f + 1) * n2], right[(f + 1) * n2]))
+                } else {
+                    None
+                };
+                let ms =
+                    stereo_lr_to_ms(bandwidth, l, r, frame_weights[f], next_lr, &mut enc).unwrap();
+                // Mid is exactly the frame-aligned (L + R) / 2.
+                for k in 0..n2 {
+                    approx(ms.mid[k], (l[k] + r[k]) / 2.0);
+                }
+                let rec = stereo_ms_to_lr(
+                    bandwidth,
+                    &ms.mid,
+                    Some(&ms.side),
+                    frame_weights[f],
+                    &mut dec,
+                )
+                .unwrap();
+                out_left.extend_from_slice(&rec.left);
+                out_right.extend_from_slice(&rec.right);
+            }
+
+            // out[i] == in[i-1] globally; out[0] reads zeroed histories.
+            assert!(out_left[0].abs() < 1e-5, "{bandwidth:?}");
+            assert!(out_right[0].abs() < 1e-5, "{bandwidth:?}");
+            for i in 1..frames * n2 {
+                assert!(
+                    (out_left[i] - left[i - 1]).abs() < 1e-4,
+                    "{bandwidth:?} left sample {i}: {} vs {}",
+                    out_left[i],
+                    left[i - 1]
+                );
+                assert!(
+                    (out_right[i] - right[i - 1]).abs() < 1e-4,
+                    "{bandwidth:?} right sample {i}: {} vs {}",
+                    out_right[i],
+                    right[i - 1]
+                );
+            }
+        }
+    }
+
+    /// Within a single decoded frame the last side sample is never
+    /// consumed (it feeds the *next* frame's first reconstruction), so
+    /// a single-frame roundtrip is exact regardless of the `next_lr`
+    /// lookahead / hold choice.
+    #[test]
+    fn lr_to_ms_single_frame_roundtrip_ignores_lookahead() {
+        let n2 = 160usize;
+        let mut rng = Lcg(0x0AC4);
+        let left: Vec<f32> = (0..n2).map(|_| rng.next_f32()).collect();
+        let right: Vec<f32> = (0..n2).map(|_| rng.next_f32()).collect();
+        let w = StereoWeightsQ13 {
+            w0_q13: 6500,
+            w1_q13: -820,
+        };
+        for next in [None, Some((0.35f32, -0.2f32))] {
+            let mut enc = StereoDownmixState::new();
+            let mut dec = StereoUnmixState::new();
+            let ms = stereo_lr_to_ms(Bandwidth::Nb, &left, &right, w, next, &mut enc).unwrap();
+            let rec = stereo_ms_to_lr(Bandwidth::Nb, &ms.mid, Some(&ms.side), w, &mut dec).unwrap();
+            for i in 1..n2 {
+                approx(rec.left[i], left[i - 1]);
+                approx(rec.right[i], right[i - 1]);
+            }
+        }
+    }
+
+    /// Downmix input validation mirrors the unmixer: empty frames,
+    /// length mismatches, and SILK-illegal bandwidths are rejected, and
+    /// the state resets to zero.
+    #[test]
+    fn lr_to_ms_rejects_bad_input_and_resets() {
+        let mut s = StereoDownmixState::new();
+        assert!(stereo_lr_to_ms(
+            Bandwidth::Wb,
+            &[],
+            &[],
+            StereoWeightsQ13::default(),
+            None,
+            &mut s
+        )
+        .is_err());
+        assert!(stereo_lr_to_ms(
+            Bandwidth::Wb,
+            &[0.0; 4],
+            &[0.0; 3],
+            StereoWeightsQ13::default(),
+            None,
+            &mut s
+        )
+        .is_err());
+        assert!(stereo_lr_to_ms(
+            Bandwidth::Swb,
+            &[0.0; 4],
+            &[0.0; 4],
+            StereoWeightsQ13::default(),
+            None,
+            &mut s
+        )
+        .is_err());
+        let _ = stereo_lr_to_ms(
+            Bandwidth::Wb,
+            &[0.1; 320],
+            &[0.2; 320],
+            StereoWeightsQ13 {
+                w0_q13: 820,
+                w1_q13: 820,
+            },
+            None,
+            &mut s,
+        )
+        .unwrap();
+        assert_ne!(s, StereoDownmixState::new());
+        s.reset();
+        assert_eq!(s, StereoDownmixState::new());
     }
 
     /// Clamping: drive both L and R out of range and confirm the

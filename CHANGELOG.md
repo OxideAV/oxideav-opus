@@ -6,6 +6,24 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- *Encode-side stereo downmix — `silk_stereo::stereo_lr_to_ms`, the
+  exact algebraic inverse of the §4.2.8 unmixer.* Solving the §4.2.8
+  reconstruction for `mid` and `side` gives the frame-aligned inverse
+  `mid[k] = (left[k]+right[k])/2`, `side[k] = (left[k]-right[k])/2 -
+  w1(k+1)*mid[k] - w0(k+1)*p0(k+1)` with the same interpolation ramp
+  the decoder applies (the last side sample is consumed by the *next*
+  frame's first reconstruction, whose ramp start equals this frame's
+  final weights — legal because every SILK frame is longer than the
+  8 ms interpolation phase). One sample of L/R lookahead
+  (`next_lr`) feeds the final `p0`; a stream-end hold is provided.
+  Cross-frame history lives in the new `StereoDownmixState` (trailing
+  mid sample + previous weights), mirroring `StereoUnmixState`'s
+  reset semantics. Verified: a 3-frame NB/MB/WB roundtrip through
+  `stereo_ms_to_lr` with per-frame weight changes reproduces the
+  input delayed by exactly one sample (the §4.2.8 delay) to 1e-4,
+  mid is exactly `(L+R)/2`, a single-frame roundtrip is lookahead-
+  independent, and validation mirrors the unmixer.
+
 - *§4.2.7.1 stereo-weight quantizer —
   `StereoWeightSymbols::quantize`.* The deterministic write-side
   inverse of the shared `weights()` reconstruction: an exhaustive
