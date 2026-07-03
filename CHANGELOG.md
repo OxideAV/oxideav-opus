@@ -4,6 +4,79 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-opus/compare/v0.0.12...v0.0.13) - 2026-07-03
+
+### Other
+
+- document the stereo SILK packet-encode subsystem + framing / RFC 7845 write side
+- §4.2.7.1 stereo-weight estimator (estimate_stereo_weights)
+- RFC 7845 write side — OpusHead::compose + assemble_multistream_packet
+- §3.2 + Appendix-B packet-framing writers (packet_compose)
+- encode-side stereo downmix stereo_lr_to_ms — exact §4.2.8 algebraic inverse
+- §4.2.7.1 stereo-weight quantizer (StereoWeightSymbols::quantize)
+- stereo SILK-only packet encoder with §4.2.2 mid/side interleave + stereo LBRR emission
+- LBRR emission landed; update encoder-scope tail
+- LBRR (in-band FEC) emission in the packet encoder, closing the FEC loop
+- document the §5.1 range encoder + SILK encode-side subsystem and the round's decoder hardening
+- SILK-only mono packet encoder, decoder-verified end-to-end + 10ms-MB synthesis fix
+- encode_silk_frame — whole-frame Table-5 write-side composition
+- encode-side symbol writers for the full §4.2.7 frame stack + Table 47-50 corrections
+- fix two fuzz-found crashes (dec_bits(32) shift overflow, §4.2.7.5.8 i64 overflow)
+- restore cargo-fuzz harness suite (4 targets) for the scheduled Fuzz workflow
+- RFC 6716 §5.1 range encoder, roundtrip-exact against the §4.1 decoder
+- truncation-safety test across the full CELT-only decode path
+- decode §4.3.1 tf_change/tf_select + §4.3.4.3 spread before §4.3.3 allocation (Table-56 order)
+- wire §4.3.3 allocation header (boost/trim/reservations) into CELT-only decode
+- record §4.3.4.5 + §4.3.4 modules; sharpen the §4.3.3 docs gap
+- §4.3.4 per-band shape decode orchestrator (celt_band_shape)
+- §4.3.4.5 Hadamard time-frequency transform (celt_tf_hadamard)
+- drop generic enumerated-denial sentences from module docs
+- README + CHANGELOG — document the RFC 7845 multistream subsystem
+- multistream coupled-stream (stereo) decode tests on real PCM
+- enforce §3 equal-duration constraint across multistream streams
+- §5.1 output-gain application + pre-skip accumulator helpers
+- MultistreamDecoder — multichannel decode + §5.1.1 channel map
+- factor a shared decode body + self-delimited packet entry point
+- multistream packet split (RFC 7845 §3)
+- OpusHead identification-header parser (RFC 7845 §5.1/§5.1.1)
+- *(opus)* neutralize black-box-validator product naming in FEC fixture prose
+- cover stereo in-band FEC routing path (fec_decode.rs)
+- SILK in-band FEC (LBRR) recovery — decode_packet_fec (§2.1.7/§4.2.5)
+- neutralize residual line-wrapped validator name in SILK test module-doc
+- neutralize black-box-validator product naming in r362 SILK-fixture prose
+- embed SILK fixtures in-crate so the decode suite runs in standalone CI
+- first end-to-end SILK fixture-decode validation suite
+- neutralise reference-source filename in celt_e_prob_model doc comments
+- neutralise reference-source naming in coarse-energy clamp doc-gap note
+- README — coarse-energy front half now decodes for non-silent CELT
+- wire CELT non-silent coarse-energy decode into the decoder
+- §4.3.2.1 CELT coarse-energy reconstruction recurrence
+- fix CELT post-filter octave to ec_dec_uint(7) (7 values 0..=6)
+- README + CHANGELOG — CELT silence-frame end-to-end milestone
+- wire CELT-only silence frame end-to-end through synthesis backend
+- CELT frame-prefix symbol decode (Table 56 head)
+- CELT §4.3.2.1 Laplace symbol decode (ec_laplace_decode)
+- CELT synthesis-backend integration suite + README/CHANGELOG
+- frame-level interleaved-i16 CELT synthesis output (celt_synthesis)
+- §4.3.6→§4.3.7.2 CELT synthesis backend composition (celt_synthesis)
+- README — stereo SILK-only now decodes end-to-end to interleaved PCM
+- run §4.2.8 stereo unmix per SILK interval, not per Opus frame
+- wire stereo SILK-only decode to interleaved PCM (§4.2.2/§4.2.7.2/§4.2.8)
+- opus §4.2.7.1/§4.2.7.2: stereo mid-channel header decode in decode_silk_frame
+- README — mono SILK-only now decodes end-to-end to real PCM
+- opus §4.5.2: cross-packet SILK state reset on CELT->SILK transition
+- opus §4: wire SILK synthesis into decoder — mono SILK-only → real PCM
+- opus §4.2.7.9: SILK frame synthesis composition (silk_synthesis)
+- README — document packet→PCM orchestration + mono SILK-only decode path
+- §4.2.6/§4.2.7 in-order SILK frame decode + wire mono SILK-only packet path
+- §3/§4 top-level packet→PCM orchestration (OpusDecoder::decode_packet)
+- §4.3.4.5 time-frequency change decode (tf_change loop + gated tf_select)
+- §4.3.7 weighted overlap-add (celt_overlap_add)
+- CELT §4.3.7 inverse MDCT transform core (celt_imdct)
+- CELT §4.3.6 band denormalisation (celt_denormalise)
+- CELT §4.3.4.1 Bits-to-Pulses pulse-cost cache (round 49)
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - *§4.2.7.1 stereo-weight **estimator** —
