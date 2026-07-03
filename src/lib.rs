@@ -744,6 +744,7 @@ pub mod silk_lsf_stabilize;
 pub mod silk_lsf_stage2;
 pub mod silk_lsf_to_lpc;
 pub mod silk_ltp;
+pub mod silk_ltp_analysis;
 pub mod silk_ltp_synth;
 pub mod silk_nlsf_quantize;
 pub mod silk_packet_encode;
