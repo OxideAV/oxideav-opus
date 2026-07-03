@@ -567,6 +567,13 @@ impl OpusDecoder {
         let mut lbrr_first = true;
         for idx in 0..num_silk_frames {
             if !header.mid_has_lbrr(idx) {
+                // §4.2.4 LBRR-flag gap: the next coded LBRR frame codes
+                // independently (§4.2.7.4), with an absolute lag
+                // (§4.2.7.6.1) and the §4.2.7.6.3 scaling field present
+                // again ("the previous LBRR frame ... is not coded").
+                lbrr_prev_gain = None;
+                lbrr_prev_lag = None;
+                lbrr_first = true;
                 continue;
             }
             let cfg = SilkFrameConfig {
@@ -585,7 +592,12 @@ impl OpusDecoder {
             };
             let decoded = decode_silk_frame(&mut rd, cfg)?;
             lbrr_prev_gain = Some(decoded.gains.last_log_gain());
-            lbrr_prev_lag = Some(decoded.ltp.primary_lag());
+            // §4.2.7.6.1: only a VOICED frame arms relative lag coding.
+            lbrr_prev_lag = if decoded.ltp.is_voiced() {
+                Some(decoded.ltp.primary_lag())
+            } else {
+                None
+            };
             lbrr_first = false;
             let _ = FrameKind::Lbrr; // documents the §4.2.7.3 kind.
         }
@@ -616,7 +628,12 @@ impl OpusDecoder {
             };
             let decoded = decode_silk_frame(&mut rd, cfg)?;
             prev_gain = Some(decoded.gains.last_log_gain());
-            prev_lag = Some(decoded.ltp.primary_lag());
+            // §4.2.7.6.1: only a VOICED frame arms relative lag coding.
+            prev_lag = if decoded.ltp.is_voiced() {
+                Some(decoded.ltp.primary_lag())
+            } else {
+                None
+            };
             prev_nlsf = Some(decoded.nlsf_q15);
             prev_nlsf_len = decoded.d_lpc;
             first = false;
@@ -721,24 +738,23 @@ impl OpusDecoder {
                     lbrr_mid.config(bandwidth, frame_size, true, Some(stereo_ctx)),
                 )?;
                 lbrr_mid.advance(&decoded);
-                // A set mid-only flag would forbid a coded side LBRR
-                // frame; the header LBRR flags already encode that, so we
-                // trust `side_lbrr` for the interleave decision.
-                if side_lbrr {
-                    let decoded = decode_silk_frame(
-                        &mut rd,
-                        lbrr_side.config(bandwidth, frame_size, true, None),
-                    )?;
-                    lbrr_side.advance(&decoded);
-                }
-            } else if side_lbrr {
-                // Side-only LBRR (mid not coded): no stereo weights on a
-                // side frame per §4.2.7.1.
+            } else {
+                // §4.2.4 LBRR-flag gap for the mid channel.
+                lbrr_mid.mark_interval_uncoded(true);
+            }
+            // A set mid-only flag would forbid a coded side LBRR frame;
+            // the header LBRR flags already encode that, so we trust
+            // `side_lbrr` for the interleave decision. (A side-only LBRR
+            // interval is legal: no stereo weights ride on a side frame
+            // per §4.2.7.1.)
+            if side_lbrr {
                 let decoded = decode_silk_frame(
                     &mut rd,
                     lbrr_side.config(bandwidth, frame_size, true, None),
                 )?;
                 lbrr_side.advance(&decoded);
+            } else {
+                lbrr_side.mark_interval_uncoded(true);
             }
         }
 
@@ -796,7 +812,11 @@ impl OpusDecoder {
                 side_frames.push(Some(side_decoded));
             } else {
                 // §4.2.7.2 / §4.5.2: an uncoded side SILK frame clears the
-                // side LTP buffer; zeros feed the §4.2.8 unmixer.
+                // side LTP buffer; zeros feed the §4.2.8 unmixer. The side
+                // carried state also resets (§4.2.7.4 / §4.2.7.5.5 /
+                // §4.2.7.6.1 all treat "previous frame not coded" as a
+                // fresh start for the next coded side frame).
+                side_state.mark_interval_uncoded(false);
                 side_frames.push(None);
             }
         }
@@ -1352,6 +1372,14 @@ impl OpusDecoder {
         let mut lbrr_frames: Vec<SilkFrameDecoded> = Vec::new();
         for idx in 0..num_silk_frames {
             if !header.mid_has_lbrr(idx) {
+                // §4.2.4 LBRR-flag gap: fresh start for the next coded
+                // LBRR frame (§4.2.7.4 / §4.2.7.5.5 / §4.2.7.6.1 /
+                // §4.2.7.6.3).
+                prev_gain = None;
+                prev_lag = None;
+                prev_nlsf = None;
+                prev_nlsf_len = 0;
+                first = true;
                 continue;
             }
             let cfg = SilkFrameConfig {
@@ -1369,7 +1397,12 @@ impl OpusDecoder {
             };
             let decoded = decode_silk_frame(&mut rd, cfg)?;
             prev_gain = Some(decoded.gains.last_log_gain());
-            prev_lag = Some(decoded.ltp.primary_lag());
+            // §4.2.7.6.1: only a VOICED frame arms relative lag coding.
+            prev_lag = if decoded.ltp.is_voiced() {
+                Some(decoded.ltp.primary_lag())
+            } else {
+                None
+            };
             prev_nlsf = Some(decoded.nlsf_q15);
             prev_nlsf_len = decoded.d_lpc;
             first = false;
@@ -1461,6 +1494,8 @@ impl OpusDecoder {
             let mid_lbrr = header.mid_has_lbrr(idx);
             let side_lbrr = header.side_has_lbrr(idx);
             if !mid_lbrr {
+                // §4.2.4 LBRR-flag gap for the mid channel.
+                mid_state.mark_interval_uncoded(true);
                 // §4.2.5 / §4.2.7.1: a side LBRR frame without a mid LBRR
                 // frame carries no stereo weights; record a zero-weight
                 // interval with the mid channel treated as silent.
@@ -1475,6 +1510,8 @@ impl OpusDecoder {
                     // a hole (handled by skipping the interval in synthesis
                     // below — we still consume the bits for alignment).
                     let _ = side_decoded;
+                } else {
+                    side_state.mark_interval_uncoded(true);
                 }
                 continue;
             }
@@ -1504,6 +1541,7 @@ impl OpusDecoder {
                 side_state.advance(&side_decoded);
                 side_frames.push(Some(side_decoded));
             } else {
+                side_state.mark_interval_uncoded(true);
                 side_frames.push(None);
             }
         }
@@ -1620,10 +1658,38 @@ impl ChannelDecodeState {
     /// next frame in this channel's sequence predicts against it.
     pub(crate) fn advance(&mut self, decoded: &crate::silk_decode::SilkFrameDecoded) {
         self.prev_gain = Some(decoded.gains.last_log_gain());
-        self.prev_lag = Some(decoded.ltp.primary_lag());
+        // §4.2.7.6.1: relative lag coding requires the previous frame of
+        // the same type to have been coded AND voiced ("that previous
+        // SILK frame was coded, but was not voiced" selects absolute
+        // coding); a non-voiced frame therefore clears the lag base.
+        self.prev_lag = if decoded.ltp.is_voiced() {
+            Some(decoded.ltp.primary_lag())
+        } else {
+            None
+        };
         self.prev_nlsf = Some(decoded.nlsf_q15);
         self.prev_nlsf_len = decoded.d_lpc;
         self.first = false;
+    }
+
+    /// Fold an UNCODED interval into the carried state (a §4.2.7.2
+    /// side-channel skip or a §4.2.4 LBRR-flag gap). The next coded
+    /// frame in the sequence then codes its gains independently with
+    /// the §4.2.7.4 clamp skipped ("in the side channel if the
+    /// previous frame in the side channel was not coded"), its primary
+    /// lag absolutely (§4.2.7.6.1 second bullet), and its §4.2.7.5.5
+    /// LSF interpolation factor forced to 4. For an LBRR sequence the
+    /// §4.2.7.6.3 LTP-scaling field also reappears ("an LBRR frame
+    /// where the LBRR flags indicate the previous LBRR frame in the
+    /// same channel is not coded"), so `first` is re-armed; for
+    /// regular frames that field only ever rides the first time
+    /// interval of the Opus frame, so `first` is cleared.
+    pub(crate) fn mark_interval_uncoded(&mut self, lbrr: bool) {
+        self.prev_gain = None;
+        self.prev_lag = None;
+        self.prev_nlsf = None;
+        self.prev_nlsf_len = 0;
+        self.first = lbrr;
     }
 }
 

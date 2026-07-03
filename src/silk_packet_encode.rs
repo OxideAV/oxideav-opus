@@ -151,6 +151,13 @@ pub fn encode_silk_only_packet_mono_with_lbrr(
     let mut lbrr_predictions: Vec<Option<SilkFrameDecoded>> = Vec::with_capacity(lbrr.len());
     for entry in lbrr.iter() {
         let Some(symbols) = entry else {
+            // §4.2.4 LBRR-flag gap: the next coded LBRR frame codes
+            // independently (§4.2.7.4), with an absolute lag
+            // (§4.2.7.6.1) and the §4.2.7.6.3 scaling field present
+            // again — the exact mirror of the decoder's gap handling.
+            lbrr_prev_gain = None;
+            lbrr_prev_lag = None;
+            lbrr_first = true;
             lbrr_predictions.push(None);
             continue;
         };
@@ -173,7 +180,12 @@ pub fn encode_silk_only_packet_mono_with_lbrr(
         };
         let decoded = encode_silk_frame(&mut re, cfg, symbols)?;
         lbrr_prev_gain = Some(decoded.gains.last_log_gain());
-        lbrr_prev_lag = Some(decoded.ltp.primary_lag());
+        // §4.2.7.6.1: only a VOICED frame arms relative lag coding.
+        lbrr_prev_lag = if decoded.ltp.is_voiced() {
+            Some(decoded.ltp.primary_lag())
+        } else {
+            None
+        };
         lbrr_first = false;
         lbrr_predictions.push(Some(decoded));
     }
@@ -202,7 +214,12 @@ pub fn encode_silk_only_packet_mono_with_lbrr(
         };
         let decoded = encode_silk_frame(&mut re, cfg, symbols)?;
         prev_gain = Some(decoded.gains.last_log_gain());
-        prev_lag = Some(decoded.ltp.primary_lag());
+        // §4.2.7.6.1: only a VOICED frame arms relative lag coding.
+        prev_lag = if decoded.ltp.is_voiced() {
+            Some(decoded.ltp.primary_lag())
+        } else {
+            None
+        };
         prev_nlsf = Some(decoded.nlsf_q15);
         prev_nlsf_len = decoded.d_lpc;
         first = false;
@@ -422,6 +439,8 @@ pub fn encode_silk_only_packet_stereo_with_lbrr(
             lbrr_mid_state.advance(&decoded);
             lbrr_mid_pred.push(Some(decoded));
         } else {
+            // §4.2.4 LBRR-flag gap for the mid channel.
+            lbrr_mid_state.mark_interval_uncoded(true);
             lbrr_mid_pred.push(None);
         }
         if let Some(side_sym) = &entry.side {
@@ -436,6 +455,8 @@ pub fn encode_silk_only_packet_stereo_with_lbrr(
             lbrr_side_state.advance(&decoded);
             lbrr_side_pred.push(Some(decoded));
         } else {
+            // §4.2.4 LBRR-flag gap for the side channel.
+            lbrr_side_state.mark_interval_uncoded(true);
             lbrr_side_pred.push(None);
         }
     }
@@ -489,8 +510,12 @@ pub fn encode_silk_only_packet_stereo_with_lbrr(
             side_state.advance(&side_decoded);
             side_pred.push(Some(side_decoded));
         } else {
-            // §4.2.7.2 / §4.5.2: an uncoded side frame leaves the side
-            // carried state untouched (the decoder does not advance it).
+            // §4.2.7.2 / §4.5.2: an uncoded side frame resets the side
+            // carried state — the next coded side frame codes its gains
+            // independently with the clamp skipped (§4.2.7.4), its lag
+            // absolutely (§4.2.7.6.1), and its LSF interpolation factor
+            // forced to 4 (§4.2.7.5.5) — mirroring the decoder.
+            side_state.mark_interval_uncoded(false);
             side_pred.push(None);
         }
     }
@@ -568,7 +593,8 @@ mod tests {
         rng: &mut Lcg,
         bandwidth: Bandwidth,
         frame_size: SilkFrameSize,
-        first: bool,
+        gains_independent: bool,
+        scaling_present: bool,
         has_prev_lag: bool,
     ) -> ScriptBufs {
         let num_subframes = if frame_size == SilkFrameSize::TenMs {
@@ -580,7 +606,7 @@ mod tests {
         let voiced = frame_type >= 4;
         let gains: Vec<GainSymbol> = (0..num_subframes)
             .map(|k| {
-                if k == 0 && first {
+                if k == 0 && gains_independent {
                     GainSymbol::Independent(rng.below(64) as u8)
                 } else {
                     GainSymbol::Delta(rng.below(41) as u8)
@@ -629,8 +655,8 @@ mod tests {
                 contour_index: rng.below(contour_cells) as u8,
                 periodicity_index,
                 filter_indices,
-                // ltp_scaling_present == `first` in the packet path.
-                ltp_scaling_index: first.then(|| rng.below(3) as u8),
+                // Must match the frame's §4.2.7.6.3 presence context.
+                ltp_scaling_index: scaling_present.then(|| rng.below(3) as u8),
             }
         });
         let blocks = shell_block_count(bandwidth, frame_size).unwrap();
@@ -715,8 +741,22 @@ mod tests {
                 SilkFrameSize::TwentyMs
             };
             let n = silk_frame_count(fs_tenths).unwrap() as usize;
+            let mut prev_voiced = false;
             let bufs: Vec<ScriptBufs> = (0..n)
-                .map(|idx| random_frame_script(&mut rng, bandwidth, frame_size, idx == 0, idx > 0))
+                .map(|idx| {
+                    let b = random_frame_script(
+                        &mut rng,
+                        bandwidth,
+                        frame_size,
+                        idx == 0,
+                        idx == 0,
+                        // §4.2.7.6.1: relative lag only after a coded
+                        // VOICED frame in the same Opus frame.
+                        idx > 0 && prev_voiced,
+                    );
+                    prev_voiced = b.header.frame_type >= 4;
+                    b
+                })
                 .collect();
             let scripts: Vec<SilkFrameSymbols<'_>> = bufs.iter().map(symbols_of).collect();
 
@@ -769,7 +809,11 @@ mod tests {
                 let decoded = decode_silk_frame(&mut rd, cfg).expect("frame decode");
                 assert_eq!(&decoded, expected, "round {round} frame {idx}");
                 prev_gain = Some(decoded.gains.last_log_gain());
-                prev_lag = Some(decoded.ltp.primary_lag());
+                prev_lag = if decoded.ltp.is_voiced() {
+                    Some(decoded.ltp.primary_lag())
+                } else {
+                    None
+                };
                 prev_nlsf = Some(decoded.nlsf_q15);
                 prev_nlsf_len = decoded.d_lpc;
                 first = false;
@@ -800,8 +844,22 @@ mod tests {
                 SilkFrameSize::TwentyMs
             };
             let n = silk_frame_count(fs_tenths).unwrap() as usize;
+            let mut prev_voiced = false;
             let bufs: Vec<ScriptBufs> = (0..n)
-                .map(|idx| random_frame_script(&mut rng, bandwidth, frame_size, idx == 0, idx > 0))
+                .map(|idx| {
+                    let b = random_frame_script(
+                        &mut rng,
+                        bandwidth,
+                        frame_size,
+                        idx == 0,
+                        idx == 0,
+                        // §4.2.7.6.1: relative lag only after a coded
+                        // VOICED frame in the same Opus frame.
+                        idx > 0 && prev_voiced,
+                    );
+                    prev_voiced = b.header.frame_type >= 4;
+                    b
+                })
                 .collect();
             let scripts: Vec<SilkFrameSymbols<'_>> = bufs.iter().map(symbols_of).collect();
 
@@ -818,19 +876,31 @@ mod tests {
             }
             let mut lbrr_bufs: Vec<Option<ScriptBufs>> = Vec::with_capacity(n);
             let mut coded_first = true;
+            let mut lbrr_prev_voiced = false;
             for &w in &which {
                 if !w {
+                    // §4.2.4 LBRR-flag gap: the carried state re-arms
+                    // (independent gains, absolute lag, scaling present).
                     lbrr_bufs.push(None);
+                    coded_first = true;
+                    lbrr_prev_voiced = false;
                     continue;
                 }
-                let mut b =
-                    random_frame_script(&mut rng, bandwidth, frame_size, coded_first, !coded_first);
+                let mut b = random_frame_script(
+                    &mut rng,
+                    bandwidth,
+                    frame_size,
+                    coded_first,
+                    coded_first,
+                    !coded_first && lbrr_prev_voiced,
+                );
                 // Force an active frame type (§4.2.7.3: LBRR is
                 // active-coded) while keeping the generator's LTP shape
                 // consistent with it.
                 if b.header.frame_type < 2 {
                     b.header.frame_type += 2; // 0/1 -> 2/3 (unvoiced, no LTP)
                 }
+                lbrr_prev_voiced = b.header.frame_type >= 4;
                 lbrr_bufs.push(Some(b));
                 coded_first = false;
             }
@@ -883,6 +953,7 @@ mod tests {
             Bandwidth::Nb,
             SilkFrameSize::TwentyMs,
             true,
+            true,
             false,
         );
         let script = symbols_of(&bufs);
@@ -921,8 +992,12 @@ mod tests {
     /// Build one stereo interval's (mid, side) script buffers.
     ///
     /// `mid_first` / `mid_has_prev_lag` describe the mid channel's
-    /// carried state; `side_first` / `side_has_prev_lag` the side
-    /// channel's (side state only advances on *coded* side frames).
+    /// carried state. The side channel decouples its gain-independence
+    /// from the §4.2.7.6.3 scaling presence: after an uncoded side
+    /// interval the next side frame codes gains independently
+    /// (§4.2.7.4 "previous ... was not coded") and its lag absolutely,
+    /// but the scaling field only ever rides the FIRST time interval
+    /// of the Opus frame for regular frames.
     #[allow(clippy::too_many_arguments)]
     fn random_stereo_interval(
         rng: &mut Lcg,
@@ -931,10 +1006,18 @@ mod tests {
         pattern: SidePattern,
         mid_first: bool,
         mid_has_prev_lag: bool,
-        side_first: bool,
+        side_gains_independent: bool,
+        side_scaling_present: bool,
         side_has_prev_lag: bool,
     ) -> (ScriptBufs, Option<ScriptBufs>) {
-        let mut mid = random_frame_script(rng, bandwidth, frame_size, mid_first, mid_has_prev_lag);
+        let mut mid = random_frame_script(
+            rng,
+            bandwidth,
+            frame_size,
+            mid_first,
+            mid_first,
+            mid_has_prev_lag,
+        );
         mid.header.stereo = Some(random_weights(rng));
         mid.header.mid_only_flag = match pattern {
             SidePattern::Active => None,
@@ -944,8 +1027,14 @@ mod tests {
         let side = match pattern {
             SidePattern::MidOnly => None,
             SidePattern::Active => {
-                let mut s =
-                    random_frame_script(rng, bandwidth, frame_size, side_first, side_has_prev_lag);
+                let mut s = random_frame_script(
+                    rng,
+                    bandwidth,
+                    frame_size,
+                    side_gains_independent,
+                    side_scaling_present,
+                    side_has_prev_lag,
+                );
                 if s.header.frame_type < 2 {
                     // Force an active type without disturbing the
                     // generator's LTP shape (0/1 → 2/3, still unvoiced).
@@ -954,8 +1043,14 @@ mod tests {
                 Some(s)
             }
             SidePattern::InactiveCoded => {
-                let mut s =
-                    random_frame_script(rng, bandwidth, frame_size, side_first, side_has_prev_lag);
+                let mut s = random_frame_script(
+                    rng,
+                    bandwidth,
+                    frame_size,
+                    side_gains_independent,
+                    side_scaling_present,
+                    side_has_prev_lag,
+                );
                 if s.header.frame_type >= 2 {
                     // Force an inactive type; inactive frames carry no
                     // §4.2.7.6 LTP.
@@ -992,8 +1087,9 @@ mod tests {
 
             let mut interval_bufs: Vec<(ScriptBufs, Option<ScriptBufs>)> = Vec::with_capacity(n);
             let mut patterns: Vec<SidePattern> = Vec::with_capacity(n);
-            let mut side_first = true;
-            let mut side_has_prev = false;
+            let mut mid_prev_voiced = false;
+            let mut side_indep = true;
+            let mut side_prev_voiced = false;
             for idx in 0..n {
                 let pattern = match rng.below(3) {
                     0 => SidePattern::Active,
@@ -1006,13 +1102,24 @@ mod tests {
                     frame_size,
                     pattern,
                     idx == 0,
-                    idx > 0,
-                    side_first,
-                    side_has_prev,
+                    idx > 0 && mid_prev_voiced,
+                    side_indep,
+                    // §4.2.7.6.3: regular frames only carry the scaling
+                    // field in the FIRST time interval.
+                    idx == 0,
+                    side_prev_voiced,
                 );
-                if pattern != SidePattern::MidOnly {
-                    side_first = false;
-                    side_has_prev = true;
+                mid_prev_voiced = iv.0.header.frame_type >= 4;
+                match &iv.1 {
+                    Some(sf) => {
+                        side_indep = false;
+                        side_prev_voiced = sf.header.frame_type >= 4;
+                    }
+                    None => {
+                        // Uncoded side interval: fresh gain/lag state.
+                        side_indep = true;
+                        side_prev_voiced = false;
+                    }
                 }
                 patterns.push(pattern);
                 interval_bufs.push(iv);
@@ -1099,6 +1206,9 @@ mod tests {
                     side_state.advance(&side_decoded);
                 } else {
                     assert!(predictions.side[idx].is_none(), "round {round} side {idx}");
+                    // §4.2.7.2: an uncoded side interval resets the side
+                    // carried state — mirror the decoder walk.
+                    side_state.mark_interval_uncoded(false);
                 }
             }
             assert!(!rd.has_error());
@@ -1131,17 +1241,23 @@ mod tests {
             // Regular frames: keep the side always actively coded for
             // this sweep (the pattern axis is covered by the other test).
             let mut interval_bufs: Vec<(ScriptBufs, Option<ScriptBufs>)> = Vec::with_capacity(n);
+            let mut mid_prev_voiced = false;
+            let mut side_prev_voiced = false;
             for idx in 0..n {
-                interval_bufs.push(random_stereo_interval(
+                let iv = random_stereo_interval(
                     &mut rng,
                     bandwidth,
                     frame_size,
                     SidePattern::Active,
                     idx == 0,
-                    idx > 0,
+                    idx > 0 && mid_prev_voiced,
                     idx == 0,
-                    idx > 0,
-                ));
+                    idx == 0,
+                    idx > 0 && side_prev_voiced,
+                );
+                mid_prev_voiced = iv.0.header.frame_type >= 4;
+                side_prev_voiced = iv.1.as_ref().is_some_and(|sf| sf.header.frame_type >= 4);
+                interval_bufs.push(iv);
             }
             let intervals: Vec<StereoIntervalScripts<'_>> = interval_bufs
                 .iter()
@@ -1169,28 +1285,49 @@ mod tests {
             for &kind in &kinds {
                 let want_mid = kind == 1 || kind == 2;
                 let want_side = kind == 2 || kind == 3;
-                let mid = want_mid.then(|| {
-                    let mut b =
-                        random_frame_script(&mut rng, bandwidth, frame_size, mid_first, mid_prev);
+                let mid = if want_mid {
+                    let mut b = random_frame_script(
+                        &mut rng,
+                        bandwidth,
+                        frame_size,
+                        mid_first,
+                        mid_first,
+                        !mid_first && mid_prev,
+                    );
                     if b.header.frame_type < 2 {
                         b.header.frame_type += 2; // active-coded (§4.2.7.3)
                     }
                     b.header.stereo = Some(random_weights(&mut rng));
                     b.header.mid_only_flag = (!want_side).then_some(true);
                     mid_first = false;
-                    mid_prev = true;
-                    b
-                });
-                let side = want_side.then(|| {
-                    let mut b =
-                        random_frame_script(&mut rng, bandwidth, frame_size, side_first, side_prev);
+                    mid_prev = b.header.frame_type >= 4;
+                    Some(b)
+                } else {
+                    // §4.2.4 LBRR-flag gap re-arms the mid LBRR state.
+                    mid_first = true;
+                    mid_prev = false;
+                    None
+                };
+                let side = if want_side {
+                    let mut b = random_frame_script(
+                        &mut rng,
+                        bandwidth,
+                        frame_size,
+                        side_first,
+                        side_first,
+                        !side_first && side_prev,
+                    );
                     if b.header.frame_type < 2 {
                         b.header.frame_type += 2;
                     }
                     side_first = false;
-                    side_prev = true;
-                    b
-                });
+                    side_prev = b.header.frame_type >= 4;
+                    Some(b)
+                } else {
+                    side_first = true;
+                    side_prev = false;
+                    None
+                };
                 lbrr_bufs.push((mid, side));
             }
             let lbrr_scripts: Vec<StereoIntervalLbrr<'_>> = lbrr_bufs
@@ -1270,6 +1407,7 @@ mod tests {
             true,
             false,
             true,
+            true,
             false,
         );
         let side = side.unwrap();
@@ -1311,12 +1449,14 @@ mod tests {
             true,
             false,
             true,
+            true,
             false,
         );
         let mut side_inactive = random_frame_script(
             &mut rng,
             Bandwidth::Wb,
             SilkFrameSize::TwentyMs,
+            true,
             true,
             false,
         );
@@ -1349,6 +1489,7 @@ mod tests {
             true,
             false,
             true,
+            true,
             false,
         );
         let side_ok = side_ok.unwrap();
@@ -1356,6 +1497,7 @@ mod tests {
             &mut rng,
             Bandwidth::Wb,
             SilkFrameSize::TwentyMs,
+            true,
             true,
             false,
         );
@@ -1383,6 +1525,7 @@ mod tests {
             Bandwidth::Wb,
             SilkFrameSize::TwentyMs,
             true,
+            true,
             false,
         );
         if lbrr_mid_bad.header.frame_type < 2 {
@@ -1403,6 +1546,69 @@ mod tests {
         );
     }
 
+    /// §4.2.7.6.1 regression (round 388): a voiced frame whose
+    /// PREVIOUS frame in the same Opus frame was coded but NOT voiced
+    /// must code its primary lag absolutely — the walkers used to
+    /// carry the unvoiced frame's zero lag and select relative coding
+    /// (the wrong PDF, a parse-level divergence on real streams).
+    #[test]
+    fn voiced_after_unvoiced_uses_absolute_lag() {
+        let mut rng = Lcg(0xAB5_01A6);
+        let bandwidth = Bandwidth::Wb;
+        let frame_size = SilkFrameSize::TwentyMs;
+
+        // Frame 0: unvoiced. Frame 1: voiced with an ABSOLUTE lag.
+        let mut f0 = random_frame_script(&mut rng, bandwidth, frame_size, true, true, false);
+        if f0.header.frame_type >= 4 {
+            f0.header.frame_type -= 2; // force unvoiced (2/3)
+            f0.ltp = None;
+        }
+        let mut f1 = random_frame_script(&mut rng, bandwidth, frame_size, false, false, false);
+        if f1.header.frame_type < 4 {
+            f1.header.frame_type = 4; // force voiced
+        }
+        f1.ltp = Some(LtpSymbols {
+            lag: LagSymbols::Absolute {
+                lag_high: 12,
+                lag_low: 3,
+            },
+            contour_index: 0,
+            periodicity_index: 0,
+            filter_indices: [0; LTP_MAX_SUBFRAMES],
+            ltp_scaling_index: None,
+        });
+        // Frame 0 gain symbols must start independent; frame 1 delta.
+        f0.gains[0] = GainSymbol::Independent(40);
+        for g in f1.gains.iter_mut() {
+            *g = GainSymbol::Delta(10);
+        }
+
+        let scripts = [symbols_of(&f0), symbols_of(&f1)];
+        let (packet, predictions) =
+            encode_silk_only_packet_mono(bandwidth, 400, &scripts).expect("absolute lag accepted");
+        assert_eq!(predictions[1].ltp.primary_lag(), 12 * 8 + 3 + 32);
+
+        let mut dec = OpusDecoder::new();
+        let out = dec.decode_packet(&packet).expect("decode");
+        assert_eq!(
+            out.frame_outcomes[0].status,
+            FrameDecodeStatus::SilkParamsDecoded
+        );
+
+        // The relative variants must now be REJECTED in this context
+        // (the previous coded frame was not voiced ⇒ absolute context).
+        let mut f1_rel = f1;
+        f1_rel.ltp = Some(LtpSymbols {
+            lag: LagSymbols::RelativeDelta { delta_index: 5 },
+            contour_index: 0,
+            periodicity_index: 0,
+            filter_indices: [0; LTP_MAX_SUBFRAMES],
+            ltp_scaling_index: None,
+        });
+        let scripts = [symbols_of(&f0), symbols_of(&f1_rel)];
+        assert!(encode_silk_only_packet_mono(bandwidth, 400, &scripts).is_err());
+    }
+
     /// Frame-count / duration mismatches are rejected.
     #[test]
     fn packet_encode_rejects_bad_shape() {
@@ -1411,6 +1617,7 @@ mod tests {
             &mut rng,
             Bandwidth::Nb,
             SilkFrameSize::TwentyMs,
+            true,
             true,
             false,
         );
