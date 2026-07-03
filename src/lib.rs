@@ -730,6 +730,7 @@ pub mod range_encoder;
 pub mod redundancy_decode_params;
 pub mod silk_decode;
 pub mod silk_excitation;
+pub mod silk_excitation_quantize;
 pub mod silk_frame;
 pub mod silk_gains;
 pub mod silk_header;
