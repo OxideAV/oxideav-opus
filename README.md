@@ -93,16 +93,35 @@ SILK §4.2.7 decode stage (header / gains with a deterministic
 quantizer / LSF stage-1 + stage-2 / interpolation index / LTP / seed
 / excitation, each returning the value the decoder will
 reconstruct), the whole-frame Table-5 composition
-(`encode_silk_frame`), and a **SILK-only mono packet encoder**
-(`encode_silk_only_packet_mono`: TOC byte + §4.2.3/§4.2.4 header
-bits + 1–3 SILK frames at 10/20/40/60 ms) whose packets decode
-end-to-end through a fresh `OpusDecoder::decode_packet` to real SILK
-PCM, with every per-frame parameter verified equal to the encoder's
-prediction. LBRR (in-band FEC, §4.2.5) emission is included and
-closes the FEC loop: `decode_packet_fec` recovers real audio from the
-encoder's own redundancy. What the encoder does *not* yet have is the
-§5.2.3 analysis front end (signal → symbol quantization beyond
-gains) and the stereo mid/side packet interleave.
+(`encode_silk_frame`), and SILK-only **packet encoders for both mono
+and stereo** (`encode_silk_only_packet_mono` /
+`encode_silk_only_packet_stereo`: TOC byte + §4.2.3/§4.2.4 header
+bits + 1–3 SILK frames at 10/20/40/60 ms — the stereo entry writing
+the §4.2.2 mid/side interleave with the §4.2.7.1 weight quintuple and
+gated §4.2.7.2 mid-only flag on each mid frame, and two independent
+per-channel carried states) whose packets decode end-to-end through a
+fresh `OpusDecoder::decode_packet` to real SILK PCM, with every
+per-frame parameter verified equal to the encoder's prediction. LBRR
+(in-band FEC, §4.2.5) emission is included for both channel layouts
+and closes the FEC loop: `decode_packet_fec` recovers real (mono or
+two-channel) audio from the encoder's own redundancy. On top of the
+packet writers sit the **stereo analysis front half** — the exact
+§4.2.8 algebraic-inverse downmix `stereo_lr_to_ms` (L/R → mid/side
+with the decoder's weight-interpolation ramp; roundtrips to the
+input at the §4.2.8 one-sample delay), the least-squares §4.2.7.1
+weight estimator `estimate_stereo_weights`, and the exhaustive
+codebook quantizer `StereoWeightSymbols::quantize` — plus the **§3.2
+/ Appendix-B framing writers** (`compose_packet`,
+`compose_packet_code3`, `compose_self_delimited`; all four codes,
+CBR/VBR, §3.2.5 padding chains, parser-validated R2/R3/R5/R6) and
+the **RFC 7845 write side** (`OpusHead::compose`, byte-identical on
+reparse, and `assemble_multistream_packet`, roundtripped against the
+splitter and decoded sample-identically through
+`MultistreamDecoder`). What the encoder does *not* yet have is the
+§5.2.3 signal analysis that picks the SILK symbols themselves
+(pitch/LTP analysis, LSF fitting, excitation quantization from
+residual PCM beyond the gains quantizer) — packets are encoded from
+symbol scripts, not yet from raw PCM.
 
 Differential encoder/decoder testing and a restored cargo-fuzz suite
 (4 coverage-guided targets, incl. an encoder↔decoder range-coder
@@ -116,7 +135,7 @@ regression tests.
 
 The crate ships a large, individually unit-tested set of SILK and
 CELT building blocks plus a complete RFC 7845 multistream /
-multichannel decode subsystem (1273 lib tests + SILK-fixture,
+multichannel decode subsystem (1296 lib tests + SILK-fixture,
 multistream, FEC, and CELT synthesis-backend integration suites).
 Per-stage progress lives in `CHANGELOG.md`.
 
@@ -211,13 +230,41 @@ mirrors of every §4.2.7 stage sharing the decode tables
 `LsfInterpolated::encode_index`, `encode_lcg_seed`,
 `LtpParameters::encode`, `Excitation::encode`), the Table-5
 whole-frame composition `encode_silk_frame`, the §4.2.3/§4.2.4
-header-bit writer `SilkHeaderBits::encode`, the §3.1 TOC composer
-`OpusTocByte::compose_byte`, and the packet-level
-`encode_silk_only_packet_mono` (+ `_with_lbrr` for §4.2.5 in-band-FEC
-emission) — every layer roundtrip-verified against the decoder, up to
-whole packets decoding end-to-end through
-`OpusDecoder::decode_packet` and FEC recovery through
-`decode_packet_fec`.
+header-bit writer `SilkHeaderBits::encode` (mono + two-channel), the
+§3.1 TOC composer `OpusTocByte::compose_byte`, and the packet-level
+`encode_silk_only_packet_mono` / `encode_silk_only_packet_stereo`
+(each with a `_with_lbrr` variant for §4.2.5 in-band-FEC emission;
+the stereo entry writes the §4.2.2 mid/side interleave with the
+§4.2.7.1 weights and gated §4.2.7.2 mid-only flag per interval and
+threads two independent per-channel carried states, exactly
+mirroring the decoder's stereo walk) — every layer
+roundtrip-verified against the decoder, up to whole packets decoding
+end-to-end through `OpusDecoder::decode_packet` (mono and stereo)
+and FEC recovery through `decode_packet_fec`.
+
+**Stereo encode analysis (§4.2.7.1 / §4.2.8 write half):**
+`stereo_lr_to_ms` — the exact algebraic inverse of the §4.2.8
+unmixer (frame-aligned L/R → mid/side with the decoder's
+weight-interpolation ramp, one-sample lookahead for the final `p0`,
+`StereoDownmixState` history; a multi-frame roundtrip through
+`stereo_ms_to_lr` reproduces the input at the §4.2.8 one-sample
+delay) — `estimate_stereo_weights` (least-squares fit of the raw
+side onto the `p0` / mid predictor pair, f64 normal equations) and
+`StereoWeightSymbols::quantize` (exhaustive deterministic argmin
+over the 5625-quintuple §4.2.7.1 codebook; representable targets
+roundtrip value-exactly).
+
+**Packet-framing / RFC 7845 write side:** `compose_packet` /
+`compose_packet_code3` / `compose_self_delimited` / `encode_length` —
+the §3.2 + Appendix-B framing writers (all four codes, CBR/VBR,
+§3.2.5 padding chains, every parser-enforced requirement validated
+before writing; roundtripped against `OpusPacket::parse` /
+`parse_self_delimited`, including chained self-delimited buffers and
+multi-frame SILK packets decoding end-to-end) — plus
+`OpusHead::compose` (byte-identical reparse, full §5.1/§5.1.1 MUST
+validation) and `assemble_multistream_packet` (§3 stream packing via
+the Appendix-B writer, equal-duration constraint enforced,
+sample-identical decode through `MultistreamDecoder`).
 
 **SILK (RFC 6716 §4.2):** frame-header decode (§4.2.7.1–§4.2.7.5.1),
 subframe gains (§4.2.7.4), the full LSF chain (stage-2 residual → NLSF
