@@ -415,6 +415,84 @@ pub fn stereo_lr_to_ms(
     Ok(MidSideFrame { mid, side })
 }
 
+/// Estimate the §4.2.7.1 prediction-weight pair that minimizes the
+/// coded side-channel energy for one frame — the encoder's *analysis*
+/// choice feeding [`crate::silk_frame::StereoWeightSymbols::quantize`]
+/// and [`stereo_lr_to_ms`].
+///
+/// The §4.2.8 reconstruction predicts the raw side signal
+/// `s[k] = (left[k] - right[k]) / 2` from the low-passed mid `p0` and
+/// the mid itself, so the residual the bitstream must carry is
+/// `s[k] - w0*p0(k+1) - w1*mid[k]` (the same terms
+/// [`stereo_lr_to_ms`] subtracts). RFC 6716 leaves the encoder's
+/// weight choice free (only the decode of the coded quintuple is
+/// normative); this estimator picks the classical least-squares
+/// optimum, solving the 2×2 normal equations
+///
+/// ```text
+///   | Σ p0²    Σ p0·m |   | w0 |   | Σ p0·s |
+///   |                 | · |    | = |        |
+///   | Σ p0·m   Σ m²   |   | w1 |   | Σ m·s  |
+/// ```
+///
+/// over the frame in f64, then converts to Q13. A singular /
+/// near-singular system (e.g. a silent mid channel) returns zero
+/// weights. The result is a *target* pair — feed it through
+/// [`crate::silk_frame::StereoWeightSymbols::quantize`] to obtain the
+/// coded quintuple, and use the quantized pair (what the decoder will
+/// reconstruct) in [`stereo_lr_to_ms`].
+///
+/// `prev_mid` is the previous frame's trailing mid sample (0.0 after a
+/// reset) and `mid_next` the next frame's first mid sample (or a hold
+/// at stream end) — the same boundary terms the downmix uses for
+/// `p0`. Errors on empty or length-mismatched inputs.
+pub fn estimate_stereo_weights(
+    mid: &[f32],
+    side_raw: &[f32],
+    prev_mid: f32,
+    mid_next: f32,
+) -> Result<StereoWeightsQ13, Error> {
+    let n2 = mid.len();
+    if n2 == 0 || side_raw.len() != n2 {
+        return Err(Error::MalformedPacket);
+    }
+    let mut sum_pp = 0f64;
+    let mut sum_pm = 0f64;
+    let mut sum_mm = 0f64;
+    let mut sum_ps = 0f64;
+    let mut sum_ms = 0f64;
+    for k in 0..n2 {
+        let m_km1 = if k >= 1 { mid[k - 1] } else { prev_mid } as f64;
+        let m_kp1 = if k + 1 < n2 { mid[k + 1] } else { mid_next } as f64;
+        let m = mid[k] as f64;
+        let p0 = (m_km1 + 2.0 * m + m_kp1) / 4.0;
+        let s = side_raw[k] as f64;
+        sum_pp += p0 * p0;
+        sum_pm += p0 * m;
+        sum_mm += m * m;
+        sum_ps += p0 * s;
+        sum_ms += m * s;
+    }
+    let det = sum_pp * sum_mm - sum_pm * sum_pm;
+    // Regularization floor: treat a (near-)singular system as "no
+    // usable predictor" and code zero weights, which the §4.2.8
+    // reconstruction handles exactly (pure sum/difference stereo).
+    if det.abs() < 1e-12 {
+        return Ok(StereoWeightsQ13::default());
+    }
+    let w0 = (sum_ps * sum_mm - sum_ms * sum_pm) / det;
+    let w1 = (sum_ms * sum_pp - sum_ps * sum_pm) / det;
+    let to_q13 = |w: f64| -> i32 {
+        (w * 8192.0)
+            .round()
+            .clamp(-(1 << 30) as f64, (1 << 30) as f64) as i32
+    };
+    Ok(StereoWeightsQ13 {
+        w0_q13: to_q13(w0),
+        w1_q13: to_q13(w1),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +831,117 @@ mod tests {
                 approx(rec.left[i], left[i - 1]);
                 approx(rec.right[i], right[i - 1]);
             }
+        }
+    }
+
+    /// Planted-weight recovery: a side channel constructed as exactly
+    /// `w0*p0 + w1*mid` (no residual) estimates back to the planted
+    /// Q13 pair within rounding.
+    #[test]
+    fn estimate_recovers_planted_weights() {
+        let mut rng = Lcg(0xE571_0001);
+        let n2 = 320usize;
+        let mid: Vec<f32> = (0..n2).map(|_| rng.next_f32()).collect();
+        let prev_mid = rng.next_f32();
+        let mid_next = rng.next_f32();
+        let (w0, w1) = (0.37f64, -0.61f64);
+        let mut side_raw = vec![0.0f32; n2];
+        for k in 0..n2 {
+            let m_km1 = if k >= 1 { mid[k - 1] } else { prev_mid } as f64;
+            let m_kp1 = if k + 1 < n2 { mid[k + 1] } else { mid_next } as f64;
+            let p0 = (m_km1 + 2.0 * mid[k] as f64 + m_kp1) / 4.0;
+            side_raw[k] = (w0 * p0 + w1 * mid[k] as f64) as f32;
+        }
+        let est = estimate_stereo_weights(&mid, &side_raw, prev_mid, mid_next).unwrap();
+        assert!(
+            (est.w0_q13 - (w0 * 8192.0).round() as i32).abs() <= 1,
+            "w0 {} vs planted {}",
+            est.w0_q13,
+            (w0 * 8192.0).round()
+        );
+        assert!(
+            (est.w1_q13 - (w1 * 8192.0).round() as i32).abs() <= 1,
+            "w1 {} vs planted {}",
+            est.w1_q13,
+            (w1 * 8192.0).round()
+        );
+    }
+
+    /// A silent (or constant-zero) mid channel has no usable predictor:
+    /// the estimator returns zero weights instead of a singular solve,
+    /// and bad shapes are rejected.
+    #[test]
+    fn estimate_zero_mid_and_bad_input() {
+        let side = vec![0.25f32; 160];
+        let mid = vec![0.0f32; 160];
+        let est = estimate_stereo_weights(&mid, &side, 0.0, 0.0).unwrap();
+        assert_eq!(est, StereoWeightsQ13::default());
+        assert!(estimate_stereo_weights(&[], &[], 0.0, 0.0).is_err());
+        assert!(estimate_stereo_weights(&mid, &side[..159], 0.0, 0.0).is_err());
+    }
+
+    /// The full encoder analysis chain — raw L/R → estimate → quantize
+    /// → downmix — codes a side channel with strictly less energy than
+    /// the unpredicted `(L - R)/2`, and the roundtrip through the
+    /// §4.2.8 unmixer still reproduces the input at the one-sample
+    /// delay.
+    #[test]
+    fn estimate_quantize_downmix_reduces_side_energy() {
+        use crate::silk_frame::StereoWeightSymbols;
+        let mut rng = Lcg(0xE571_C0DE);
+        let n2 = 320usize;
+        // Correlated stereo: right = mostly-scaled left plus a small
+        // independent component, so the mid channel predicts the side.
+        let left: Vec<f32> = (0..n2).map(|_| rng.next_f32()).collect();
+        let right: Vec<f32> = left
+            .iter()
+            .map(|&l| 0.4 * l + 0.12 * rng.next_f32())
+            .collect();
+
+        let mid: Vec<f32> = left
+            .iter()
+            .zip(&right)
+            .map(|(&l, &r)| (l + r) / 2.0)
+            .collect();
+        let side_raw: Vec<f32> = left
+            .iter()
+            .zip(&right)
+            .map(|(&l, &r)| (l - r) / 2.0)
+            .collect();
+        let target = estimate_stereo_weights(&mid, &side_raw, 0.0, mid[n2 - 1]).unwrap();
+        let quintuple = StereoWeightSymbols::quantize(crate::silk_frame::StereoPredictionWeights {
+            w0_q13: target.w0_q13,
+            w1_q13: target.w1_q13,
+        });
+        let coded = quintuple.weights();
+        let coded_w = StereoWeightsQ13 {
+            w0_q13: coded.w0_q13,
+            w1_q13: coded.w1_q13,
+        };
+
+        // Downmix from a state whose previous weights equal the coded
+        // pair (flat ramp — the steady-state condition).
+        let mut enc = StereoDownmixState::new();
+        enc.prev_weights = coded_w;
+        let ms = stereo_lr_to_ms(Bandwidth::Wb, &left, &right, coded_w, None, &mut enc).unwrap();
+
+        let energy = |v: &[f32]| -> f64 { v.iter().map(|&x| (x as f64) * (x as f64)).sum() };
+        assert!(
+            energy(&ms.side) < 0.7 * energy(&side_raw),
+            "predicted side energy {} not below unpredicted {}",
+            energy(&ms.side),
+            energy(&side_raw)
+        );
+
+        // The roundtrip guarantee is weight-independent: decode back
+        // and confirm the delayed identity still holds.
+        let mut dec = StereoUnmixState::new();
+        dec.prev_weights = coded_w;
+        let rec =
+            stereo_ms_to_lr(Bandwidth::Wb, &ms.mid, Some(&ms.side), coded_w, &mut dec).unwrap();
+        for i in 1..n2 {
+            assert!((rec.left[i] - left[i - 1]).abs() < 1e-4, "left {i}");
+            assert!((rec.right[i] - right[i - 1]).abs() < 1e-4, "right {i}");
         }
     }
 

@@ -6,6 +6,23 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- *§4.2.7.1 stereo-weight **estimator** —
+  `silk_stereo::estimate_stereo_weights`.* The encoder-analysis
+  companion to the quantizer and downmix: a least-squares fit of the
+  raw side signal `(L-R)/2` onto the two §4.2.8 predictor terms (the
+  low-passed mid `p0` and the mid itself), solving the 2×2 normal
+  equations in f64 over the frame with the same `p0` boundary terms
+  the downmix uses, returning zero weights for a (near-)singular
+  system (silent mid). RFC 6716 leaves the encoder's weight choice
+  free — only the decode of the coded quintuple is normative — so
+  the estimator's output is a *target* pair fed through
+  `StereoWeightSymbols::quantize`. Verified: a side channel built as
+  exactly `w0*p0 + w1*mid` estimates back to the planted Q13 pair
+  within ±1, and the full analysis chain (raw L/R → estimate →
+  quantize → `stereo_lr_to_ms`) codes a side channel with markedly
+  less energy than the unpredicted `(L-R)/2` on correlated stereo
+  while the §4.2.8 roundtrip identity still holds.
+
 - *RFC 7845 write side — `OpusHead::compose` (§5.1 / §5.1.1) and
   `multistream::assemble_multistream_packet` (§3).* `compose` is the
   exact write-side mirror of `OpusHead::parse`: it validates every

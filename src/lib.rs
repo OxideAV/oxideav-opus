@@ -937,8 +937,8 @@ pub use silk_resampler::{
     SILK_RESAMPLER_DELAY_MS_WB, SUPPORTED_OUTPUT_RATES_HZ,
 };
 pub use silk_stereo::{
-    interp_phase_samples, stereo_lr_to_ms, stereo_ms_to_lr, MidSideFrame, StereoDownmixState,
-    StereoFrame, StereoUnmixState, StereoWeightsQ13,
+    estimate_stereo_weights, interp_phase_samples, stereo_lr_to_ms, stereo_ms_to_lr, MidSideFrame,
+    StereoDownmixState, StereoFrame, StereoUnmixState, StereoWeightsQ13,
 };
 pub use toc::{Bandwidth, ChannelMapping, FrameCountCode, Mode, OpusTocByte};
 
