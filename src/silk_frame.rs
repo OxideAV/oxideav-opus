@@ -581,6 +581,53 @@ impl StereoWeightSymbols {
         let w0_q13 = STEREO_WEIGHT_Q13[wi0] + step0 - w1_q13;
         StereoPredictionWeights { w0_q13, w1_q13 }
     }
+
+    /// Quantize a target §4.2.7.1 weight pair to the nearest coded
+    /// quintuple — the deterministic write-side inverse of
+    /// [`Self::weights`].
+    ///
+    /// The §4.2.7.1 codebook is small (25 stage-1 × 3×5 × 3×5 stage-2/3
+    /// index combinations = 5625 quintuples), so this is an exhaustive
+    /// argmin of the squared Q13 error `(w0 - t0)² + (w1 - t1)²` over
+    /// every quintuple, evaluated through the shared normative
+    /// reconstruction — no approximation, no reliance on any structure
+    /// beyond what [`Self::weights`] itself defines. Ties keep the
+    /// first candidate in `(n, i0, i1, i2, i3)` lexicographic order, so
+    /// the result is fully deterministic.
+    ///
+    /// The achieved pair is available as `quantize(t).weights()`; a
+    /// target that is exactly representable (any output of
+    /// [`Self::weights`]) reconstructs value-exactly.
+    pub fn quantize(target: StereoPredictionWeights) -> StereoWeightSymbols {
+        let mut best = StereoWeightSymbols {
+            n: 0,
+            i0: 0,
+            i1: 0,
+            i2: 0,
+            i3: 0,
+        };
+        let mut best_err = i64::MAX;
+        for n in 0..=24u8 {
+            for i0 in 0..=2u8 {
+                for i1 in 0..=4u8 {
+                    for i2 in 0..=2u8 {
+                        for i3 in 0..=4u8 {
+                            let cand = StereoWeightSymbols { n, i0, i1, i2, i3 };
+                            let w = cand.weights();
+                            let e0 = (w.w0_q13 - target.w0_q13) as i64;
+                            let e1 = (w.w1_q13 - target.w1_q13) as i64;
+                            let err = e0 * e0 + e1 * e1;
+                            if err < best_err {
+                                best_err = err;
+                                best = cand;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
 }
 
 /// The raw pre-gains header symbol choices consumed by the encode-side
@@ -1091,5 +1138,99 @@ mod tests {
             SilkFrameHeader::encode_lsf_stage1(&mut re, Bandwidth::Swb, SignalType::Voiced, 0)
                 .is_err()
         );
+    }
+
+    /// Enumerate every §4.2.7.1 quintuple in `(n, i0, i1, i2, i3)`
+    /// lexicographic order.
+    fn all_weight_quintuples() -> Vec<StereoWeightSymbols> {
+        let mut v = Vec::with_capacity(5625);
+        for n in 0..=24u8 {
+            for i0 in 0..=2u8 {
+                for i1 in 0..=4u8 {
+                    for i2 in 0..=2u8 {
+                        for i3 in 0..=4u8 {
+                            v.push(StereoWeightSymbols { n, i0, i1, i2, i3 });
+                        }
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// A representable target (any output of `weights()`) quantizes back
+    /// value-exactly: the achieved pair equals the target pair. Sampled
+    /// across the whole codebook (stride 7 keeps the exhaustive
+    /// `quantize` affordable while touching every index dimension).
+    #[test]
+    fn stereo_weight_quantize_exact_on_representable_targets() {
+        let all = all_weight_quintuples();
+        for q in all.iter().step_by(7) {
+            let target = q.weights();
+            let quant = StereoWeightSymbols::quantize(target);
+            assert_eq!(
+                quant.weights(),
+                target,
+                "quintuple {q:?} did not roundtrip through quantize"
+            );
+        }
+    }
+
+    /// `quantize` is a true argmin: for random unrepresentable targets
+    /// no quintuple in the codebook achieves a strictly smaller squared
+    /// Q13 error than the returned one, and repeated calls are
+    /// deterministic.
+    #[test]
+    fn stereo_weight_quantize_is_argmin_and_deterministic() {
+        let all = all_weight_quintuples();
+        let err = |w: StereoPredictionWeights, t: StereoPredictionWeights| -> i64 {
+            let e0 = (w.w0_q13 - t.w0_q13) as i64;
+            let e1 = (w.w1_q13 - t.w1_q13) as i64;
+            e0 * e0 + e1 * e1
+        };
+        // Small deterministic LCG.
+        let mut s = 0x5EED_0385u64;
+        let mut next = move || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 33) as i32 % 60001) - 30000
+        };
+        for _ in 0..25 {
+            let target = StereoPredictionWeights {
+                w0_q13: next(),
+                w1_q13: next(),
+            };
+            let quant = StereoWeightSymbols::quantize(target);
+            let best = err(quant.weights(), target);
+            for cand in &all {
+                assert!(
+                    err(cand.weights(), target) >= best,
+                    "candidate {cand:?} beats quantize({target:?}) = {quant:?}"
+                );
+            }
+            assert_eq!(StereoWeightSymbols::quantize(target), quant);
+        }
+    }
+
+    /// Extreme targets saturate to the codebook's extreme reachable
+    /// weight pairs (computed from the codebook itself, not hard-coded).
+    #[test]
+    fn stereo_weight_quantize_saturates_at_extremes() {
+        let all = all_weight_quintuples();
+        let max_w1 = all.iter().map(|q| q.weights().w1_q13).max().unwrap();
+        let min_w1 = all.iter().map(|q| q.weights().w1_q13).min().unwrap();
+        // A target far above every reachable w1 (with w0 target 0) must
+        // land on a maximal-w1 quintuple, and symmetrically below.
+        let hi = StereoWeightSymbols::quantize(StereoPredictionWeights {
+            w0_q13: 0,
+            w1_q13: 1 << 20,
+        });
+        assert_eq!(hi.weights().w1_q13, max_w1);
+        let lo = StereoWeightSymbols::quantize(StereoPredictionWeights {
+            w0_q13: 0,
+            w1_q13: -(1 << 20),
+        });
+        assert_eq!(lo.weights().w1_q13, min_w1);
     }
 }

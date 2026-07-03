@@ -6,6 +6,19 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- *§4.2.7.1 stereo-weight quantizer —
+  `StereoWeightSymbols::quantize`.* The deterministic write-side
+  inverse of the shared `weights()` reconstruction: an exhaustive
+  argmin of the squared Q13 error over all 5625 codebook quintuples
+  (25 stage-1 × 3×5 × 3×5 stage-2/3 combinations), with lexicographic
+  first-wins tie-breaking. Completes the stereo encode-side symbol
+  story: an encoder now maps a target `(w0_Q13, w1_Q13)` pair to the
+  quintuple the mid frame carries. Verified: representable targets
+  roundtrip value-exactly across the codebook, random targets are
+  true argmins against a full codebook scan, and out-of-range targets
+  saturate to the extreme reachable weights (derived from the
+  codebook, not hard-coded).
+
 - *Stereo SILK-only Opus **packet** encoder —
   `silk_packet_encode::encode_silk_only_packet_stereo` (+
   `_with_lbrr`), the §4.2.2 mid/side interleave writer.* Per 20 ms
