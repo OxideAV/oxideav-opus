@@ -636,6 +636,112 @@ impl LsfStage2 {
         })
     }
 
+    /// Build an [`LsfStage2`] directly from `d_LPC` signed indices
+    /// `I2[k] ∈ [-10, 10]` without touching a bitstream — the same
+    /// non-bitstream tail [`Self::decode`] and [`Self::encode`] share
+    /// (Table selection + the §4.2.7.5.2 backwards-prediction
+    /// inverse). Used by the encoder's quantisation search, which
+    /// needs the `res_Q10[]` of a candidate before deciding whether
+    /// to write it.
+    pub fn from_indices(bandwidth: Bandwidth, lsf_stage1: u8, i2_in: &[i8]) -> Result<Self, Error> {
+        let tables = StageTables::for_bandwidth(bandwidth, lsf_stage1)?;
+        if i2_in.len() != tables.d_lpc || i2_in.iter().any(|&v| !(-10..=10).contains(&v)) {
+            return Err(Error::MalformedPacket);
+        }
+        let mut i2 = [0i8; D_LPC_MAX];
+        i2[..tables.d_lpc].copy_from_slice(i2_in);
+        let res_q10 = compute_res_q10(
+            &i2,
+            tables.d_lpc,
+            tables.qstep,
+            (tables.weight_list_0, tables.weight_list_1),
+            tables.pred_weight_select_row,
+        );
+        Ok(Self {
+            len: tables.d_lpc as u8,
+            i2,
+            res_q10,
+        })
+    }
+
+    /// Quantize a desired stage-2 residual `res_target_q10[]` (the
+    /// IHMW-scaled distance from the stage-1 codebook vector to the
+    /// analysis NLSF target) into the indices `I2[k]` whose decoded
+    /// `res_Q10[]` best approaches it — the encode-side inverse of
+    /// the §4.2.7.5.2 reconstruction.
+    ///
+    /// The decode recursion runs `k = d_LPC-1` down to `0`, each
+    /// step adding a backwards prediction from the already-decoded
+    /// `res_Q10[k+1]`; this quantiser walks the same direction,
+    /// subtracts the prediction that the decoder WILL apply (computed
+    /// from the indices already chosen), and picks the index whose
+    /// quantisation contribution lands closest to the remainder
+    /// (ties toward the smaller |I2|, i.e. cheaper symbols — the
+    /// full delayed-decision search of §5.2.3.5 is an encoder-side
+    /// freedom this deterministic greedy trades away).
+    ///
+    /// Returns the [`LsfStage2`] the decoder will reconstruct.
+    pub fn quantize(
+        bandwidth: Bandwidth,
+        lsf_stage1: u8,
+        res_target_q10: &[i32],
+    ) -> Result<Self, Error> {
+        let tables = StageTables::for_bandwidth(bandwidth, lsf_stage1)?;
+        let d_lpc = tables.d_lpc;
+        if res_target_q10.len() != d_lpc {
+            return Err(Error::MalformedPacket);
+        }
+        let qstep = tables.qstep;
+        let q_contrib = |i2: i32| -> i32 {
+            let sign = match i2.cmp(&0) {
+                core::cmp::Ordering::Less => -1,
+                core::cmp::Ordering::Greater => 1,
+                core::cmp::Ordering::Equal => 0,
+            };
+            (((i2 << 10) - sign * 102) * qstep) >> 16
+        };
+
+        let mut i2 = [0i8; D_LPC_MAX];
+        let mut res_q10 = [0i32; D_LPC_MAX];
+        for k in (0..d_lpc).rev() {
+            let pred_contrib = if k + 1 < d_lpc {
+                let pred_q8 = pred_weight(
+                    (tables.weight_list_0, tables.weight_list_1),
+                    tables.pred_weight_select_row,
+                    k,
+                );
+                (res_q10[k + 1] * pred_q8) >> 8
+            } else {
+                0
+            };
+            let want = res_target_q10[k] - pred_contrib;
+            // One I2 step contributes ~qstep<<10>>16 res_Q10 units;
+            // seed near the ratio then refine over ±1 neighbours.
+            let seed = (((want as i64) << 16) / ((qstep as i64) << 10)) as i32;
+            let mut best = (0i32, i32::MAX);
+            for cand in (seed - 1)..=(seed + 1) {
+                let c = cand.clamp(-10, 10);
+                let err = (q_contrib(c) - want).abs();
+                if err < best.1 || (err == best.1 && c.abs() < best.0.abs()) {
+                    best = (c, err);
+                }
+            }
+            // Zero is always a candidate (cheap symbol; also covers a
+            // seed pushed away by the ±102 offset).
+            if (q_contrib(0) - want).abs() < best.1 {
+                best = (0, (q_contrib(0) - want).abs());
+            }
+            i2[k] = best.0 as i8;
+            res_q10[k] = pred_contrib + q_contrib(best.0);
+        }
+
+        Ok(Self {
+            len: d_lpc as u8,
+            i2,
+            res_q10,
+        })
+    }
+
     /// Number of populated entries (== `d_LPC`: 10 for NB / MB, 16 for
     /// WB).
     pub fn len(&self) -> usize {

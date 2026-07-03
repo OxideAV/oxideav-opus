@@ -151,6 +151,21 @@ pub fn cb1_q8(bandwidth: Bandwidth, lsf_stage1: u8) -> Result<&'static [u8], Err
     }
 }
 
+/// The §4.2.7.5.3 IHMW weight vector `w_Q9[]` for a `(bandwidth, I1)`
+/// stage-1 codebook entry, without running a stage-2 reconstruction.
+///
+/// The encoder's quantisation search needs these weights BEFORE it has
+/// chosen the stage-2 indices (the residual target is the IHMW-scaled
+/// distance from the codebook vector to the analysis NLSF), so this
+/// exposes the same derivation [`NlsfReconstructed::from_stage1_and_stage2`]
+/// performs internally. Only the first `d_LPC` entries are populated.
+pub fn ihmw_w_q9_for(bandwidth: Bandwidth, lsf_stage1: u8) -> Result<[i32; D_LPC_MAX], Error> {
+    let cb1 = cb1_q8(bandwidth, lsf_stage1)?;
+    let mut w_q9 = [0i32; D_LPC_MAX];
+    ihmw_weights_q9(cb1, &mut w_q9);
+    Ok(w_q9)
+}
+
 /// Compute the per-coefficient IHMW weights `w_Q9[k]` for the given
 /// stage-1 codebook vector, per RFC 6716 §4.2.7.5.3.
 ///
