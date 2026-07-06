@@ -181,6 +181,78 @@ pub fn compose_packet_code3(
     Ok(out)
 }
 
+/// Re-frame a **code-0** Opus packet (`TOC | frame`) as a §3.2.5
+/// code-3 packet padded to **exactly** `target_len` bytes — the CBR
+/// transport shaping §3.2.5 padding exists for. The compressed frame
+/// bytes are unchanged, so the padded packet decodes identically to
+/// the original; only the framing layer differs (frame-count code 3,
+/// `M = 1`, CBR, the `p` bit + 255-chained padding length when padding
+/// is present).
+///
+/// Any `target_len >= frame + 2` bytes is reachable exactly: sizes at
+/// the 254-byte chain boundaries use a non-minimal padding chain (a
+/// `255` continuation byte followed by a small terminal byte), which
+/// the §3.2.5 parse folds to the same padding count.
+pub fn pad_packet_to(packet: &[u8], target_len: usize) -> Result<Vec<u8>, Error> {
+    if packet.len() < 2 {
+        return Err(Error::MalformedPacket);
+    }
+    let toc = OpusTocByte::from_byte(packet[0]);
+    if toc.frame_count_code != FrameCountCode::One {
+        return Err(Error::MalformedPacket);
+    }
+    let frame = &packet[1..];
+    if frame.len() > MAX_FRAME_BYTES {
+        return Err(Error::MalformedPacket);
+    }
+    // Same config + stereo bit, frame-count code rewritten to 3.
+    let toc3 = (packet[0] & !0b11) | 0b11;
+    // TOC + count byte + frame = the minimum code-3 shape (no padding).
+    let base = 2 + frame.len();
+    if target_len < base {
+        return Err(Error::MalformedPacket);
+    }
+    if target_len == base {
+        return compose_packet_code3(toc3, &[frame], false, 0);
+    }
+    // `excess` bytes must be exactly consumed by the padding chain plus
+    // the padding zeros: a chain of `c` bytes (c-1 continuation `255`s
+    // + one terminal byte t in 0..=254) encodes (c-1)*254 + t padding
+    // bytes, so `c` chain bytes reach any padding in
+    // [(c-1)*254, (c-1)*254 + 254] — pick the c whose window contains
+    // `excess - c`.
+    let excess = target_len - base;
+    let mut chain_bytes = None;
+    for c in 1..=excess {
+        let Some(padding) = excess.checked_sub(c) else {
+            break;
+        };
+        let floor = (c - 1) * 254;
+        if padding >= floor && padding <= floor + 254 {
+            chain_bytes = Some((c, padding));
+            break;
+        }
+        if floor > padding {
+            break;
+        }
+    }
+    let Some((c, padding)) = chain_bytes else {
+        return Err(Error::MalformedPacket);
+    };
+    let mut out = Vec::with_capacity(target_len);
+    out.push(toc3);
+    // Count byte: M = 1, p = 1 (padding present), v = 0 (CBR).
+    out.push((1u8 << 2) | (1 << 1));
+    for _ in 0..c - 1 {
+        out.push(255);
+    }
+    out.push((padding - (c - 1) * 254) as u8);
+    out.extend_from_slice(frame);
+    out.resize(out.len() + padding, 0);
+    debug_assert_eq!(out.len(), target_len);
+    Ok(out)
+}
+
 /// Compose one **self-delimited** Opus packet (RFC 6716 Appendix B,
 /// Figures 25-29) — the write-side mirror of
 /// [`crate::framing_self_delim::parse_self_delimited`], for chaining
@@ -601,5 +673,38 @@ mod tests {
             }
             assert_eq!(out.samples_per_channel(), 2 * 960, "candidate {idx}");
         }
+    }
+
+    /// `pad_packet_to` reaches EVERY target size from the code-3
+    /// minimum up through several §3.2.5 chain boundaries (including
+    /// the non-minimal-chain sizes), and each padded packet reparses to
+    /// the identical single frame with the exact requested length.
+    #[test]
+    fn pad_packet_to_hits_every_target_exactly() {
+        let mut rng = Lcg(0x0AD5_1391);
+        let body = random_frame(&mut rng, 40);
+        let mut packet = vec![toc(FrameCountCode::One)];
+        packet.extend_from_slice(&body);
+
+        let base = 2 + body.len();
+        // Below the minimum: rejected.
+        assert!(pad_packet_to(&packet, base - 1).is_err());
+        for target in base..base + 900 {
+            let padded = pad_packet_to(&packet, target).expect("pad");
+            assert_eq!(padded.len(), target, "target {target}");
+            let parsed = OpusPacket::parse(&padded).expect("parse");
+            assert_eq!(parsed.frames().len(), 1, "target {target}");
+            assert_eq!(parsed.frames()[0], &body[..], "target {target}");
+            // The framing keeps the §3.1 config + channel bits.
+            assert_eq!(
+                parsed.toc.config,
+                OpusTocByte::from_byte(packet[0]).config,
+                "target {target}"
+            );
+        }
+        // Only code-0 packets are re-framed.
+        let code3 = compose_packet_code3(toc(FrameCountCode::Arbitrary), &[&body], false, 0)
+            .expect("compose");
+        assert!(pad_packet_to(&code3, code3.len() + 10).is_err());
     }
 }

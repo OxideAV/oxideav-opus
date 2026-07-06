@@ -4,6 +4,11 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- CBR / padding on encode: `pad_packet_to` re-frames a code-0 packet as a
+  §3.2.5 code-3 packet padded to an exact byte size (every target size
+  reachable, non-minimal padding chains at the 254-byte boundaries) and
+  `SilkEncoderMono/Stereo::encode_packet_cbr` emit constant-size packets
+  that decode identically to the unpadded stream
 - LBRR (in-band FEC) from PCM: `SilkEncoderMono::set_fec` /
   `SilkEncoderStereo::set_fec` — each packet carries a reduced-rate §4.2.5
   re-encode of the PREVIOUS packet's active intervals, analysed from a

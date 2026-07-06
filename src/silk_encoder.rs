@@ -682,6 +682,22 @@ impl SilkEncoderMono {
             voiced,
         })
     }
+
+    /// [`Self::encode_packet`] with §3.2.5 CBR transport shaping: the
+    /// packet is re-framed as a code-3 packet padded to **exactly**
+    /// `target_bytes` (constant packet size on the wire; the decode is
+    /// identical). Errors when the compressed packet exceeds the
+    /// target — the analysis state has then already advanced, so pick
+    /// a target with headroom for the configured rate.
+    pub fn encode_packet_cbr(
+        &mut self,
+        pcm: &[f32],
+        target_bytes: usize,
+    ) -> Result<EncodedSilkPacket, Error> {
+        let mut out = self.encode_packet(pcm)?;
+        out.packet = crate::packet_compose::pad_packet_to(&out.packet, target_bytes)?;
+        Ok(out)
+    }
 }
 
 /// One interval of the previous stereo packet kept for the next
@@ -1008,6 +1024,20 @@ impl SilkEncoderStereo {
             reconstructed,
             voiced,
         })
+    }
+
+    /// [`Self::encode_packet`] with §3.2.5 CBR transport shaping (see
+    /// [`SilkEncoderMono::encode_packet_cbr`]).
+    pub fn encode_packet_cbr(
+        &mut self,
+        left: &[f32],
+        right: &[f32],
+        next_lr: Option<(f32, f32)>,
+        target_bytes: usize,
+    ) -> Result<EncodedSilkPacket, Error> {
+        let mut out = self.encode_packet(left, right, next_lr)?;
+        out.packet = crate::packet_compose::pad_packet_to(&out.packet, target_bytes)?;
+        Ok(out)
     }
 }
 
@@ -1501,6 +1531,39 @@ mod tests {
             let audio = dec.decode_packet(&packets[idx]).unwrap();
             assert_eq!(audio.channels, 2);
         }
+    }
+
+    /// CBR shaping: every packet lands at exactly the target size and
+    /// decodes to the same PCM as the unpadded VBR stream.
+    #[test]
+    fn cbr_packets_have_exact_size_and_identical_decode() {
+        let bw = Bandwidth::Nb;
+        let mut enc_vbr = SilkEncoderMono::new(bw).unwrap();
+        let mut enc_cbr = SilkEncoderMono::new(bw).unwrap();
+        let flen = enc_vbr.frame_samples();
+        let target = 400usize;
+
+        let mut dec_vbr = OpusDecoder::new();
+        let mut dec_cbr = OpusDecoder::new();
+        for pkt_idx in 0..5 {
+            let pcm: Vec<f32> = (0..flen)
+                .map(|i| {
+                    let t = (pkt_idx * flen + i) as f64 / 8_000.0;
+                    (0.3 * (core::f64::consts::TAU * 250.0 * t).sin()) as f32
+                })
+                .collect();
+            let v = enc_vbr.encode_packet(&pcm).unwrap();
+            let c = enc_cbr.encode_packet_cbr(&pcm, target).unwrap();
+            assert_eq!(c.packet.len(), target, "packet {pkt_idx}");
+            assert!(v.packet.len() < target, "target must leave headroom");
+            let out_v = dec_vbr.decode_packet(&v.packet).unwrap();
+            let out_c = dec_cbr.decode_packet(&c.packet).unwrap();
+            assert_eq!(out_v.pcm, out_c.pcm, "packet {pkt_idx}");
+        }
+
+        // A target below the compressed size is rejected.
+        let pcm: Vec<f32> = (0..flen).map(|i| 0.4 * (i as f32 * 0.7).sin()).collect();
+        assert!(enc_cbr.encode_packet_cbr(&pcm, 4).is_err());
     }
 
     /// FEC off ⇒ byte-identical to the FEC-on encoder's FIRST packet
