@@ -243,9 +243,9 @@ pub fn pad_packet_to(packet: &[u8], target_len: usize) -> Result<Vec<u8>, Error>
     out.push(toc3);
     // Count byte: M = 1, p = 1 (padding present), v = 0 (CBR).
     out.push((1u8 << 2) | (1 << 1));
-    for _ in 0..c - 1 {
-        out.push(255);
-    }
+    // c-1 continuation bytes (255 = 254 padding bytes + chain
+    // continues), then the terminal byte.
+    out.resize(out.len() + (c - 1), 255);
     out.push((padding - (c - 1) * 254) as u8);
     out.extend_from_slice(frame);
     out.resize(out.len() + padding, 0);
