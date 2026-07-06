@@ -4,6 +4,14 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- streaming decoder: carry the §4.2.7.4 gain-clamp base (`previous_log_gain`)
+  and the §4.2.7.5.5 NLSF interpolation base `n0` across Opus frames — the
+  independent first-subframe gain of a packet is now clamped against the
+  previous packet's last gain, and a coded `w_Q2 < 4` on a packet's first
+  20 ms frame interpolates against the previous packet's decoded NLSFs
+  (both were previously reset per packet); FEC recovery seeds the bases
+  from the LBRR reconstruction under the §4.2.7.4 packet-loss latitude
+
 ## [0.0.13](https://github.com/OxideAV/oxideav-opus/compare/v0.0.12...v0.0.13) - 2026-07-03
 
 ### Other

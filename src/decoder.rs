@@ -290,6 +290,23 @@ pub struct OpusDecoder {
     /// across Opus frames. `None` until the first stereo SILK-only frame;
     /// reset (zeroed) on any §4.2.7.1 mono→stereo transition.
     silk_stereo_unmix: Option<crate::silk_stereo::StereoUnmixState>,
+    /// Cross-Opus-frame §4.2.7 reconstruction carry for the mono SILK
+    /// channel: the last decoded subframe gain (the §4.2.7.4 clamp base,
+    /// which persists "in the same channel" across Opus frames) and the
+    /// last decoded NLSF vector (the §4.2.7.5.5 interpolation base `n0`,
+    /// "the LSF coefficients decoded for the prior frame"). Cleared on a
+    /// §4.5.2 SILK reset and on a SILK bandwidth change.
+    silk_carry_mono: SilkChannelCarry,
+    /// Cross-Opus-frame §4.2.7 reconstruction carry for the stereo MID
+    /// channel (see [`Self::silk_carry_mono`]).
+    silk_carry_mid: SilkChannelCarry,
+    /// Cross-Opus-frame §4.2.7 reconstruction carry for the stereo SIDE
+    /// channel. An uncoded side frame at the end of a packet leaves this
+    /// cleared, so the next coded side frame codes independently with the
+    /// §4.2.7.4 clamp skipped and the §4.2.7.5.5 factor forced to 4 —
+    /// exactly the RFC's "previous frame in the side channel was not
+    /// coded" rules.
+    silk_carry_side: SilkChannelCarry,
     /// Operating mode of the most recently decoded Opus frame, used to
     /// drive the §4.5.2 SILK state-reset rule ("the SILK state is reset
     /// before every SILK-only or Hybrid frame where the previous frame
@@ -379,6 +396,12 @@ impl OpusDecoder {
                 if let Some(unmix) = self.silk_stereo_unmix.as_mut() {
                     unmix.reset();
                 }
+                // §4.2.7.4 / §4.2.7.5.5: "the clamping is skipped after a
+                // decoder reset" and the interpolation factor is forced
+                // to 4 — drop the carried gain / NLSF bases.
+                self.silk_carry_mono = SilkChannelCarry::default();
+                self.silk_carry_mid = SilkChannelCarry::default();
+                self.silk_carry_side = SilkChannelCarry::default();
             }
         }
 
@@ -396,6 +419,13 @@ impl OpusDecoder {
                 mid.reset();
                 side.reset();
             }
+            // The mid/side §4.2.7 reconstruction carries follow the same
+            // policy as the stereo synthesis state: a channel-count
+            // change clears them (the mono carry mirrors the mono
+            // synthesis state and persists, matching the treatment of
+            // `silk_synth_mono` above).
+            self.silk_carry_mid = SilkChannelCarry::default();
+            self.silk_carry_side = SilkChannelCarry::default();
         }
 
         self.last_channels = Some(channels);
@@ -603,46 +633,30 @@ impl OpusDecoder {
         }
 
         // §4.2.6 regular SILK frames: one per time interval, even when
-        // the VAD flag is unset. Inter-frame state threads across them.
-        let mut prev_gain: Option<u8> = None;
-        let mut prev_lag: Option<i32> = None;
-        let mut prev_nlsf: Option<[i16; crate::silk_lsf_stage2::D_LPC_MAX]> = None;
-        let mut prev_nlsf_len = 0usize;
-        let mut first = true;
+        // the VAD flag is unset. Inter-frame state threads across them,
+        // resuming the cross-Opus-frame §4.2.7.4 gain-clamp base and the
+        // §4.2.7.5.5 NLSF interpolation base `n0` carried from the
+        // previous Opus frame (the frame-local `first` flag still makes
+        // the first frame's gain independently CODED and its §4.2.7.6.3
+        // scaling / absolute lag present, per the per-Opus-frame rules).
+        let mut chan = ChannelDecodeState::resume(&self.silk_carry_mono, bandwidth);
         let mut decoded_frames: Vec<SilkFrameDecoded> =
             Vec::with_capacity(num_silk_frames as usize);
         for idx in 0..num_silk_frames {
-            let cfg = SilkFrameConfig {
-                bandwidth,
-                frame_size,
-                voice_active: header.mid_vad(idx),
-                first_subframe_independent: first || prev_gain.is_none(),
-                previous_log_gain: prev_gain,
-                previous_primary_lag: prev_lag,
-                ltp_scaling_present: first,
-                lsf_interp_after_reset: first || prev_nlsf.is_none(),
-                previous_nlsf_q15: prev_nlsf,
-                previous_nlsf_len: prev_nlsf_len,
+            let decoded = decode_silk_frame(
+                &mut rd,
                 // Mono SILK-only path: no §4.2.7.1 / §4.2.7.2 stereo header.
-                stereo: None,
-            };
-            let decoded = decode_silk_frame(&mut rd, cfg)?;
-            prev_gain = Some(decoded.gains.last_log_gain());
-            // §4.2.7.6.1: only a VOICED frame arms relative lag coding.
-            prev_lag = if decoded.ltp.is_voiced() {
-                Some(decoded.ltp.primary_lag())
-            } else {
-                None
-            };
-            prev_nlsf = Some(decoded.nlsf_q15);
-            prev_nlsf_len = decoded.d_lpc;
-            first = false;
+                chan.config(bandwidth, frame_size, header.mid_vad(idx), None),
+            )?;
+            chan.advance(&decoded);
             decoded_frames.push(decoded);
         }
 
         if rd.has_error() {
             return Err(Error::MalformedPacket);
         }
+        // Persist the §4.2.7.4 / §4.2.7.5.5 bases for the next Opus frame.
+        self.silk_carry_mono = chan.to_carry(bandwidth);
 
         // §4.2.7.9 synthesis: turn the decoded SILK frames into
         // internal-rate (8/12/16 kHz) time-domain samples, threading the
@@ -760,8 +774,10 @@ impl OpusDecoder {
 
         // §4.2.6 regular SILK frames: per 20 ms interval, the mid frame
         // then (unless the §4.2.7.2 mid-only flag is set) the side frame.
-        let mut mid_state = ChannelDecodeState::new();
-        let mut side_state = ChannelDecodeState::new();
+        // Each channel resumes its cross-Opus-frame §4.2.7.4 gain-clamp
+        // base and §4.2.7.5.5 NLSF interpolation base `n0`.
+        let mut mid_state = ChannelDecodeState::resume(&self.silk_carry_mid, bandwidth);
+        let mut side_state = ChannelDecodeState::resume(&self.silk_carry_side, bandwidth);
         let mut mid_frames: Vec<SilkFrameDecoded> = Vec::with_capacity(num_silk_frames as usize);
         // Per-interval side frame: `Some(frame)` when coded, `None` when
         // the side channel is skipped (mid-only flag set or side VAD path
@@ -824,6 +840,12 @@ impl OpusDecoder {
         if rd.has_error() {
             return Err(Error::MalformedPacket);
         }
+        // Persist the per-channel §4.2.7.4 / §4.2.7.5.5 bases for the
+        // next Opus frame (an uncoded trailing side interval leaves the
+        // side carry cleared, arming the RFC's "previous frame in the
+        // side channel was not coded" fresh-start rules).
+        self.silk_carry_mid = mid_state.to_carry(bandwidth);
+        self.silk_carry_side = side_state.to_carry(bandwidth);
 
         // §4.2.7.9 synthesis for both channels, threading the cross-Opus-
         // frame histories. (Re)create the state on a bandwidth change.
@@ -1333,7 +1355,7 @@ impl OpusDecoder {
         routing: &OpusFrameRouting,
     ) -> Result<Option<(Vec<f32>, crate::toc::Bandwidth)>, Error> {
         use crate::range_decoder::RangeDecoder;
-        use crate::silk_decode::{decode_silk_frame, SilkFrameConfig, SilkFrameDecoded};
+        use crate::silk_decode::{decode_silk_frame, SilkFrameDecoded};
         use crate::silk_excitation::SilkFrameSize;
         use crate::silk_header::SilkHeaderBits;
         use crate::silk_synthesis::{synthesize_silk_frame, SilkSynthState};
@@ -1364,48 +1386,20 @@ impl OpusDecoder {
         // interval order, threading the LBRR-local previous gain / lag /
         // NLSF state (the same Table-5 inter-frame dependencies as regular
         // frames, but over the LBRR sub-sequence).
-        let mut prev_gain: Option<u8> = None;
-        let mut prev_lag: Option<i32> = None;
-        let mut prev_nlsf: Option<[i16; crate::silk_lsf_stage2::D_LPC_MAX]> = None;
-        let mut prev_nlsf_len = 0usize;
-        let mut first = true;
+        let mut lbrr_chan = ChannelDecodeState::new();
         let mut lbrr_frames: Vec<SilkFrameDecoded> = Vec::new();
         for idx in 0..num_silk_frames {
             if !header.mid_has_lbrr(idx) {
                 // §4.2.4 LBRR-flag gap: fresh start for the next coded
                 // LBRR frame (§4.2.7.4 / §4.2.7.5.5 / §4.2.7.6.1 /
                 // §4.2.7.6.3).
-                prev_gain = None;
-                prev_lag = None;
-                prev_nlsf = None;
-                prev_nlsf_len = 0;
-                first = true;
+                lbrr_chan.mark_interval_uncoded(true);
                 continue;
             }
-            let cfg = SilkFrameConfig {
-                bandwidth,
-                frame_size,
-                voice_active: true, // §4.2.5: all LBRR frames are active.
-                first_subframe_independent: first || prev_gain.is_none(),
-                previous_log_gain: prev_gain,
-                previous_primary_lag: prev_lag,
-                ltp_scaling_present: first,
-                lsf_interp_after_reset: first || prev_nlsf.is_none(),
-                previous_nlsf_q15: prev_nlsf,
-                previous_nlsf_len: prev_nlsf_len,
-                stereo: None,
-            };
-            let decoded = decode_silk_frame(&mut rd, cfg)?;
-            prev_gain = Some(decoded.gains.last_log_gain());
-            // §4.2.7.6.1: only a VOICED frame arms relative lag coding.
-            prev_lag = if decoded.ltp.is_voiced() {
-                Some(decoded.ltp.primary_lag())
-            } else {
-                None
-            };
-            prev_nlsf = Some(decoded.nlsf_q15);
-            prev_nlsf_len = decoded.d_lpc;
-            first = false;
+            // §4.2.5: all LBRR frames are active.
+            let decoded =
+                decode_silk_frame(&mut rd, lbrr_chan.config(bandwidth, frame_size, true, None))?;
+            lbrr_chan.advance(&decoded);
             lbrr_frames.push(decoded);
         }
 
@@ -1415,6 +1409,13 @@ impl OpusDecoder {
         if lbrr_frames.is_empty() {
             return Ok(None);
         }
+        // The recovered interval becomes "the most recent coded frame"
+        // in this channel: seed the cross-Opus-frame §4.2.7.4 /
+        // §4.2.7.5.5 bases from the LBRR reconstruction (the RFC's
+        // packet-loss latitude — the true regular-frame bases were lost
+        // with the packet, and the LBRR frames are the re-encode of the
+        // same interval).
+        self.silk_carry_mono = lbrr_chan.to_carry(bandwidth);
 
         // §4.2.7.9 synthesis from a fresh state: the lost frame's true
         // history is unavailable, so the recovered signal is reconstructed
@@ -1579,6 +1580,11 @@ impl OpusDecoder {
 
         self.silk_synth_stereo = Some((mid_synth, side_synth));
         self.silk_stereo_unmix = Some(unmix);
+        // As in the mono FEC path: the recovered interval seeds the
+        // cross-Opus-frame §4.2.7.4 / §4.2.7.5.5 bases for both channels
+        // (the §4.2.7.4 packet-loss latitude).
+        self.silk_carry_mid = mid_state.to_carry(bandwidth);
+        self.silk_carry_side = side_state.to_carry(bandwidth);
         Ok(Some((left, right, bandwidth)))
     }
 
@@ -1602,6 +1608,24 @@ impl OpusDecoder {
 /// Append `per_channel * channels` interleaved zero samples to `pcm`.
 fn push_silence(pcm: &mut Vec<i16>, per_channel: usize, channels: u8) {
     pcm.resize(pcm.len() + per_channel * channels as usize, 0);
+}
+
+/// Cross-Opus-frame SILK per-channel reconstruction carry: the last
+/// decoded subframe gain — the §4.2.7.4 clamp base, `log_gain =
+/// max(gain_index, previous_log_gain - 16)`, whose `previous_log_gain`
+/// persists "in the same channel" across Opus frames — and the last
+/// decoded NLSF vector — the §4.2.7.5.5 interpolation base `n0_Q15`,
+/// "the LSF coefficients decoded for the prior frame", which the RFC
+/// only replaces with the forced `w_Q2 = 4` after a decoder reset or an
+/// uncoded side frame. Tagged with the bandwidth it was decoded at: the
+/// NLSF order and codebooks are bandwidth-specific, so a bandwidth
+/// switch drops the carry (mirroring the synthesis-state re-creation).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SilkChannelCarry {
+    gain: Option<u8>,
+    nlsf: Option<[i16; crate::silk_lsf_stage2::D_LPC_MAX]>,
+    nlsf_len: usize,
+    bandwidth: Option<crate::toc::Bandwidth>,
 }
 
 /// Per-channel inter-frame decode state threaded across the SILK frames
@@ -1628,6 +1652,37 @@ impl ChannelDecodeState {
         }
     }
 
+    /// Resume a channel sequence at an Opus-frame boundary from the
+    /// cross-frame carry: the §4.2.7.4 clamp base and §4.2.7.5.5 `n0`
+    /// persist, while the frame-local `first` flag re-arms (the first
+    /// frame's gain is independently *coded* per Opus frame, its lag is
+    /// absolute, and its §4.2.7.6.3 scaling field is present). A carry
+    /// recorded at a different bandwidth is dropped (fresh start).
+    pub(crate) fn resume(carry: &SilkChannelCarry, bandwidth: crate::toc::Bandwidth) -> Self {
+        if carry.bandwidth != Some(bandwidth) {
+            return Self::new();
+        }
+        Self {
+            prev_gain: carry.gain,
+            prev_lag: None,
+            prev_nlsf: carry.nlsf,
+            prev_nlsf_len: carry.nlsf_len,
+            first: true,
+        }
+    }
+
+    /// Capture the cross-Opus-frame carry after this channel's last
+    /// frame of the Opus frame has been folded in via [`Self::advance`]
+    /// (or cleared via [`Self::mark_interval_uncoded`]).
+    pub(crate) fn to_carry(&self, bandwidth: crate::toc::Bandwidth) -> SilkChannelCarry {
+        SilkChannelCarry {
+            gain: self.prev_gain,
+            nlsf: self.prev_nlsf,
+            nlsf_len: self.prev_nlsf_len,
+            bandwidth: Some(bandwidth),
+        }
+    }
+
     /// Build the [`crate::silk_decode::SilkFrameConfig`] for the next SILK
     /// frame in this channel's sequence, given the §4.2.4 VAD flag and the
     /// optional §4.2.7.1 / §4.2.7.2 stereo header context (present only on
@@ -1647,7 +1702,11 @@ impl ChannelDecodeState {
             previous_log_gain: self.prev_gain,
             previous_primary_lag: self.prev_lag,
             ltp_scaling_present: self.first,
-            lsf_interp_after_reset: self.first || self.prev_nlsf.is_none(),
+            // §4.2.7.5.5: the factor is forced to 4 only when no prior
+            // decoded NLSF base exists (decoder reset / uncoded side
+            // frame) — for a resumed sequence `n0` comes from the
+            // previous Opus frame even though `first` is set.
+            lsf_interp_after_reset: self.prev_nlsf.is_none(),
             previous_nlsf_q15: self.prev_nlsf,
             previous_nlsf_len: self.prev_nlsf_len,
             stereo,
@@ -2485,6 +2544,240 @@ mod tests {
         assert!(
             tell_after_alloc > tell_after_coarse,
             "alloc tell {tell_after_alloc} must advance past coarse tell {tell_after_coarse}"
+        );
+    }
+
+    // ---- Cross-packet §4.2.7.4 / §4.2.7.5.5 reconstruction carry ----
+
+    use crate::silk_decode::SilkFrameSymbols;
+    use crate::silk_excitation::ExcitationSymbols;
+    use crate::silk_frame::{SilkHeaderSymbols, StereoPredictionWeights, StereoWeightSymbols};
+    use crate::silk_gains::GainSymbol;
+    use crate::silk_packet_encode::{
+        encode_silk_only_packet_mono, encode_silk_only_packet_stereo, StereoIntervalScripts,
+    };
+
+    /// Owned buffers for one scripted NB 20 ms unvoiced SILK frame (4
+    /// subframes, d_LPC = 10, 160 excitation samples in 10 shell
+    /// blocks).
+    struct FrameScript {
+        gains: Vec<GainSymbol>,
+        i2: Vec<i8>,
+        lsb_counts: Vec<u8>,
+        e_raw: Vec<i32>,
+        header: SilkHeaderSymbols,
+        lsf_stage1: u8,
+        lsf_interp_w_q2: Option<u8>,
+    }
+
+    impl FrameScript {
+        /// An unvoiced NB frame whose first-subframe gain symbol,
+        /// stage-1 LSF index, §4.2.7.5.5 factor, and excitation are
+        /// caller-chosen; the remaining subframes hold the gain steady
+        /// (`Delta(4)` ⇒ `log_gain = previous_log_gain`).
+        fn nb_unvoiced(first_gain: GainSymbol, lsf_stage1: u8, w_q2: u8, pulses: bool) -> Self {
+            let mut e_raw = vec![0i32; 160];
+            if pulses {
+                for (i, slot) in e_raw.iter_mut().enumerate().step_by(8) {
+                    *slot = if (i / 8) % 2 == 0 { 1 } else { -1 };
+                }
+            }
+            Self {
+                gains: vec![
+                    first_gain,
+                    GainSymbol::Delta(4),
+                    GainSymbol::Delta(4),
+                    GainSymbol::Delta(4),
+                ],
+                i2: vec![0i8; 10],
+                lsb_counts: vec![0u8; 10],
+                e_raw,
+                header: SilkHeaderSymbols {
+                    stereo: None,
+                    mid_only_flag: None,
+                    frame_type: 2, // Unvoiced / Low (Table 10) — VAD set.
+                },
+                lsf_stage1,
+                lsf_interp_w_q2: Some(w_q2),
+            }
+        }
+
+        fn symbols(&self) -> SilkFrameSymbols<'_> {
+            SilkFrameSymbols {
+                header: self.header,
+                gains: &self.gains,
+                lsf_stage1: self.lsf_stage1,
+                lsf_stage2_i2: &self.i2,
+                lsf_interp_w_q2: self.lsf_interp_w_q2,
+                ltp: None,
+                lcg_seed: 0,
+                excitation: ExcitationSymbols {
+                    rate_level: 0,
+                    lsb_counts: &self.lsb_counts,
+                    e_raw: &self.e_raw,
+                },
+            }
+        }
+    }
+
+    fn rms(pcm: &[i16]) -> f64 {
+        let e: f64 = pcm.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        (e / pcm.len().max(1) as f64).sqrt()
+    }
+
+    /// §4.2.7.4: `previous_log_gain` persists across Opus frames, so an
+    /// independently coded first-subframe gain in the NEXT packet is
+    /// clamped to `max(gain_index, prev - 16)`. Packet A ends at
+    /// log gain 63; packet B codes gain index 10, which a streaming
+    /// decoder must lift to 47 (a fresh decoder decodes 10). The ~50 dB
+    /// level difference is the observable.
+    #[test]
+    fn gain_clamp_base_carries_across_packets() {
+        let bw = crate::toc::Bandwidth::Nb;
+        let loud = FrameScript::nb_unvoiced(GainSymbol::Independent(63), 0, 4, true);
+        let quiet = FrameScript::nb_unvoiced(GainSymbol::Independent(10), 0, 4, true);
+        let (pkt_a, _) = encode_silk_only_packet_mono(bw, 200, &[loud.symbols()]).unwrap();
+        let (pkt_b, _) = encode_silk_only_packet_mono(bw, 200, &[quiet.symbols()]).unwrap();
+
+        let mut fresh = OpusDecoder::new();
+        let quiet_alone = fresh.decode_packet(&pkt_b).unwrap();
+
+        let mut stream = OpusDecoder::new();
+        stream.decode_packet(&pkt_a).unwrap();
+        let quiet_streamed = stream.decode_packet(&pkt_b).unwrap();
+
+        let r_fresh = rms(&quiet_alone.pcm);
+        let r_stream = rms(&quiet_streamed.pcm);
+        assert!(
+            r_stream > 30.0 * r_fresh.max(1e-9),
+            "clamp must lift the streamed gain: fresh rms {r_fresh:.2}, streamed {r_stream:.2}"
+        );
+    }
+
+    /// [`OpusDecoder::reset`] drops the §4.2.7.4 clamp base ("the
+    /// clamping is skipped after a decoder reset"): decoding packet B
+    /// after a reset must be byte-identical to a fresh decode.
+    #[test]
+    fn reset_clears_gain_clamp_base() {
+        let bw = crate::toc::Bandwidth::Nb;
+        let loud = FrameScript::nb_unvoiced(GainSymbol::Independent(63), 0, 4, true);
+        let quiet = FrameScript::nb_unvoiced(GainSymbol::Independent(10), 0, 4, true);
+        let (pkt_a, _) = encode_silk_only_packet_mono(bw, 200, &[loud.symbols()]).unwrap();
+        let (pkt_b, _) = encode_silk_only_packet_mono(bw, 200, &[quiet.symbols()]).unwrap();
+
+        let mut fresh = OpusDecoder::new();
+        let alone = fresh.decode_packet(&pkt_b).unwrap();
+
+        let mut stream = OpusDecoder::new();
+        stream.decode_packet(&pkt_a).unwrap();
+        stream.reset();
+        let after_reset = stream.decode_packet(&pkt_b).unwrap();
+        assert_eq!(alone.pcm, after_reset.pcm);
+    }
+
+    /// §4.2.7.5.5: the interpolation base `n0` is "the LSF coefficients
+    /// decoded for the prior frame" — including across Opus frames. Two
+    /// second packets that differ ONLY in the coded factor (`w_Q2 = 0`
+    /// vs `4`) must reconstruct differently after the same first packet
+    /// (with `w_Q2 = 0` the first half-frame runs the PREVIOUS packet's
+    /// LPC), while a fresh decoder — where the factor is forced to 4 —
+    /// reconstructs them identically.
+    #[test]
+    fn nlsf_interp_n0_carries_across_packets() {
+        let bw = crate::toc::Bandwidth::Nb;
+        let a = FrameScript::nb_unvoiced(GainSymbol::Independent(45), 0, 4, true);
+        let b_interp = FrameScript::nb_unvoiced(GainSymbol::Independent(45), 25, 0, true);
+        let b_no_interp = FrameScript::nb_unvoiced(GainSymbol::Independent(45), 25, 4, true);
+        let (pkt_a, _) = encode_silk_only_packet_mono(bw, 200, &[a.symbols()]).unwrap();
+        let (pkt_b0, _) = encode_silk_only_packet_mono(bw, 200, &[b_interp.symbols()]).unwrap();
+        let (pkt_b4, _) = encode_silk_only_packet_mono(bw, 200, &[b_no_interp.symbols()]).unwrap();
+
+        // Fresh decoders: no prior NLSF base exists, the factor is
+        // forced to 4, and both variants decode identically.
+        let mut f0 = OpusDecoder::new();
+        let mut f4 = OpusDecoder::new();
+        assert_eq!(
+            f0.decode_packet(&pkt_b0).unwrap().pcm,
+            f4.decode_packet(&pkt_b4).unwrap().pcm,
+            "without a carried n0 the coded factor must be ignored"
+        );
+
+        // Streaming decoders: after packet A the coded factor is live.
+        let mut s0 = OpusDecoder::new();
+        let mut s4 = OpusDecoder::new();
+        s0.decode_packet(&pkt_a).unwrap();
+        s4.decode_packet(&pkt_a).unwrap();
+        let out0 = s0.decode_packet(&pkt_b0).unwrap();
+        let out4 = s4.decode_packet(&pkt_b4).unwrap();
+        assert_ne!(
+            out0.pcm, out4.pcm,
+            "w_Q2 = 0 must interpolate against the previous packet's NLSFs"
+        );
+    }
+
+    /// The stereo SIDE channel carries its own §4.2.7.4 clamp base
+    /// across packets (independent of the mid channel's).
+    #[test]
+    fn stereo_side_gain_clamp_carries_across_packets() {
+        let bw = crate::toc::Bandwidth::Nb;
+        let weights = StereoWeightSymbols::quantize(StereoPredictionWeights {
+            w0_q13: 0,
+            w1_q13: 0,
+        });
+        // Mid frames: fixed moderate gain, silent excitation.
+        let mid = |first: u8| {
+            let mut m = FrameScript::nb_unvoiced(GainSymbol::Independent(first), 0, 4, false);
+            m.header.stereo = Some(weights);
+            m
+        };
+        let mid_a = mid(30);
+        let mid_b = mid(30);
+        // Side frames: packet A ends at log gain 63; packet B codes 10.
+        let side_a = FrameScript::nb_unvoiced(GainSymbol::Independent(63), 0, 4, true);
+        let side_b = FrameScript::nb_unvoiced(GainSymbol::Independent(10), 0, 4, true);
+
+        let (pkt_a, _) = encode_silk_only_packet_stereo(
+            bw,
+            200,
+            &[StereoIntervalScripts {
+                mid: mid_a.symbols(),
+                side: Some(side_a.symbols()),
+            }],
+        )
+        .unwrap();
+        let (pkt_b, _) = encode_silk_only_packet_stereo(
+            bw,
+            200,
+            &[StereoIntervalScripts {
+                mid: mid_b.symbols(),
+                side: Some(side_b.symbols()),
+            }],
+        )
+        .unwrap();
+
+        // The side signal is (L - R) / 2 up to the (zero) prediction
+        // weights; compare its energy fresh vs streamed.
+        let side_rms = |audio: &DecodedAudio| {
+            let d: Vec<i16> = audio
+                .pcm
+                .chunks_exact(2)
+                .map(|lr| ((lr[0] as i32 - lr[1] as i32) / 2) as i16)
+                .collect();
+            rms(&d)
+        };
+
+        let mut fresh = OpusDecoder::new();
+        let alone = fresh.decode_packet(&pkt_b).unwrap();
+
+        let mut stream = OpusDecoder::new();
+        stream.decode_packet(&pkt_a).unwrap();
+        let streamed = stream.decode_packet(&pkt_b).unwrap();
+
+        let r_fresh = side_rms(&alone);
+        let r_stream = side_rms(&streamed);
+        assert!(
+            r_stream > 30.0 * r_fresh.max(1e-9),
+            "side clamp must lift the streamed gain: fresh {r_fresh:.2}, streamed {r_stream:.2}"
         );
     }
 }
