@@ -132,6 +132,9 @@ pub struct AnalyzedFrame {
     pub reconstructed: Vec<f32>,
     /// Whether the frame was coded voiced.
     pub voiced: bool,
+    /// §4.2.7.5.5 factor: `Some(4)` on a 20 ms frame (no interpolation
+    /// split), `None` on a 10 ms frame (the factor is not stored).
+    pub lsf_interp_w_q2: Option<u8>,
 }
 
 impl AnalyzedFrame {
@@ -143,7 +146,7 @@ impl AnalyzedFrame {
             gains: &self.gains,
             lsf_stage1: self.lsf_stage1,
             lsf_stage2_i2: &self.i2,
-            lsf_interp_w_q2: Some(4),
+            lsf_interp_w_q2: self.lsf_interp_w_q2,
             ltp: self.ltp,
             lcg_seed: self.lcg_seed,
             excitation: ExcitationSymbols {
@@ -279,8 +282,23 @@ impl ChannelAnalyzer {
         pcm: &[f32],
         first_in_packet: bool,
     ) -> Result<AnalyzedFrame, Error> {
+        self.analyze_frame_sized(pcm, first_in_packet, SilkFrameSize::TwentyMs)
+    }
+
+    /// [`Self::analyze_frame_at`] for an explicit SILK frame size: a
+    /// 20 ms frame (4 subframes) or the §4.2.2 single 10 ms frame
+    /// (2 subframes, whose §4.2.7.5.5 factor is not stored).
+    pub fn analyze_frame_sized(
+        &mut self,
+        pcm: &[f32],
+        first_in_packet: bool,
+        frame_size: SilkFrameSize,
+    ) -> Result<AnalyzedFrame, Error> {
         let n = subframe_samples(self.bandwidth)?;
-        let num_subframes = 4usize;
+        let num_subframes = match frame_size {
+            SilkFrameSize::TenMs => 2usize,
+            SilkFrameSize::TwentyMs => 4usize,
+        };
         let frame_len = n * num_subframes;
         if pcm.len() != frame_len {
             return Err(Error::MalformedPacket);
@@ -461,7 +479,7 @@ impl ChannelAnalyzer {
             reconstructed,
         } = quantize_excitation_frame(
             self.bandwidth,
-            SilkFrameSize::TwentyMs,
+            frame_size,
             signal_type,
             QuantizationOffsetType::Low,
             lcg_seed,
@@ -504,6 +522,9 @@ impl ChannelAnalyzer {
             e_raw,
             reconstructed,
             voiced,
+            // §4.2.7.5.5: stored (as the no-split value 4) only on
+            // 20 ms frames.
+            lsf_interp_w_q2: (frame_size == SilkFrameSize::TwentyMs).then_some(4),
         })
     }
 }
@@ -520,16 +541,27 @@ pub struct EncodedSilkPacket {
     pub voiced: bool,
 }
 
-/// Validate an analysed-encoder packet duration: 20 / 40 / 60 ms (one
-/// to three 20 ms SILK frames per §4.2.2; the 10 ms two-subframe
-/// analysis front end is not built).
-fn frames_per_packet(packet_tenths_ms: u16) -> Result<usize, Error> {
+/// Map an analysed-encoder packet duration to its §4.2.2 layout: a
+/// 10 ms packet carries one 10 ms (2-subframe) SILK frame; 20 / 40 /
+/// 60 ms packets carry one to three 20 ms SILK frames.
+fn packet_layout(packet_tenths_ms: u16) -> Result<(usize, SilkFrameSize), Error> {
     match packet_tenths_ms {
-        200 => Ok(1),
-        400 => Ok(2),
-        600 => Ok(3),
+        100 => Ok((1, SilkFrameSize::TenMs)),
+        200 => Ok((1, SilkFrameSize::TwentyMs)),
+        400 => Ok((2, SilkFrameSize::TwentyMs)),
+        600 => Ok((3, SilkFrameSize::TwentyMs)),
         _ => Err(Error::MalformedPacket),
     }
+}
+
+/// Samples in one SILK frame of `frame_size` at `bandwidth`'s
+/// internal rate.
+fn frame_size_samples(bandwidth: Bandwidth, frame_size: SilkFrameSize) -> Result<usize, Error> {
+    let n = subframe_samples(bandwidth)?;
+    Ok(match frame_size {
+        SilkFrameSize::TenMs => n * 2,
+        SilkFrameSize::TwentyMs => n * 4,
+    })
 }
 
 /// The previous packet's material a FEC-enabled encoder keeps so the
@@ -554,6 +586,7 @@ pub struct SilkEncoderMono {
     channel: ChannelAnalyzer,
     packet_tenths_ms: u16,
     frames_per_packet: usize,
+    silk_frame_size: SilkFrameSize,
     fec: bool,
     pending_fec: Option<PendingFecMono>,
 }
@@ -565,18 +598,20 @@ impl SilkEncoderMono {
         Self::with_packet_duration(bandwidth, 200)
     }
 
-    /// Create an encoder emitting `packet_tenths_ms` (200 / 400 / 600 —
-    /// i.e. 20 / 40 / 60 ms) SILK-only packets: one analysed 20 ms SILK
-    /// frame per §4.2.2 time interval, packed into a single code-0 Opus
-    /// packet.
+    /// Create an encoder emitting `packet_tenths_ms` (100 / 200 / 400 /
+    /// 600 — i.e. 10 / 20 / 40 / 60 ms) SILK-only packets: one analysed
+    /// SILK frame per §4.2.2 time interval (a single 2-subframe frame
+    /// for a 10 ms packet), packed into a single code-0 Opus packet.
     pub fn with_packet_duration(
         bandwidth: Bandwidth,
         packet_tenths_ms: u16,
     ) -> Result<Self, Error> {
+        let (frames_per_packet, silk_frame_size) = packet_layout(packet_tenths_ms)?;
         Ok(Self {
             channel: ChannelAnalyzer::new(bandwidth)?,
             packet_tenths_ms,
-            frames_per_packet: frames_per_packet(packet_tenths_ms)?,
+            frames_per_packet,
+            silk_frame_size,
             fec: false,
             pending_fec: None,
         })
@@ -597,9 +632,10 @@ impl SilkEncoderMono {
 
     /// Per-packet input length: the packet duration at the internal
     /// rate (20 ms = 160 NB / 240 MB / 320 WB samples, times the 1-3
-    /// SILK frames per packet).
+    /// SILK frames per packet; half that for a 10 ms packet).
     pub fn frame_samples(&self) -> usize {
-        subframe_samples(self.channel.bandwidth).unwrap_or(0) * 4 * self.frames_per_packet
+        frame_size_samples(self.channel.bandwidth, self.silk_frame_size).unwrap_or(0)
+            * self.frames_per_packet
     }
 
     /// Reset all carried state (matches a §4.5.2 decoder reset).
@@ -618,7 +654,7 @@ impl SilkEncoderMono {
         if pcm.len() != self.frame_samples() {
             return Err(Error::MalformedPacket);
         }
-        let flen = subframe_samples(bandwidth)? * 4;
+        let flen = frame_size_samples(bandwidth, self.silk_frame_size)?;
 
         // §4.2.5 / §2.1.7: the LBRR frames riding in THIS packet are a
         // reduced-rate re-encode of the PREVIOUS packet's intervals,
@@ -634,7 +670,7 @@ impl SilkEncoderMono {
                 let mut lbrr_first = true;
                 let mut out = Vec::with_capacity(self.frames_per_packet);
                 for chunk in pending.pcm.chunks_exact(flen) {
-                    let f = la.analyze_frame_at(chunk, lbrr_first)?;
+                    let f = la.analyze_frame_sized(chunk, lbrr_first, self.silk_frame_size)?;
                     if f.header.frame_type >= 2 {
                         lbrr_first = false;
                         out.push(Some(f));
@@ -657,7 +693,10 @@ impl SilkEncoderMono {
 
         let mut frames = Vec::with_capacity(self.frames_per_packet);
         for (k, chunk) in pcm.chunks_exact(flen).enumerate() {
-            frames.push(self.channel.analyze_frame_at(chunk, k == 0)?);
+            frames.push(
+                self.channel
+                    .analyze_frame_sized(chunk, k == 0, self.silk_frame_size)?,
+            );
         }
         let symbols: Vec<_> = frames.iter().map(AnalyzedFrame::symbols).collect();
         let lbrr_symbols: Vec<Option<SilkFrameSymbols<'_>>> = lbrr_frames
@@ -741,6 +780,7 @@ pub struct SilkEncoderStereo {
     prev_mid: f32,
     packet_tenths_ms: u16,
     frames_per_packet: usize,
+    silk_frame_size: SilkFrameSize,
     fec: bool,
     pending_fec: Option<PendingFecStereo>,
 }
@@ -752,15 +792,16 @@ impl SilkEncoderStereo {
         Self::with_packet_duration(bandwidth, 200)
     }
 
-    /// Create a stereo encoder emitting `packet_tenths_ms` (200 / 400 /
-    /// 600 — i.e. 20 / 40 / 60 ms) SILK-only packets: per 20 ms
-    /// interval, the §4.2.7.1 weights are re-estimated, the §4.2.8
-    /// downmix re-run, and the §4.2.7.2 mid-only decision re-taken,
-    /// exactly matching the decoder's per-interval unmix.
+    /// Create a stereo encoder emitting `packet_tenths_ms` (100 / 200 /
+    /// 400 / 600 — i.e. 10 / 20 / 40 / 60 ms) SILK-only packets: per
+    /// §4.2.2 interval, the §4.2.7.1 weights are re-estimated, the
+    /// §4.2.8 downmix re-run, and the §4.2.7.2 mid-only decision
+    /// re-taken, exactly matching the decoder's per-interval unmix.
     pub fn with_packet_duration(
         bandwidth: Bandwidth,
         packet_tenths_ms: u16,
     ) -> Result<Self, Error> {
+        let (frames_per_packet, silk_frame_size) = packet_layout(packet_tenths_ms)?;
         Ok(Self {
             bandwidth,
             mid: ChannelAnalyzer::new(bandwidth)?,
@@ -768,7 +809,8 @@ impl SilkEncoderStereo {
             downmix: StereoDownmixState::new(),
             prev_mid: 0.0,
             packet_tenths_ms,
-            frames_per_packet: frames_per_packet(packet_tenths_ms)?,
+            frames_per_packet,
+            silk_frame_size,
             fec: false,
             pending_fec: None,
         })
@@ -786,7 +828,8 @@ impl SilkEncoderStereo {
     /// Per-packet input length per channel (the packet duration at the
     /// internal rate).
     pub fn frame_samples(&self) -> usize {
-        subframe_samples(self.bandwidth).unwrap_or(0) * 4 * self.frames_per_packet
+        frame_size_samples(self.bandwidth, self.silk_frame_size).unwrap_or(0)
+            * self.frames_per_packet
     }
 
     /// Reset all carried state.
@@ -815,7 +858,7 @@ impl SilkEncoderStereo {
         if left.len() != total_len || right.len() != total_len {
             return Err(Error::MalformedPacket);
         }
-        let flen = subframe_samples(self.bandwidth)? * 4;
+        let flen = frame_size_samples(self.bandwidth, self.silk_frame_size)?;
 
         // §4.2.5 / §2.1.7: re-encode the PREVIOUS packet's intervals as
         // this packet's LBRR frames, from the pre-packet analyzer
@@ -839,7 +882,11 @@ impl SilkEncoderStereo {
                         // flag depends on whether a side LBRR frame
                         // actually rides this interval.
                         let side_frame = if iv.side_active {
-                            let sf = ls.analyze_frame_at(&iv.side_pcm, side_first)?;
+                            let sf = ls.analyze_frame_sized(
+                                &iv.side_pcm,
+                                side_first,
+                                self.silk_frame_size,
+                            )?;
                             if sf.header.frame_type >= 2 {
                                 side_first = false;
                                 Some(sf)
@@ -853,7 +900,8 @@ impl SilkEncoderStereo {
                             side_first = true;
                             None
                         };
-                        let mf = lm.analyze_frame_at(&iv.mid_pcm, mid_first)?;
+                        let mf =
+                            lm.analyze_frame_sized(&iv.mid_pcm, mid_first, self.silk_frame_size)?;
                         if mf.header.frame_type >= 2 {
                             let mut mf = mf;
                             mf.header.stereo = Some(iv.weights);
@@ -942,7 +990,9 @@ impl SilkEncoderStereo {
             let code_side = side_rms > MID_ONLY_SIDE_RMS;
 
             // ---- Per-channel analysis. ----
-            let mut mid_frame = self.mid.analyze_frame_at(&ms.mid, k == 0)?;
+            let mut mid_frame =
+                self.mid
+                    .analyze_frame_sized(&ms.mid, k == 0, self.silk_frame_size)?;
             mid_frame.header.stereo = Some(weight_symbols);
 
             let side_active;
@@ -953,7 +1003,9 @@ impl SilkEncoderStereo {
                 // decoder's side sequence cleared its bases but not its
                 // §4.2.7.6.3 first-frame flag — mirroring
                 // `mark_interval_uncoded(false)`).
-                let side_frame = self.side.analyze_frame_at(&ms.side, k == 0)?;
+                let side_frame =
+                    self.side
+                        .analyze_frame_sized(&ms.side, k == 0, self.silk_frame_size)?;
                 // §4.2.7.2: the mid-only flag is present iff the side
                 // VAD for the interval is CLEAR. A coded ACTIVE side
                 // frame (type >= 2) sets the VAD, so the flag is
@@ -1221,6 +1273,72 @@ mod tests {
         let steady = &snrs[2..];
         let avg = steady.iter().sum::<f64>() / steady.len() as f64;
         assert!(avg > 10.0, "pulse-train tracking SNR too low: {avg:.1} dB");
+    }
+
+    /// 10 ms packets (one 2-subframe SILK frame, §4.2.7.5.5 factor not
+    /// stored): NB sine end-to-end through the streaming decoder with
+    /// the §3 sample count and the tone preserved.
+    #[test]
+    fn nb_sine_10ms_packets_roundtrip() {
+        let bw = Bandwidth::Nb;
+        let mut enc = SilkEncoderMono::with_packet_duration(bw, 100).unwrap();
+        let flen = enc.frame_samples();
+        assert_eq!(flen, 80); // 10 ms at 8 kHz
+        let fs = 8_000.0f64;
+        let f = 220.0f64;
+
+        let mut dec = OpusDecoder::new();
+        let mut decoded_48k: Vec<f64> = Vec::new();
+        for pkt_idx in 0..20 {
+            let pcm: Vec<f32> = (0..flen)
+                .map(|i| {
+                    let t = (pkt_idx * flen + i) as f64 / fs;
+                    (0.3 * (core::f64::consts::TAU * f * t).sin()) as f32
+                })
+                .collect();
+            let out = enc.encode_packet(&pcm).unwrap();
+            let audio = dec.decode_packet(&out.packet).unwrap();
+            assert_eq!(audio.channels, 1);
+            // §3.1: a 10 ms packet is 480 samples at 48 kHz.
+            assert_eq!(audio.pcm.len(), 480);
+            decoded_48k.extend(audio.pcm.iter().map(|&v| v as f64 / 32768.0));
+        }
+        let tail = &decoded_48k[decoded_48k.len() / 3..];
+        let (_, proj) = sine_projection(tail, f, 48_000.0);
+        assert!(proj > 8.0, "48 kHz sine projection SNR: {proj:.1} dB");
+    }
+
+    /// 10 ms stereo packets (with FEC on, exercising the 10 ms LBRR
+    /// path too) decode with the right shape on the real decoder.
+    #[test]
+    fn stereo_10ms_packets_with_fec_decode() {
+        let bw = Bandwidth::Wb;
+        let mut enc = SilkEncoderStereo::with_packet_duration(bw, 100).unwrap();
+        enc.set_fec(true);
+        let flen = enc.frame_samples();
+        assert_eq!(flen, 160); // 10 ms at 16 kHz, per channel
+        let fs = 16_000.0f64;
+
+        let gen = |i: usize| -> (f32, f32) {
+            let t = i as f64 / fs;
+            let s = (core::f64::consts::TAU * 500.0 * t).sin();
+            ((0.35 * s) as f32, (0.15 * s) as f32)
+        };
+        let mut dec = OpusDecoder::new();
+        for pkt_idx in 0..8 {
+            let mut left = Vec::with_capacity(flen);
+            let mut right = Vec::with_capacity(flen);
+            for i in 0..flen {
+                let (l, r) = gen(pkt_idx * flen + i);
+                left.push(l);
+                right.push(r);
+            }
+            let next = gen((pkt_idx + 1) * flen);
+            let out = enc.encode_packet(&left, &right, Some(next)).unwrap();
+            let audio = dec.decode_packet(&out.packet).unwrap();
+            assert_eq!(audio.channels, 2);
+            assert_eq!(audio.pcm.len(), 2 * 480);
+        }
     }
 
     /// 40 ms multi-frame packets (two §4.2.2 SILK frames per packet)

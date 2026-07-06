@@ -4,6 +4,10 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- analysed 10 ms packets: `with_packet_duration(bw, 100)` on both encoders
+  emits one 2-subframe SILK frame per packet (§4.2.7.5.5 factor not
+  stored), completing the encoder's SILK frame-size matrix (10/20/40/60 ms
+  x NB/MB/WB x mono/stereo, FEC and CBR shaping included)
 - CBR / padding on encode: `pad_packet_to` re-frames a code-0 packet as a
   §3.2.5 code-3 packet padded to an exact byte size (every target size
   reachable, non-minimal padding chains at the 254-byte boundaries) and
