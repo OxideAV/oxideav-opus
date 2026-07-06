@@ -564,36 +564,54 @@ impl SilkEncoderMono {
     }
 }
 
-/// Streaming stereo SILK encoder: 20 ms of L/R internal-rate PCM in,
-/// one stereo SILK-only Opus packet out (§5.2.2 stereo mixing +
-/// §4.2.7.1 weight coding + §4.2.7.2 mid-only escape).
+/// Streaming stereo SILK encoder: 20 / 40 / 60 ms of L/R internal-rate
+/// PCM in, one stereo SILK-only Opus packet out (§5.2.2 stereo mixing +
+/// §4.2.7.1 weight coding + §4.2.7.2 mid-only escape, run **per 20 ms
+/// interval** exactly like the decoder's §4.2.2 interleaved walk).
 #[derive(Debug, Clone)]
 pub struct SilkEncoderStereo {
     bandwidth: Bandwidth,
     mid: ChannelAnalyzer,
     side: ChannelAnalyzer,
     downmix: StereoDownmixState,
-    /// Previous frame's trailing raw-mid sample (the §4.2.8 `p0`
+    /// Previous interval's trailing raw-mid sample (the §4.2.8 `p0`
     /// boundary term for the weight estimate).
     prev_mid: f32,
+    packet_tenths_ms: u16,
+    frames_per_packet: usize,
 }
 
 impl SilkEncoderStereo {
-    /// Create a stereo encoder for one SILK internal bandwidth.
+    /// Create a 20 ms-packet stereo encoder for one SILK internal
+    /// bandwidth.
     pub fn new(bandwidth: Bandwidth) -> Result<Self, Error> {
+        Self::with_packet_duration(bandwidth, 200)
+    }
+
+    /// Create a stereo encoder emitting `packet_tenths_ms` (200 / 400 /
+    /// 600 — i.e. 20 / 40 / 60 ms) SILK-only packets: per 20 ms
+    /// interval, the §4.2.7.1 weights are re-estimated, the §4.2.8
+    /// downmix re-run, and the §4.2.7.2 mid-only decision re-taken,
+    /// exactly matching the decoder's per-interval unmix.
+    pub fn with_packet_duration(
+        bandwidth: Bandwidth,
+        packet_tenths_ms: u16,
+    ) -> Result<Self, Error> {
         Ok(Self {
             bandwidth,
             mid: ChannelAnalyzer::new(bandwidth)?,
             side: ChannelAnalyzer::new(bandwidth)?,
             downmix: StereoDownmixState::new(),
             prev_mid: 0.0,
+            packet_tenths_ms,
+            frames_per_packet: frames_per_packet(packet_tenths_ms)?,
         })
     }
 
-    /// Per-packet input length per channel (20 ms at the internal
-    /// rate).
+    /// Per-packet input length per channel (the packet duration at the
+    /// internal rate).
     pub fn frame_samples(&self) -> usize {
-        subframe_samples(self.bandwidth).unwrap_or(0) * 4
+        subframe_samples(self.bandwidth).unwrap_or(0) * 4 * self.frames_per_packet
     }
 
     /// Reset all carried state.
@@ -604,11 +622,12 @@ impl SilkEncoderStereo {
         self.prev_mid = 0.0;
     }
 
-    /// Encode one 20 ms frame of stereo internal-rate PCM.
+    /// Encode one packet's worth (20 / 40 / 60 ms) of stereo
+    /// internal-rate PCM.
     ///
     /// `left.len()` and `right.len()` must equal
-    /// [`Self::frame_samples`]. `next_lr` is the NEXT frame's first
-    /// left/right sample pair when known (the §4.2.8 one-sample
+    /// [`Self::frame_samples`]. `next_lr` is the first left/right
+    /// sample pair AFTER this packet when known (the §4.2.8 one-sample
     /// lookahead of the exact downmix); pass `None` at stream end.
     pub fn encode_packet(
         &mut self,
@@ -616,89 +635,123 @@ impl SilkEncoderStereo {
         right: &[f32],
         next_lr: Option<(f32, f32)>,
     ) -> Result<EncodedSilkPacket, Error> {
-        let frame_len = self.frame_samples();
-        if left.len() != frame_len || right.len() != frame_len {
+        let total_len = self.frame_samples();
+        if left.len() != total_len || right.len() != total_len {
             return Err(Error::MalformedPacket);
         }
+        let flen = subframe_samples(self.bandwidth)? * 4;
 
-        // ---- §5.2.3.4 stereo mixing: estimate + quantize weights,
-        // then run the exact §4.2.8 inverse with the QUANTIZED pair
-        // (what the decoder will apply). ----
-        let mid_raw: Vec<f32> = left
-            .iter()
-            .zip(right)
-            .map(|(&l, &r)| (l + r) / 2.0)
-            .collect();
-        let side_raw: Vec<f32> = left
-            .iter()
-            .zip(right)
-            .map(|(&l, &r)| (l - r) / 2.0)
-            .collect();
-        let mid_next = match next_lr {
-            Some((l, r)) => (l + r) / 2.0,
-            None => mid_raw[frame_len - 1],
-        };
-        let target = crate::silk_stereo::estimate_stereo_weights(
-            &mid_raw,
-            &side_raw,
-            self.prev_mid,
-            mid_next,
-        )?;
-        let weight_symbols = StereoWeightSymbols::quantize(StereoPredictionWeights {
-            w0_q13: target.w0_q13,
-            w1_q13: target.w1_q13,
-        });
-        let decoded_w = weight_symbols.weights();
-        let ms = stereo_lr_to_ms(
-            self.bandwidth,
-            left,
-            right,
-            StereoWeightsQ13 {
-                w0_q13: decoded_w.w0_q13,
-                w1_q13: decoded_w.w1_q13,
-            },
-            next_lr,
-            &mut self.downmix,
-        )?;
-        self.prev_mid = mid_raw[frame_len - 1];
+        let mut mid_frames: Vec<AnalyzedFrame> = Vec::with_capacity(self.frames_per_packet);
+        let mut side_frames: Vec<Option<AnalyzedFrame>> =
+            Vec::with_capacity(self.frames_per_packet);
 
-        // ---- Mid-only decision (§4.2.7.2). ----
-        let side_energy: f64 = ms.side.iter().map(|&v| (v as f64) * (v as f64)).sum();
-        let side_rms = (side_energy / frame_len as f64).sqrt();
-        let code_side = side_rms > MID_ONLY_SIDE_RMS;
-
-        // ---- Per-channel analysis. ----
-        let mut mid_frame = self.mid.analyze_frame(&ms.mid)?;
-        mid_frame.header.stereo = Some(weight_symbols);
-
-        let (packet, mid_reconstructed, voiced) = if code_side {
-            let side_frame = self.side.analyze_frame(&ms.side)?;
-            // Side coded with an active type → side VAD set → the
-            // §4.2.7.2 mid-only flag is absent.
-            mid_frame.header.mid_only_flag = None;
-            let iv = StereoIntervalScripts {
-                mid: mid_frame.symbols(),
-                side: Some(side_frame.symbols()),
+        for k in 0..self.frames_per_packet {
+            let l = &left[k * flen..(k + 1) * flen];
+            let r = &right[k * flen..(k + 1) * flen];
+            // The §4.2.8 one-sample lookahead: the next interval's
+            // first pair inside the packet, the caller's `next_lr` on
+            // the last interval.
+            let interval_next = if k + 1 < self.frames_per_packet {
+                Some((left[(k + 1) * flen], right[(k + 1) * flen]))
+            } else {
+                next_lr
             };
-            let (packet, _) = encode_silk_only_packet_stereo(self.bandwidth, 200, &[iv])?;
-            (packet, mid_frame.reconstructed.clone(), mid_frame.voiced)
-        } else {
-            // Mid-only: flag present and set; the decoder clears the
-            // side channel's synthesis state and gain history after
-            // the uncoded side frame — mirror it.
-            mid_frame.header.mid_only_flag = Some(true);
-            self.side.reset();
-            let iv = StereoIntervalScripts {
-                mid: mid_frame.symbols(),
-                side: None,
-            };
-            let (packet, _) = encode_silk_only_packet_stereo(self.bandwidth, 200, &[iv])?;
-            (packet, mid_frame.reconstructed.clone(), mid_frame.voiced)
-        };
 
+            // ---- §5.2.3.4 stereo mixing: estimate + quantize weights,
+            // then run the exact §4.2.8 inverse with the QUANTIZED pair
+            // (what the decoder will apply), per interval — the decoder
+            // reads one §4.2.7.1 quintuple per mid frame and restarts
+            // its 8 ms interpolation ramp each interval. ----
+            let mid_raw: Vec<f32> = l.iter().zip(r).map(|(&a, &b)| (a + b) / 2.0).collect();
+            let side_raw: Vec<f32> = l.iter().zip(r).map(|(&a, &b)| (a - b) / 2.0).collect();
+            let mid_next = match interval_next {
+                Some((a, b)) => (a + b) / 2.0,
+                None => mid_raw[flen - 1],
+            };
+            let target = crate::silk_stereo::estimate_stereo_weights(
+                &mid_raw,
+                &side_raw,
+                self.prev_mid,
+                mid_next,
+            )?;
+            let weight_symbols = StereoWeightSymbols::quantize(StereoPredictionWeights {
+                w0_q13: target.w0_q13,
+                w1_q13: target.w1_q13,
+            });
+            let decoded_w = weight_symbols.weights();
+            let ms = stereo_lr_to_ms(
+                self.bandwidth,
+                l,
+                r,
+                StereoWeightsQ13 {
+                    w0_q13: decoded_w.w0_q13,
+                    w1_q13: decoded_w.w1_q13,
+                },
+                interval_next,
+                &mut self.downmix,
+            )?;
+            self.prev_mid = mid_raw[flen - 1];
+
+            // ---- Mid-only decision (§4.2.7.2), per interval. ----
+            let side_energy: f64 = ms.side.iter().map(|&v| (v as f64) * (v as f64)).sum();
+            let side_rms = (side_energy / flen as f64).sqrt();
+            let code_side = side_rms > MID_ONLY_SIDE_RMS;
+
+            // ---- Per-channel analysis. ----
+            let mut mid_frame = self.mid.analyze_frame_at(&ms.mid, k == 0)?;
+            mid_frame.header.stereo = Some(weight_symbols);
+
+            if code_side {
+                // The side channel's "first frame" is the packet's
+                // first interval; a side frame after a mid-only
+                // interval keeps `first_in_packet = false` (the
+                // decoder's side sequence cleared its bases but not its
+                // §4.2.7.6.3 first-frame flag — mirroring
+                // `mark_interval_uncoded(false)`).
+                let side_frame = self.side.analyze_frame_at(&ms.side, k == 0)?;
+                // §4.2.7.2: the mid-only flag is present iff the side
+                // VAD for the interval is CLEAR. A coded ACTIVE side
+                // frame (type >= 2) sets the VAD, so the flag is
+                // absent; a coded INACTIVE side frame leaves the VAD
+                // clear and the flag rides as `Some(false)`.
+                mid_frame.header.mid_only_flag = if side_frame.header.frame_type >= 2 {
+                    None
+                } else {
+                    Some(false)
+                };
+                mid_frames.push(mid_frame);
+                side_frames.push(Some(side_frame));
+            } else {
+                // Mid-only: flag present and set; the decoder clears
+                // the side channel's synthesis state and carried bases
+                // after the uncoded side frame — mirror it.
+                mid_frame.header.mid_only_flag = Some(true);
+                self.side.reset();
+                mid_frames.push(mid_frame);
+                side_frames.push(None);
+            }
+        }
+
+        let intervals: Vec<StereoIntervalScripts<'_>> = mid_frames
+            .iter()
+            .zip(side_frames.iter())
+            .map(|(m, s)| StereoIntervalScripts {
+                mid: m.symbols(),
+                side: s.as_ref().map(AnalyzedFrame::symbols),
+            })
+            .collect();
+        let (packet, _) =
+            encode_silk_only_packet_stereo(self.bandwidth, self.packet_tenths_ms, &intervals)?;
+
+        let mut reconstructed = Vec::with_capacity(total_len);
+        let mut voiced = false;
+        for m in &mid_frames {
+            reconstructed.extend_from_slice(&m.reconstructed);
+            voiced |= m.voiced;
+        }
         Ok(EncodedSilkPacket {
             packet,
-            reconstructed: mid_reconstructed,
+            reconstructed,
             voiced,
         })
     }
@@ -1076,6 +1129,94 @@ mod tests {
             (ratio - 2.0).abs() < 0.5,
             "panning ratio {ratio:.2} (amps {amp_l:.3}/{amp_r:.3})"
         );
+    }
+
+    /// Stereo 40 ms multi-frame packets: two §4.2.2 intervals per
+    /// packet, each with its own §4.2.7.1 weights and §4.2.7.2
+    /// decision, decoding on the real streaming decoder with panning
+    /// preserved.
+    #[test]
+    fn stereo_40ms_multiframe_roundtrips() {
+        let bw = Bandwidth::Wb;
+        let mut enc = SilkEncoderStereo::with_packet_duration(bw, 400).unwrap();
+        let flen = enc.frame_samples();
+        assert_eq!(flen, 640); // 40 ms at 16 kHz, per channel
+        let fs = 16_000.0f64;
+        let f = 350.0f64;
+
+        let gen = |i: usize| -> (f32, f32) {
+            let t = i as f64 / fs;
+            let s = (core::f64::consts::TAU * f * t).sin();
+            ((0.4 * s) as f32, (0.2 * s) as f32)
+        };
+
+        let mut dec = OpusDecoder::new();
+        let mut l48: Vec<f64> = Vec::new();
+        let mut r48: Vec<f64> = Vec::new();
+        for pkt_idx in 0..6 {
+            let mut left = Vec::with_capacity(flen);
+            let mut right = Vec::with_capacity(flen);
+            for i in 0..flen {
+                let (l, r) = gen(pkt_idx * flen + i);
+                left.push(l);
+                right.push(r);
+            }
+            let next = gen((pkt_idx + 1) * flen);
+            let out = enc.encode_packet(&left, &right, Some(next)).unwrap();
+            let audio = dec.decode_packet(&out.packet).unwrap();
+            assert_eq!(audio.channels, 2);
+            // §3.1: 40 ms stereo = 1920 samples per channel at 48 kHz.
+            assert_eq!(audio.pcm.len(), 2 * 1920);
+            for ch in audio.pcm.chunks_exact(2) {
+                l48.push(ch[0] as f64 / 32768.0);
+                r48.push(ch[1] as f64 / 32768.0);
+            }
+        }
+
+        let tail_l = &l48[l48.len() / 3..];
+        let tail_r = &r48[r48.len() / 3..];
+        let (amp_l, proj_l) = sine_projection(tail_l, f, 48_000.0);
+        let (amp_r, proj_r) = sine_projection(tail_r, f, 48_000.0);
+        assert!(proj_l > 8.0, "left projection SNR: {proj_l:.1} dB");
+        assert!(proj_r > 8.0, "right projection SNR: {proj_r:.1} dB");
+        let ratio = amp_l / amp_r.max(1e-9);
+        assert!(
+            (ratio - 2.0).abs() < 0.5,
+            "panning ratio {ratio:.2} (amps {amp_l:.3}/{amp_r:.3})"
+        );
+    }
+
+    /// Stereo 60 ms packets whose side channel dies mid-packet: the
+    /// per-interval §4.2.7.2 decision must mix coded-side and mid-only
+    /// intervals inside ONE packet and still decode.
+    #[test]
+    fn stereo_60ms_mixed_midonly_intervals_decode() {
+        let bw = Bandwidth::Nb;
+        let mut enc = SilkEncoderStereo::with_packet_duration(bw, 600).unwrap();
+        let flen = enc.frame_samples();
+        let flen20 = flen / 3;
+
+        let mut dec = OpusDecoder::new();
+        for pkt_idx in 0..3 {
+            let mut left = Vec::with_capacity(flen);
+            let mut right = Vec::with_capacity(flen);
+            for i in 0..flen {
+                let s = 0.3 * (((pkt_idx * flen + i) as f32) * 0.4).sin();
+                // Interval 1 of each packet: identical channels (zero
+                // side); intervals 0 and 2: panned (live side).
+                if i / flen20 == 1 {
+                    left.push(s);
+                    right.push(s);
+                } else {
+                    left.push(s);
+                    right.push(0.5 * s);
+                }
+            }
+            let out = enc.encode_packet(&left, &right, None).unwrap();
+            let audio = dec.decode_packet(&out.packet).unwrap();
+            assert_eq!(audio.channels, 2);
+            assert_eq!(audio.pcm.len(), 2 * 2880);
+        }
     }
 
     /// Identical L and R (zero side signal): the encoder must take the

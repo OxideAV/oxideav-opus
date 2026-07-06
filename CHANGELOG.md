@@ -4,6 +4,12 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- analysed stereo SILK encoder: 40 / 60 ms multi-frame stereo packets
+  (`SilkEncoderStereo::with_packet_duration`) — per 20 ms interval the
+  §4.2.7.1 weights are re-estimated, the §4.2.8 exact downmix re-run, and
+  the §4.2.7.2 mid-only decision re-taken (coded-side, inactive-side
+  `Some(false)` flag, and mid-only intervals can mix inside one packet),
+  matching the decoder's per-interval unmix walk
 - analysed SILK encoder: 40 / 60 ms multi-frame packets from PCM
   (`SilkEncoderMono::with_packet_duration`) — one analysed 20 ms SILK frame
   per §4.2.2 interval with the intra-packet carried state threaded like the
