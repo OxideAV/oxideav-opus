@@ -77,7 +77,8 @@ use crate::silk_ltp_analysis::ltp_analysis;
 use crate::silk_ltp_synth::LtpSynthState;
 use crate::silk_nlsf_quantize::quantize_nlsf;
 use crate::silk_packet_encode::{
-    encode_silk_only_packet_mono, encode_silk_only_packet_stereo, StereoIntervalScripts,
+    encode_silk_only_packet_mono_with_lbrr, encode_silk_only_packet_stereo_with_lbrr,
+    StereoIntervalLbrr, StereoIntervalScripts,
 };
 use crate::silk_pitch::{pitch_analysis, quantize_lag};
 use crate::silk_stereo::{stereo_lr_to_ms, StereoDownmixState, StereoWeightsQ13};
@@ -87,6 +88,11 @@ use crate::Error;
 /// Target RMS of the excitation pulses (`e_raw`) the gain selection
 /// aims for — the bitrate/precision knob of this encoder.
 const TARGET_PULSE_RMS: f64 = 2.0;
+
+/// Reduced pulse target for §4.2.5 LBRR (in-band FEC) re-encodes: the
+/// redundant copy spends roughly half the pulse budget of the regular
+/// frames (§2.1.7 codes the previous frame "at a lower bitrate").
+const LBRR_PULSE_RMS: f64 = 1.0;
 
 /// Initial bandwidth-expansion chirp applied to the Burg predictor
 /// before LSF conversion.
@@ -168,6 +174,16 @@ pub struct ChannelAnalyzer {
     /// packet boundary (the first frame of an Opus frame always codes
     /// its lag absolutely).
     prev_lag: Option<i32>,
+    /// Target excitation-pulse RMS of the gain selection
+    /// ([`TARGET_PULSE_RMS`] normally, [`LBRR_PULSE_RMS`] for a
+    /// re-armed LBRR re-encoder).
+    pulse_rms: f64,
+    /// When set (LBRR re-encoders), active frames are coded UNVOICED —
+    /// the LBRR sequence synthesizes from a fresh §4.2.7.9 state on
+    /// both sides, so an LTP filter would predict from an all-zero
+    /// history: no prediction gain, and the closed-loop pulses would
+    /// have to carry the entire un-predicted signal at enormous rate.
+    force_unvoiced: bool,
 }
 
 impl ChannelAnalyzer {
@@ -189,6 +205,8 @@ impl ChannelAnalyzer {
             lpc_state: LpcSynthState::new(bandwidth)?,
             prev_log_gain: None,
             prev_lag: None,
+            pulse_rms: TARGET_PULSE_RMS,
+            force_unvoiced: false,
         })
     }
 
@@ -201,6 +219,31 @@ impl ChannelAnalyzer {
         }
         self.ltp_state.reset();
         self.lpc_state.reset();
+        self.prev_log_gain = None;
+        self.prev_lag = None;
+    }
+
+    /// Re-arm a CLONE of a channel analyzer as the §4.2.5 LBRR
+    /// re-encoder for the packet the clone was snapshotted BEFORE: the
+    /// FEC decoder synthesizes LBRR frames from a fresh §4.2.7.9 state
+    /// and the LBRR sequence codes its first gain independently with no
+    /// clamp base, so the closed-loop mirror starts fresh too. The
+    /// input history is kept — it only conditions the analysis — and
+    /// the pulse target drops to the reduced LBRR rate.
+    pub fn rearm_for_lbrr(&mut self) {
+        self.ltp_state.reset();
+        self.lpc_state.reset();
+        self.prev_log_gain = None;
+        self.prev_lag = None;
+        self.pulse_rms = LBRR_PULSE_RMS;
+        self.force_unvoiced = true;
+    }
+
+    /// Mark a §4.2.4 LBRR-flag gap (an interval with no LBRR frame):
+    /// the next coded LBRR frame codes its gain independently and its
+    /// lag absolutely again, mirroring the packet writer's and the
+    /// decoder's gap handling.
+    pub fn mark_lbrr_gap(&mut self) {
         self.prev_log_gain = None;
         self.prev_lag = None;
     }
@@ -296,8 +339,10 @@ impl ChannelAnalyzer {
         let r = lpc_residual(&buf, &[], &a_hat);
 
         // ---- 3. Pitch analysis + LTP (§5.2.3.2 / §5.2.3.6). ----
-        // Skipped for an inactive frame (no LTP search on silence).
-        let pa = if active {
+        // Skipped for an inactive frame (no LTP search on silence) and
+        // for LBRR re-encoders (`force_unvoiced` — LTP has no history
+        // to predict from in the fresh-state LBRR sequence).
+        let pa = if active && !self.force_unvoiced {
             Some(pitch_analysis(self.bandwidth, &r, hist_len, num_subframes)?)
         } else {
             None
@@ -376,7 +421,7 @@ impl ChannelAnalyzer {
             // e_raw ≈ res * 2^31 / gain_Q16 (see the module docs of
             // silk_excitation_quantize): gain that lands the pulses on
             // the target RMS.
-            let want_gain = rms * (1u64 << 31) as f64 / TARGET_PULSE_RMS;
+            let want_gain = rms * (1u64 << 31) as f64 / self.pulse_rms;
             desired[s] = quantize_log_gain(want_gain);
         }
         // §4.2.7.4 threading. Packet-first frame: independent coding
@@ -487,16 +532,30 @@ fn frames_per_packet(packet_tenths_ms: u16) -> Result<usize, Error> {
     }
 }
 
+/// The previous packet's material a FEC-enabled encoder keeps so the
+/// NEXT packet can carry its §4.2.5 LBRR re-encode: the input PCM and
+/// a clone of the channel analyzer as it stood BEFORE that packet was
+/// analysed (its history conditions the re-analysis).
+#[derive(Debug, Clone)]
+struct PendingFecMono {
+    pcm: Vec<f32>,
+    analyzer: ChannelAnalyzer,
+}
+
 /// Streaming mono SILK encoder: 20 / 40 / 60 ms of internal-rate PCM
 /// in, one SILK-only Opus packet out (one §4.2.2 SILK frame per 20 ms
 /// interval, with the intra-packet §4.2.7.4 / §4.2.7.6.1 carried state
 /// threaded across them and per-frame §4.2.3 VAD flags derived from
-/// the signal).
+/// the signal). With [`Self::set_fec`] enabled, each packet also
+/// carries the §4.2.5 LBRR (in-band FEC) re-encode of the previous
+/// packet's active intervals at the reduced LBRR rate.
 #[derive(Debug, Clone)]
 pub struct SilkEncoderMono {
     channel: ChannelAnalyzer,
     packet_tenths_ms: u16,
     frames_per_packet: usize,
+    fec: bool,
+    pending_fec: Option<PendingFecMono>,
 }
 
 impl SilkEncoderMono {
@@ -518,7 +577,22 @@ impl SilkEncoderMono {
             channel: ChannelAnalyzer::new(bandwidth)?,
             packet_tenths_ms,
             frames_per_packet: frames_per_packet(packet_tenths_ms)?,
+            fec: false,
+            pending_fec: None,
         })
+    }
+
+    /// Enable / disable §4.2.5 LBRR (in-band FEC) emission: when on,
+    /// every packet after the first carries a reduced-rate re-encode of
+    /// the previous packet's ACTIVE intervals, which a receiver can
+    /// recover with [`crate::decoder::OpusDecoder::decode_packet_fec`]
+    /// when the previous packet is lost. Disabling also drops any
+    /// pending redundancy.
+    pub fn set_fec(&mut self, enabled: bool) {
+        self.fec = enabled;
+        if !enabled {
+            self.pending_fec = None;
+        }
     }
 
     /// Per-packet input length: the packet duration at the internal
@@ -531,6 +605,7 @@ impl SilkEncoderMono {
     /// Reset all carried state (matches a §4.5.2 decoder reset).
     pub fn reset(&mut self) {
         self.channel.reset();
+        self.pending_fec = None;
     }
 
     /// Encode one packet's worth (20 / 40 / 60 ms) of mono
@@ -544,12 +619,57 @@ impl SilkEncoderMono {
             return Err(Error::MalformedPacket);
         }
         let flen = subframe_samples(bandwidth)? * 4;
+
+        // §4.2.5 / §2.1.7: the LBRR frames riding in THIS packet are a
+        // reduced-rate re-encode of the PREVIOUS packet's intervals,
+        // analysed from the pre-packet analyzer snapshot with a fresh
+        // closed-loop state (mirroring the FEC decoder's fresh
+        // synthesis). Inactive intervals carry no LBRR (§4.2.7.3 codes
+        // every LBRR frame with the active PDFs) and re-arm the gap
+        // rules.
+        let lbrr_frames: Vec<Option<AnalyzedFrame>> = match self.pending_fec.take() {
+            Some(pending) => {
+                let mut la = pending.analyzer;
+                la.rearm_for_lbrr();
+                let mut lbrr_first = true;
+                let mut out = Vec::with_capacity(self.frames_per_packet);
+                for chunk in pending.pcm.chunks_exact(flen) {
+                    let f = la.analyze_frame_at(chunk, lbrr_first)?;
+                    if f.header.frame_type >= 2 {
+                        lbrr_first = false;
+                        out.push(Some(f));
+                    } else {
+                        la.mark_lbrr_gap();
+                        lbrr_first = true;
+                        out.push(None);
+                    }
+                }
+                out
+            }
+            None => vec![None; self.frames_per_packet],
+        };
+        if self.fec {
+            self.pending_fec = Some(PendingFecMono {
+                pcm: pcm.to_vec(),
+                analyzer: self.channel.clone(),
+            });
+        }
+
         let mut frames = Vec::with_capacity(self.frames_per_packet);
         for (k, chunk) in pcm.chunks_exact(flen).enumerate() {
             frames.push(self.channel.analyze_frame_at(chunk, k == 0)?);
         }
         let symbols: Vec<_> = frames.iter().map(AnalyzedFrame::symbols).collect();
-        let (packet, _) = encode_silk_only_packet_mono(bandwidth, self.packet_tenths_ms, &symbols)?;
+        let lbrr_symbols: Vec<Option<SilkFrameSymbols<'_>>> = lbrr_frames
+            .iter()
+            .map(|o| o.as_ref().map(AnalyzedFrame::symbols))
+            .collect();
+        let (packet, _, _) = encode_silk_only_packet_mono_with_lbrr(
+            bandwidth,
+            self.packet_tenths_ms,
+            &symbols,
+            &lbrr_symbols,
+        )?;
         let mut reconstructed = Vec::with_capacity(pcm.len());
         let mut voiced = false;
         for f in &frames {
@@ -564,10 +684,36 @@ impl SilkEncoderMono {
     }
 }
 
+/// One interval of the previous stereo packet kept for the next
+/// packet's §4.2.5 LBRR re-encode: the DOWNMIXED mid/side signals and
+/// coded weight quintuple from the regular pass (so the redundant copy
+/// codes the identical §4.2.8 mix), plus whether the regular pass
+/// coded an ACTIVE side frame (only then does the interval carry a
+/// side LBRR frame).
+#[derive(Debug, Clone)]
+struct PendingFecStereoInterval {
+    mid_pcm: Vec<f32>,
+    side_pcm: Vec<f32>,
+    side_active: bool,
+    weights: StereoWeightSymbols,
+}
+
+/// The previous stereo packet's material a FEC-enabled encoder keeps
+/// (see [`PendingFecMono`]): per-interval mix products plus clones of
+/// both channel analyzers as they stood BEFORE that packet.
+#[derive(Debug, Clone)]
+struct PendingFecStereo {
+    intervals: Vec<PendingFecStereoInterval>,
+    mid_analyzer: ChannelAnalyzer,
+    side_analyzer: ChannelAnalyzer,
+}
+
 /// Streaming stereo SILK encoder: 20 / 40 / 60 ms of L/R internal-rate
 /// PCM in, one stereo SILK-only Opus packet out (§5.2.2 stereo mixing +
 /// §4.2.7.1 weight coding + §4.2.7.2 mid-only escape, run **per 20 ms
-/// interval** exactly like the decoder's §4.2.2 interleaved walk).
+/// interval** exactly like the decoder's §4.2.2 interleaved walk). With
+/// [`Self::set_fec`] enabled, each packet also carries the §4.2.5 LBRR
+/// re-encode of the previous packet's active intervals.
 #[derive(Debug, Clone)]
 pub struct SilkEncoderStereo {
     bandwidth: Bandwidth,
@@ -579,6 +725,8 @@ pub struct SilkEncoderStereo {
     prev_mid: f32,
     packet_tenths_ms: u16,
     frames_per_packet: usize,
+    fec: bool,
+    pending_fec: Option<PendingFecStereo>,
 }
 
 impl SilkEncoderStereo {
@@ -605,7 +753,18 @@ impl SilkEncoderStereo {
             prev_mid: 0.0,
             packet_tenths_ms,
             frames_per_packet: frames_per_packet(packet_tenths_ms)?,
+            fec: false,
+            pending_fec: None,
         })
+    }
+
+    /// Enable / disable §4.2.5 LBRR (in-band FEC) emission (see
+    /// [`SilkEncoderMono::set_fec`]).
+    pub fn set_fec(&mut self, enabled: bool) {
+        self.fec = enabled;
+        if !enabled {
+            self.pending_fec = None;
+        }
     }
 
     /// Per-packet input length per channel (the packet duration at the
@@ -620,6 +779,7 @@ impl SilkEncoderStereo {
         self.side.reset();
         self.downmix.reset();
         self.prev_mid = 0.0;
+        self.pending_fec = None;
     }
 
     /// Encode one packet's worth (20 / 40 / 60 ms) of stereo
@@ -640,6 +800,74 @@ impl SilkEncoderStereo {
             return Err(Error::MalformedPacket);
         }
         let flen = subframe_samples(self.bandwidth)? * 4;
+
+        // §4.2.5 / §2.1.7: re-encode the PREVIOUS packet's intervals as
+        // this packet's LBRR frames, from the pre-packet analyzer
+        // snapshots at the reduced rate. The stored downmix products +
+        // weight quintuples make the redundant copy code the identical
+        // §4.2.8 mix. Per channel, an interval without an LBRR frame
+        // re-arms the §4.2.4 gap rules.
+        let (lbrr_mid, lbrr_side): (Vec<Option<AnalyzedFrame>>, Vec<Option<AnalyzedFrame>>) =
+            match self.pending_fec.take() {
+                Some(pending) => {
+                    let mut lm = pending.mid_analyzer;
+                    let mut ls = pending.side_analyzer;
+                    lm.rearm_for_lbrr();
+                    ls.rearm_for_lbrr();
+                    let mut mid_first = true;
+                    let mut side_first = true;
+                    let mut mids = Vec::with_capacity(self.frames_per_packet);
+                    let mut sides = Vec::with_capacity(self.frames_per_packet);
+                    for iv in &pending.intervals {
+                        // Side first: the mid LBRR frame's §4.2.7.2
+                        // flag depends on whether a side LBRR frame
+                        // actually rides this interval.
+                        let side_frame = if iv.side_active {
+                            let sf = ls.analyze_frame_at(&iv.side_pcm, side_first)?;
+                            if sf.header.frame_type >= 2 {
+                                side_first = false;
+                                Some(sf)
+                            } else {
+                                ls.mark_lbrr_gap();
+                                side_first = true;
+                                None
+                            }
+                        } else {
+                            ls.mark_lbrr_gap();
+                            side_first = true;
+                            None
+                        };
+                        let mf = lm.analyze_frame_at(&iv.mid_pcm, mid_first)?;
+                        if mf.header.frame_type >= 2 {
+                            let mut mf = mf;
+                            mf.header.stereo = Some(iv.weights);
+                            // §4.2.7.2 on an LBRR mid frame: the flag
+                            // is present (and must be SET) iff no side
+                            // LBRR frame follows in this interval.
+                            mf.header.mid_only_flag = if side_frame.is_some() {
+                                None
+                            } else {
+                                Some(true)
+                            };
+                            mid_first = false;
+                            mids.push(Some(mf));
+                        } else {
+                            lm.mark_lbrr_gap();
+                            mid_first = true;
+                            mids.push(None);
+                        }
+                        sides.push(side_frame);
+                    }
+                    (mids, sides)
+                }
+                None => (
+                    vec![None; self.frames_per_packet],
+                    vec![None; self.frames_per_packet],
+                ),
+            };
+        let fec_snapshot = self.fec.then(|| (self.mid.clone(), self.side.clone()));
+        let mut fec_intervals: Vec<PendingFecStereoInterval> =
+            Vec::with_capacity(self.frames_per_packet);
 
         let mut mid_frames: Vec<AnalyzedFrame> = Vec::with_capacity(self.frames_per_packet);
         let mut side_frames: Vec<Option<AnalyzedFrame>> =
@@ -701,6 +929,7 @@ impl SilkEncoderStereo {
             let mut mid_frame = self.mid.analyze_frame_at(&ms.mid, k == 0)?;
             mid_frame.header.stereo = Some(weight_symbols);
 
+            let side_active;
             if code_side {
                 // The side channel's "first frame" is the packet's
                 // first interval; a side frame after a mid-only
@@ -714,22 +943,35 @@ impl SilkEncoderStereo {
                 // frame (type >= 2) sets the VAD, so the flag is
                 // absent; a coded INACTIVE side frame leaves the VAD
                 // clear and the flag rides as `Some(false)`.
-                mid_frame.header.mid_only_flag = if side_frame.header.frame_type >= 2 {
-                    None
-                } else {
-                    Some(false)
-                };
+                side_active = side_frame.header.frame_type >= 2;
+                mid_frame.header.mid_only_flag = if side_active { None } else { Some(false) };
                 mid_frames.push(mid_frame);
                 side_frames.push(Some(side_frame));
             } else {
                 // Mid-only: flag present and set; the decoder clears
                 // the side channel's synthesis state and carried bases
                 // after the uncoded side frame — mirror it.
+                side_active = false;
                 mid_frame.header.mid_only_flag = Some(true);
                 self.side.reset();
                 mid_frames.push(mid_frame);
                 side_frames.push(None);
             }
+            if fec_snapshot.is_some() {
+                fec_intervals.push(PendingFecStereoInterval {
+                    mid_pcm: ms.mid.clone(),
+                    side_pcm: ms.side.clone(),
+                    side_active,
+                    weights: weight_symbols,
+                });
+            }
+        }
+        if let Some((mid_analyzer, side_analyzer)) = fec_snapshot {
+            self.pending_fec = Some(PendingFecStereo {
+                intervals: fec_intervals,
+                mid_analyzer,
+                side_analyzer,
+            });
         }
 
         let intervals: Vec<StereoIntervalScripts<'_>> = mid_frames
@@ -740,8 +982,20 @@ impl SilkEncoderStereo {
                 side: s.as_ref().map(AnalyzedFrame::symbols),
             })
             .collect();
-        let (packet, _) =
-            encode_silk_only_packet_stereo(self.bandwidth, self.packet_tenths_ms, &intervals)?;
+        let lbrr: Vec<StereoIntervalLbrr<'_>> = lbrr_mid
+            .iter()
+            .zip(lbrr_side.iter())
+            .map(|(m, s)| StereoIntervalLbrr {
+                mid: m.as_ref().map(AnalyzedFrame::symbols),
+                side: s.as_ref().map(AnalyzedFrame::symbols),
+            })
+            .collect();
+        let (packet, _, _) = encode_silk_only_packet_stereo_with_lbrr(
+            self.bandwidth,
+            self.packet_tenths_ms,
+            &intervals,
+            &lbrr,
+        )?;
 
         let mut reconstructed = Vec::with_capacity(total_len);
         let mut voiced = false;
@@ -776,6 +1030,11 @@ fn quantize_log_gain(want_gain_q16: f64) -> u8 {
 mod tests {
     use super::*;
     use crate::decoder::OpusDecoder;
+
+    fn rms(pcm: &[i16]) -> f64 {
+        let e: f64 = pcm.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        (e / pcm.len().max(1) as f64).sqrt()
+    }
 
     fn snr_db(reference: &[f32], test: &[f32]) -> f64 {
         let mut sig = 0.0f64;
@@ -1129,6 +1388,144 @@ mod tests {
             (ratio - 2.0).abs() < 0.5,
             "panning ratio {ratio:.2} (amps {amp_l:.3}/{amp_r:.3})"
         );
+    }
+
+    /// LBRR from PCM (mono): with FEC on, every packet after the first
+    /// carries the previous packet's re-encode; dropping a packet and
+    /// recovering it via `decode_packet_fec` on the NEXT packet yields
+    /// real (tone-tracking) audio, and the stream continues cleanly.
+    #[test]
+    fn mono_fec_recovers_lost_packet() {
+        use crate::decoder::FecDecodeStatus;
+        use crate::range_decoder::RangeDecoder;
+        use crate::silk_header::SilkHeaderBits;
+
+        let bw = Bandwidth::Wb;
+        let mut enc = SilkEncoderMono::new(bw).unwrap();
+        enc.set_fec(true);
+        let flen = enc.frame_samples();
+        let fs = 16_000.0f64;
+        let f = 400.0f64;
+
+        let mut packets = Vec::new();
+        for pkt_idx in 0..8 {
+            let pcm: Vec<f32> = (0..flen)
+                .map(|i| {
+                    let t = (pkt_idx * flen + i) as f64 / fs;
+                    (0.3 * (core::f64::consts::TAU * f * t).sin()) as f32
+                })
+                .collect();
+            packets.push(enc.encode_packet(&pcm).unwrap().packet);
+        }
+
+        // Every packet after the first must carry the §4.2.4 LBRR flag.
+        for (idx, pkt) in packets.iter().enumerate() {
+            let mut rd = RangeDecoder::new(&pkt[1..]);
+            let header = SilkHeaderBits::decode(&mut rd, 1, false).unwrap();
+            assert_eq!(
+                header.mid_has_lbrr(0),
+                idx > 0,
+                "packet {idx} LBRR flag wrong"
+            );
+        }
+
+        // Lose packet 3; recover it from packet 4's LBRR.
+        let mut dec = OpusDecoder::new();
+        let mut out48: Vec<f64> = Vec::new();
+        for idx in 0..8 {
+            if idx == 3 {
+                continue;
+            }
+            if idx == 4 {
+                let rec = dec.decode_packet_fec(&packets[4]).unwrap();
+                assert_eq!(rec.status, FecDecodeStatus::Recovered);
+                assert_eq!(rec.pcm.len(), 960);
+                // The recovered interval must be real signal, not the
+                // silence fallback.
+                assert!(rms(&rec.pcm) > 500.0, "recovered rms {}", rms(&rec.pcm));
+                out48.extend(rec.pcm.iter().map(|&v| v as f64 / 32768.0));
+            }
+            let audio = dec.decode_packet(&packets[idx]).unwrap();
+            out48.extend(audio.pcm.iter().map(|&v| v as f64 / 32768.0));
+        }
+        // The whole healed stream is still the 400 Hz tone.
+        let tail = &out48[out48.len() / 3..];
+        let (_, proj) = sine_projection(tail, f, 48_000.0);
+        assert!(proj > 8.0, "healed-stream projection SNR: {proj:.1} dB");
+    }
+
+    /// LBRR from PCM (stereo, 40 ms packets): the redundant copy spans
+    /// both channels and every interval; recovery succeeds on the real
+    /// decoder.
+    #[test]
+    fn stereo_fec_recovers_lost_packet() {
+        use crate::decoder::FecDecodeStatus;
+
+        let bw = Bandwidth::Nb;
+        let mut enc = SilkEncoderStereo::with_packet_duration(bw, 400).unwrap();
+        enc.set_fec(true);
+        let flen = enc.frame_samples();
+        let fs = 8_000.0f64;
+        let f = 300.0f64;
+
+        let gen = |i: usize| -> (f32, f32) {
+            let t = i as f64 / fs;
+            let s = (core::f64::consts::TAU * f * t).sin();
+            ((0.4 * s) as f32, (0.2 * s) as f32)
+        };
+        let mut packets = Vec::new();
+        for pkt_idx in 0..6 {
+            let mut left = Vec::with_capacity(flen);
+            let mut right = Vec::with_capacity(flen);
+            for i in 0..flen {
+                let (l, r) = gen(pkt_idx * flen + i);
+                left.push(l);
+                right.push(r);
+            }
+            let next = gen((pkt_idx + 1) * flen);
+            packets.push(enc.encode_packet(&left, &right, Some(next)).unwrap().packet);
+        }
+
+        let mut dec = OpusDecoder::new();
+        for idx in 0..6 {
+            if idx == 2 {
+                continue; // lost
+            }
+            if idx == 3 {
+                let rec = dec.decode_packet_fec(&packets[3]).unwrap();
+                assert_eq!(rec.status, FecDecodeStatus::Recovered);
+                assert_eq!(rec.channels, 2);
+                assert_eq!(rec.pcm.len(), 2 * 1920);
+                assert!(rms(&rec.pcm) > 300.0, "recovered rms {}", rms(&rec.pcm));
+            }
+            let audio = dec.decode_packet(&packets[idx]).unwrap();
+            assert_eq!(audio.channels, 2);
+        }
+    }
+
+    /// FEC off ⇒ byte-identical to the FEC-on encoder's FIRST packet
+    /// (which has no previous packet to protect), and no LBRR flag on
+    /// later packets.
+    #[test]
+    fn fec_off_packets_carry_no_lbrr() {
+        use crate::range_decoder::RangeDecoder;
+        use crate::silk_header::SilkHeaderBits;
+
+        let bw = Bandwidth::Nb;
+        let mut enc_plain = SilkEncoderMono::new(bw).unwrap();
+        let mut enc_fec = SilkEncoderMono::new(bw).unwrap();
+        enc_fec.set_fec(true);
+        let flen = enc_plain.frame_samples();
+        let pcm: Vec<f32> = (0..flen).map(|i| 0.2 * (i as f32 * 0.3).sin()).collect();
+
+        let p_plain = enc_plain.encode_packet(&pcm).unwrap().packet;
+        let p_fec = enc_fec.encode_packet(&pcm).unwrap().packet;
+        assert_eq!(p_plain, p_fec, "first FEC packet has nothing to protect");
+
+        let p2 = enc_plain.encode_packet(&pcm).unwrap().packet;
+        let mut rd = RangeDecoder::new(&p2[1..]);
+        let header = SilkHeaderBits::decode(&mut rd, 1, false).unwrap();
+        assert!(!header.mid_has_lbrr(0));
     }
 
     /// Stereo 40 ms multi-frame packets: two §4.2.2 intervals per

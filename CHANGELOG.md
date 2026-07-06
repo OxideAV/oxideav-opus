@@ -4,6 +4,15 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- LBRR (in-band FEC) from PCM: `SilkEncoderMono::set_fec` /
+  `SilkEncoderStereo::set_fec` — each packet carries a reduced-rate §4.2.5
+  re-encode of the PREVIOUS packet's active intervals, analysed from a
+  pre-packet analyzer snapshot with a fresh closed-loop state (mirroring
+  the FEC decoder's fresh synthesis) and coded unvoiced (LTP has no history
+  in the fresh-state LBRR sequence); inactive intervals leave §4.2.4 gaps;
+  stereo LBRR reuses the regular pass's downmix + §4.2.7.1 weights;
+  recovery verified through `decode_packet_fec` on dropped packets
+- packet writers now enforce §3.2 R2 (compressed frame <= 1275 bytes)
 - analysed stereo SILK encoder: 40 / 60 ms multi-frame stereo packets
   (`SilkEncoderStereo::with_packet_duration`) — per 20 ms interval the
   §4.2.7.1 weights are re-estimated, the §4.2.8 exact downmix re-run, and

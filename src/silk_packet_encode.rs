@@ -227,8 +227,11 @@ pub fn encode_silk_only_packet_mono_with_lbrr(
     }
 
     // §5.1.5 finalize; §3.2 code-0 framing = TOC byte + the single
-    // compressed frame.
+    // compressed frame. R2: a frame may not exceed 1275 bytes.
     let body = re.finish();
+    if body.len() > 1275 {
+        return Err(Error::MalformedPacket);
+    }
     let mut packet = Vec::with_capacity(1 + body.len());
     packet.push(toc);
     packet.extend_from_slice(&body);
@@ -520,8 +523,12 @@ pub fn encode_silk_only_packet_stereo_with_lbrr(
         }
     }
 
-    // §5.1.5 finalize; §3.2 code-0 framing.
+    // §5.1.5 finalize; §3.2 code-0 framing. R2: a frame may not exceed
+    // 1275 bytes.
     let body = re.finish();
+    if body.len() > 1275 {
+        return Err(Error::MalformedPacket);
+    }
     let mut packet = Vec::with_capacity(1 + body.len());
     packet.push(toc);
     packet.extend_from_slice(&body);
