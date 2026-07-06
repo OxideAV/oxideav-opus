@@ -16,10 +16,12 @@
 //!     `w_Q2 = 4` (no interpolation split).
 //!  2. **Pitch + voicing** (§5.2.3.2): whitened-domain open-loop lag
 //!     search ([`crate::silk_pitch`]); voiced frames quantize the
-//!     primary lag (absolute coding — every packet carries one SILK
-//!     frame, which §4.2.7.6.1 makes absolute) and pitch contour, and
-//!     run the §5.2.3.6 LTP codebook quantisation
-//!     ([`crate::silk_ltp_analysis`]) against the DECODED lags.
+//!     primary lag (absolutely on a packet's first SILK frame, relative
+//!     to the previous frame's decoded lag when §4.2.7.6.1 allows it)
+//!     and pitch contour, and run the §5.2.3.6 LTP codebook
+//!     quantisation ([`crate::silk_ltp_analysis`]) against the DECODED
+//!     lags. A frame whose input RMS sits below the activity floor is
+//!     coded INACTIVE (§4.2.3 VAD clear) and skips the search.
 //!  3. **Gains** (§5.2.3.3's role): per-subframe residual energy →
 //!     the §4.2.7.4 log-gain index whose dequantised value scales the
 //!     excitation pulses to a target RMS; the first subframe's index
@@ -46,8 +48,10 @@
 //! audio tracking the input.
 //!
 //! Input is PCM at the SILK **internal** rate (8 kHz NB / 12 kHz MB /
-//! 16 kHz WB), nominal range `[-1.0, 1.0]`, one 20 ms frame per
-//! packet.
+//! 16 kHz WB), nominal range `[-1.0, 1.0]`. Packets carry 20, 40, or
+//! 60 ms (one to three analysed 20 ms SILK frames per §4.2.2, with the
+//! intra-packet §4.2.7.4 / §4.2.7.6.1 carried state threaded across
+//! them exactly the way the decoder's regular-frame walk threads it).
 //!
 //! All truth is taken from RFC 6716 §4.2.7 / §4.2.8 / §5.2. No
 //! external library source is consulted.
@@ -91,6 +95,10 @@ const ANALYSIS_CHIRP: f64 = 0.996;
 /// Side-channel RMS below which a stereo interval is coded mid-only
 /// (§4.2.7.2).
 const MID_ONLY_SIDE_RMS: f64 = 1.0e-4;
+
+/// Frame RMS below which a frame is coded INACTIVE (§4.2.7.3 frame
+/// type 0, VAD flag clear) — the signal-derived §4.2.3 VAD decision.
+const ACTIVITY_RMS: f64 = 1.0e-3;
 
 /// One channel's fully analysed SILK frame: every Table-5 symbol
 /// (owned) plus the encoder's decode-mirror monitoring.
@@ -155,6 +163,11 @@ pub struct ChannelAnalyzer {
     lpc_state: LpcSynthState,
     /// Cross-packet §4.2.7.4 clamp base.
     prev_log_gain: Option<u8>,
+    /// Intra-packet §4.2.7.6.1 relative-lag base: the previous frame's
+    /// decoded primary lag when that frame was voiced. Cleared at every
+    /// packet boundary (the first frame of an Opus frame always codes
+    /// its lag absolutely).
+    prev_lag: Option<i32>,
 }
 
 impl ChannelAnalyzer {
@@ -175,6 +188,7 @@ impl ChannelAnalyzer {
             ltp_state: LtpSynthState::new(bandwidth)?,
             lpc_state: LpcSynthState::new(bandwidth)?,
             prev_log_gain: None,
+            prev_lag: None,
         })
     }
 
@@ -188,12 +202,40 @@ impl ChannelAnalyzer {
         self.ltp_state.reset();
         self.lpc_state.reset();
         self.prev_log_gain = None;
+        self.prev_lag = None;
     }
 
     /// Analyse one 20 ms internal-rate frame into a complete Table-5
     /// symbol script (stereo header parts left `None`; the stereo
-    /// wrapper fills them). Advances every carried state.
+    /// wrapper fills them). Advances every carried state. Equivalent to
+    /// [`Self::analyze_frame_at`] with `first_in_packet = true` (the
+    /// one-frame-per-packet case).
     pub fn analyze_frame(&mut self, pcm: &[f32]) -> Result<AnalyzedFrame, Error> {
+        self.analyze_frame_at(pcm, true)
+    }
+
+    /// Analyse one 20 ms internal-rate frame as SILK frame
+    /// `first_in_packet ? 0 : k>0` of a (possibly multi-frame) Opus
+    /// frame, threading the intra-packet carried state exactly the way
+    /// the §4.2.6 regular-frame decode walk threads it:
+    ///
+    /// * **Gains** (§4.2.7.4): the packet's first frame codes its first
+    ///   subframe gain independently (floored against the cross-packet
+    ///   clamp base); later frames delta-code it against the previous
+    ///   frame's last subframe gain.
+    /// * **Pitch lag** (§4.2.7.6.1): the packet's first frame codes its
+    ///   primary lag absolutely; a later frame following a VOICED frame
+    ///   codes relative to that frame's decoded lag.
+    /// * **LTP scaling** (§4.2.7.6.3): present only on the packet's
+    ///   first frame.
+    /// * **VAD** (§4.2.3 / §4.2.7.3): derived from the signal — a frame
+    ///   whose RMS is below the activity floor is coded INACTIVE (frame
+    ///   type 0, VAD flag clear), skipping the pitch/LTP search.
+    pub fn analyze_frame_at(
+        &mut self,
+        pcm: &[f32],
+        first_in_packet: bool,
+    ) -> Result<AnalyzedFrame, Error> {
         let n = subframe_samples(self.bandwidth)?;
         let num_subframes = 4usize;
         let frame_len = n * num_subframes;
@@ -202,6 +244,16 @@ impl ChannelAnalyzer {
         }
         let (lag_min, lag_max, _) = lag_range(self.bandwidth)?;
         let hist_len = self.hist.len();
+
+        // §4.2.7.6.1: the packet's first frame always codes its lag
+        // absolutely — the relative base never crosses a packet.
+        if first_in_packet {
+            self.prev_lag = None;
+        }
+
+        // ---- 0. Signal-activity (VAD) decision (§4.2.3). ----
+        let input_energy: f64 = pcm.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        let active = (input_energy / frame_len as f64).sqrt() >= ACTIVITY_RMS;
 
         // Contiguous analysis buffer: [history | frame], f64.
         let mut buf = Vec::with_capacity(hist_len + frame_len);
@@ -244,14 +296,23 @@ impl ChannelAnalyzer {
         let r = lpc_residual(&buf, &[], &a_hat);
 
         // ---- 3. Pitch analysis + LTP (§5.2.3.2 / §5.2.3.6). ----
-        let pa = pitch_analysis(self.bandwidth, &r, hist_len, num_subframes)?;
-        let voiced = pa.voiced;
-        let (ltp_symbols, ltp_params, decoded_lags) = if voiced {
-            // Quantize the primary lag first; re-derive the DECODED
-            // subframe lags from the decoded primary so the LTP
-            // analysis and the excitation loop see exactly what the
-            // decoder will.
-            let (lag_sym, decoded_primary) = quantize_lag(self.bandwidth, pa.primary_lag, None)?;
+        // Skipped for an inactive frame (no LTP search on silence).
+        let pa = if active {
+            Some(pitch_analysis(self.bandwidth, &r, hist_len, num_subframes)?)
+        } else {
+            None
+        };
+        let voiced = pa.as_ref().is_some_and(|p| p.voiced);
+        let (ltp_symbols, ltp_params, decoded_lags, decoded_primary) = if voiced {
+            let pa = pa.as_ref().expect("voiced implies analysis ran");
+            // Quantize the primary lag first — relative to the previous
+            // frame's decoded lag when §4.2.7.6.1 allows it (a voiced
+            // predecessor in the same packet), absolutely otherwise —
+            // then re-derive the DECODED subframe lags from the decoded
+            // primary so the LTP analysis and the excitation loop see
+            // exactly what the decoder will.
+            let (lag_sym, decoded_primary) =
+                quantize_lag(self.bandwidth, pa.primary_lag, self.prev_lag)?;
             let offs = contour_offsets(self.bandwidth, num_subframes, pa.contour_index)?;
             let mut lags = [0i32; LTP_MAX_SUBFRAMES];
             for (s, slot) in lags.iter_mut().enumerate().take(num_subframes) {
@@ -269,26 +330,33 @@ impl ChannelAnalyzer {
                 contour_index: pa.contour_index,
                 periodicity_index: lq.periodicity_index,
                 filter_indices: lq.filter_indices,
-                // Index 0 → the §4.2.7.6.3 default 15565.
-                ltp_scaling_index: Some(0),
+                // §4.2.7.6.3: the scaling field rides only the packet's
+                // first frame; index 0 → the default 15565 (which is
+                // also what an absent field reconstructs to).
+                ltp_scaling_index: first_in_packet.then_some(0),
             };
             let params = LtpFrameParams {
                 pitch_lags: lags,
                 taps_q7: lq.taps_q7,
                 ltp_scaling_q14: 15565,
             };
-            (Some(symbols), Some(params), lags)
+            (Some(symbols), Some(params), lags, Some(decoded_primary))
         } else {
-            (None, None, [0i32; LTP_MAX_SUBFRAMES])
+            (None, None, [0i32; LTP_MAX_SUBFRAMES], None)
         };
+        // §4.2.7.6.1: only a VOICED frame arms relative lag coding for
+        // the next frame in the same packet.
+        self.prev_lag = decoded_primary;
 
         // ---- 4. Gain selection (§4.2.7.4 quantize). ----
         // Per-subframe LTP-filtered residual energy → the log gain
         // whose dequantised value puts the pulses at TARGET_PULSE_RMS.
         let signal_type = if voiced {
             SignalType::Voiced
-        } else {
+        } else if active {
             SignalType::Unvoiced
+        } else {
+            SignalType::Inactive
         };
         let mut desired = [0u8; LTP_MAX_SUBFRAMES];
         for s in 0..num_subframes {
@@ -311,17 +379,27 @@ impl ChannelAnalyzer {
             let want_gain = rms * (1u64 << 31) as f64 / TARGET_PULSE_RMS;
             desired[s] = quantize_log_gain(want_gain);
         }
-        // Cross-packet §4.2.7.4 clamp safety: the decoder computes
-        // log_gain = max(gain_index, prev - 16) with prev carried
-        // ACROSS packets; flooring our index keeps the clamp inert.
-        if let Some(prev) = self.prev_log_gain {
-            desired[0] = desired[0].max(prev.saturating_sub(16));
+        // §4.2.7.4 threading. Packet-first frame: independent coding
+        // with the cross-packet clamp kept inert by flooring the index
+        // (the decoder computes log_gain = max(gain_index, prev - 16)
+        // with prev carried ACROSS packets). Later frames in the same
+        // packet: delta-coded against the previous frame's last
+        // subframe gain, exactly as the decoder's regular walk does.
+        let first_subframe_is_independent = first_in_packet || self.prev_log_gain.is_none();
+        if first_subframe_is_independent {
+            if let Some(prev) = self.prev_log_gain {
+                desired[0] = desired[0].max(prev.saturating_sub(16));
+            }
         }
         let gains_cfg = SubframeGainsConfig {
             signal_type,
             num_subframes: num_subframes as u8,
-            first_subframe_is_independent: true,
-            previous_log_gain: None,
+            first_subframe_is_independent,
+            previous_log_gain: if first_in_packet {
+                None
+            } else {
+                self.prev_log_gain
+            },
         };
         let (gain_symbols, gains) = SubframeGains::quantize(gains_cfg, &desired[..num_subframes])?;
         let gains_q16_arr = gains.dequant_q16();
@@ -359,8 +437,17 @@ impl ChannelAnalyzer {
             header: SilkHeaderSymbols {
                 stereo: None,
                 mid_only_flag: None,
-                // Table 10: Unvoiced/Low = 2, Voiced/Low = 4 (active).
-                frame_type: if voiced { 4 } else { 2 },
+                // Table 10 (Low offset column): Inactive = 0,
+                // Unvoiced = 2, Voiced = 4. Types >= 2 set the §4.2.3
+                // VAD flag; the signal-derived activity decision above
+                // selects Inactive for silent frames.
+                frame_type: if voiced {
+                    4
+                } else if active {
+                    2
+                } else {
+                    0
+                },
             },
             gains: gain_symbols,
             lsf_stage1: nq.lsf_stage1,
@@ -388,26 +475,57 @@ pub struct EncodedSilkPacket {
     pub voiced: bool,
 }
 
-/// Streaming mono SILK encoder: 20 ms of internal-rate PCM in, one
-/// SILK-only Opus packet out.
+/// Validate an analysed-encoder packet duration: 20 / 40 / 60 ms (one
+/// to three 20 ms SILK frames per §4.2.2; the 10 ms two-subframe
+/// analysis front end is not built).
+fn frames_per_packet(packet_tenths_ms: u16) -> Result<usize, Error> {
+    match packet_tenths_ms {
+        200 => Ok(1),
+        400 => Ok(2),
+        600 => Ok(3),
+        _ => Err(Error::MalformedPacket),
+    }
+}
+
+/// Streaming mono SILK encoder: 20 / 40 / 60 ms of internal-rate PCM
+/// in, one SILK-only Opus packet out (one §4.2.2 SILK frame per 20 ms
+/// interval, with the intra-packet §4.2.7.4 / §4.2.7.6.1 carried state
+/// threaded across them and per-frame §4.2.3 VAD flags derived from
+/// the signal).
 #[derive(Debug, Clone)]
 pub struct SilkEncoderMono {
     channel: ChannelAnalyzer,
+    packet_tenths_ms: u16,
+    frames_per_packet: usize,
 }
 
 impl SilkEncoderMono {
-    /// Create an encoder for one SILK internal bandwidth (NB / MB /
-    /// WB; SWB / FB are rejected — SILK never codes them).
+    /// Create a 20 ms-packet encoder for one SILK internal bandwidth
+    /// (NB / MB / WB; SWB / FB are rejected — SILK never codes them).
     pub fn new(bandwidth: Bandwidth) -> Result<Self, Error> {
+        Self::with_packet_duration(bandwidth, 200)
+    }
+
+    /// Create an encoder emitting `packet_tenths_ms` (200 / 400 / 600 —
+    /// i.e. 20 / 40 / 60 ms) SILK-only packets: one analysed 20 ms SILK
+    /// frame per §4.2.2 time interval, packed into a single code-0 Opus
+    /// packet.
+    pub fn with_packet_duration(
+        bandwidth: Bandwidth,
+        packet_tenths_ms: u16,
+    ) -> Result<Self, Error> {
         Ok(Self {
             channel: ChannelAnalyzer::new(bandwidth)?,
+            packet_tenths_ms,
+            frames_per_packet: frames_per_packet(packet_tenths_ms)?,
         })
     }
 
-    /// Per-packet input length: 20 ms at the internal rate
-    /// (160 NB / 240 MB / 320 WB samples).
+    /// Per-packet input length: the packet duration at the internal
+    /// rate (20 ms = 160 NB / 240 MB / 320 WB samples, times the 1-3
+    /// SILK frames per packet).
     pub fn frame_samples(&self) -> usize {
-        subframe_samples(self.channel.bandwidth).unwrap_or(0) * 4
+        subframe_samples(self.channel.bandwidth).unwrap_or(0) * 4 * self.frames_per_packet
     }
 
     /// Reset all carried state (matches a §4.5.2 decoder reset).
@@ -415,19 +533,33 @@ impl SilkEncoderMono {
         self.channel.reset();
     }
 
-    /// Encode one 20 ms frame of mono internal-rate PCM into a
-    /// SILK-only Opus packet.
+    /// Encode one packet's worth (20 / 40 / 60 ms) of mono
+    /// internal-rate PCM into a SILK-only Opus packet.
     ///
     /// `pcm.len()` must equal [`Self::frame_samples`]; samples are
     /// nominally in `[-1.0, 1.0]`.
     pub fn encode_packet(&mut self, pcm: &[f32]) -> Result<EncodedSilkPacket, Error> {
         let bandwidth = self.channel.bandwidth;
-        let frame = self.channel.analyze_frame(pcm)?;
-        let (packet, _) = encode_silk_only_packet_mono(bandwidth, 200, &[frame.symbols()])?;
+        if pcm.len() != self.frame_samples() {
+            return Err(Error::MalformedPacket);
+        }
+        let flen = subframe_samples(bandwidth)? * 4;
+        let mut frames = Vec::with_capacity(self.frames_per_packet);
+        for (k, chunk) in pcm.chunks_exact(flen).enumerate() {
+            frames.push(self.channel.analyze_frame_at(chunk, k == 0)?);
+        }
+        let symbols: Vec<_> = frames.iter().map(AnalyzedFrame::symbols).collect();
+        let (packet, _) = encode_silk_only_packet_mono(bandwidth, self.packet_tenths_ms, &symbols)?;
+        let mut reconstructed = Vec::with_capacity(pcm.len());
+        let mut voiced = false;
+        for f in &frames {
+            reconstructed.extend_from_slice(&f.reconstructed);
+            voiced |= f.voiced;
+        }
         Ok(EncodedSilkPacket {
             packet,
-            reconstructed: frame.reconstructed,
-            voiced: frame.voiced,
+            reconstructed,
+            voiced,
         })
     }
 }
@@ -747,6 +879,114 @@ mod tests {
         let steady = &snrs[2..];
         let avg = steady.iter().sum::<f64>() / steady.len() as f64;
         assert!(avg > 10.0, "pulse-train tracking SNR too low: {avg:.1} dB");
+    }
+
+    /// 40 ms multi-frame packets (two §4.2.2 SILK frames per packet)
+    /// from PCM: the intra-packet delta-gain / relative-lag threading
+    /// must decode end-to-end on the real streaming decoder with the
+    /// §3 sample count and the input tone preserved.
+    #[test]
+    fn wb_sine_40ms_multiframe_roundtrips() {
+        let bw = Bandwidth::Wb;
+        let mut enc = SilkEncoderMono::with_packet_duration(bw, 400).unwrap();
+        let flen = enc.frame_samples();
+        assert_eq!(flen, 640); // 40 ms at 16 kHz
+        let fs = 16_000.0f64;
+        let f = 400.0f64;
+
+        let mut dec = OpusDecoder::new();
+        let mut decoded_48k: Vec<f64> = Vec::new();
+        for pkt_idx in 0..6 {
+            let pcm: Vec<f32> = (0..flen)
+                .map(|i| {
+                    let t = (pkt_idx * flen + i) as f64 / fs;
+                    (0.3 * (core::f64::consts::TAU * f * t).sin()) as f32
+                })
+                .collect();
+            let out = enc.encode_packet(&pcm).unwrap();
+            let audio = dec.decode_packet(&out.packet).unwrap();
+            assert_eq!(audio.channels, 1);
+            // §3.1: a 40 ms packet is 1920 samples at 48 kHz.
+            assert_eq!(audio.pcm.len(), 1920);
+            decoded_48k.extend(audio.pcm.iter().map(|&v| v as f64 / 32768.0));
+        }
+        let tail = &decoded_48k[decoded_48k.len() / 3..];
+        let (_, proj) = sine_projection(tail, f, 48_000.0);
+        assert!(proj > 10.0, "48 kHz sine projection SNR: {proj:.1} dB");
+    }
+
+    /// 60 ms multi-frame packets on a voiced pulse train: successive
+    /// voiced frames inside one packet exercise the §4.2.7.6.1
+    /// relative-lag coding; the packets must decode and track.
+    #[test]
+    fn mb_60ms_multiframe_voiced_pulse_train() {
+        let bw = Bandwidth::Mb;
+        let mut enc = SilkEncoderMono::with_packet_duration(bw, 600).unwrap();
+        let flen = enc.frame_samples();
+        assert_eq!(flen, 720); // 60 ms at 12 kHz
+        let period = 80usize; // 150 Hz at 12 kHz
+
+        let mut dec = OpusDecoder::new();
+        let mut any_voiced = false;
+        let mut snrs = Vec::new();
+        let mut lp = 0.0f64;
+        let mut sample_idx = 0usize;
+        for _pkt in 0..4 {
+            let pcm: Vec<f32> = (0..flen)
+                .map(|_| {
+                    let pulse = if sample_idx % period == 0 { 1.0 } else { 0.0 };
+                    lp = 0.75 * lp + 0.25 * pulse;
+                    sample_idx += 1;
+                    (0.5 * lp) as f32
+                })
+                .collect();
+            let out = enc.encode_packet(&pcm).unwrap();
+            any_voiced |= out.voiced;
+            snrs.push(snr_db(&pcm, &out.reconstructed));
+            let audio = dec.decode_packet(&out.packet).unwrap();
+            // §3.1: a 60 ms packet is 2880 samples at 48 kHz.
+            assert_eq!(audio.pcm.len(), 2880);
+        }
+        assert!(any_voiced, "pulse train never classified voiced");
+        let steady = &snrs[1..];
+        let avg = steady.iter().sum::<f64>() / steady.len() as f64;
+        assert!(avg > 8.0, "multi-frame tracking SNR too low: {avg:.1} dB");
+    }
+
+    /// The per-frame §4.2.3 VAD flags come from the signal: a 60 ms
+    /// packet whose middle 20 ms interval is silent must code that
+    /// frame INACTIVE (VAD bit clear) while the flanking tone frames
+    /// stay active — verified by decoding the packet's §4.2.3 header
+    /// bits directly.
+    #[test]
+    fn silent_interval_codes_inactive_vad_flag() {
+        use crate::range_decoder::RangeDecoder;
+        use crate::silk_header::SilkHeaderBits;
+
+        let bw = Bandwidth::Nb;
+        let mut enc = SilkEncoderMono::with_packet_duration(bw, 600).unwrap();
+        let flen20 = 160usize;
+        let mut pcm = vec![0.0f32; 3 * flen20];
+        for (k, slot) in pcm.iter_mut().enumerate() {
+            if k / flen20 != 1 {
+                *slot = 0.3 * ((k as f32) * 0.5).sin();
+            }
+        }
+        let out = enc.encode_packet(&pcm).unwrap();
+
+        // Parse the packet: TOC byte + one code-0 frame; the §4.2.3
+        // header VAD bits are the first symbols of the SILK payload.
+        let body = &out.packet[1..];
+        let mut rd = RangeDecoder::new(body);
+        let header = SilkHeaderBits::decode(&mut rd, 3, false).unwrap();
+        assert!(header.mid_vad(0), "tone interval 0 must be active");
+        assert!(!header.mid_vad(1), "silent interval 1 must be inactive");
+        assert!(header.mid_vad(2), "tone interval 2 must be active");
+
+        // And the packet still decodes to real PCM.
+        let mut dec = OpusDecoder::new();
+        let audio = dec.decode_packet(&out.packet).unwrap();
+        assert_eq!(audio.pcm.len(), 2880);
     }
 
     /// Loud → silence → loud transitions: the cross-packet §4.2.7.4

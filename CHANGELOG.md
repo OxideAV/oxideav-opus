@@ -4,6 +4,13 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- analysed SILK encoder: 40 / 60 ms multi-frame packets from PCM
+  (`SilkEncoderMono::with_packet_duration`) — one analysed 20 ms SILK frame
+  per §4.2.2 interval with the intra-packet carried state threaded like the
+  decoder's regular walk (delta-coded first gains, §4.2.7.6.1 relative lags
+  after a voiced frame, §4.2.7.6.3 scaling on the first frame only), plus
+  signal-derived per-frame §4.2.3 VAD flags (silent intervals code frame
+  type 0 / Inactive and skip the pitch search)
 - streaming decoder: carry the §4.2.7.4 gain-clamp base (`previous_log_gain`)
   and the §4.2.7.5.5 NLSF interpolation base `n0` across Opus frames — the
   independent first-subframe gain of a packet is now clamped against the
