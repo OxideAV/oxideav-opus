@@ -121,8 +121,20 @@ reparse, and `assemble_multistream_packet`, roundtripped against the
 splitter and decoded sample-identically through
 `MultistreamDecoder`). On top of it all now sits the **§5.2.3 SILK
 signal analysis** — `encode(pcm)` is real: `SilkEncoderMono` /
-`SilkEncoderStereo` derive every Table-5 symbol from 20 ms of
-internal-rate PCM per packet. The chain is Burg's-method LPC
+`SilkEncoderStereo` derive every Table-5 symbol from internal-rate
+PCM across the full SILK packet matrix — 10 / 20 / 40 / 60 ms
+packets (one 2-subframe frame, or one to three 20 ms frames with the
+intra-packet delta-gain / §4.2.7.6.1 relative-lag / §4.2.7.6.3
+scaling-presence threading of the decoder's regular walk), per-frame
+§4.2.3 VAD flags derived from the signal (silent intervals code
+frame type 0 and skip the pitch search), §4.2.5 **LBRR in-band FEC**
+from PCM (`set_fec(true)`: each packet re-encodes the previous
+packet's active intervals at a reduced rate from a pre-packet
+analyzer snapshot with a fresh closed-loop state, recovered
+end-to-end through `decode_packet_fec`), and §3.2.5 **CBR transport
+shaping** (`encode_packet_cbr` / `pad_packet_to`: exact-byte-size
+code-3 re-framing, every target size reachable, decode-identical).
+The chain is Burg's-method LPC
 (§5.2.3.4.2.1) → analysis-direction LPC→NLSF conversion (deflated
 line-spectral root search, verified as the exact inverse of the
 §4.2.7.5.6 fixed-point reconstruction) → exhaustive stage-1
@@ -154,10 +166,19 @@ the j = k+1 read (substituting 0), producing badly wrong LPC filters
 that burned up to 12 prediction-gain-limiter rounds on perfectly
 stable codebook vectors — now fixed and pinned by an analytic
 closed-form regression over all 64 NB/WB stage-1 codebook entries.
+Round 391 closed two more reconstruction-level streaming gaps: the
+§4.2.7.4 gain-clamp base (`previous_log_gain`) and the §4.2.7.5.5
+NLSF interpolation base `n0` now carry ACROSS Opus frames in the
+streaming `OpusDecoder` (both were previously re-armed per packet,
+so the first frame of every packet skipped the independent-gain
+clamp and ignored its coded `w_Q2`), cleared exactly on the RFC's
+reset events (§4.5.2 SILK reset, bandwidth change, uncoded side
+frame) and seeded from the LBRR reconstruction after FEC recovery
+under the §4.2.7.4 packet-loss latitude.
 
 The crate ships a large, individually unit-tested set of SILK and
 CELT building blocks plus a complete RFC 7845 multistream /
-multichannel decode subsystem (1340 lib tests + SILK-fixture,
+multichannel decode subsystem (1357 lib tests + SILK-fixture,
 multistream, FEC, and CELT synthesis-backend integration suites).
 Per-stage progress lives in `CHANGELOG.md`.
 
@@ -167,7 +188,8 @@ Per-stage progress lives in `CHANGELOG.md`.
 
 - `OpusDecoder::decode_packet` — the top-level packet → interleaved
   48 kHz PCM path: TOC parse, §3.2 frame split, §4.5 multi-frame loop,
-  per-mode routing, the §4.5.2 cross-packet SILK state reset, and the
+  per-mode routing, the §4.5.2 cross-packet SILK state reset, the
+  cross-packet §4.2.7.4 / §4.2.7.5.5 reconstruction carry, and the
   RFC 7845 §5.1 output sample-count layout. Mono SILK-only packets decode
   end-to-end to real PCM (bitstream → §4.2.7.9 synthesis → §4.2.9
   resample); other modes emit correct-length silence flagged via
