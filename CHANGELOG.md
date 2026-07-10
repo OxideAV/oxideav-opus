@@ -4,6 +4,19 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- FIX: `CeltEnergyState::new` initialised the §4.3.5 anti-collapse
+  energy references (`old_log_e` / `old_log_e2`) to zero; a fresh
+  stream (or a §4.5.2 reset) has no previous frame energy, so they
+  must start at the −28 log2 energy floor — with a zero init the
+  first transient frame after stream start / reset computed its
+  anti-collapse thresholds as if every band had held unit energy and
+  injected the wrong noise, and the error rang through the overlap /
+  post-filter / de-emphasis state for several frames. Found black-box:
+  low-rate CELT-only streams whose first frame is transient decoded at
+  ~30 dB startup SNR against the reference; with the floor init the
+  same streams reach >99 dB (a 16 kb/s 20 ms tone stream improves
+  53.4 → 106.7 dB whole-stream, a noise stream 45.4 → 99.1 dB), and
+  the staged fixture corpus is unchanged
 - **FIX (wire-format): the §3.2.5 code-3 frame-count byte was parsed
   and written bit-reversed.** RFC 6716 Figure 5 is MSB-first — `v`
   (VBR) is 0x80, `p` (padding) is 0x40, `M` is the low six bits — but

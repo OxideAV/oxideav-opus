@@ -110,14 +110,23 @@ impl Default for CeltEnergyState {
 }
 
 impl CeltEnergyState {
-    /// Fresh (stream-start / post-§4.5.2-reset) state: all-zero, as
-    /// the reference decoder's cleared state.
+    /// Fresh (stream-start / post-§4.5.2-reset) state: the coarse
+    /// energies (`old_band_e`) start at zero, while the §4.3.5
+    /// anti-collapse references (`old_log_e` / `old_log_e2`) start at
+    /// the [`ENERGY_FLOOR`] — a fresh stream has no "previous frame
+    /// energy", so the anti-collapse threshold must treat every band
+    /// as if it had been silent, not as if it had held unit energy.
+    /// Validated black-box: with a zero init the first transient
+    /// frame of a stream (and every transient frame after a reset)
+    /// injects the wrong anti-collapse noise and the startup frames
+    /// decode ~30 dB from the reference; with the floor init the same
+    /// streams decode at >99 dB.
     #[must_use]
     pub fn new() -> Self {
         Self {
             old_band_e: [[0.0; CELT_NUM_BANDS]; 2],
-            old_log_e: [[0.0; CELT_NUM_BANDS]; 2],
-            old_log_e2: [[0.0; CELT_NUM_BANDS]; 2],
+            old_log_e: [[ENERGY_FLOOR; CELT_NUM_BANDS]; 2],
+            old_log_e2: [[ENERGY_FLOOR; CELT_NUM_BANDS]; 2],
             rng: 0,
         }
     }
