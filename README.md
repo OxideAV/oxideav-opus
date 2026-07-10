@@ -56,18 +56,39 @@ with all cross-frame state carried and the §4.5.2 resets applied.
 Validated against the reference decodes of the fixture corpus:
 `celt-fb-stereo-128kbps` (20 ms FB stereo) and `celt-2.5ms-low-latency`
 reconstruct at **~88–108 dB SNR** — i16-quantization-level waveform
-agreement. **Hybrid packets decode end-to-end**
+agreement — and a 50+-stream black-box low-bitrate corpus (6–48 kb/s,
+2.5–20 ms, mono/stereo) decodes stationary content reference-exact
+(~100–109 dB; the remaining known seam is transient-heavy content at
+low rates, ~30–50 dB, under investigation — anti-collapse injection,
+the folding seed policy, and the §4.3.3 boost gate have all been
+black-box eliminated or fixed). **Hybrid packets decode end-to-end**
 (`FrameDecodeStatus::HybridDecoded`): the SILK layer (WB internal) and
 the CELT layer (bands 17–21) share one range coder with the §4.5.1
-redundancy side information decoded between them, and the 48 kHz
-outputs sum per §4.4 (energy parity with the reference decode on
-`hybrid-fb-mono-28kbps`; waveform-level hybrid conformance awaits a
-group-delay-matched SILK resampler and the redundant 5 ms frame's own
-synthesis + cross-lap at mode switches, which are the remaining §4.5
-refinements). The §4.4 packet-loss concealment is also outstanding
-(the RFC defines PLC as a non-normative decoder feature with no
-bitstream algorithm; lost / DTX frames currently emit the §4.6 silence
-floor).
+redundancy side information decoded between them (the main coder's
+buffer reduced per §4.5.1.3 so its raw bits read from the reduced
+end), and the 48 kHz outputs sum per §4.4 (energy parity with the
+reference decode on `hybrid-fb-mono-28kbps`; low-band waveform
+alignment awaits a group-delay-matched SILK resampler). The **§4.5
+transition machinery is in place**: the 5 ms redundant CELT frame is
+decoded like a CELT-only frame (own coder, no TOC, carrier channels /
+bandwidth with the MB→WB override) through the stream's single CELT
+state whose geometry adapts without dropping state, the §4.5.2 resets
+land where Figure 18 puts them (an end-position redundant frame takes
+the reset and warms the following CELT frames; a beginning-position
+one continues the previous state ahead of the deferred main-layer
+reset), and the §4.5.1.4 output stitching (first-2.5 ms-as-is +
+power-complementary cross-lap) is applied on both placements — the
+`mode-switching` fixture's Hybrid→CELT transition window decodes at
+~109 dB against the reference, and the CELT-only segment after the
+switch is reference-exact (~107 dB). **Packet-loss concealment
+(§4.4)** is implemented per the RFC's per-mode guidance
+(`OpusDecoder::conceal_loss`): LPC extrapolation (Burg fit +
+pitch-cyclic residual) after SILK-bearing frames, pitch-periodic
+waveform repetition after CELT-only frames, an energy-decay envelope
+across consecutive losses down to the silence floor, and a 2.5 ms
+extrapolation tail cross-lapped into the first packet decoded after
+the loss run; in-band FEC (`decode_packet_fec`) remains the preferred
+recovery when the next packet is available.
 
 The crate now also carries the start of the **encode side**: the
 bit-exact §5.1 range *encoder* (`RangeEncoder` — the §5.1.1 symbol

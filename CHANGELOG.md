@@ -4,6 +4,14 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- §4.5 mode-switching integration suite (`tests/mode_switching_decode.rs`)
+  on the embedded `mode-switching` fixture (Hybrid→CELT-only switch
+  with encoder-emitted §4.5.1 redundancy): whole-stream decode with
+  per-mode status assertions, Hybrid-segment energy parity, and
+  waveform-level thresholds on the transition window (~109 dB measured)
+  and the CELT-only segment (~107 dB) — a wrong §4.5.2 reset placement
+  or a skipped redundant frame desynchronizes the CELT segment's
+  inter-coded energy and fails the suite
 - FIX: `CeltEnergyState::new` initialised the §4.3.5 anti-collapse
   energy references (`old_log_e` / `old_log_e2`) to zero; a fresh
   stream (or a §4.5.2 reset) has no previous frame energy, so they
