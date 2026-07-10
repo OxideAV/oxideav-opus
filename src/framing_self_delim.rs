@@ -177,9 +177,11 @@ fn parse_sd_code3<'a>(
 ) -> Result<(Vec<&'a [u8]>, usize), Error> {
     let fc = *buffer.get(*cursor).ok_or(Error::MalformedPacket)?;
     *cursor += 1;
-    let v_bit = fc & 0x01 != 0;
-    let p_bit = fc & 0x02 != 0;
-    let m = fc >> 2;
+    // §3.2.5 Figure 5 (MSB-first): `v` = 0x80, `p` = 0x40, `M` = low
+    // six bits.
+    let v_bit = fc & 0x80 != 0;
+    let p_bit = fc & 0x40 != 0;
+    let m = fc & 0x3F;
     if m == 0 || m > MAX_FRAMES_PER_PACKET {
         return Err(Error::MalformedPacket);
     }
@@ -349,7 +351,7 @@ mod tests {
     fn code3_cbr_three_frames_no_padding() {
         // TOC code 3 + frame-count byte (M=3, v=0, p=0) + Appendix-B
         // per-frame length 2 + three 2-byte frames.
-        let fc = 3u8 << 2;
+        let fc = 3u8;
         let bytes = [
             toc_byte(0, false, 3),
             fc,
@@ -373,7 +375,7 @@ mod tests {
     #[test]
     fn code3_cbr_with_padding() {
         // M=2, p=1, padding-len=2 (one byte chain closing at 2).
-        let fc = (2u8 << 2) | 0b10;
+        let fc = 0x40 | 2u8;
         let bytes = [
             toc_byte(0, false, 3),
             fc,
@@ -402,7 +404,7 @@ mod tests {
     fn code3_vbr_three_frames() {
         // M=3, v=1, p=0. Inline §3.2.1 lengths for frames 1..M-1 = 2,
         // then Appendix-B length for frame M.
-        let fc = (3u8 << 2) | 0b01;
+        let fc = 0x80 | 3u8;
         let bytes = [
             toc_byte(0, false, 3),
             fc,
@@ -518,7 +520,7 @@ mod tests {
     fn code3_cbr_missing_padding_bytes() {
         // Declares 4 trailing padding bytes via the §3.2.5 chain but
         // body ends after the frame payloads.
-        let fc = (1u8 << 2) | 0b10;
+        let fc = 0x40 | 1u8;
         let bytes = [
             toc_byte(0, false, 3),
             fc,
@@ -533,7 +535,7 @@ mod tests {
     #[test]
     fn code3_padding_chain_runs_off_end() {
         // p_bit set, but no padding-length byte present.
-        let fc = (1u8 << 2) | 0b10;
+        let fc = 0x40 | 1u8;
         let bytes = [toc_byte(0, false, 3), fc];
         assert_eq!(parse_self_delimited(&bytes), Err(Error::MalformedPacket));
     }

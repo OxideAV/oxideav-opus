@@ -195,10 +195,13 @@ fn parse_code2(body: &[u8]) -> Result<(Vec<&[u8]>, usize), Error> {
 ///    `R = N - 2 - P` (R6: R must be a non-negative multiple of M).
 fn parse_code3(body: &[u8]) -> Result<(Vec<&[u8]>, usize), Error> {
     // R6/R7: a code-3 packet has at least the frame-count byte.
+    // §3.2.5 Figure 5 (RFC bit diagrams are MSB-first): bit 0 = `v`
+    // is the MSB (0x80), bit 1 = `p` is 0x40, and `M` is the low six
+    // bits.
     let fc = *body.first().ok_or(Error::MalformedPacket)?;
-    let v_bit = fc & 0x01 != 0;
-    let p_bit = fc & 0x02 != 0;
-    let m = fc >> 2;
+    let v_bit = fc & 0x80 != 0;
+    let p_bit = fc & 0x40 != 0;
+    let m = fc & 0x3F;
     if m == 0 || m > MAX_FRAMES_PER_PACKET {
         return Err(Error::MalformedPacket);
     }
@@ -456,11 +459,47 @@ mod tests {
 
     // ----- §3.2.5 Code 3 -----
 
+    /// §3.2.5 Figure 5 wire layout: RFC bit diagrams are MSB-first,
+    /// so `v` = 0x80, `p` = 0x40, and `M` occupies the LOW six bits.
+    /// This pins the layout against a reference-encoder-shaped CBR
+    /// packet (frame-count byte 0x41 = v:0 p:1 M:1, one padding-length
+    /// byte, 4 padding bytes) — a roundtrip test alone cannot catch a
+    /// writer and parser that agree on a *reversed* layout, which is
+    /// exactly the bug this test guards against (every code-3 CBR
+    /// packet from a real encoder was rejected as malformed).
+    #[test]
+    fn code3_frame_count_byte_wire_layout_matches_rfc_figure5() {
+        // TOC 0x4B: config 9 (SILK WB 20 ms), mono, code 3.
+        let mut pkt = vec![0x4Bu8, 0x41, 0x04];
+        pkt.extend_from_slice(&[0xAA; 53]);
+        pkt.extend_from_slice(&[0x00; 4]);
+        assert_eq!(pkt.len(), 60);
+        let parsed = OpusPacket::parse(&pkt).expect("real-encoder CBR padded packet");
+        assert_eq!(parsed.frame_count(), 1);
+        assert_eq!(parsed.frames()[0].len(), 53);
+        assert_eq!(parsed.padding, 4);
+
+        // The VBR flag is the MSB: 0x80 | M, with M-1 length bytes.
+        let vbr_pkt = [0x4Bu8, 0x80 | 2, 3, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let parsed = OpusPacket::parse(&vbr_pkt).expect("VBR M=2");
+        assert_eq!(parsed.frame_count(), 2);
+        assert_eq!(parsed.frames()[0], &[0x11, 0x22, 0x33]);
+        assert_eq!(parsed.frames()[1], &[0x44, 0x55]);
+
+        // A byte with the OLD (reversed) reading of "v=0 p=1 M=1"
+        // (0x06 = M:6 in the RFC layout) parses as M=6 CBR — not as a
+        // padded single-frame packet.
+        let old_layout = [0x4Bu8, 0x06, 1, 2, 3, 4, 5, 6];
+        let parsed = OpusPacket::parse(&old_layout).expect("M=6 CBR, R=6");
+        assert_eq!(parsed.frame_count(), 6);
+        assert_eq!(parsed.padding, 0);
+    }
+
     #[test]
     fn code3_cbr_no_padding() {
         // M = 3, vbr=0, p=0; three equal-size frames of 4 bytes each.
         let m: u8 = 3;
-        let fc = m << 2; // v=0 p=0
+        let fc = m; // v=0 p=0
         let mut packet = vec![toc(15, false, 3), fc];
         packet.extend_from_slice(&[0xA1, 0xA2, 0xA3, 0xA4]);
         packet.extend_from_slice(&[0xB1, 0xB2, 0xB3, 0xB4]);
@@ -487,7 +526,7 @@ mod tests {
         // M = 2, p=1, v=0, padding chain = single byte "5" -> 5 trailing
         // zero bytes. Then 2 frames of 3 bytes each.
         let m: u8 = 2;
-        let fc = (m << 2) | 0b10; // p=1, v=0
+        let fc = 0x40 | m; // p=1, v=0
         let mut packet = vec![toc(15, false, 3), fc, 5];
         packet.extend_from_slice(&[0xD1, 0xD2, 0xD3]);
         packet.extend_from_slice(&[0xE1, 0xE2, 0xE3]);
@@ -504,7 +543,7 @@ mod tests {
         // M = 3, v=1, p=0. M-1 = 2 length sequences then last-frame
         // is implicit. Frame sizes: 2, 4, 1.
         let m: u8 = 3;
-        let fc = (m << 2) | 0b01;
+        let fc = 0x80 | m;
         let mut packet = vec![toc(15, false, 3), fc, 2, 4];
         packet.extend_from_slice(&[0xA1, 0xA2]);
         packet.extend_from_slice(&[0xB1, 0xB2, 0xB3, 0xB4]);
@@ -527,7 +566,7 @@ mod tests {
         //                      + 68 + 7 pad = 1 + 1 + 3 + 310 + 7 = 322.
         // Total packet = 323 bytes.
         let m: u8 = 4;
-        let fc = (m << 2) | 0b11; // p=1, v=1
+        let fc = 0xC0 | m; // p=1, v=1
         let pad_len = 7u8;
         let sizes = [99u8, 77, 66, 68];
         let mut packet = vec![toc(15, false, 3), fc, pad_len];
@@ -556,7 +595,7 @@ mod tests {
         // demands another length byte. Verify that "255, 3" => 257
         // padding bytes (254 + 3).
         let m: u8 = 1;
-        let fc = (m << 2) | 0b10; // p=1, v=0
+        let fc = 0x40 | m; // p=1, v=0
         let mut packet = vec![toc(15, false, 3), fc, 255, 3];
         // Frame body: any non-padding payload. 4 bytes is fine.
         packet.extend_from_slice(&[0xF1, 0xF2, 0xF3, 0xF4]);
@@ -586,7 +625,7 @@ mod tests {
     fn code3_rejects_padding_overrunning_body() {
         // M = 1, p=1, padding declared as 200 but only 5 bytes of
         // payload follow.
-        let fc = (1 << 2) | 0b10;
+        let fc = 0x40 | 1;
         let mut packet = vec![toc(15, false, 3), fc, 200];
         packet.extend_from_slice(&[0; 5]);
         assert_eq!(OpusPacket::parse(&packet), Err(Error::MalformedPacket));
@@ -595,7 +634,7 @@ mod tests {
     #[test]
     fn code3_vbr_rejects_lengths_exceeding_remaining() {
         // M = 3, v=1, lengths 100, 100 but only 50 bytes remain.
-        let fc = (3 << 2) | 0b01;
+        let fc = 0x80 | 3;
         let mut packet = vec![toc(15, false, 3), fc, 100, 100];
         packet.extend_from_slice(&[0; 50]);
         assert_eq!(OpusPacket::parse(&packet), Err(Error::MalformedPacket));
@@ -613,7 +652,7 @@ mod tests {
         // M = 48 (cap per R5 at 2.5 ms frames), v=1, p=0.
         // Each frame size = 1 byte; 47 declared + 1 implicit.
         let m: u8 = MAX_FRAMES_PER_PACKET;
-        let fc = (m << 2) | 0b01;
+        let fc = 0x80 | m;
         let mut packet = vec![toc(16, false, 3), fc];
         packet.extend(std::iter::repeat(1u8).take(47)); // 47 declared lengths of 1
         packet.extend(std::iter::repeat(0xCC).take(48));

@@ -194,7 +194,7 @@ fn r5_code3_frame_count_zero_rejected() {
     // M = 1..=48 with CBR R=0 (body of just the frame-count byte +
     // zero frames of zero bytes each ⇒ R=0, R%M=0, accepted).
     for m in 1u8..=MAX_FRAMES_PER_PACKET {
-        let p = [3u8, m << 2]; // v=0, p=0, M=m
+        let p = [3u8, m]; // v=0, p=0, M=m
         let parsed = OpusPacket::parse(&p)
             .unwrap_or_else(|e| panic!("R5: M={m} should be accepted (got {e})"));
         assert_eq!(parsed.frames().len(), m as usize);
@@ -211,13 +211,13 @@ fn r5_code3_frame_count_zero_rejected() {
 /// 7 frame-data bytes ⇒ R = 7, R % 3 = 1 ⇒ R6 violation.
 #[test]
 fn r6_code3_cbr_r_not_multiple_of_m_rejected() {
-    // TOC = 3 (c=3), frame-count byte: v=0, p=0, M=3 ⇒ 0x0C.
-    let mut p = vec![3u8, 0x0C];
+    // TOC = 3 (c=3), frame-count byte: v=0, p=0, M=3 ⇒ 0x03.
+    let mut p = vec![3u8, 0x03];
     p.extend_from_slice(&[0u8; 7]);
     assert!(OpusPacket::parse(&p).is_err(), "R6: R=7, M=3, 7%3=1");
 
     // Same setup with R=6 ⇒ R%M=0 ⇒ accepted, two bytes per frame.
-    let mut p = vec![3u8, 0x0C];
+    let mut p = vec![3u8, 0x03];
     p.extend_from_slice(&[0u8; 6]);
     let parsed = OpusPacket::parse(&p).expect("R6 boundary accept");
     assert_eq!(parsed.frames().len(), 3);
@@ -236,9 +236,9 @@ fn r6_code3_cbr_r_not_multiple_of_m_rejected() {
 /// ⇒ R7 violation.
 #[test]
 fn r7_code3_vbr_declared_length_overruns_remaining() {
-    // TOC=3 (c=3), frame-count byte: v=1, p=0, M=2 ⇒ 0x09.
+    // TOC=3 (c=3), frame-count byte: v=1, p=0, M=2 ⇒ 0x82.
     // First-frame length byte: 50.
-    let mut p = vec![3u8, 0x09, 50u8];
+    let mut p = vec![3u8, 0x82, 50u8];
     p.extend_from_slice(&[0u8; 10]);
     assert!(
         OpusPacket::parse(&p).is_err(),
@@ -248,7 +248,7 @@ fn r7_code3_vbr_declared_length_overruns_remaining() {
     // R7 boundary: declared length 5 with body of TOC + framecount +
     // length(=5) + 5+10 bytes ⇒ first frame 5 bytes, last frame 10
     // bytes ⇒ accepted.
-    let mut p = vec![3u8, 0x09, 5u8];
+    let mut p = vec![3u8, 0x82, 5u8];
     p.extend_from_slice(&[0u8; 15]);
     let parsed = OpusPacket::parse(&p).expect("R7 boundary accept");
     assert_eq!(parsed.frames().len(), 2);
@@ -261,17 +261,17 @@ fn r7_code3_vbr_declared_length_overruns_remaining() {
 /// must be rejected (the chain reading hits end-of-buffer).
 #[test]
 fn code3_padding_chain_truncation_rejected() {
-    // TOC=3, frame-count byte v=0 p=1 M=1 ⇒ 0x06. Padding chain
+    // TOC=3, frame-count byte v=0 p=1 M=1 ⇒ 0x41. Padding chain
     // declares 100 bytes, but no body follows ⇒ R6/R7 violation
     // (the padding chain byte is missing entirely).
-    let p = [3u8, 0x06];
+    let p = [3u8, 0x41];
     assert!(
         OpusPacket::parse(&p).is_err(),
         "padding length byte missing"
     );
 
     // Pad chain says "200 bytes of padding" but body has only 5.
-    let mut p = vec![3u8, 0x06, 200u8];
+    let mut p = vec![3u8, 0x41, 200u8];
     p.extend_from_slice(&[0u8; 5]);
     assert!(OpusPacket::parse(&p).is_err(), "padding > remaining");
 }
@@ -281,10 +281,10 @@ fn code3_padding_chain_truncation_rejected() {
 /// end-of-buffer).
 #[test]
 fn code3_padding_chain_255_unterminated_rejected() {
-    // TOC=3, fc=0x06 (v=0, p=1, M=1). Then three 255 padding bytes,
+    // TOC=3, fc=0x41 (v=0, p=1, M=1). Then three 255 padding bytes,
     // each extending the chain by 254 + demanding another byte — but
     // the buffer ends.
-    let p = [3u8, 0x06, 255, 255, 255];
+    let p = [3u8, 0x41, 255, 255, 255];
     assert!(OpusPacket::parse(&p).is_err(), "255-chain runs off end");
 }
 
@@ -456,9 +456,9 @@ fn silk_header_60ms_lbrr_bitmap_never_zero_when_global_set() {
 fn code3_minimal_two_byte_packet_sweep_no_panic() {
     for fc in 0u8..=255 {
         let p = [3u8, fc];
-        let v = fc & 0x01 != 0;
-        let pp = fc & 0x02 != 0;
-        let m = fc >> 2;
+        let v = fc & 0x80 != 0;
+        let pp = fc & 0x40 != 0;
+        let m = fc & 0x3F;
         let result = OpusPacket::parse(&p);
         // Acceptance precondition: M in 1..=48 per R5 (the §3.2.5
         // frame-count field is 6 bits ⇒ 0..=63 raw, but values
@@ -491,7 +491,7 @@ fn code3_minimal_two_byte_packet_sweep_no_panic() {
 /// consulting the actual payload bytes.
 #[test]
 fn r2_code3_vbr_declared_length_capped_at_max_frame_bytes() {
-    // c=3, fc: v=1, p=0, M=2 ⇒ 0x09. Declared first-frame length =
+    // c=3, fc: v=1, p=0, M=2 ⇒ 0x82. Declared first-frame length =
     // 1276 (two-byte §3.2.1 sequence: 252 + 256*4 = 1276 → encode
     // as first=252, second=(1276-252)/4=256... — too large for a
     // single byte). 1276 = 252 + 256*4. (1276 - 252)/4 = 256, but
@@ -502,7 +502,7 @@ fn r2_code3_vbr_declared_length_capped_at_max_frame_bytes() {
     // (boundary). To probe R2 strictly we need a constructible
     // length > 1275 — which isn't expressible in the §3.2.1
     // encoding. Confirm 1275 is acceptable as the boundary.
-    let mut p = vec![3u8, 0x09, 255u8, 255u8];
+    let mut p = vec![3u8, 0x82, 255u8, 255u8];
     p.extend_from_slice(&[0u8; 1275 + 5]); // 1275 first + 5 second
     let parsed = OpusPacket::parse(&p).expect("R2 boundary code 3 VBR");
     assert_eq!(parsed.frames().len(), 2);
@@ -544,7 +544,7 @@ fn parse_short_packet_sweep_never_panics() {
 fn parsed_frames_borrow_inside_packet_bounds() {
     // A code-3 VBR packet with M=3, no padding, declared lengths
     // (4, 5), final-frame length implicit.
-    let mut p = vec![3u8, (3 << 2) | 0x01, 4u8, 5u8];
+    let mut p = vec![3u8, 0x80 | 3, 4u8, 5u8];
     p.extend_from_slice(&[0xAAu8; 4]); // frame 0
     p.extend_from_slice(&[0xBBu8; 5]); // frame 1
     p.extend_from_slice(&[0xCCu8; 6]); // frame 2 (implicit length 6)

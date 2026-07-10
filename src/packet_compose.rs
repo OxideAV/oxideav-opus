@@ -164,7 +164,7 @@ pub fn compose_packet_code3(
     let m = frames.len();
     let mut out = Vec::new();
     out.push(toc_byte);
-    out.push(((m as u8) << 2) | (u8::from(padding > 0) << 1) | u8::from(vbr));
+    out.push((u8::from(vbr) << 7) | (u8::from(padding > 0) << 6) | (m as u8));
     if padding > 0 {
         write_padding_chain(padding, &mut out);
     }
@@ -242,7 +242,7 @@ pub fn pad_packet_to(packet: &[u8], target_len: usize) -> Result<Vec<u8>, Error>
     let mut out = Vec::with_capacity(target_len);
     out.push(toc3);
     // Count byte: M = 1, p = 1 (padding present), v = 0 (CBR).
-    out.push((1u8 << 2) | (1 << 1));
+    out.push(0x40 | 1u8);
     // c-1 continuation bytes (255 = 254 padding bytes + chain
     // continues), then the terminal byte.
     out.resize(out.len() + (c - 1), 255);
@@ -302,7 +302,7 @@ pub fn compose_self_delimited(
                 return Err(Error::MalformedPacket);
             }
             let m = frames.len();
-            out.push(((m as u8) << 2) | (u8::from(padding > 0) << 1) | u8::from(vbr));
+            out.push((u8::from(vbr) << 7) | (u8::from(padding > 0) << 6) | (m as u8));
             if padding > 0 {
                 write_padding_chain(padding, &mut out);
             }
@@ -332,6 +332,31 @@ mod tests {
     use crate::frames::{decode_length, OpusPacket};
     use crate::framing_self_delim::parse_self_delimited;
     use crate::toc::{Bandwidth, Mode};
+
+    /// §3.2.5 Figure 5 wire layout on the WRITE side: the frame-count
+    /// byte carries `v` in the MSB (0x80), `p` at 0x40, and `M` in the
+    /// low six bits. Roundtrips through our own parser cannot catch a
+    /// consistently reversed layout, so the emitted byte is pinned
+    /// literally here.
+    #[test]
+    fn code3_frame_count_byte_emitted_msb_first() {
+        // TOC 0x4B = config 9 (SILK WB 20 ms), mono, code 3.
+        let f1: &[u8] = &[0xAA; 4];
+        let f2: &[u8] = &[0xBB; 4];
+
+        // CBR, no padding: fc = M.
+        let pkt = compose_packet_code3(0x4B, &[f1, f2], false, 0).unwrap();
+        assert_eq!(pkt[1], 2, "CBR no-padding fc byte");
+
+        // CBR with padding: fc = 0x40 | M.
+        let pkt = compose_packet_code3(0x4B, &[f1, f2], false, 3).unwrap();
+        assert_eq!(pkt[1], 0x40 | 2, "CBR padded fc byte");
+        assert_eq!(pkt[2], 3, "padding-length byte");
+
+        // VBR: fc = 0x80 | M.
+        let pkt = compose_packet_code3(0x4B, &[f1, f2], true, 0).unwrap();
+        assert_eq!(pkt[1], 0x80 | 2, "VBR fc byte");
+    }
 
     /// A tiny deterministic LCG.
     struct Lcg(u64);
