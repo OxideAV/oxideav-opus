@@ -623,7 +623,7 @@
 //!   consume this primitive; both run at the consumer site.
 //!
 //! * The §4.3.4.1 *Bits-to-Pulses* pulse-cost cache
-//!   ([`celt_pulse_cache`]: the 105-entry [`CACHE_INDEX50`] band-major
+//!   ([`celt_pulse_cache`]: the 105-entry [`CACHE_INDEX50`] LM-major
 //!   `(band, LM)` → offset map + the 392-byte run-packed
 //!   [`CACHE_BITS50`] cost curves, [`bits_to_pulses`]`(band, lm,
 //!   b_target) -> Result<u8, PulseCacheError>` returning the largest

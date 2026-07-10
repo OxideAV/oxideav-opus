@@ -4,6 +4,15 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- FIX: `celt_pulse_cache` indexed the §4.3.4.1 cost cache band-major
+  (`band * 5 + LM`); the 105-entry index is LM-major
+  (`(LM + 1) * 21 + band`, five rows of 21 bands — pulse-cache format
+  trace §2.1, corrected). Every non-trivial `(band, LM)` lookup
+  resolved to the wrong run. Accessors now use the LM-major mapping and
+  a data-internal test pins the trace-§2.3 property that each of the 23
+  runs serves exactly one effective band size `N`
+- `RangeDecoder::range_size()`: read-only accessor for the §4.1 range
+  state `rng`, the carried folding-noise LCG seed of the CELT layer
 - analysed 10 ms packets: `with_packet_duration(bw, 100)` on both encoders
   emits one 2-subframe SILK frame per packet (§4.2.7.5.5 factor not
   stored), completing the encoder's SILK frame-size matrix (10/20/40/60 ms

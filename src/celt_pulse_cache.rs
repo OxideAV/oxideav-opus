@@ -40,19 +40,24 @@
 //! `LM = log2(frame_size / 120)`, with `LM ∈ 0..=4` covering the
 //! 2.5 / 5 / 10 / 20 ms frames plus the short-block transient variant.
 //! There are `21 × 5 = 105` distinct `(band, LM)` tuples, which is
-//! exactly the length of [`CACHE_INDEX50`]. The tuple maps to the flat
-//! index in **band-major** order:
+//! exactly the length of [`CACHE_INDEX50`]. The five LM rows cover the
+//! *split levels* `LM ∈ -1..=3`, stored at row `LM + 1` (row 0 is the
+//! `LM = -1` level reached by the §4.3.4.4 band splitting; rows 1–4
+//! are the 2.5 / 5 / 10 / 20 ms whole-band levels). The tuple maps to
+//! the flat index in **LM-major** order (5 rows of 21 bands — the
+//! corrected §2.1 mapping of the staged pulse-cache format trace):
 //!
 //! ```text
-//! i      = band * CACHE_LM_COUNT + LM
+//! i      = lm_row * CELT_NUM_BANDS + band      (lm_row = LM + 1)
 //! offset = CACHE_INDEX50[i]
 //! ```
 //!
 //! A `-1` offset is a sentinel ([`CACHE_INDEX_SENTINEL`]) meaning the
-//! `(band, LM)` has no cached cost curve — the band is a single
-//! coefficient (no pulse packing) or small enough that the allocator
-//! uses a direct formula. The eight sentinels are band 0 at all five
-//! LM values plus band 1 at `LM ∈ {0, 1, 2}`.
+//! `(band, LM)` has no cached cost curve — its effective `N` is zero
+//! (never reached by the allocator). The eight sentinels are bands
+//! 0–7 of row 0 (the `LM = -1` split level, where the one-bin bands
+//! halve to nothing). Under this mapping each of the 23 distinct runs
+//! serves exactly one effective band size `N` (trace §2.3).
 //!
 //! ## Run format
 //!
@@ -94,9 +99,9 @@
 //!
 //! Narrative: RFC 6716 §4.3.4 / §4.3.4.1 (*Bits to Pulses*) in
 //! `docs/audio/opus/rfc6716-opus.txt`, plus the run-format trace
-//! `docs/audio/opus/pulse-cache-format-trace.md` (the band-major
-//! indexing rule, run packing, sentinel pattern, and qbits → bits
-//! conversion). Numeric tables: the 105-entry `cache_index50` and
+//! `docs/audio/opus/pulse-cache-format-trace.md` (the corrected §2.1
+//! LM-major indexing rule, run packing, sentinel pattern, and
+//! qbits → bits conversion). Numeric tables: the 105-entry `cache_index50` and
 //! 392-byte `cache_bits50` sequences from
 //! `docs/audio/opus/tables/cache-index50.csv` and
 //! `docs/audio/opus/tables/cache-bits50.csv` (see the `.meta`
@@ -128,13 +133,15 @@ pub const CACHE_INDEX_SENTINEL: i16 = -1;
 /// largest runs cap at 40).
 pub const CACHE_MAX_PULSES: u8 = 40;
 
-/// §4.3.4.1 `cache_index50`: maps the band-major `(band, LM)` flat
+/// §4.3.4.1 `cache_index50`: maps the LM-major `(lm_row, band)` flat
 /// index to a byte offset into [`CACHE_BITS50`], or
 /// [`CACHE_INDEX_SENTINEL`].
 ///
-/// Layout: `i = band * CACHE_LM_COUNT + LM`, band-major, so the first
-/// five entries are band 0 at `LM = 0..=4`. The eight `-1` entries are
-/// band 0 (all LM) plus band 1 (`LM ∈ {0, 1, 2}`).
+/// Layout: `i = lm_row * CELT_NUM_BANDS + band` with `lm_row = LM + 1`
+/// — five rows of 21 bands (the corrected §2.1 mapping of the staged
+/// pulse-cache format trace). The first 21 entries are the `LM = -1`
+/// split-level row; its eight `-1` sentinels are bands 0–7 (one-bin
+/// bands whose `LM = -1` half is empty).
 ///
 /// Numeric facts from `docs/audio/opus/tables/cache-index50.csv`.
 pub static CACHE_INDEX50: [i16; CACHE_INDEX_LEN] = [
@@ -193,8 +200,13 @@ pub enum PulseCacheError {
     PulseCountOutOfRange { k: u8, max_k: u8 },
 }
 
-/// Resolve the band-major `(band, LM)` flat index into [`CACHE_INDEX50`]
-/// (RFC 6716 §4.3.4.1; run-format trace §2).
+/// Resolve the LM-major `(band, lm_row)` flat index into
+/// [`CACHE_INDEX50`] (RFC 6716 §4.3.4.1; run-format trace §2.1,
+/// corrected mapping).
+///
+/// `lm` here is the **row index** `LM + 1 ∈ 0..5` (row 0 is the
+/// `LM = -1` split level; rows 1–4 the whole-band 2.5/5/10/20 ms
+/// levels).
 ///
 /// Returns [`PulseCacheError::BandOutOfRange`] / `LmOutOfRange` for
 /// out-of-range inputs.
@@ -205,7 +217,7 @@ pub const fn cache_flat_index(band: usize, lm: usize) -> Result<usize, PulseCach
     if lm >= CACHE_LM_COUNT {
         return Err(PulseCacheError::LmOutOfRange { lm });
     }
-    Ok(band * CACHE_LM_COUNT + lm)
+    Ok(lm * CELT_NUM_BANDS + band)
 }
 
 /// Return the [`CACHE_BITS50`] byte offset for a `(band, LM)` tuple, or
@@ -303,29 +315,67 @@ mod tests {
     }
 
     #[test]
-    fn exactly_eight_sentinels_in_bands_zero_and_one() {
+    fn exactly_eight_sentinels_in_row_zero_bands_zero_through_seven() {
         let sentinels: Vec<usize> = (0..CACHE_INDEX_LEN)
             .filter(|&i| CACHE_INDEX50[i] == CACHE_INDEX_SENTINEL)
             .collect();
         assert_eq!(sentinels.len(), 8);
-        // Band 0 at all five LM = flat indices 0..=4; band 1 at
-        // LM 0,1,2 = flat indices 5,6,7.
+        // LM-major layout (trace §2.1): flat indices 0..=7 are row 0
+        // (the LM = -1 split level), bands 0..=7 — the one-bin bands
+        // whose halved width is empty.
         assert_eq!(sentinels, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        for band in 0..8 {
+            assert_eq!(cache_flat_index(band, 0), Ok(band));
+        }
     }
 
     #[test]
     fn sentinel_lookup_returns_sentinel_error() {
-        // Band 0, LM 0 is a sentinel.
+        // Row 0 (LM = -1), bands 0..=7 are the sentinels.
         assert_eq!(
             cache_run_offset(0, 0),
             Err(PulseCacheError::SentinelTuple { band: 0, lm: 0 })
         );
-        // Band 1, LM 2 is a sentinel; LM 3 is the first non-sentinel.
         assert_eq!(
-            cache_run_offset(1, 2),
-            Err(PulseCacheError::SentinelTuple { band: 1, lm: 2 })
+            cache_run_offset(7, 0),
+            Err(PulseCacheError::SentinelTuple { band: 7, lm: 0 })
         );
-        assert_eq!(cache_run_offset(1, 3), Ok(0));
+        // Band 8 of row 0 (width-2 band halved to N = 1) is the first
+        // non-sentinel and points at the flat N = 1 run.
+        assert_eq!(cache_run_offset(8, 0), Ok(0));
+        // Band 1 at whole-band rows is never a sentinel; at row 3
+        // (LM = 2) it uses the run at offset 123.
+        assert_eq!(cache_run_offset(1, 3), Ok(123));
+    }
+
+    #[test]
+    fn each_run_serves_exactly_one_effective_band_size() {
+        // Trace §2.3 data-internal check: with the LM-major mapping,
+        // every distinct run offset corresponds to exactly one
+        // effective size N = (width << lm_row) >> 1, and the sentinel
+        // appears exactly when N = 0.
+        use crate::celt_band_layout::{celt_band_bins_per_channel, CeltFrameSize};
+        use std::collections::HashMap;
+        let mut n_for_offset: HashMap<usize, usize> = HashMap::new();
+        for lm_row in 0..CACHE_LM_COUNT {
+            for band in 0..CELT_NUM_BANDS {
+                let width =
+                    celt_band_bins_per_channel(band, CeltFrameSize::Ms2_5).unwrap() as usize;
+                let n = (width << lm_row) >> 1;
+                let flat = cache_flat_index(band, lm_row).unwrap();
+                let off = CACHE_INDEX50[flat];
+                if n == 0 {
+                    assert_eq!(off, CACHE_INDEX_SENTINEL, "band {band} row {lm_row}");
+                } else {
+                    assert_ne!(off, CACHE_INDEX_SENTINEL, "band {band} row {lm_row}");
+                    let prev = n_for_offset.insert(off as usize, n);
+                    if let Some(prev_n) = prev {
+                        assert_eq!(prev_n, n, "offset {off} serves two sizes");
+                    }
+                }
+            }
+        }
+        assert_eq!(n_for_offset.len(), 23);
     }
 
     #[test]
@@ -405,10 +455,11 @@ mod tests {
 
     #[test]
     fn first_run_is_flat_seven() {
-        // Run at offset 0 (band 1 / LM 3): maxK = 40, qbits[1..=40] = 7.
-        assert_eq!(cache_max_pulses(1, 3), Ok(40));
+        // Run at offset 0 (the N = 1 profile; e.g. band 0 at row 1,
+        // LM = 0): maxK = 40, qbits[1..=40] = 7.
+        assert_eq!(cache_max_pulses(0, 1), Ok(40));
         for k in 1..=40u8 {
-            assert_eq!(cache_pulse_cost(1, 3, k), Ok(7));
+            assert_eq!(cache_pulse_cost(0, 1, k), Ok(7));
         }
     }
 
@@ -416,11 +467,11 @@ mod tests {
     fn pulse_cost_rejects_zero_and_overflow_k() {
         // Run at offset 0 has maxK = 40.
         assert_eq!(
-            cache_pulse_cost(1, 3, 0),
+            cache_pulse_cost(0, 1, 0),
             Err(PulseCacheError::PulseCountOutOfRange { k: 0, max_k: 40 })
         );
         assert_eq!(
-            cache_pulse_cost(1, 3, 41),
+            cache_pulse_cost(0, 1, 41),
             Err(PulseCacheError::PulseCountOutOfRange { k: 41, max_k: 40 })
         );
     }
@@ -428,14 +479,15 @@ mod tests {
     #[test]
     fn bits_to_pulses_flat_run_fits_all_at_budget_seven() {
         // Flat run (qbits all 7): a budget of 7 fits all 40 pulses.
-        assert_eq!(bits_to_pulses(1, 3, 7), Ok(40));
+        assert_eq!(bits_to_pulses(0, 1, 7), Ok(40));
         // A budget of 6 fits none (every cost is 7 > 6).
-        assert_eq!(bits_to_pulses(1, 3, 6), Ok(0));
+        assert_eq!(bits_to_pulses(0, 1, 6), Ok(0));
     }
 
     #[test]
     fn bits_to_pulses_picks_exact_threshold() {
-        // Run at offset 41 (band 2 / LM 2): qbits[1]=15, qbits[2]=23,
+        // Run at offset 41 (the N = 2 profile; band 2 at row 2, LM =
+        // 1): qbits[1]=15, qbits[2]=23,
         // qbits[3]=28, ... A budget of 23 should fit exactly K=2.
         assert_eq!(cache_pulse_cost(2, 2, 1), Ok(15));
         assert_eq!(cache_pulse_cost(2, 2, 2), Ok(23));
@@ -491,8 +543,8 @@ mod tests {
 
     #[test]
     fn last_run_at_offset_387_has_max_k_four() {
-        // Run at offset 387 (band 20 / LM 4): maxK = 4, qbits =
-        // [67, 127, 182, 234].
+        // Run at offset 387 (band 20 at row 4, LM = 3): maxK = 4,
+        // qbits = [67, 127, 182, 234].
         assert_eq!(cache_run_offset(20, 4), Ok(387));
         assert_eq!(cache_max_pulses(20, 4), Ok(4));
         assert_eq!(cache_pulse_cost(20, 4, 1), Ok(67));

@@ -123,6 +123,17 @@ impl<'a> RangeDecoder<'a> {
         self.error
     }
 
+    /// The current §4.1 range size `rng`.
+    ///
+    /// The CELT layer captures this value at the end of each frame and
+    /// carries it as the seed of the §4.3.4 / §4.3.5 folding-noise LCG
+    /// for the *next* frame (the carried `rng` decoder state). It is a
+    /// read-only observation of the coder state; no symbol is consumed.
+    #[must_use]
+    pub fn range_size(&self) -> u32 {
+        self.rng
+    }
+
     /// Current whole-bit budget consumed by the range coder plus the
     /// raw-bit reader, per RFC 6716 §4.1.6.1.
     ///
