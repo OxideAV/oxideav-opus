@@ -4,6 +4,16 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- FIX: `celt_frame_prefix` decoded the §4.3.7.1 post-filter octave as
+  `ec_dec_uint(7)` (values 0..=6); Table 56 codes it `uniform (6)`, i.e.
+  `ec_dec_uint(6)` over 0..=5 — the §4.3.7.1 period bound ("between 15
+  and 1022, inclusively") only holds for octave <= 5. Any caller
+  decoding a post-filter-enabled frame through this helper consumed the
+  wrong interval and desynchronized every following symbol (the live
+  frame-decode path already read the correct 6-value symbol; the helper
+  is the exported API surface). The octave sweep test now pins the
+  0..=5 range, the reachability of octave 5, and the §4.3.7.1 period
+  bound across the whole sweep
 - FIX: `celt_pulse_cache` indexed the §4.3.4.1 cost cache band-major
   (`band * 5 + LM`); the 105-entry index is LM-major
   (`(LM + 1) * 21 + band`, five rows of 21 bands — pulse-cache format
