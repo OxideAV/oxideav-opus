@@ -90,17 +90,41 @@
 //! after the first boost bit (the §4.3.3 "subsequent boosts in a band
 //! cost only a single bit" rule).
 //!
-//! ## §4.3.3 budget conservation
+//! ## §4.3.3 budget gate — the shrinking-budget reading
 //!
-//! The §4.3.3 inner-loop gate is `dynalloc_loop_logp + tell <
-//! total_bits + total_boost`. Each boost step does `total_boost +=
-//! quanta; total_bits -= quanta`, so the sum `total_bits + total_boost`
-//! is conserved across boost steps and equals the original frame
-//! budget in 1/8 bits throughout the entire §4.3.3 boost procedure.
-//! The §4.3.3 procedure thus tracks two quantities — `total_bits` (the
-//! capacity still available for non-boost allocation) and
-//! `total_boost` (the §4.3.3 accumulator consumed by the downstream
-//! §4.3.3 allocation-trim gate) — whose *sum* is fixed.
+//! The §4.3.3 inner-loop gate is
+//!
+//! ```text
+//!     tell + dynalloc_loop_logp*8  <  total_bits      (1/8-bit units)
+//! ```
+//!
+//! where `total_bits` **shrinks** by `quanta` on every boost step
+//! (`total_boost` grows by the same amount): each committed boost
+//! promises the band `quanta` extra 1/8 bits of shape allocation out
+//! of the same frame, so the room left for coding further boost
+//! symbols is the frame budget *minus* the boosts committed so far.
+//!
+//! The §4.3.3 gate sentence as literally printed ("dynalloc_loop_logp
+//! in 8th bits plus tell is less than total_bits plus total_boost")
+//! is self-neutralizing under the section's own updates ("add quanta
+//! to … total_boost, subtract quanta from total_bits" keeps the sum
+//! constant), which would make both updates vacuous inside the loop
+//! and reduce the gate to the raw frame size. Three independent
+//! grounds resolve the gate to the shrinking-budget form implemented
+//! here:
+//!
+//! 1. the section's stated intent — boosts are "subject to the frame
+//!    actually having enough room to obey the boost and having enough
+//!    room to code the boost symbol" (a raw-frame gate checks only the
+//!    symbol, never the room to obey);
+//! 2. the immediately following §4.3.3 trim gate, which is normatively
+//!    "the total frame size in 8th bits **minus total_boost**" — the
+//!    same shrinking budget;
+//! 3. black-box validation: across a 48-stream low-bitrate CELT-only
+//!    stress corpus, three streams decode boost symbols inside the
+//!    divergence window, and only the shrinking-budget gate stays
+//!    aligned with the reference decode (`opusdec`) on all of them
+//!    (the raw-frame gate desynchronizes those frames).
 //!
 //! ## Provenance
 //!
@@ -110,7 +134,8 @@
 //! No external numeric table is required for this module: the
 //! `dynalloc_logp` start (6) and floor (2), the 48 1/8-bit boost step,
 //! and the `min(8*N, max(48, N))` quanta rule are all inlined in the
-//! RFC body.
+//! RFC body. The budget-gate reading is validated black-box (see
+//! above).
 
 use crate::range_decoder::RangeDecoder;
 
@@ -163,23 +188,25 @@ pub enum BandBoostError {
 /// §4.3.3 boost-quanta lookup for a single band (RFC 6716 §4.3.3,
 /// p. 114).
 ///
-/// `n_bins_per_channel` is the §4.3 Table 55 per-channel MDCT-bin
-/// count for the band at the current `LM` (use
-/// [`crate::celt_band_layout::celt_band_bins_per_channel`]). The
-/// returned value is in 1/8-bit units, matching the §4.3.3
-/// budget-bookkeeping convention.
+/// `n_bins` is the number of MDCT bins the band spans across **all
+/// coded channels** — the §4.3 Table 55 per-channel bin count times
+/// the channel count (`C * (band_width << LM)`). The §4.3.3 "1/8th
+/// bit/sample" and "1 bit/sample" quanta limits count every sample
+/// the boost feeds, and a stereo band's shape allocation covers both
+/// channels' bins. The returned value is in 1/8-bit units, matching
+/// the §4.3.3 budget-bookkeeping convention.
 ///
 /// `quanta = min(8*N, max(48, N))` per the §4.3.3 narrative. The
 /// helper returns `0` for a zero-bin band (a malformed configuration
 /// the §4.3 Table 55 layout never produces, but the math defines
 /// naturally as `min(0, max(48, 0)) = 0`).
-pub const fn band_boost_quanta(n_bins_per_channel: u32) -> u32 {
-    let floored = if n_bins_per_channel > BAND_BOOST_QUANTA_FLOOR_EIGHTH_BITS {
-        n_bins_per_channel
+pub const fn band_boost_quanta(n_bins: u32) -> u32 {
+    let floored = if n_bins > BAND_BOOST_QUANTA_FLOOR_EIGHTH_BITS {
+        n_bins
     } else {
         BAND_BOOST_QUANTA_FLOOR_EIGHTH_BITS
     };
-    let ceiling = BAND_BOOST_QUANTA_CEIL_MULT * n_bins_per_channel;
+    let ceiling = BAND_BOOST_QUANTA_CEIL_MULT * n_bins;
     if ceiling < floored {
         ceiling
     } else {
@@ -247,8 +274,10 @@ pub struct BandBoostOutcome {
 ///    [`band_boost_quanta`].
 /// 2. Initialise `boost = 0` and `dynalloc_loop_logp = dynalloc_logp`.
 /// 3. Loop while
-///    `(dynalloc_loop_logp * 8) + tell < total_bits + total_boost`
-///    AND `boost < caps[band - start]`. Inside the loop:
+///    `(dynalloc_loop_logp * 8) + tell < total_bits`
+///    AND `boost < caps[band - start]`, where `total_bits` is the
+///    frame budget minus every boost committed so far (the
+///    shrinking-budget gate — see the module docs). Inside the loop:
 ///    a. Decode one bit at cost `dynalloc_loop_logp` (in whole bits)
 ///    via [`RangeDecoder::dec_bit_logp`].
 ///    b. If the bit is `0`, break.
@@ -265,8 +294,8 @@ pub struct BandBoostOutcome {
 /// `caps[]` is the per-band §4.3.3 cap vector, indexed by `band -
 /// start`, in 1/8 bits (use [`crate::celt_cache_caps50::cap_for_band_bits`]).
 ///
-/// `n_bins[]` is the per-band per-channel MDCT-bin count, indexed by
-/// `band - start` (use [`crate::celt_band_layout::celt_band_bins_per_channel`]).
+/// `n_bins[]` is the per-band MDCT-bin count across all coded
+/// channels (`C * (band_width << LM)`), indexed by `band - start`.
 ///
 /// On a malformed `start..end` window or a `caps[]` / `n_bins[]`
 /// length mismatch, returns the appropriate [`BandBoostError`] *without
@@ -301,13 +330,13 @@ pub fn decode_band_boosts(
         });
     }
 
-    // §4.3.3: total_bits is the frame size in 1/8 bits, total_boost
-    // starts at zero. The two are kept separate because total_boost
-    // feeds the §4.3.3 allocation-trim gate downstream, but the
-    // §4.3.3 inner-loop check `tell + dynalloc_loop_logp <
-    // total_bits + total_boost` always sums the two — yielding the
-    // §4.3.3 invariant that the sum equals the original frame budget
-    // throughout.
+    // §4.3.3: total_bits is the frame size in 1/8 bits, shrinking by
+    // quanta on every committed boost; total_boost starts at zero and
+    // grows by the same amount (it feeds the §4.3.3 allocation-trim
+    // gate downstream, which is normatively "the total frame size in
+    // 8th bits minus total_boost" — the same shrinking budget the
+    // inner-loop gate checks here; see the module docs for the full
+    // resolution of the gate reading).
     let mut total_bits_eighth: u32 = frame_size_bytes.saturating_mul(64);
     let mut total_boost_eighth: u32 = 0;
     let mut dynalloc_logp = DYNALLOC_LOGP_INIT;
@@ -324,14 +353,15 @@ pub fn decode_band_boosts(
 
         loop {
             // §4.3.3 inner-loop gate: `dynalloc_loop_logp + tell <
-            // total_bits + total_boost`. `tell` and the logp budget
-            // are in 1/8 bits; `dynalloc_loop_logp` is in whole bits
-            // so we scale it by 8.
+            // total_bits` with the shrinking `total_bits` — the frame
+            // must have room to code the boost symbol AND to obey
+            // every boost committed so far. `tell` and the logp
+            // budget are in 1/8 bits; `dynalloc_loop_logp` is in
+            // whole bits so we scale it by 8.
             let tell_frac = rd.tell_frac();
             let logp_eighth = dynalloc_loop_logp.saturating_mul(8);
-            let budget_eighth = total_bits_eighth.saturating_add(total_boost_eighth);
             let projected_tell = tell_frac.saturating_add(logp_eighth);
-            if projected_tell >= budget_eighth {
+            if projected_tell >= total_bits_eighth {
                 break;
             }
             if boost >= cap_band {
@@ -724,6 +754,66 @@ mod tests {
         let mut d = rd(&PAYLOAD_STOP_BIASED);
         let outcome = decode_band_boosts(&mut d, 0, 21, &[1000; 21], &[48; 21], 1275).unwrap();
         assert_eq!(outcome.dynalloc_logp_final, DYNALLOC_LOGP_INIT);
+    }
+
+    // ---- §4.3.3 shrinking-budget gate discriminator ----
+
+    /// The gate that ends a boost run must be the SHRINKING budget
+    /// (frame minus committed boosts), not the raw frame size. Encode
+    /// a run of `1` boost bits into a tiny (2-byte = 128 1/8-bit)
+    /// frame with a huge cap: the loop must stop because
+    /// `tell + logp*8` crossed `total_bits = frame − total_boost`
+    /// while still being far below the raw frame budget — the exact
+    /// window where the two §4.3.3 gate readings diverge (the
+    /// raw-frame reading would keep decoding boost symbols there and
+    /// desynchronize; validated black-box on low-bitrate reference
+    /// streams, see the module docs).
+    #[test]
+    fn gate_uses_shrinking_budget_not_raw_frame_size() {
+        use crate::range_encoder::RangeEncoder;
+
+        // A generous supply of `1` bits at the §4.3.3 costs: the first
+        // at logp = 6, the rest at logp = 1.
+        let mut enc = RangeEncoder::new();
+        enc.enc_bit_logp(true, DYNALLOC_LOGP_INIT);
+        for _ in 0..40 {
+            enc.enc_bit_logp(true, DYNALLOC_LOOP_LOGP_AFTER_FIRST);
+        }
+        let buf = enc.finish();
+
+        let mut d = RangeDecoder::new(&buf);
+        let frame_bytes = 2u32; // 128 1/8 bits
+        let cap = 10_000u32; // never the binding constraint
+        let outcome = decode_band_boosts(&mut d, 0, 1, &[cap], &[48], frame_bytes).unwrap();
+        let band = outcome.per_band[0];
+
+        // The loop decoded at least one boost and then stopped on the
+        // budget gate: the cap was not reached and no stop bit was
+        // coded (every available bit was a 1).
+        assert!(band.boost_eighth_bits > 0, "no boost decoded: {band:?}");
+        assert!(band.boost_eighth_bits < cap, "cap ended the loop");
+
+        // Discriminator: at the stopping point the raw-frame gate
+        // would have continued (tell + 8 is far below 128), but the
+        // shrinking budget was exhausted.
+        let tell_after = d.tell_frac();
+        let logp_eighth = DYNALLOC_LOOP_LOGP_AFTER_FIRST * 8;
+        assert!(
+            tell_after + logp_eighth < frame_bytes * 64,
+            "the raw-frame gate would also have stopped here — the \
+             scenario no longer discriminates (tell {tell_after})"
+        );
+        assert!(
+            tell_after + logp_eighth >= outcome.total_bits_remaining_eighth_bits,
+            "loop stopped while the shrinking budget still had room \
+             (tell {tell_after}, remaining {})",
+            outcome.total_bits_remaining_eighth_bits
+        );
+        // The budget bookkeeping: remaining = frame − total_boost.
+        assert_eq!(
+            outcome.total_bits_remaining_eighth_bits,
+            (frame_bytes * 64).saturating_sub(outcome.total_boost_eighth_bits)
+        );
     }
 
     // ---- BandBoost / BandBoostOutcome shape ----

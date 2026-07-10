@@ -286,36 +286,30 @@ pub fn decode_celt_frame(
         )
         .unwrap_or(0) as i32;
     }
+    // §4.3.3 dynalloc band boosts (the shrinking-budget loop), decoded
+    // by the dedicated module. The caps window and the per-band bin
+    // counts (across all coded channels) parameterize the quanta and
+    // the per-band boost ceiling.
     let mut offsets = [0i32; CELT_NUM_BANDS];
-    {
-        let mut dynalloc_logp: u32 = 6;
-        let mut total_q3: i64 = total_bits << BITRES;
-        let mut tell_frac = i64::from(rd.tell_frac());
-        for i in start..end {
-            let width = (c as i32) * (band_width(i) << lm);
-            // Quanta: min(6 bits, max(1 bit/sample cap, 1/8 bit floor)).
-            let quanta = (width << BITRES).min((6 << BITRES).max(width));
-            let mut dynalloc_loop_logp = dynalloc_logp;
-            let mut boost: i32 = 0;
-            while tell_frac + i64::from(dynalloc_loop_logp << BITRES) < total_q3 && boost < cap[i] {
-                let flag = rd.dec_bit_logp(dynalloc_loop_logp);
-                tell_frac = i64::from(rd.tell_frac());
-                if flag == 0 {
-                    break;
-                }
-                boost += quanta;
-                total_q3 -= i64::from(quanta);
-                dynalloc_loop_logp = 1;
-            }
-            offsets[i] = boost;
-            if boost > 0 && dynalloc_logp > 2 {
-                dynalloc_logp -= 1;
-            }
-        }
+    let caps_window: Vec<u32> = (start..end).map(|i| cap[i].max(0) as u32).collect();
+    let n_bins_window: Vec<u32> = (start..end)
+        .map(|i| (c as u32) * ((band_width(i) << lm) as u32))
+        .collect();
+    let boosts = crate::celt_band_boost::decode_band_boosts(
+        rd,
+        start,
+        end,
+        &caps_window,
+        &n_bins_window,
+        frame_bytes as u32,
+    )
+    .expect("band window and slices are built from start..end");
+    for (i, bb) in boosts.per_band.iter().enumerate() {
+        offsets[start + i] = bb.boost_eighth_bits as i32;
     }
     // Every boost step moved `quanta` from total_bits into
     // total_boost, so the accumulated boost is the offset sum.
-    let total_boost: u32 = offsets[start..end].iter().map(|&b| b as u32).sum();
+    let total_boost: u32 = boosts.total_boost_eighth_bits;
 
     // §4.3.3 allocation trim.
     let alloc_trim = crate::celt_alloc_trim::decode_alloc_trim(

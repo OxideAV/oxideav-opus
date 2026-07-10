@@ -14,6 +14,23 @@ All notable changes to `oxideav-opus` are recorded here.
   is the exported API surface). The octave sweep test now pins the
   0..=5 range, the reachability of octave 5, and the §4.3.7.1 period
   bound across the whole sweep
+- FIX: `celt_band_boost::decode_band_boosts` gated the §4.3.3 boost
+  loop against a constant raw-frame budget (`total_bits + total_boost`,
+  which the section's own updates hold constant) and computed the boost
+  quanta from per-channel bin counts. The gate is the **shrinking**
+  budget — the frame in 1/8 bits minus every boost committed so far —
+  per the §4.3.3 intent clause ("enough room to obey the boost and …
+  to code the boost symbol"), the §4.3.3 trim gate immediately after
+  ("total frame size in 8th bits minus total_boost"), and a black-box
+  discrimination experiment: across a 48-stream low-bitrate CELT-only
+  stress corpus, three streams decode boost bits inside the divergence
+  window and only the shrinking gate stays aligned with the reference
+  decode (10–16 dB vs 35–39 dB SNR). The quanta `N` counts the band's
+  MDCT bins across all coded channels (`C * (band_width << LM)`). The
+  live CELT frame decode now **calls** the module (previously it carried
+  its own inline copy of the loop; the fixed helper is byte-identical
+  on the whole stress corpus + fixtures), and a range-encoder-crafted
+  regression pins the shrinking-gate discriminator
 - FIX: `celt_pulse_cache` indexed the §4.3.4.1 cost cache band-major
   (`band * 5 + LM`); the 105-entry index is LM-major
   (`(LM + 1) * 21 + band`, five rows of 21 bands — pulse-cache format
