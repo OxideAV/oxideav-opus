@@ -4,6 +4,55 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **FIX (wire-format): the §3.2.5 code-3 frame-count byte was parsed
+  and written bit-reversed.** RFC 6716 Figure 5 is MSB-first — `v`
+  (VBR) is 0x80, `p` (padding) is 0x40, `M` is the low six bits — but
+  both §3.2 parsers (`OpusPacket::parse`, `parse_self_delimited`) and
+  all code-3 writers (`compose_packet_code3`, the code-3 arm of
+  `compose_self_delimited`, `pad_packet_to`) used `v` = 0x01, `p` =
+  0x02, `M` = the HIGH six bits. Because writer and parser agreed with
+  each other, every in-crate roundtrip test passed while **every
+  code-3 packet from a real encoder was rejected as malformed** (a
+  black-box CBR VoIP stream lost 80 of 101 packets; a CBR-padded
+  packet's byte 0x41 read as "VBR, M=16") and every packet we emitted
+  was undecodable elsewhere. Found by a black-box stress corpus;
+  wire-layout bytes are now pinned literally on both the parse side
+  and the write side, precisely because roundtrip testing is blind to
+  a consistently reversed layout
+- **§4.5 transition machinery: redundant-frame synthesis + cross-lap
+  + reset placement.** The 5 ms redundant CELT frame (§4.5.1) is now
+  *decoded and mixed*, not just skipped over:
+  - SILK-only frames run the §4.5.1.1 implicit check (≥ 17 bits
+    remaining after the SILK layer) that was previously absent, then
+    the Table-65 position and the whole-bytes-remaining size;
+  - Hybrid frames now **shrink the main coder's buffer**
+    (`RangeDecoder::shrink_buffer`, new) by the §4.5.1.3 size so the
+    MDCT layer's raw bits read from the end of the reduced buffer as
+    the spec requires (previously only the bit budget shrank — any
+    redundancy-bearing hybrid frame with raw bits misread them);
+  - the redundant frame decodes "like any other CELT-only frame"
+    (§4.5.1.4: own coder, no TOC, 5 ms, carrier's channels, carrier
+    bandwidth with MB→WB) through the stream's one CELT state, whose
+    geometry now *adapts without dropping state*
+    (`CeltSynthesis::set_geometry`, new — §4.5 keeps state across
+    frame-size/channel changes; resets happen only where §4.5.2 puts
+    them);
+  - §4.5.2 placement per Figure 18: an end-position redundant frame
+    takes the CELT reset itself (`!R`) and its warmed state carries
+    into the following CELT-only/Hybrid frames (the packet-boundary
+    reset is suppressed via the carried §4.5.1 decision — rule 3, now
+    also applied to SILK→Hybrid per the `;H` row); a
+    beginning-position one decodes on the un-reset state (rule 4)
+    before the deferred main-layer reset (`|H`);
+  - §4.5.1.4 output stitching: beginning-position — first 2.5 ms of
+    the redundant output as-is (main output discarded), second 2.5 ms
+    cross-lapped; end-position — the redundant frame's second half
+    cross-lapped with the end of the main signal; both under the
+    power-complementary CELT MDCT window.
+  On the staged mode-switching fixture the Hybrid→CELT transition
+  window improves from 105.6 dB to 108.8 dB against the reference
+  decode (the CELT-only segment stays reference-exact at ~107 dB);
+  black-box A/B across a switching stress corpus shows no regressions
 - **Packet-loss concealment (RFC 6716 §4.4)** — `OpusDecoder::conceal_loss`
   fills a lost packet with real extrapolated audio instead of silence,
   following the §4.4 per-mode guidance: after a SILK-only / Hybrid

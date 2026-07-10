@@ -123,6 +123,29 @@ impl<'a> RangeDecoder<'a> {
         self.error
     }
 
+    /// Reduce the buffer in use to its first `new_len` bytes
+    /// (RFC 6716 §4.5.1.3).
+    ///
+    /// When a Hybrid Opus frame carries a §4.5.1 redundant CELT frame,
+    /// "the decoder reduces the size of the buffer currently in use by
+    /// the range coder by that amount. The MDCT layer reads any raw
+    /// bits from the end of this reduced buffer, and all calculations
+    /// of the number of bits remaining in the buffer must be done
+    /// using this new, reduced size" — the trailing bytes belong to
+    /// the byte-aligned redundant frame, which uses its own coder.
+    ///
+    /// Latches the sticky error when the shrink is impossible: the
+    /// range coder has already read past `new_len`, raw bits were
+    /// already consumed from the discarded tail, or `new_len` exceeds
+    /// the current buffer (all only reachable on a corrupt frame).
+    pub fn shrink_buffer(&mut self, new_len: usize) {
+        if new_len > self.buf.len() || self.fwd > new_len || self.back != 0 {
+            self.error = true;
+            return;
+        }
+        self.buf = &self.buf[..new_len];
+    }
+
     /// The current §4.1 range size `rng`.
     ///
     /// The CELT layer captures this value at the end of each frame and

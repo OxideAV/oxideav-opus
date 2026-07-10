@@ -174,15 +174,22 @@ fn redundancy_is_present(decision: RedundancyDecision) -> bool {
 /// * **Rule 1** is `next ∈ {SilkOnly, Hybrid} && prev == CeltOnly`.
 /// * **Rule 2** is `next ∈ {Hybrid, CeltOnly} && prev != next`
 ///   unless rule 3 or rule 4 overrides.
-/// * **Rule 3** overrides rule 2 when `prev ∈ {SilkOnly, Hybrid}`,
-///   `next == CeltOnly`, and redundancy is present: the CELT reset
-///   moves from "before the new-mode frame" to "before the redundant
-///   CELT frame only" ([`CeltResetPlacement::BeforeRedundantOnly`]).
-/// * **Rule 4** overrides rule 2 when `prev == CeltOnly`,
-///   `next ∈ {SilkOnly, Hybrid}`, and redundancy is present: the
-///   CELT decoder is NOT reset for the redundant frame, and rule 2
-///   does not fire anyway because the new mode is SILK-only, leaving
-///   [`CeltResetPlacement::None`].
+/// * **Rule 3** overrides rule 2 when `prev ∈ {SilkOnly, Hybrid}`
+///   carried an end-position redundant CELT frame into a mode change
+///   whose new mode is Hybrid or CELT-only: the CELT reset moves from
+///   "before the new-mode frame" to "before the redundant CELT frame
+///   only" ([`CeltResetPlacement::BeforeRedundantOnly`]) — §4.5.3
+///   Figure 18's `!R` rows (SILK/Hybrid → CELT with redundancy, and
+///   NB/MB SILK → Hybrid with redundancy, whose Hybrid frame takes
+///   only the SILK reset `;H`).
+/// * **Rule 4** applies when `prev == CeltOnly` and
+///   `next ∈ {SilkOnly, Hybrid}` with redundancy: the CELT decoder is
+///   NOT reset *for the embedded redundant frame* (it decodes on the
+///   carried state). For `next == SilkOnly` no frame-level CELT reset
+///   exists anyway ([`CeltResetPlacement::None`]); for
+///   `next == Hybrid` the frame-level reset still applies to the main
+///   CELT layer (Figure 18 `|H`), ordered *after* the redundant
+///   frame's decode by the driver.
 pub fn decide_state_resets(
     prev_mode: OperatingMode,
     next_mode: OperatingMode,
@@ -223,21 +230,15 @@ fn celt_reset_placement(
         // SILK still resets per rule 1, handled separately.
         (OperatingMode::CeltOnly, OperatingMode::SilkOnly) => CeltResetPlacement::None,
 
-        // Rule 2 vs. rule 4 carve-out for CELT-only → Hybrid:
-        //
-        // * Without redundancy, rule 2 fires: mode changes AND new
-        //   mode is Hybrid → CELT resets before the new-mode frame.
-        // * With redundancy, rule 2's "except when the transition
-        //   uses redundancy" exception applies, AND rule 4 forbids
-        //   resetting CELT for the redundant frame itself. Net
-        //   result: CELT is not reset by §4.5.2 policy.
-        (OperatingMode::CeltOnly, OperatingMode::Hybrid) => {
-            if redundancy_present {
-                CeltResetPlacement::None
-            } else {
-                CeltResetPlacement::BeforeFrame
-            }
-        }
+        // CELT-only → Hybrid. Rule 2 fires either way — §4.5.3
+        // Figure 18 marks the Hybrid frame `|H` (CELT and SILK
+        // resets) even in the "CELT to Hybrid with Redundancy" row.
+        // Rule 4's "the CELT decoder is not reset for decoding the
+        // redundant CELT frame" governs only the *embedded redundant
+        // frame*, which decodes on the carried state *before* the
+        // reset is applied to the Hybrid frame's main CELT layer (the
+        // driver orders redundant-decode → reset → main layer).
+        (OperatingMode::CeltOnly, OperatingMode::Hybrid) => CeltResetPlacement::BeforeFrame,
 
         // Rule 3 carve-out vs. rule-2 default for SILK-only/Hybrid →
         // CELT-only.
@@ -249,13 +250,23 @@ fn celt_reset_placement(
             }
         }
 
-        // SILK-only ↔ Hybrid. Rule 2: new mode is Hybrid → reset; new
-        // mode is SILK-only → no reset (SILK-only is not "Hybrid or
-        // CELT-only"). Redundancy plays no role: §4.5.2 only carves
-        // out the redundancy exception when the new mode is
-        // CELT-only (rule 3) or the previous mode was CELT-only
-        // (rule 4).
-        (OperatingMode::SilkOnly, OperatingMode::Hybrid) => CeltResetPlacement::BeforeFrame,
+        // SILK-only → Hybrid. Rule 2: the new mode is Hybrid → reset —
+        // "except when the transition uses redundancy": §4.5.3
+        // Figure 18's "NB or MB SILK to Hybrid with Redundancy" row is
+        // `!R → ;H` — the CELT reset (`!`) is placed before the
+        // end-position redundant CELT frame carried by the last SILK
+        // frame, and the Hybrid frame takes only the SILK reset (`;`),
+        // its CELT layer continuing from the redundant frame's warmed
+        // state.
+        (OperatingMode::SilkOnly, OperatingMode::Hybrid) => {
+            if redundancy_present {
+                CeltResetPlacement::BeforeRedundantOnly
+            } else {
+                CeltResetPlacement::BeforeFrame
+            }
+        }
+        // Hybrid → SILK-only. Rule 2 does not fire (SILK-only is not
+        // "Hybrid or CELT-only"); redundancy plays no role.
         (OperatingMode::Hybrid, OperatingMode::SilkOnly) => CeltResetPlacement::None,
 
         // Same-mode pairs are filtered above; the match is otherwise
@@ -500,9 +511,14 @@ mod tests {
     }
 
     #[test]
-    fn rule4_celt_to_hybrid_with_redundancy_does_not_reset_celt() {
+    fn rule4_celt_to_hybrid_with_redundancy_resets_celt_before_main_layer() {
+        // §4.5.3 Figure 18 "CELT to Hybrid with Redundancy" marks the
+        // Hybrid frame `|H` (CELT and SILK resets). Rule 4 only
+        // exempts the *embedded redundant frame*, which the driver
+        // decodes on the carried state before applying this reset to
+        // the main CELT layer.
         let r = decide_state_resets(OperatingMode::CeltOnly, OperatingMode::Hybrid, present());
-        assert_eq!(r.celt, CeltResetPlacement::None);
+        assert_eq!(r.celt, CeltResetPlacement::BeforeFrame);
         // SILK still resets per rule 1.
         assert!(r.silk);
     }
@@ -553,11 +569,11 @@ mod tests {
             (H, H, true, false, P::None),
             (C, C, false, false, P::None),
             (C, C, true, false, P::None),
-            // SILK-only ↔ Hybrid (mode change, never involves
-            // CELT-only — rule 3 / 4 do not apply, redundancy
-            // irrelevant for CELT placement).
+            // SILK-only ↔ Hybrid. With redundancy the CELT reset
+            // belongs before the previous SILK frame's end-position
+            // redundant CELT frame (Figure 18 `!R → ;H`).
             (S, H, false, false, P::BeforeFrame),
-            (S, H, true, false, P::BeforeFrame),
+            (S, H, true, false, P::BeforeRedundantOnly),
             (H, S, false, false, P::None),
             (H, S, true, false, P::None),
             // SILK-only/Hybrid → CELT-only.
@@ -565,11 +581,13 @@ mod tests {
             (S, C, true, false, P::BeforeRedundantOnly),
             (H, C, false, false, P::BeforeFrame),
             (H, C, true, false, P::BeforeRedundantOnly),
-            // CELT-only → SILK-only/Hybrid.
+            // CELT-only → SILK-only/Hybrid. The `|H` row of Figure 18
+            // keeps the main-layer CELT reset even with redundancy
+            // (the embedded redundant frame decodes before it).
             (C, S, false, true, P::None),
             (C, S, true, true, P::None),
             (C, H, false, true, P::BeforeFrame),
-            (C, H, true, true, P::None),
+            (C, H, true, true, P::BeforeFrame),
         ];
 
         for (prev, next, red_present, expected_silk, expected_celt) in cases {
@@ -624,20 +642,17 @@ mod tests {
     }
 
     #[test]
-    fn figure18_celt_to_hybrid_with_redundancy_marks_silk_reset_only() {
-        // §4.5.3 row "CELT to Hybrid with Redundancy": the `|`
-        // marker is documented as "CELT and SILK decoder resets" in
-        // the key, but rule 4 explicitly says the CELT decoder is
-        // NOT reset *for the redundant frame*; the `|` reflects the
-        // CELT-decoder state at the H frame boundary in the original
-        // figure where the redundant CELT decode itself implicitly
-        // re-initialises CELT memories. From §4.5.2's standpoint
-        // (which is what this module encodes), CELT is not reset by
-        // policy at the H boundary, only by the redundant frame
-        // having been decoded. We pin that distinction here.
+    fn figure18_celt_to_hybrid_with_redundancy_marks_both_resets() {
+        // §4.5.3 row "CELT to Hybrid with Redundancy": the `|` marker
+        // is "CELT and SILK decoder resets" in the key — both resets
+        // apply at the H frame. Rule 4's "the CELT decoder is not
+        // reset for decoding the redundant CELT frame" governs only
+        // the embedded redundant frame, which decodes on the carried
+        // state *before* the frame-level reset (the driver orders
+        // redundant-decode → reset → main CELT layer).
         let r = decide_state_resets(OperatingMode::CeltOnly, OperatingMode::Hybrid, present());
         assert!(r.silk);
-        assert_eq!(r.celt, CeltResetPlacement::None);
+        assert_eq!(r.celt, CeltResetPlacement::BeforeFrame);
     }
 
     #[test]

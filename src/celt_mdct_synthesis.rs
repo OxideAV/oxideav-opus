@@ -111,6 +111,83 @@ impl CeltSynthesis {
         self.channels
     }
 
+    /// Change the frame geometry **without** dropping the carried
+    /// state (§4.5.1.4 / §4.5.2: the 5 ms redundant CELT frame and the
+    /// frames around a transition share one CELT decoder whose state
+    /// is only reset where the §4.5.2 rules say so, even though the
+    /// frame sizes differ).
+    ///
+    /// The §4.3.7 overlap is [`CELT_OVERLAP_48K`] samples for every
+    /// legal 48 kHz frame length (120/240/480/960), and the comb-filter
+    /// history and de-emphasis memory are length-independent, so a
+    /// frame-length change carries everything verbatim. A channel-count
+    /// change adapts the per-channel state the way the §4.5 transition
+    /// text expects a channel switch to be handled smoothly: mono →
+    /// stereo duplicates the mono state into both channels; stereo →
+    /// mono averages the two.
+    pub fn set_geometry(&mut self, channels: usize, n: usize) {
+        if channels != self.channels {
+            let overlap = CELT_OVERLAP_48K.min(self.n);
+            let hist_len = COMB_MAX_PERIOD + 2;
+            let pick = |per_len: usize, buf: &[f64], c: usize| -> Vec<f64> {
+                buf[c * per_len..(c + 1) * per_len].to_vec()
+            };
+            let (om, hi, de) = if self.channels == 1 {
+                // Duplicate mono state into every new channel.
+                let om0 = pick(overlap, &self.overlap_mem, 0);
+                let hi0 = pick(hist_len, &self.hist, 0);
+                let de0 = self.deemph_mem[0];
+                (
+                    om0.repeat(channels),
+                    hi0.repeat(channels),
+                    vec![de0; channels],
+                )
+            } else {
+                // Average the old channels into one, then spread.
+                let old_c = self.channels as f64;
+                let mut om0 = vec![0.0f64; overlap];
+                let mut hi0 = vec![0.0f64; hist_len];
+                let mut de0 = 0.0f64;
+                for c in 0..self.channels {
+                    for (j, v) in om0.iter_mut().enumerate() {
+                        *v += self.overlap_mem[c * overlap + j] / old_c;
+                    }
+                    for (j, v) in hi0.iter_mut().enumerate() {
+                        *v += self.hist[c * hist_len + j] / old_c;
+                    }
+                    de0 += self.deemph_mem[c] / old_c;
+                }
+                (
+                    om0.repeat(channels),
+                    hi0.repeat(channels),
+                    vec![de0; channels],
+                )
+            };
+            self.overlap_mem = om;
+            self.hist = hi;
+            self.deemph_mem = de;
+            self.channels = channels;
+        }
+        if n != self.n {
+            // The overlap length is CELT_OVERLAP_48K for every legal n
+            // (all are >= 120); re-slice defensively if it ever
+            // differs.
+            let old_overlap = CELT_OVERLAP_48K.min(self.n);
+            let new_overlap = CELT_OVERLAP_48K.min(n);
+            if new_overlap != old_overlap {
+                let mut om = vec![0.0f64; self.channels * new_overlap];
+                for c in 0..self.channels {
+                    let keep = new_overlap.min(old_overlap);
+                    om[c * new_overlap..c * new_overlap + keep].copy_from_slice(
+                        &self.overlap_mem[c * old_overlap..c * old_overlap + keep],
+                    );
+                }
+                self.overlap_mem = om;
+            }
+            self.n = n;
+        }
+    }
+
     /// Zero all carried state (§4.5.2 CELT reset).
     pub fn reset(&mut self) {
         self.overlap_mem.fill(0.0);

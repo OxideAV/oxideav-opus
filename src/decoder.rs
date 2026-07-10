@@ -320,6 +320,21 @@ pub struct OpusDecoder {
     /// history, the consecutive-loss counter, and the pending
     /// concealment-to-real cross-lap tail.
     plc: crate::plc::PlcState,
+    /// §4.5.1 redundancy decision taken on the most recently decoded
+    /// Opus frame. Drives the §4.5.2 reset policy at the next packet
+    /// boundary (rule 3: a SILK/Hybrid frame that carried an
+    /// end-position redundant CELT frame already reset the CELT state
+    /// before decoding it, so the following CELT-only / Hybrid frame
+    /// must NOT reset again).
+    last_redundancy: crate::celt_redundancy::RedundancyDecision,
+    /// Deferred §4.5.2 CELT reset for a Hybrid frame's main CELT
+    /// layer: when the packet-boundary policy says the CELT state
+    /// resets *before the frame* but the frame is Hybrid, the frame
+    /// may open with a §4.5.1.2 beginning-position redundant CELT
+    /// frame that must decode on the **un-reset** state (Figure 18's
+    /// `R & |H`); the reset is applied between the redundant frame
+    /// and the main CELT layer instead.
+    celt_reset_before_main: bool,
     /// Frame duration (§3.1 Table 2, tenths of ms) of the most
     /// recently decoded packet — the duration [`Self::conceal_loss`]
     /// conceals when the lost packet's own duration is unknown.
@@ -371,17 +386,17 @@ impl OpusDecoder {
         let channels = routing.channel_count();
         let per_frame_samples = output_samples_per_channel(routing.frame_size_tenths_ms);
 
-        // §4.5.2 SILK state reset: the SILK decoder is reset before every
-        // SILK-only or Hybrid frame whose predecessor was CELT-only. We
-        // apply this at the Opus-packet boundary using the recorded
-        // previous operating mode. (Redundancy placement only moves the
-        // CELT reset, which doesn't affect the SILK reset, so we pass the
-        // safe NotPresent default here.)
+        // §4.5.2 state resets at the Opus-packet boundary, using the
+        // recorded previous operating mode and the §4.5.1 redundancy
+        // decision of the previous frame (rule 3: an end-position
+        // redundant CELT frame in the previous SILK/Hybrid frame
+        // already took the CELT reset, so the new-mode frame must not
+        // reset again).
         if let Some(prev_mode) = self.prev_mode {
             let reset = crate::mode_transition_reset::decide_state_resets(
                 prev_mode,
                 routing.operating_mode,
-                crate::celt_redundancy::RedundancyDecision::NotPresent,
+                self.last_redundancy,
             );
             if reset.silk {
                 if let Some(state) = self.silk_synth_mono.as_mut() {
@@ -401,11 +416,29 @@ impl OpusDecoder {
                 self.silk_carry_mid = SilkChannelCarry::default();
                 self.silk_carry_side = SilkChannelCarry::default();
             }
-            if reset.celt_resets() {
-                // §4.5.2 rules 2–4: drop the carried CELT state so the
-                // next CELT-layer frame starts from the reset state.
-                self.celt_energy = None;
-                self.celt_synth = None;
+            match reset.celt {
+                crate::mode_transition_reset::CeltResetPlacement::BeforeFrame => {
+                    if routing.operating_mode == OperatingMode::Hybrid {
+                        // Defer: a beginning-position redundant CELT
+                        // frame inside the Hybrid frame decodes on the
+                        // un-reset state first (§4.5.2 rule 4 /
+                        // Figure 18's `R & |H`); the main CELT layer
+                        // takes the reset afterwards.
+                        self.celt_reset_before_main = true;
+                    } else {
+                        // §4.5.2 rule 2: drop the carried CELT state so
+                        // the new-mode frame starts from the reset
+                        // state.
+                        self.celt_energy = None;
+                        self.celt_synth = None;
+                    }
+                }
+                // Rule 3: the reset already happened before the
+                // previous frame's end-position redundant CELT frame;
+                // the state must carry into this frame. Rule 4 / None:
+                // no CELT reset for this transition.
+                crate::mode_transition_reset::CeltResetPlacement::BeforeRedundantOnly
+                | crate::mode_transition_reset::CeltResetPlacement::None => {}
             }
         }
 
@@ -515,6 +548,11 @@ impl OpusDecoder {
         let per_channel = output_samples_per_channel(routing.frame_size_tenths_ms);
         let channels = routing.channel_count();
 
+        // §4.5.1 bookkeeping: only SILK-only / Hybrid frames can carry
+        // redundancy; every other frame clears the carried decision
+        // (the paths below overwrite it when they find one).
+        self.last_redundancy = crate::celt_redundancy::RedundancyDecision::NotPresent;
+
         // §3.2.1 zero-length frame: DTX / lost. §4.6 floor = silence.
         if frame.is_empty() {
             push_silence(pcm, per_channel, channels);
@@ -545,11 +583,19 @@ impl OpusDecoder {
     /// ([`FrameDecodeStatus::SilkParamsDecoded`]). A truncated / malformed
     /// frame yields [`FrameDecodeStatus::SilkDecodeError`] and silence.
     ///
-    /// A **stereo** Opus frame routes to
-    /// [`Self::decode_silk_only_stereo`], which runs the §4.2.6 mid/side
-    /// interleave with the §4.2.7.1 / §4.2.7.2 symbols enabled and the
-    /// §4.2.8 unmixing back half, emitting interleaved L/R PCM
+    /// A **stereo** Opus frame runs the §4.2.6 mid/side interleave with
+    /// the §4.2.7.1 / §4.2.7.2 symbols enabled and the §4.2.8 unmixing
+    /// back half, emitting interleaved L/R PCM
     /// ([`FrameDecodeStatus::SilkStereoDecoded`]).
+    ///
+    /// After the SILK layer, the §4.5.1.1 **implicit redundancy check**
+    /// runs: when at least 17 bits remain, the frame carries a 5 ms
+    /// redundant CELT frame in its trailing whole bytes, which is
+    /// decoded (§4.5.1.4) and cross-lapped into this frame's output at
+    /// the signalled §4.5.1.2 position. An end-position redundant
+    /// frame takes the §4.5.2 CELT reset *before* its decode and the
+    /// warmed state carries into the next (CELT-layer) frame; a
+    /// beginning-position one continues the previous CELT state.
     fn decode_silk_only_frame(
         &mut self,
         frame: &[u8],
@@ -561,8 +607,9 @@ impl OpusDecoder {
         let pcm_start = pcm.len();
         push_silence(pcm, per_channel, channels);
 
-        if channels == 2 {
-            let status = match self.decode_silk_only_stereo(frame, routing) {
+        let mut rd = crate::range_decoder::RangeDecoder::new(frame);
+        let status = if channels == 2 {
+            match self.decode_silk_layer_stereo(&mut rd, routing) {
                 Ok((left, right, bandwidth)) => {
                     // §4.2.9 (non-normative): resample each channel to the
                     // 48 kHz output rate, then write it interleaved
@@ -576,46 +623,65 @@ impl OpusDecoder {
                     FrameDecodeStatus::SilkStereoDecoded
                 }
                 Err(_) => FrameDecodeStatus::SilkDecodeError,
-            };
-            return FrameOutcome {
-                samples_per_channel: per_channel,
-                status,
-            };
-        }
-
-        let status = match self.decode_silk_only_mono(frame, routing) {
-            Ok((internal, bandwidth)) => {
-                // §4.2.9 (non-normative): resample the internal-rate
-                // signal to the 48 kHz decoder output rate and write it
-                // over the reserved silence region. The spec says "the
-                // resampler itself is non-normative, and a decoder can use
-                // any method it wants"; we use linear interpolation.
-                resample_internal_to_output_i16(
-                    &internal,
-                    bandwidth,
-                    &mut pcm[pcm_start..pcm_start + per_channel],
-                );
-                FrameDecodeStatus::SilkParamsDecoded
             }
-            Err(_) => FrameDecodeStatus::SilkDecodeError,
+        } else {
+            match self.decode_silk_layer_mono(&mut rd, routing) {
+                Ok((internal, bandwidth)) => {
+                    // §4.2.9 (non-normative): resample the internal-rate
+                    // signal to the 48 kHz decoder output rate and write it
+                    // over the reserved silence region. The spec says "the
+                    // resampler itself is non-normative, and a decoder can
+                    // use any method it wants"; we use linear interpolation.
+                    resample_internal_to_output_i16(
+                        &internal,
+                        bandwidth,
+                        &mut pcm[pcm_start..pcm_start + per_channel],
+                    );
+                    FrameDecodeStatus::SilkParamsDecoded
+                }
+                Err(_) => FrameDecodeStatus::SilkDecodeError,
+            }
         };
+
+        // §4.5.1: the implicit redundancy signal only means anything
+        // when the SILK layer decoded cleanly (a desynchronized coder's
+        // tell() is meaningless).
+        let mut redundancy = crate::celt_redundancy::RedundancyDecision::NotPresent;
+        if !matches!(status, FrameDecodeStatus::SilkDecodeError) && !rd.has_error() {
+            redundancy = crate::celt_redundancy::decode_redundancy(
+                &mut rd,
+                OperatingMode::SilkOnly,
+                frame.len(),
+            );
+            if let Some(params) =
+                crate::redundancy_decode_params::redundant_frame_params(routing, redundancy)
+            {
+                let red_bytes = &frame[frame.len() - params.size_bytes..];
+                // §4.5.2: an end-position redundant frame opens a new
+                // CELT chain (reset before its decode; Figure 18's
+                // `!R`); a beginning-position one continues the
+                // previous chain (rule 4).
+                let reset_before = matches!(
+                    params.position,
+                    crate::celt_redundancy::RedundancyPosition::End
+                );
+                if let Some(red_pcm) = self.decode_redundant_celt(red_bytes, &params, reset_before)
+                {
+                    apply_redundancy_cross_lap(
+                        &mut pcm[pcm_start..],
+                        &red_pcm,
+                        channels as usize,
+                        params.position,
+                    );
+                }
+            }
+        }
+        self.last_redundancy = redundancy;
+
         FrameOutcome {
             samples_per_channel: per_channel,
             status,
         }
-    }
-
-    /// Decode the full §4.2 bitstream of one mono SILK-only Opus frame:
-    /// §4.2.3 header bits, the §4.2.5 LBRR frames, and the §4.2.6 regular
-    /// SILK frames, consuming every symbol in order. Returns `Ok(())`
-    /// when the whole frame decodes cleanly.
-    fn decode_silk_only_mono(
-        &mut self,
-        frame: &[u8],
-        routing: &OpusFrameRouting,
-    ) -> Result<(Vec<f32>, crate::toc::Bandwidth), Error> {
-        let mut rd = crate::range_decoder::RangeDecoder::new(frame);
-        self.decode_silk_layer_mono(&mut rd, routing)
     }
 
     /// The mono §4.2 SILK layer decode on a caller-supplied range
@@ -764,17 +830,6 @@ impl OpusDecoder {
     ///
     /// Returns `(left, right, bandwidth)` at the SILK internal rate.
     #[allow(clippy::type_complexity)]
-    fn decode_silk_only_stereo(
-        &mut self,
-        frame: &[u8],
-        routing: &OpusFrameRouting,
-    ) -> Result<(Vec<f32>, Vec<f32>, crate::toc::Bandwidth), Error> {
-        let mut rd = crate::range_decoder::RangeDecoder::new(frame);
-        self.decode_silk_layer_stereo(&mut rd, routing)
-    }
-
-    /// The stereo §4.2 SILK layer decode on a caller-supplied range
-    /// coder (see [`Self::decode_silk_layer_mono`]).
     fn decode_silk_layer_stereo(
         &mut self,
         rd: &mut crate::range_decoder::RangeDecoder<'_>,
@@ -1025,14 +1080,18 @@ impl OpusDecoder {
             crate::toc::Bandwidth::Fb => 21,
         };
 
-        // (Re)build the carried CELT state on a geometry change.
-        let rebuild = !self
-            .celt_synth
-            .as_ref()
-            .is_some_and(|s| s.channels() == channels && s.frame_len() == n);
-        if rebuild {
-            self.celt_synth = Some(crate::celt_mdct_synthesis::CeltSynthesis::new(channels, n));
-            self.celt_energy = Some(crate::celt_frame_decode::CeltEnergyState::new());
+        // Adapt the carried CELT state to this frame's geometry
+        // WITHOUT dropping it: §4.5 says switching between any two
+        // CELT-only configurations needs no special treatment (the
+        // MDCT overlap smooths the transition), and a §4.5.1
+        // redundant frame's warmed state must carry into this frame
+        // (rule 3). Resets happen only where §4.5.2 places them (the
+        // packet-boundary policy above).
+        match self.celt_synth.as_mut() {
+            Some(s) => s.set_geometry(channels, n),
+            None => {
+                self.celt_synth = Some(crate::celt_mdct_synthesis::CeltSynthesis::new(channels, n))
+            }
         }
         let energy = self.celt_energy.get_or_insert_with(Default::default);
 
@@ -1205,7 +1264,7 @@ impl OpusDecoder {
     /// the §4.2.4 LBRR flags are all clear (no FEC data), or `Err` on a
     /// malformed bitstream.
     ///
-    /// Unlike [`Self::decode_silk_only_mono`], which only consumed the
+    /// Unlike [`Self::decode_silk_layer_mono`], which only consumed the
     /// LBRR bits to keep the range coder aligned, this path actually runs
     /// the §4.2.7.9 synthesis on the LBRR parameters. Per §4.2.5 the LBRR
     /// frames form their own independent sequence covering the prior
@@ -1452,21 +1511,24 @@ impl OpusDecoder {
         Ok(Some((left, right, bandwidth)))
     }
 
-    /// Decode one Hybrid Opus frame (§4.2 SILK + §4.3 CELT). Currently
-    /// emits silence; depends on both layer paths landing.
     /// Decode one Hybrid Opus frame (§4.4): the §4.2 SILK layer (WB
     /// internal rate) and the §4.3 CELT layer (bands 17–21) share one
     /// range coder; their 48 kHz outputs are summed.
     ///
     /// After the SILK layer the §4.5.1 redundancy side information is
-    /// decoded; when a redundant CELT frame is present its bytes are
-    /// excluded from the CELT layer's budget (the redundant frame's
-    /// own 5 ms synthesis/cross-lap is a pending refinement — the
-    /// main-path audio is decoded either way). The SILK→48 kHz
-    /// resample is the crate's non-normative linear interpolator, so
-    /// the low band is not bit-aligned with the reference decoder's
-    /// resampler; the CELT band and the assembly are the normative
-    /// paths.
+    /// decoded. A present redundant CELT frame occupies the trailing
+    /// bytes: the main coder's buffer is reduced by that amount
+    /// (§4.5.1.3 — its raw bits then read from the end of the reduced
+    /// buffer), and the 5 ms redundant frame is decoded (§4.5.1.4) and
+    /// cross-lapped into this frame's output at the signalled
+    /// position. A beginning-position redundant frame decodes on the
+    /// carried CELT state *before* the deferred §4.5.2 main-layer
+    /// reset (Figure 18's `R & |H`); an end-position one takes the
+    /// §4.5.2 reset itself and its warmed state carries into the next
+    /// CELT-only frame (`!R`). The SILK→48 kHz resample is the
+    /// crate's non-normative linear interpolator, so the low band is
+    /// not bit-aligned with the reference decoder's resampler; the
+    /// CELT band and the assembly are the normative paths.
     fn decode_hybrid_frame(
         &mut self,
         frame: &[u8],
@@ -1511,7 +1573,13 @@ impl OpusDecoder {
             }
         };
         if !silk_ok {
-            // §4.6 floor: the reserved silence stands in.
+            // §4.6 floor: the reserved silence stands in. A deferred
+            // §4.5.2 CELT reset still applies (the broken frame cannot
+            // decode the redundant frame the deferral was waiting on).
+            if std::mem::take(&mut self.celt_reset_before_main) {
+                self.celt_energy = None;
+                self.celt_synth = None;
+            }
             pcm[pcm_start..].fill(0);
             return FrameOutcome {
                 samples_per_channel: per_channel,
@@ -1521,16 +1589,22 @@ impl OpusDecoder {
 
         // §4.5.1 redundancy side information; a present redundant CELT
         // frame occupies the trailing bytes, shrinking the main CELT
-        // layer's budget.
+        // layer's budget AND its raw-bit buffer (§4.5.1.3: "the MDCT
+        // layer reads any raw bits from the end of this reduced
+        // buffer").
         let redundancy =
             crate::celt_redundancy::decode_redundancy(&mut rd, OperatingMode::Hybrid, frame.len());
+        self.last_redundancy = redundancy;
         let celt_bytes = match redundancy {
             crate::celt_redundancy::RedundancyDecision::Present { size_bytes, .. } => {
-                frame.len().saturating_sub(size_bytes)
+                let reduced = frame.len().saturating_sub(size_bytes);
+                rd.shrink_buffer(reduced);
+                reduced
             }
             crate::celt_redundancy::RedundancyDecision::Invalid => {
                 // §4.5.1.3: stop decoding this frame; keep the SILK
                 // audio already written.
+                self.celt_reset_before_main = false;
                 return FrameOutcome {
                     samples_per_channel: per_channel,
                     status: FrameDecodeStatus::HybridDecoded,
@@ -1538,6 +1612,29 @@ impl OpusDecoder {
             }
             crate::celt_redundancy::RedundancyDecision::NotPresent => frame.len(),
         };
+        let red_params =
+            crate::redundancy_decode_params::redundant_frame_params(routing, redundancy);
+
+        // §4.5.2 / Figure 18 `R & |H`: a beginning-position redundant
+        // frame (CELT→Hybrid transition) decodes on the carried CELT
+        // state, BEFORE the deferred main-layer reset.
+        let mut red_pcm: Option<Vec<i16>> = None;
+        if let Some(params) = &red_params {
+            if matches!(
+                params.position,
+                crate::celt_redundancy::RedundancyPosition::Beginning
+            ) {
+                let red_bytes = &frame[frame.len() - params.size_bytes..];
+                red_pcm = self.decode_redundant_celt(red_bytes, params, false);
+            }
+        }
+
+        // Deferred §4.5.2 reset for the main CELT layer (rule 2 /
+        // Figure 18 `|H`), placed after the redundant frame's decode.
+        if std::mem::take(&mut self.celt_reset_before_main) {
+            self.celt_energy = None;
+            self.celt_synth = None;
+        }
 
         // §4.3 CELT layer: bands 17.. per the signalled bandwidth.
         let Some(celt_size) =
@@ -1554,13 +1651,11 @@ impl OpusDecoder {
             crate::toc::Bandwidth::Swb => 19,
             _ => 21,
         };
-        let rebuild = !self
-            .celt_synth
-            .as_ref()
-            .is_some_and(|s| s.channels() == channels && s.frame_len() == n);
-        if rebuild {
-            self.celt_synth = Some(crate::celt_mdct_synthesis::CeltSynthesis::new(channels, n));
-            self.celt_energy = Some(crate::celt_frame_decode::CeltEnergyState::new());
+        match self.celt_synth.as_mut() {
+            Some(s) => s.set_geometry(channels, n),
+            None => {
+                self.celt_synth = Some(crate::celt_mdct_synthesis::CeltSynthesis::new(channels, n))
+            }
         }
         let energy = self.celt_energy.get_or_insert_with(Default::default);
         let out = crate::celt_frame_decode::decode_celt_frame(
@@ -1601,14 +1696,181 @@ impl OpusDecoder {
         synth.synthesize_frame(&freq, blocks, out.post_filter, &mut celt_pcm);
 
         // §4.4: the layer outputs sum (saturating at the i16 rails).
-        let region = &mut pcm[pcm_start..pcm_start + per_channel * channels];
-        for (dst, &c) in region.iter_mut().zip(celt_pcm.iter()) {
-            *dst = dst.saturating_add(c);
+        {
+            let region = &mut pcm[pcm_start..pcm_start + per_channel * channels];
+            for (dst, &c) in region.iter_mut().zip(celt_pcm.iter()) {
+                *dst = dst.saturating_add(c);
+            }
+        }
+
+        // §4.5.2 / Figure 18 `!R`: an end-position redundant frame
+        // (Hybrid→CELT transition) takes the CELT reset itself, after
+        // the main layer; its warmed state carries into the next
+        // CELT-only frame (whose packet-boundary reset rule 3
+        // suppresses).
+        if let Some(params) = &red_params {
+            if matches!(
+                params.position,
+                crate::celt_redundancy::RedundancyPosition::End
+            ) {
+                let red_bytes = &frame[frame.len() - params.size_bytes..];
+                red_pcm = self.decode_redundant_celt(red_bytes, params, true);
+            }
+        }
+        if let (Some(params), Some(red)) = (&red_params, &red_pcm) {
+            apply_redundancy_cross_lap(&mut pcm[pcm_start..], red, channels, params.position);
         }
 
         FrameOutcome {
             samples_per_channel: per_channel,
             status: FrameDecodeStatus::HybridDecoded,
+        }
+    }
+
+    /// Decode and synthesize one §4.5.1.4 redundant CELT frame from its
+    /// byte-aligned slice at the tail of the carrier Opus frame,
+    /// returning 5 ms of interleaved PCM (240 samples per channel), or
+    /// `None` when the redundant bitstream is malformed.
+    ///
+    /// Per §4.5.1.4 the redundant frame "is decoded like any other
+    /// CELT-only frame, with the exception that it does not contain a
+    /// TOC byte": its own fresh range coder over `red`, band range
+    /// `0..end` for the carrier's audio bandwidth (MB carriers use WB),
+    /// the carrier's channel count, and the fixed 5 ms frame size.
+    /// `reset_before` applies the §4.5.2 CELT reset before the decode
+    /// (end-position redundant frames — Figure 18's `!R`); otherwise
+    /// the carried state (energy history, MDCT overlap, post-filter,
+    /// de-emphasis) continues into the redundant frame.
+    fn decode_redundant_celt(
+        &mut self,
+        red: &[u8],
+        params: &crate::redundancy_decode_params::RedundantFrameParams,
+        reset_before: bool,
+    ) -> Option<Vec<i16>> {
+        use crate::celt_band_layout::CeltFrameSize;
+
+        let n = output_samples_per_channel(params.duration_tenths_ms);
+        let channels = channel_count(params.channels) as usize;
+        let lm = CeltFrameSize::from_frame_tenths_ms(params.duration_tenths_ms as u32)?
+            .column_index() as i32;
+        let end = match params.bandwidth {
+            crate::toc::Bandwidth::Nb => 13,
+            crate::toc::Bandwidth::Mb | crate::toc::Bandwidth::Wb => 17,
+            crate::toc::Bandwidth::Swb => 19,
+            crate::toc::Bandwidth::Fb => 21,
+        };
+
+        // The redundant frame shares the stream's one CELT decoder;
+        // only its geometry differs (§4.5.2 keeps the state across the
+        // size change unless a reset is placed here).
+        match self.celt_synth.as_mut() {
+            Some(s) => s.set_geometry(channels, n),
+            None => {
+                self.celt_synth = Some(crate::celt_mdct_synthesis::CeltSynthesis::new(channels, n))
+            }
+        }
+        if self.celt_energy.is_none() {
+            self.celt_energy = Some(crate::celt_frame_decode::CeltEnergyState::new());
+        }
+        if reset_before {
+            self.celt_energy.as_mut().expect("built above").reset();
+            self.celt_synth.as_mut().expect("built above").reset();
+        }
+
+        let energy = self.celt_energy.as_mut().expect("built above");
+        let mut rd = crate::range_decoder::RangeDecoder::new(red);
+        let out = crate::celt_frame_decode::decode_celt_frame(
+            &mut rd,
+            red.len(),
+            0,
+            end,
+            lm,
+            channels,
+            energy,
+        );
+        if rd.has_error() || u64::from(rd.tell()) > 8 * red.len() as u64 {
+            return None;
+        }
+
+        let m = 1usize << lm;
+        let mut freq = vec![0.0f64; channels * n];
+        for c in 0..channels {
+            for band in 0..end {
+                let gain = out.band_gain[c][band];
+                let off = m * crate::celt_rate_alloc::band_edge(band) as usize;
+                let len = m * crate::celt_rate_alloc::band_width(band) as usize;
+                for j in 0..len {
+                    freq[c * n + off + j] = gain * out.x[c * out.plane + off + j];
+                }
+            }
+        }
+        let blocks = if out.transient { m } else { 1 };
+        let synth = self.celt_synth.as_mut().expect("built above");
+        let mut red_pcm = vec![0i16; channels * n];
+        synth.synthesize_frame(&freq, blocks, out.post_filter, &mut red_pcm);
+        Some(red_pcm)
+    }
+}
+
+/// Apply the §4.5.1.4 redundant-frame cross-lap into one decoded Opus
+/// frame's interleaved PCM `region`.
+///
+/// `red` is the redundant CELT frame's 5 ms of interleaved output. For
+/// a **beginning**-position redundant frame (CELT→SILK/Hybrid
+/// transition) "the final reconstructed output uses the first 2.5 ms of
+/// audio output by the decoder for the redundant frame as is,
+/// discarding the corresponding output of the SILK-only or Hybrid
+/// portion", and the remaining 2.5 ms are cross-lapped into the main
+/// signal. For an **end**-position one (SILK/Hybrid→CELT transition)
+/// "only the second half (2.5 ms) of the audio output … is used",
+/// cross-lapped with the end of the main signal. Both laps use the
+/// power-complementary CELT MDCT window (§4.5.1.4), squared into
+/// amplitude weights exactly as the §4.3.7.1 post-filter transition
+/// does.
+fn apply_redundancy_cross_lap(
+    region: &mut [i16],
+    red: &[i16],
+    channels: usize,
+    position: crate::celt_redundancy::RedundancyPosition,
+) {
+    use crate::celt_mdct_window::{celt_overlap_window, CELT_OVERLAP_48K};
+
+    let lap = CELT_OVERLAP_48K; // 120 samples = 2.5 ms at 48 kHz
+    let half = lap * channels;
+    if red.len() < 2 * half || region.len() < 2 * half || channels == 0 {
+        return;
+    }
+    let window = celt_overlap_window();
+    let mix = |a: i16, b: i16, f: f64| -> i16 {
+        // a fades in under f, b fades out under 1 - f.
+        (f64::from(a) * f + f64::from(b) * (1.0 - f))
+            .round()
+            .clamp(-32768.0, 32767.0) as i16
+    };
+    match position {
+        crate::celt_redundancy::RedundancyPosition::Beginning => {
+            // First 2.5 ms: redundant output as-is.
+            region[..half].copy_from_slice(&red[..half]);
+            // Next 2.5 ms: main fades in, redundant fades out.
+            for (i, &w) in window.iter().enumerate().take(lap) {
+                let f = w * w;
+                for c in 0..channels {
+                    let idx = half + i * channels + c;
+                    region[idx] = mix(region[idx], red[idx], f);
+                }
+            }
+        }
+        crate::celt_redundancy::RedundancyPosition::End => {
+            // Last 2.5 ms: the redundant frame's second half fades in,
+            // the main signal fades out.
+            let base = region.len() - half;
+            for (i, &w) in window.iter().enumerate().take(lap) {
+                let f = w * w;
+                for c in 0..channels {
+                    let idx = base + i * channels + c;
+                    region[idx] = mix(red[half + i * channels + c], region[idx], f);
+                }
+            }
         }
     }
 }

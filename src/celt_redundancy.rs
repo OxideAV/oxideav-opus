@@ -141,9 +141,10 @@ impl RedundancyPosition {
 ///   decoder stop decoding and discard the rest of the current Opus
 ///   frame." The caller can drop any partial CELT output and proceed
 ///   with whatever audio was decoded prior to the §4.5.1 stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RedundancyDecision {
     /// No redundant CELT frame in this Opus frame.
+    #[default]
     NotPresent,
     /// Redundant CELT frame is present at `position`, sized
     /// `size_bytes` whole bytes (always at least
