@@ -19,6 +19,22 @@ All notable changes to `oxideav-opus` are recorded here.
   §4.3.4.1 `bits2pulses` / `pulses2bits` / `get_pulses` cost-cache
   accessors and the `logN400` table; exact-integer 1/8-bit arithmetic
   throughout
+- **CELT-only frames decode end-to-end to real PCM**
+  (`FrameDecodeStatus::CeltDecoded`): `celt_frame_decode` sequences the
+  whole Table-56 entropy layer (silence / post-filter / transient /
+  intra flags with the exact budget gates, coarse energy with its
+  budget fallbacks, TF flags, spread, dynalloc boosts, trim, the
+  implicit allocation, fine energy, PVQ band shapes, the anti-collapse
+  bit, and the §4.3.2.3 final-bit backfill) and rolls the cross-frame
+  energy history; `celt_mdct_synthesis` runs the signal half
+  (denormalisation, long/short-block inverse MDCT + overlap-add, the
+  §4.3.7.1 pitch post-filter with crossfaded parameter transitions,
+  §4.3.7.2 de-emphasis) with all carried state. Validated against the
+  reference decodes of the fixture corpus: `celt-fb-stereo-128kbps`
+  and `celt-2.5ms-low-latency` both reconstruct at ~100 dB SNR
+  (arithmetic-precision agreement); §4.5.2 CELT resets are applied on
+  mode transitions. The narrower `CeltCoarseEnergyDecoded` /
+  `CeltAllocationDecoded` statuses are superseded and removed
 - `celt_band_decode`: the §4.3.4 recursive band decode — PVQ leaf
   decode with the exact spreading rotation (two-stride lattice), band
   splitting with entropy-coded split angles (triangular / uniform /

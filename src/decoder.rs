@@ -60,9 +60,18 @@
 //!   ([`FrameDecodeStatus::SilkStereoDecoded`]). The §4.2.7.1 mono→stereo
 //!   weight reset and the §4.5.2 SILK state reset are applied across
 //!   packets.
-//! * **CELT-only / Hybrid** frames emit silence of the correct length
-//!   flagged [`FrameDecodeStatus::LayerNotWired`] (CELT is gated on the
-//!   §4.3.2.1 coarse-energy Laplace decode).
+//! * **CELT-only** frames run the full §4.3 decode → PCM path: the
+//!   Table-56 entropy decode ([`crate::celt_frame_decode`]: frame flags,
+//!   coarse / fine / final energies, TF, spread, dynalloc, trim, the
+//!   §4.3.3 implicit allocation, §4.3.4 PVQ band shapes with folding,
+//!   §4.3.5 anti-collapse) and the §4.3.6–§4.3.7.2 synthesis
+//!   ([`crate::celt_mdct_synthesis`]: denormalisation, long/short-block
+//!   inverse MDCT + overlap-add, the §4.3.7.1 pitch post-filter, and
+//!   de-emphasis), with all cross-frame state carried
+//!   ([`FrameDecodeStatus::CeltDecoded`]).
+//! * **Hybrid** frames emit silence of the correct length flagged
+//!   [`FrameDecodeStatus::LayerNotWired`] (the SILK + CELT layer sum is
+//!   the remaining assembly step).
 //!
 //! Either way the multi-frame packet loop and the RFC 7845 §5.1 48 kHz
 //! sample-count accounting are exercised end-to-end.
@@ -143,38 +152,11 @@ pub enum FrameDecodeStatus {
     /// error (a malformed / truncated frame). Silence of the correct length
     /// was emitted in its place per the §4.6 floor.
     CeltDecodeError,
-    /// A **non-silent** CELT-only frame whose §4.3.7.1 prefix *and*
-    /// §4.3.2.1 coarse-energy were decoded from the real range coder:
-    /// the per-band coarse log-energy envelope was reconstructed (the 2-D
-    /// predictor recurrence in [`crate::celt_coarse_energy`]) and threaded
-    /// into the cross-frame predictor state. The remaining band-data
-    /// stages (bit allocation, §4.3.4 PVQ band shapes, §4.3.2.2 fine
-    /// energy) are not yet wired, so silence of the correct length is
-    /// still emitted and the synthesis backend's overlap-add / de-emphasis
-    /// state is advanced — but the coarse-energy *front half* of the
-    /// entropy decode is now real. (Distinct from
-    /// [`Self::LayerNotWired`]: the frame prefix and coarse energy are
-    /// actually consumed.)
-    CeltCoarseEnergyDecoded,
-    /// A **non-silent** CELT-only frame that additionally decoded the
-    /// §4.3.3 allocation *header* from the real range coder, on top of
-    /// the §4.3.7.1 prefix and §4.3.2.1 coarse energy: the §4.3.3 band
-    /// boosts ([`crate::celt_band_boost::decode_band_boosts`]), the
-    /// §4.3.3 allocation trim ([`crate::celt_alloc_trim::decode_alloc_trim`]),
-    /// and the §4.3.3 anti-collapse / skip / intensity-stereo /
-    /// dual-stereo reservations ([`crate::celt_reservations::reserve_block`])
-    /// were consumed in §4.3.3 order, advancing the range-coder position
-    /// through the entire signalled part of the allocation. The remaining
-    /// §4.3.3 implicit allocation (the `interp_bits2pulses` per-band
-    /// pulse / fine-energy split — reference-code-only, absent from the
-    /// RFC narrative body) plus the §4.3.4 PVQ band shapes and §4.3.2.2
-    /// fine energy are still pending, so silence of the correct length is
-    /// emitted and the synthesis backend's overlap-add / de-emphasis state
-    /// is advanced with all-zero bands. The *signalled* allocation
-    /// header is now real. (Distinct from
-    /// [`Self::CeltCoarseEnergyDecoded`]: the boost / trim / reservation
-    /// symbols are actually consumed.)
-    CeltAllocationDecoded,
+    /// A **non-silent** CELT-only frame decoded end-to-end: the full
+    /// Table-56 entropy decode ([`crate::celt_frame_decode`]) followed
+    /// by the §4.3.6–§4.3.7.2 synthesis
+    /// ([`crate::celt_mdct_synthesis`]). The emitted PCM is real audio.
+    CeltDecoded,
 }
 
 /// The result of decoding one Opus frame: how many per-channel samples
@@ -312,20 +294,16 @@ pub struct OpusDecoder {
     /// before every SILK-only or Hybrid frame where the previous frame
     /// was CELT-only"). `None` before the first frame / after a reset.
     prev_mode: Option<OperatingMode>,
-    /// CELT synthesis backend state (the §4.3.7 MDCT overlap-add history
-    /// and §4.3.7.2 de-emphasis memory, per channel), carried across the
-    /// CELT frames of the stream. `None` until the first CELT-layer frame
-    /// is synthesized; re-created when the CELT frame size or channel
-    /// count changes (a §4.5.2-style reset, since the overlap geometry
-    /// depends on the frame size).
-    celt_synth: Option<crate::celt_synthesis::CeltSynthState>,
-    /// §4.3.2.1 CELT coarse-energy predictor state (the per-band
-    /// mean-removed `E[b][l-1]` history the inter-frame predictor reads),
-    /// carried across the CELT frames of the stream. Reset on a SILK→CELT
-    /// transition (§4.5.2) and whenever an intra frame is decoded (where
-    /// `alpha = 0` ignores the prior frame anyway). `None` until the first
-    /// CELT-layer frame whose coarse energy is reconstructed.
-    celt_coarse: Option<crate::celt_coarse_energy::CoarseEnergyState>,
+    /// CELT synthesis-side state (§4.3.7 overlap-add memory, §4.3.7.1
+    /// post-filter signal history + parameter pair, §4.3.7.2
+    /// de-emphasis memory), carried across the CELT frames of the
+    /// stream. `None` until the first CELT frame; rebuilt when the CELT
+    /// frame size or channel count changes and dropped on a §4.5.2
+    /// CELT reset.
+    celt_synth: Option<crate::celt_mdct_synthesis::CeltSynthesis>,
+    /// CELT entropy-side state (the §4.3.2 per-band energy history and
+    /// the carried folding-noise seed), advanced by every CELT frame.
+    celt_energy: Option<crate::celt_frame_decode::CeltEnergyState>,
 }
 
 impl OpusDecoder {
@@ -402,6 +380,12 @@ impl OpusDecoder {
                 self.silk_carry_mono = SilkChannelCarry::default();
                 self.silk_carry_mid = SilkChannelCarry::default();
                 self.silk_carry_side = SilkChannelCarry::default();
+            }
+            if reset.celt_resets() {
+                // §4.5.2 rules 2–4: drop the carried CELT state so the
+                // next CELT-layer frame starts from the reset state.
+                self.celt_energy = None;
+                self.celt_synth = None;
             }
         }
 
@@ -905,162 +889,22 @@ impl OpusDecoder {
         Ok((left, right, bandwidth))
     }
 
-    /// Decode the Table-56 CELT symbols that sit between the §4.3.2.1
-    /// coarse energy and the §4.3.4 residual: the §4.3.1 time-frequency
-    /// resolution, the §4.3.4.3 spread parameter, and the §4.3.3
-    /// signalled allocation header. All are read from the live range
-    /// coder in exact Table-56 order:
+    /// Decode one CELT-only Opus frame (§4.3) end-to-end.
     ///
-    /// 1. **`tf_change` / `tf_select`** (§4.3.1, `celt_tf_decode::decode_tf`):
-    ///    the per-band time-frequency resolution flags and the gated
-    ///    `tf_select` bit. These come immediately after coarse energy in
-    ///    Table 56 and *must* be consumed before the allocation, or every
-    ///    subsequent symbol reads from the wrong bitstream position.
-    /// 2. **`spread`** (§4.3.4.3, `celt_spreading::decode_spread`): the
-    ///    2-bit spread symbol (PDF `{7,2,21,2}/32`), Table-56-ordered
-    ///    right before the dynamic allocation.
-    /// 3. **Band boosts** (§4.3.3, `celt_band_boost::decode_band_boosts`):
-    ///    the per-band dynamic-allocation boost symbols over the coding
-    ///    window `start..end`, fed the per-band cap vector `cap[]`
-    ///    ([`crate::celt_cache_caps50::cap_for_band_bits`]) and the
-    ///    per-band MDCT-bin counts.
-    /// 4. **Allocation trim** (§4.3.3, `celt_alloc_trim::decode_alloc_trim`):
-    ///    the single trim symbol, gated on whether 6 bits still fit after
-    ///    the boosts.
-    /// 5. **Reservations** (§4.3.3, `celt_reservations::reserve_block`):
-    ///    the §4.3.3 anti-collapse / skip / intensity-stereo / dual-stereo
-    ///    bit reservations. (`reserve_block` only *computes* the reserved
-    ///    eighth-bit counts; the anti-collapse / skip / intensity / dual
-    ///    *bits* themselves are decoded later in Table-56 order, after the
-    ///    implicit allocation + residual, so nothing is read from the
-    ///    coder here — but the reservation computation reads
-    ///    `ec_tell_frac` at exactly this point and must run now to stay
-    ///    faithful to the §4.3.3 ordering and to validate the running
-    ///    budget.)
+    /// Runs the full Table-56 entropy decode
+    /// ([`crate::celt_frame_decode::decode_celt_frame`]: frame flags,
+    /// coarse / fine / final energies, TF, spread, dynalloc, trim, the
+    /// §4.3.3 implicit allocation, §4.3.4 PVQ band shapes with folding,
+    /// and §4.3.5 anti-collapse), then the §4.3.6–§4.3.7.2 synthesis
+    /// ([`crate::celt_mdct_synthesis::CeltSynthesis`]: denormalisation,
+    /// long/short-block inverse MDCT with overlap-add, the §4.3.7.1
+    /// pitch post-filter, and de-emphasis), emitting real 48 kHz PCM.
     ///
-    /// Returns the decoded [`crate::celt_tf_decode::TfDecode`] and the
-    /// `spread` value (both needed by the pending §4.3.4 band-shape
-    /// decode) on success, or `Err(())` on a caller-side bookkeeping error
-    /// from one of the sub-decoders (a band-window / length mismatch,
-    /// never a malformed-bitstream signal — that surfaces through the
-    /// range coder's sticky error flag, which the caller checks via
-    /// `rd.has_error()`).
-    ///
-    /// The §4.3.3 *implicit* allocation (the reference-only
-    /// `interp_bits2pulses` per-band pulse / fine-energy split) is **not**
-    /// performed here: it reads nothing further from the range coder, so
-    /// stopping after the reservation block leaves the coder positioned
-    /// exactly where the §4.3.4 PVQ residual decode will resume once that
-    /// (currently docs-gapped) interpolation lands.
-    #[allow(clippy::too_many_arguments)]
-    fn decode_celt_tf_spread_allocation(
-        rd: &mut crate::range_decoder::RangeDecoder<'_>,
-        celt_size: crate::celt_band_layout::CeltFrameSize,
-        is_transient: bool,
-        channels: u8,
-        start: usize,
-        end: usize,
-        frame_size_bytes: u32,
-    ) -> Result<(crate::celt_tf_decode::TfDecode, u8), ()> {
-        use crate::celt_cache_caps50::CacheCapsStereo;
-
-        let is_stereo = channels == 2;
-        let stereo_axis = if is_stereo {
-            CacheCapsStereo::Stereo
-        } else {
-            CacheCapsStereo::Mono
-        };
-        let lm = celt_size.column_index() as u32;
-        let band_count = end - start;
-
-        // §4.3.1 (Table 56): tf_change / tf_select come immediately after
-        // coarse energy. Decode them from the live coder so the band
-        // boosts below read from the correct bitstream position.
-        let tf = crate::celt_tf_decode::decode_tf(rd, celt_size, is_transient, start, end);
-
-        // §4.3.4.3 (Table 56): the spread symbol is next, right before the
-        // dynamic allocation.
-        let spread = crate::celt_spreading::decode_spread(rd);
-
-        // §4.3.3 per-band cap[] and per-channel MDCT-bin counts over the
-        // coding window. Both are indexed by `band - start`.
-        let mut caps: Vec<u32> = Vec::with_capacity(band_count);
-        let mut n_bins: Vec<u32> = Vec::with_capacity(band_count);
-        for band in start..end {
-            let bins = crate::celt_band_layout::celt_band_bins_per_channel(band, celt_size)
-                .ok_or(())? as u32;
-            let cap = crate::celt_cache_caps50::cap_for_band_bits(
-                lm,
-                stereo_axis,
-                band as u32,
-                channels as u32,
-                bins,
-            )
-            .map_err(|_| ())?;
-            caps.push(cap);
-            n_bins.push(bins);
-        }
-
-        // Step 1: §4.3.3 band boosts.
-        let boosts = crate::celt_band_boost::decode_band_boosts(
-            rd,
-            start,
-            end,
-            &caps,
-            &n_bins,
-            frame_size_bytes,
-        )
-        .map_err(|_| ())?;
-
-        // Step 2: §4.3.3 allocation trim. The gate uses the running
-        // `ec_tell_frac` and the `total_boost` from step 1.
-        let _trim = crate::celt_alloc_trim::decode_alloc_trim(
-            rd,
-            rd.tell_frac(),
-            frame_size_bytes,
-            boosts.total_boost_eighth_bits,
-        )
-        .map_err(|_| ())?;
-
-        // Step 3: §4.3.3 reservations. These read the running
-        // `ec_tell_frac` *after* the trim symbol and only *compute* the
-        // reserved eighth-bit budget; they consume no further range-coder
-        // symbols at this point.
-        let _reservations = crate::celt_reservations::reserve_block(
-            frame_size_bytes,
-            rd.tell_frac(),
-            boosts.total_boost_eighth_bits,
-            celt_size,
-            is_transient,
-            is_stereo,
-            band_count as u32,
-        )
-        .map_err(|_| ())?;
-
-        Ok((tf, spread))
-    }
-
-    /// Decode one CELT-only Opus frame (§4.3).
-    ///
-    /// Decodes the §4.3.7.1 range-coded frame prefix (silence flag +
-    /// post-filter group + transient + intra) from the real range coder.
-    /// When the **silence** flag is set, the frame is fully wired
-    /// end-to-end: the §4.3.6→§4.3.7.2 synthesis backend
-    /// ([`crate::celt_synthesis::CeltSynthState`]) is advanced with
-    /// all-zero band shapes and energies, producing silence PCM at the
-    /// 48 kHz output rate while carrying the MDCT overlap-add and
-    /// de-emphasis state forward for subsequent frames
-    /// ([`FrameDecodeStatus::CeltSilence`]). The synthesis state is
-    /// (re)built whenever the CELT frame size or channel count changes.
-    ///
-    /// Non-silent CELT frames still emit silence flagged
-    /// [`FrameDecodeStatus::LayerNotWired`]: the §4.3.2.1 coarse-energy
-    /// reconstruction recurrence (the 2-D predictor accumulation and its
-    /// per-band mean baseline) is not yet available in the clean-room
-    /// `docs/` material, so the band-energy envelope cannot be rebuilt.
-    /// The Laplace symbol decoder ([`crate::celt_laplace`]) and the prefix
-    /// decoder are in place; the missing piece is the reconstruction
-    /// arithmetic feeding the per-band `log2_energy`.
+    /// Cross-frame state (energy history + folding seed, overlap and
+    /// post-filter memories) is carried in `self`; it is rebuilt when
+    /// the frame geometry (size / channels) changes and dropped on a
+    /// §4.5.2 CELT reset. A range-coder error or a bit-budget overrun
+    /// yields [`FrameDecodeStatus::CeltDecodeError`] and silence.
     fn decode_celt_only_frame(
         &mut self,
         frame: &[u8],
@@ -1070,160 +914,85 @@ impl OpusDecoder {
         use crate::celt_band_layout::CeltFrameSize;
 
         let per_channel = output_samples_per_channel(routing.frame_size_tenths_ms);
-        let channels = routing.channel_count();
+        let channels = routing.channel_count() as usize;
         let pcm_start = pcm.len();
-        push_silence(pcm, per_channel, channels);
+        push_silence(pcm, per_channel, channels as u8);
+        let err = FrameOutcome {
+            samples_per_channel: per_channel,
+            status: FrameDecodeStatus::CeltDecodeError,
+        };
 
-        // The CELT layer needs a Table-55 frame size; a 40/60 ms frame
-        // can never route here (those are SILK-only), so a `None` is a
-        // routing invariant violation — fall back to the unwired floor.
         let Some(celt_size) =
             CeltFrameSize::from_frame_tenths_ms(routing.frame_size_tenths_ms as u32)
         else {
-            return FrameOutcome {
-                samples_per_channel: per_channel,
-                status: FrameDecodeStatus::LayerNotWired(OperatingMode::CeltOnly),
-            };
+            return err;
+        };
+        let lm = celt_size.column_index() as i32;
+        let n = per_channel; // CELT-only runs at the 48 kHz output rate.
+                             // §4.4 / Table 55: the coded band range ends at the signalled
+                             // audio bandwidth (NB→13, WB→17, SWB→19, FB→21).
+        let end = match routing.toc_bandwidth {
+            crate::toc::Bandwidth::Nb => 13,
+            crate::toc::Bandwidth::Mb | crate::toc::Bandwidth::Wb => 17,
+            crate::toc::Bandwidth::Swb => 19,
+            crate::toc::Bandwidth::Fb => 21,
         };
 
-        // §4.3.7.1 frame prefix from the real range coder.
+        // (Re)build the carried CELT state on a geometry change.
+        let rebuild = !self
+            .celt_synth
+            .as_ref()
+            .is_some_and(|s| s.channels() == channels && s.frame_len() == n);
+        if rebuild {
+            self.celt_synth = Some(crate::celt_mdct_synthesis::CeltSynthesis::new(channels, n));
+            self.celt_energy = Some(crate::celt_frame_decode::CeltEnergyState::new());
+        }
+        let energy = self.celt_energy.get_or_insert_with(Default::default);
+
+        // §4.3 entropy half.
         let mut rd = crate::range_decoder::RangeDecoder::new(frame);
-        let prefix = crate::celt_frame_prefix::decode_celt_frame_prefix(&mut rd);
-        if rd.has_error() {
-            return FrameOutcome {
-                samples_per_channel: per_channel,
-                status: FrameDecodeStatus::CeltDecodeError,
-            };
+        let out = crate::celt_frame_decode::decode_celt_frame(
+            &mut rd,
+            frame.len(),
+            0,
+            end,
+            lm,
+            channels,
+            energy,
+        );
+        if rd.has_error() || u64::from(rd.tell()) > 8 * frame.len() as u64 {
+            return err;
         }
 
-        // Non-silent frames now decode the §4.3.2.1 coarse energy from the
-        // range coder. The downstream band-data stages (bit allocation,
-        // §4.3.4 PVQ band shapes, §4.3.2.2 fine energy) are not yet wired,
-        // so we still emit the §4.6 floor and advance the synthesis state
-        // with all-zero bands — but the coarse-energy front half of the
-        // entropy decode is real, and the cross-frame predictor state is
-        // threaded forward for the next frame.
-        let final_status = if prefix.silence {
-            FrameDecodeStatus::CeltSilence
-        } else {
-            // Reset the coarse-energy predictor on an intra frame (where
-            // `alpha = 0` discards the prior frame anyway) or when no
-            // state has been carried yet; otherwise reuse the threaded
-            // history so the inter-frame predictor sees `E[b][l-1]`.
-            if prefix.intra || self.celt_coarse.is_none() {
-                self.celt_coarse = Some(crate::celt_coarse_energy::CoarseEnergyState::new());
-            }
-            let coarse = self.celt_coarse.as_mut().expect("just built");
-            let start = crate::celt_band_layout::celt_first_coded_band(false);
-            let end = crate::celt_band_layout::celt_end_coded_band();
-            match coarse.decode_frame(&mut rd, celt_size, prefix.intra, start, end) {
-                Ok(_frame) => {
-                    if rd.has_error() {
-                        return FrameOutcome {
-                            samples_per_channel: per_channel,
-                            status: FrameDecodeStatus::CeltDecodeError,
-                        };
-                    }
-                    // §4.3.1 TF + §4.3.4.3 spread + §4.3.3 allocation
-                    // header: the Table-56 symbols between coarse energy
-                    // and the §4.3.4 residual (tf_change / tf_select,
-                    // spread, band boosts, allocation trim, and the
-                    // anti-collapse / skip / intensity / dual
-                    // reservations), decoded in Table-56 order from the
-                    // same range coder. This advances the entropy decode
-                    // through everything the bitstream explicitly carries
-                    // before the (reference-only) implicit interpolation.
-                    match Self::decode_celt_tf_spread_allocation(
-                        &mut rd,
-                        celt_size,
-                        prefix.transient,
-                        channels,
-                        start,
-                        end,
-                        frame.len() as u32,
-                    ) {
-                        Ok((_tf, _spread)) => {
-                            if rd.has_error() {
-                                return FrameOutcome {
-                                    samples_per_channel: per_channel,
-                                    status: FrameDecodeStatus::CeltDecodeError,
-                                };
-                            }
-                            FrameDecodeStatus::CeltAllocationDecoded
-                        }
-                        Err(()) => {
-                            return FrameOutcome {
-                                samples_per_channel: per_channel,
-                                status: FrameDecodeStatus::CeltDecodeError,
-                            };
-                        }
-                    }
-                }
-                Err(_) => {
-                    return FrameOutcome {
-                        samples_per_channel: per_channel,
-                        status: FrameDecodeStatus::CeltDecodeError,
-                    };
-                }
-            }
-        };
-
-        // Drive the synthesis backend with all-zero bands (the band shapes
-        // are not yet decoded). For a silence frame this is the §4.5.1
-        // behaviour; for a coarse-only frame it advances the overlap-add /
-        // de-emphasis state while the band-data stages land.
-        // (Re)build the CELT synthesis state if absent or if its geometry
-        // no longer matches this frame's size / channel count.
-        let needs_rebuild = match &self.celt_synth {
-            Some(s) => {
-                s.channels() != channels as usize
-                    || s.transform_half_len() != (celt_size.to_frame_tenths_ms() as usize * 48) / 10
-            }
-            None => true,
-        };
-        if needs_rebuild {
-            match crate::celt_synthesis::CeltSynthState::new(celt_size, false, channels as usize) {
-                Ok(s) => self.celt_synth = Some(s),
-                Err(_) => {
-                    return FrameOutcome {
-                        samples_per_channel: per_channel,
-                        status: FrameDecodeStatus::CeltDecodeError,
-                    };
+        // §4.3.6 denormalisation into the frame spectrum (bins outside
+        // the coded range stay zero).
+        let m = 1usize << lm;
+        let mut freq = vec![0.0f64; channels * n];
+        for c in 0..channels {
+            for band in 0..end {
+                let gain = out.band_gain[c][band];
+                let off = m * crate::celt_rate_alloc::band_edge(band) as usize;
+                let len = m * crate::celt_rate_alloc::band_width(band) as usize;
+                for j in 0..len {
+                    freq[c * n + off + j] = gain * out.x[c * out.plane + off + j];
                 }
             }
         }
-        let synth = self.celt_synth.as_mut().expect("just built");
 
-        // All-zero per-band shapes and energies: one zero shape slice per
-        // coded band (each of its Table-55 bin length) and a matching
-        // zero-energy vector, for every channel.
-        let coded_bands = synth.coded_bands();
-        let first = synth.first_coded_band();
-        let mut shape_storage: Vec<Vec<f64>> = Vec::with_capacity(coded_bands);
-        for band in first..(first + coded_bands) {
-            let bins = crate::celt_band_layout::celt_band_bins_per_channel(band, celt_size)
-                .unwrap_or(0) as usize;
-            shape_storage.push(vec![0.0_f64; bins]);
-        }
-        let shape_refs: Vec<&[f64]> = shape_storage.iter().map(Vec::as_slice).collect();
-        let energies = vec![0.0_f64; coded_bands];
-        let per_channel_args: Vec<(&[&[f64]], &[f64])> = (0..channels as usize)
-            .map(|_| (shape_refs.as_slice(), energies.as_slice()))
-            .collect();
+        // §4.3.7 synthesis (signal half).
+        let blocks = if out.transient { m } else { 1 };
+        let synth = self.celt_synth.as_mut().expect("state built above");
+        let mut frame_pcm = vec![0i16; channels * n];
+        synth.synthesize_frame(&freq, blocks, out.post_filter, &mut frame_pcm);
+        let region = &mut pcm[pcm_start..pcm_start + per_channel * channels];
+        region.copy_from_slice(&frame_pcm);
 
-        match synth.synthesize_frame_interleaved_i16(&per_channel_args) {
-            Ok(pcm_frame) => {
-                let region = &mut pcm[pcm_start..pcm_start + per_channel * channels as usize];
-                let n = region.len().min(pcm_frame.len());
-                region[..n].copy_from_slice(&pcm_frame[..n]);
-                FrameOutcome {
-                    samples_per_channel: per_channel,
-                    status: final_status,
-                }
-            }
-            Err(_) => FrameOutcome {
-                samples_per_channel: per_channel,
-                status: FrameDecodeStatus::CeltDecodeError,
+        FrameOutcome {
+            samples_per_channel: per_channel,
+            status: if out.silence {
+                FrameDecodeStatus::CeltSilence
+            } else {
+                FrameDecodeStatus::CeltDecoded
             },
         }
     }
@@ -1921,17 +1690,14 @@ mod tests {
         // 2 channels interleaved => pcm len = 2 * samples_per_channel.
         assert_eq!(out.pcm.len(), 2 * out.samples_per_channel());
         let routing = OpusFrameRouting::from_toc(OpusTocByte::from_byte(pkt[0]));
-        // A CELT-only frame now decodes its §4.3.7.1 prefix and, when
-        // non-silent, its §4.3.2.1 coarse energy from the real range
-        // coder — so the status is one of the real CELT outcomes
-        // (silence / coarse-energy-decoded / a decode error on a 2-byte
-        // body), never the not-wired placeholder.
+        // A CELT-only frame decodes end-to-end — so the status is one
+        // of the real CELT outcomes (silence / fully decoded / a decode
+        // error on a 2-byte body), never the not-wired placeholder.
         assert!(
             matches!(
                 out.frame_outcomes[0].status,
                 FrameDecodeStatus::CeltSilence
-                    | FrameDecodeStatus::CeltCoarseEnergyDecoded
-                    | FrameDecodeStatus::CeltAllocationDecoded
+                    | FrameDecodeStatus::CeltDecoded
                     | FrameDecodeStatus::CeltDecodeError
             ),
             "got {:?}",
@@ -2222,11 +1988,10 @@ mod tests {
     #[test]
     fn pcm_length_matches_routing_for_every_config() {
         // Every Table-2 config decodes to a PCM buffer of the routing's
-        // 48 kHz length × channels. Mono SILK-only configs now synthesize
-        // real audio (§4.2.7.9); the still-unwired layers (CELT-only,
-        // Hybrid, and stereo SILK) emit correct-length silence. This sweep
-        // pins the length invariant for all 32 configs and the silence
-        // invariant for the not-yet-wired ones.
+        // 48 kHz length × channels. SILK-only and CELT-only configs now
+        // synthesize real audio; the remaining unwired layer (Hybrid)
+        // and every error/silence outcome emit correct-length silence.
+        // This sweep pins the length invariant for all 32 configs.
         let mut dec = OpusDecoder::new();
         for config in 0u8..32 {
             for stereo in [false, true] {
@@ -2236,14 +2001,15 @@ mod tests {
                 let expected = output_samples_per_channel(routing.frame_size_tenths_ms)
                     * out.channels as usize;
                 assert_eq!(out.pcm.len(), expected, "config {config} stereo {stereo}");
-                // The unwired layers (everything except a successfully
-                // synthesized mono or stereo SILK-only frame) still emit
-                // silence.
-                let is_wired_silk = matches!(
+                // Everything except a successfully synthesized SILK or
+                // CELT frame still emits silence.
+                let is_wired = matches!(
                     out.frame_outcomes[0].status,
-                    FrameDecodeStatus::SilkParamsDecoded | FrameDecodeStatus::SilkStereoDecoded
+                    FrameDecodeStatus::SilkParamsDecoded
+                        | FrameDecodeStatus::SilkStereoDecoded
+                        | FrameDecodeStatus::CeltDecoded
                 );
-                if !is_wired_silk {
+                if !is_wired {
                     assert!(
                         out.pcm.iter().all(|&s| s == 0),
                         "config {config} stereo {stereo} status {:?} should be silence",
@@ -2353,21 +2119,14 @@ mod tests {
     }
 
     #[test]
-    fn celt_non_silent_frame_decodes_coarse_energy() {
-        // A CELT body whose silence flag is clear now takes the
-        // §4.3.2.1 coarse-energy decode path: the per-band log-energy
-        // envelope is reconstructed from the real range coder, the
-        // cross-frame predictor state is threaded, and the synthesis
-        // backend is advanced with all-zero bands (the band-shape stages
-        // are still pending). The frame must report
-        // CeltCoarseEnergyDecoded — or CeltDecodeError if the short body
-        // truncates mid-decode — never the not-wired placeholder, never
-        // a panic, and emit silence of the correct length.
+    fn celt_non_silent_frame_decodes_fully() {
+        // A CELT body whose silence flag is clear takes the full §4.3
+        // decode → synthesis path: the status is CeltDecoded (or
+        // CeltDecodeError when the entropy content of the random body
+        // is impossible), never a panic, never the not-wired
+        // placeholder, and the PCM length is exact.
         use crate::celt_frame_prefix::decode_celt_frame_prefix;
         use crate::range_decoder::RangeDecoder;
-        // Find a longer body with silence = 0 and no range-coder error in
-        // the prefix (the 21-band coarse decode needs enough bytes to not
-        // immediately truncate).
         let mut chosen: Option<Vec<u8>> = None;
         for b0 in 0u16..=255 {
             let buf = [
@@ -2387,9 +2146,7 @@ mod tests {
         assert!(
             matches!(
                 out.frame_outcomes[0].status,
-                FrameDecodeStatus::CeltCoarseEnergyDecoded
-                    | FrameDecodeStatus::CeltAllocationDecoded
-                    | FrameDecodeStatus::CeltDecodeError
+                FrameDecodeStatus::CeltDecoded | FrameDecodeStatus::CeltDecodeError
             ),
             "got {:?}",
             out.frame_outcomes[0].status
@@ -2398,10 +2155,11 @@ mod tests {
     }
 
     #[test]
-    fn celt_coarse_energy_threads_predictor_across_frames() {
-        // Two successive non-silent CELT-only inter frames must thread the
-        // coarse-energy predictor state: after the first decodes, the
-        // decoder carries a CoarseEnergyState; the second reuses it.
+    fn celt_energy_state_threads_across_frames() {
+        // Two successive non-silent CELT-only frames must thread the
+        // §4.3.2 energy history: after the first decodes fully, the
+        // decoder carries a CeltEnergyState whose per-band energies the
+        // second frame's inter prediction reads.
         use crate::celt_frame_prefix::decode_celt_frame_prefix;
         use crate::range_decoder::RangeDecoder;
         let mut chosen: Option<Vec<u8>> = None;
@@ -2416,135 +2174,51 @@ mod tests {
                 break;
             }
         }
-        // Not every leading byte yields a non-silent, non-intra prefix; if
-        // none does, the threading invariant is still exercised by the
-        // single-frame test above, so skip silently.
         if let Some(body) = chosen {
             let pkt = code0_packet(19, false, &body); // 20 ms CELT-only mono
             let mut dec = OpusDecoder::new();
             let first = dec.decode_packet(&pkt).expect("decode");
-            // After a successful coarse decode the predictor state exists.
-            // (A non-silent inter frame now also runs the §4.3.3 allocation
-            // header, so the terminal status is `CeltAllocationDecoded`; a
-            // truncated allocation header falls back to `CeltDecodeError`,
-            // but the coarse predictor state was already threaded before
-            // that point regardless.)
-            if matches!(
-                first.frame_outcomes[0].status,
-                FrameDecodeStatus::CeltCoarseEnergyDecoded
-                    | FrameDecodeStatus::CeltAllocationDecoded
-            ) {
-                assert!(dec.celt_coarse.is_some());
+            if first.frame_outcomes[0].status == FrameDecodeStatus::CeltDecoded {
+                let carried = dec.celt_energy.clone().expect("energy state carried");
+                let second = dec.decode_packet(&pkt).expect("decode");
+                // The same packet decodes against a different energy
+                // history, so (when both frames fully decode) the
+                // carried state must have advanced.
+                if second.frame_outcomes[0].status == FrameDecodeStatus::CeltDecoded {
+                    assert!(dec.celt_energy.is_some());
+                    assert_ne!(
+                        dec.celt_energy.as_ref().unwrap().old_band_e,
+                        carried.old_log_e2,
+                        "energy history must roll forward"
+                    );
+                }
             }
-            let _second = dec.decode_packet(&pkt).expect("decode");
         }
     }
 
     #[test]
-    fn celt_non_silent_frame_decodes_allocation_header() {
-        // On top of the §4.3.2.1 coarse energy, a non-silent CELT-only
-        // frame now consumes the §4.3.3 *signalled* allocation header
-        // (band boosts + alloc trim + reservations) from the same range
-        // coder. With a body long enough to survive the 21-band coarse
-        // decode plus the boost/trim symbols, the terminal status is
-        // `CeltAllocationDecoded`; a body that truncates mid-header still
-        // reports a real CELT outcome (never the not-wired placeholder),
-        // never panics, and emits silence of the correct length.
-        use crate::celt_frame_prefix::decode_celt_frame_prefix;
-        use crate::range_decoder::RangeDecoder;
-
-        // A 20 ms CELT-only frame (config 19) has 21 coded bands; pick a
-        // generous body so the allocation header has room to decode.
-        let mut chosen: Option<Vec<u8>> = None;
-        for b0 in 0u16..=255 {
-            let buf = [
-                b0 as u8, 0x91, 0x37, 0xc4, 0x6e, 0x2d, 0xa8, 0x5b, 0xf1, 0x0c, 0x93, 0x47, 0xbe,
-                0x21,
-            ];
-            let mut rd = RangeDecoder::new(&buf);
-            let p = decode_celt_frame_prefix(&mut rd);
-            if !p.silence && !rd.has_error() {
-                chosen = Some(buf.to_vec());
-                break;
-            }
-        }
-        let body = chosen.expect("a non-silent CELT body exists in the candidate set");
-        let pkt = code0_packet(19, false, &body); // 20 ms CELT-only mono
-        let mut dec = OpusDecoder::new();
-        let out = dec.decode_packet(&pkt).expect("decode");
-
-        // Whatever the body's exact entropy content, the status must be a
-        // real CELT outcome that reflects an actually-consumed bitstream,
-        // and the per-channel length is the 20 ms 48 kHz count (960).
-        assert!(
-            matches!(
-                out.frame_outcomes[0].status,
-                FrameDecodeStatus::CeltAllocationDecoded
-                    | FrameDecodeStatus::CeltCoarseEnergyDecoded
-                    | FrameDecodeStatus::CeltDecodeError
-            ),
-            "got {:?}",
-            out.frame_outcomes[0].status
-        );
-        assert_eq!(out.pcm.len(), 960);
-    }
-
-    #[test]
-    fn celt_tf_spread_allocation_advances_tell_past_coarse_energy() {
-        // Direct exercise of the §4.3.1 TF + §4.3.4.3 spread + §4.3.3
-        // allocation-header decoder: it must advance the range coder
-        // strictly past where the §4.3.2.1 coarse energy left it (the
-        // tf_change / spread / boost symbols consume real bits), and it
-        // must not panic or report a caller-side bookkeeping error for a
-        // well-formed band window.
-        use crate::celt_band_layout::{celt_end_coded_band, celt_first_coded_band, CeltFrameSize};
-        use crate::celt_coarse_energy::CoarseEnergyState;
-        use crate::celt_frame_prefix::decode_celt_frame_prefix;
+    fn celt_full_decode_consumes_bits_within_budget() {
+        // Direct exercise of the §4.3 frame decode: on a non-silent
+        // body it must consume real bits and never report a tell past
+        // the frame budget unless the coder latched an error.
+        use crate::celt_frame_decode::{decode_celt_frame, CeltEnergyState};
         use crate::range_decoder::RangeDecoder;
 
         let body: [u8; 14] = [
             0x40, 0x91, 0x37, 0xc4, 0x6e, 0x2d, 0xa8, 0x5b, 0xf1, 0x0c, 0x93, 0x47, 0xbe, 0x21,
         ];
         let mut rd = RangeDecoder::new(&body);
-        let prefix = decode_celt_frame_prefix(&mut rd);
-        // The chosen first byte must not select silence for this test to
-        // be meaningful; assert it so a table change can't silently void
-        // the assertion.
-        assert!(!prefix.silence, "test body must be non-silent");
-
-        let celt_size = CeltFrameSize::Ms20;
-        let start = celt_first_coded_band(false);
-        let end = celt_end_coded_band();
-
-        let mut coarse = CoarseEnergyState::new();
-        coarse
-            .decode_frame(&mut rd, celt_size, prefix.intra, start, end)
-            .expect("coarse energy decodes");
-        let tell_after_coarse = rd.tell_frac();
-
-        let (tf, spread) = OpusDecoder::decode_celt_tf_spread_allocation(
-            &mut rd,
-            celt_size,
-            prefix.transient,
-            1,
-            start,
-            end,
-            body.len() as u32,
-        )
-        .expect("tf/spread/allocation header decodes without a bookkeeping error");
-        let tell_after_alloc = rd.tell_frac();
-
-        // The TF decode produces one tf_change per coded band; the spread
-        // symbol is one of the four §4.3.4.3 values.
-        assert_eq!(tf.tf_change.len(), end - start);
-        assert!(spread <= crate::celt_spreading::SPREAD_MAX);
-
-        // The TF + spread + band-boost symbols all read real bits, so the
-        // tell must strictly advance past where coarse energy left it.
-        assert!(
-            tell_after_alloc > tell_after_coarse,
-            "alloc tell {tell_after_alloc} must advance past coarse tell {tell_after_coarse}"
-        );
+        let mut st = CeltEnergyState::new();
+        let out = decode_celt_frame(&mut rd, body.len(), 0, 21, 3, 1, &mut st);
+        assert!(!out.silence, "test body must be non-silent");
+        assert!(rd.tell() > 1, "the frame decode must consume bits");
+        if !rd.has_error() {
+            assert!(
+                rd.tell() as usize <= 8 * body.len(),
+                "tell {} past budget",
+                rd.tell()
+            );
+        }
     }
 
     // ---- Cross-packet §4.2.7.4 / §4.2.7.5.5 reconstruction carry ----

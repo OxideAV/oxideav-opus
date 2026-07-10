@@ -633,8 +633,7 @@ fn celt_only_decode_truncation_never_panics() {
             matches!(
                 out.frame_outcomes[0].status,
                 FrameDecodeStatus::CeltSilence
-                    | FrameDecodeStatus::CeltCoarseEnergyDecoded
-                    | FrameDecodeStatus::CeltAllocationDecoded
+                    | FrameDecodeStatus::CeltDecoded
                     | FrameDecodeStatus::CeltDecodeError
             ),
             "len {trunc}: got {:?}",
