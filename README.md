@@ -31,59 +31,43 @@ synthesis states and converted from mid/side to left/right by the §4.2.8
 `silk_stereo` unmixer, run **per SILK interval** with that interval's
 §4.2.7.1 weights and the cross-packet `StereoUnmixState` history. The
 §4.5.2 SILK state reset (CELT→SILK transition) and the §4.2.7.1
-mono→stereo weight reset are applied across packets. The CELT **synthesis
-backend** is now composed end-to-end: `celt_synthesis::CeltSynthState`
-turns already-decoded per-band shapes + `log2` energies into time-domain
-PCM through §4.3.6 denormalise → §4.3.7 inverse MDCT → §4.3.7 weighted
-overlap-add → §4.3.7.2 de-emphasis, threading the cross-frame overlap and
-de-emphasis state (the CELT analogue of `silk_synthesis`), and emits
-interleaved 48 kHz i16 via `synthesize_frame_interleaved_i16`. A
-**CELT-only silence frame now decodes end-to-end to real PCM**: the
-§4.3.7.1 range-coded frame prefix (silence flag + post-filter group +
-transient + intra) is decoded from the real range coder by
-`celt_frame_prefix`, and a set silence flag drives the synthesis backend
-with all-zero bands, emitting zero PCM while advancing the overlap-add /
-de-emphasis state (`FrameDecodeStatus::CeltSilence`). The §4.3.2.1
-coarse-energy *front half* now decodes for non-silent CELT-only frames:
-the Laplace symbol decoder (`celt_laplace::ec_laplace_decode`, the
-15-bit path) feeds the new `celt_coarse_energy` *reconstruction
-recurrence*, which runs the §4.3.2.1 2-D prediction filter
-`A(z_l, z_b)` in reverse (the frequency accumulator `pred_freq[b+1] =
-pred_freq[b] + (1-beta)*R[b]` and `E[b][l] = alpha*E[b][l-1] +
-pred_freq[b] + R[b]`, derived algebraically from the RFC z-transform),
-adds back the §4.3 `e_means` Q4 baseline, and threads the cross-frame
-`E[b][l-1]` predictor state on `OpusDecoder` (reset on an intra frame /
-SILK→CELT transition). A non-silent CELT-only frame thus consumes its
-prefix + coarse energy from the real range coder and advances the
-synthesis state, reporting `FrameDecodeStatus::CeltCoarseEnergyDecoded`.
-On top of the coarse energy, a non-silent frame now also decodes the
-full run of Table-56 symbols between coarse energy and the §4.3.4
-residual, from the same range coder in exact Table-56 order: the §4.3.1
-per-band `tf_change` flags and gated `tf_select` bit (`celt_tf_decode`),
-the §4.3.4.3 `spread` symbol (`celt_spreading`), then the §4.3.3
-allocation *header* — the signalled part of the bit allocation: the band
-boosts
-(`celt_band_boost`, walked over the `start..end` coding window with the
-per-band `cap[]` from `celt_cache_caps50` and the per-channel MDCT-bin
-counts), the allocation trim (`celt_alloc_trim`, gated on the running
-`ec_tell_frac`), and the §4.3.3 anti-collapse / skip / intensity-stereo
-/ dual-stereo reservations (`celt_reservations`). This advances the
-entropy decoder through everything the bitstream explicitly carries
-before the implicit interpolation, leaving the coder positioned exactly
-where the §4.3.4 PVQ shape decode resumes, and the frame reports
-`FrameDecodeStatus::CeltAllocationDecoded`. The remaining CELT band-data
-stages — the §4.3.3 *implicit* allocation (`interp_bits2pulses`, the
-per-band pulse / fine-energy split, which is reference-code-only and
-absent from the RFC narrative body), §4.3.4 PVQ band shapes, and
-§4.3.2.2 fine energy — are still pending, so the band shapes are
-all-zero and these frames emit correct-length silence until those land.
-The one residual coarse-energy seam is the RFC's "clamped internally"
-bound, which is not in the normative body (only in reference code) and
-is left as a documented identity in `celt_coarse_energy` — exact for
-every in-range bitstream — pending a clean-room docs trace. The §4.4
-packet-loss concealment is also outstanding (the RFC defines PLC as a
-non-normative decoder feature with no bitstream algorithm; lost / DTX
-frames currently emit the §4.6 silence floor).
+mono→stereo weight reset are applied across packets. **CELT-only packets now decode
+end-to-end to real PCM** (`FrameDecodeStatus::CeltDecoded`): the whole
+§4.3 Table-56 entropy layer runs with the normative per-symbol budget
+gates (`celt_frame_decode` — silence with the exhausted-budget rule,
+the §4.3.7.1 post-filter parameters, transient + intra, §4.3.2.1
+coarse energy with its three low-budget fallbacks, §4.3.1 TF flags,
+spread, the shrinking-budget dynalloc boosts, trim, the §4.3.3
+*implicit* allocation ported in exact 1/8-bit integer arithmetic
+(`celt_rate_alloc` — quality-row search, 6-step interpolation
+bisection, backward skip decode, intensity / dual-stereo, fine-energy
+split), §4.3.2.2 fine energy, the §4.3.4 recursive band decode
+(`celt_band_decode` — PVQ leaves with the exact two-stride spreading
+rotation, split angles on the triangular / uniform / step PDFs with
+bit-exact mid/side weighting, stereo merge + intensity + dual-stereo,
+Haar/Hadamard time-frequency reorganization, spectral folding with the
+RFC 8251 §9 update, collapse masks), the §4.3.5 anti-collapse, and the
+§4.3.2.3 final fine bits), then the signal half (`celt_mdct_synthesis`
+— denormalisation in the log2-amplitude energy domain with the
+RFC 8251 §8 cap, unit-scale inverse MDCT for long and short blocks
+under the low-overlap window, overlap-add, the recursive §4.3.7.1 comb
+filter with crossfaded parameter transitions, §4.3.7.2 de-emphasis),
+with all cross-frame state carried and the §4.5.2 resets applied.
+Validated against the reference decodes of the fixture corpus:
+`celt-fb-stereo-128kbps` (20 ms FB stereo) and `celt-2.5ms-low-latency`
+reconstruct at **~88–108 dB SNR** — i16-quantization-level waveform
+agreement. **Hybrid packets decode end-to-end**
+(`FrameDecodeStatus::HybridDecoded`): the SILK layer (WB internal) and
+the CELT layer (bands 17–21) share one range coder with the §4.5.1
+redundancy side information decoded between them, and the 48 kHz
+outputs sum per §4.4 (energy parity with the reference decode on
+`hybrid-fb-mono-28kbps`; waveform-level hybrid conformance awaits a
+group-delay-matched SILK resampler and the redundant 5 ms frame's own
+synthesis + cross-lap at mode switches, which are the remaining §4.5
+refinements). The §4.4 packet-loss concealment is also outstanding
+(the RFC defines PLC as a non-normative decoder feature with no
+bitstream algorithm; lost / DTX frames currently emit the §4.6 silence
+floor).
 
 The crate now also carries the start of the **encode side**: the
 bit-exact §5.1 range *encoder* (`RangeEncoder` — the §5.1.1 symbol
