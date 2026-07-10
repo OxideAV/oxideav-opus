@@ -4,6 +4,30 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Packet-loss concealment (RFC 6716 §4.4)** — `OpusDecoder::conceal_loss`
+  fills a lost packet with real extrapolated audio instead of silence,
+  following the §4.4 per-mode guidance: after a SILK-only / Hybrid
+  frame, an LPC extrapolation of the previous output (Burg fit over
+  the trailing history, bandwidth-expanded for guaranteed decay,
+  driven by the pitch-cyclic LPC residual — the long-term + short-term
+  predictor continuation); after a CELT-only frame, a pitch-periodic
+  waveform repetition (normalized-autocorrelation pitch search over
+  the §4.3.7.1 period range 15..=1022, cyclic repeat of the final
+  period). Consecutive losses decay in energy to the silence floor,
+  and each concealment carries a 2.5 ms extrapolation tail that is
+  cross-lapped (power-complementary window pair, the §4.5.1.4 seam
+  shape) into the head of the first packet decoded after the loss run
+  — both joins are smooth. FEC recovery
+  (`decode_packet_fec`) now also feeds the concealment history, so a
+  loss immediately after a recovered frame extrapolates from the
+  recovered signal. New `plc` module (13 unit tests) + a
+  `FrameDecodeStatus::Concealed` outcome + a 5-test `plc_decode`
+  integration suite driving dropped-packet patterns on the real SILK
+  and CELT fixtures (single-loss continuity at both joins bounded by
+  the neighbourhood's natural sample-to-sample step, non-silent
+  single-loss energy parity, 30-loss burst monotone decay to the
+  floor with clean post-burst recovery, duration tracking, and 440 Hz
+  tonal-continuation dominance on the sine fixture)
 - FIX: `celt_frame_prefix` decoded the §4.3.7.1 post-filter octave as
   `ec_dec_uint(7)` (values 0..=6); Table 56 codes it `uniform (6)`, i.e.
   `ec_dec_uint(6)` over 0..=5 — the §4.3.7.1 period bound ("between 15

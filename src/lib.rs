@@ -729,6 +729,7 @@ pub mod mode_transition_reset;
 pub mod multistream;
 pub mod opus_head;
 pub mod packet_compose;
+pub mod plc;
 pub mod range_decoder;
 pub mod range_encoder;
 pub mod redundancy_decode_params;
@@ -887,6 +888,10 @@ pub use opus_head::{
 };
 pub use packet_compose::{
     compose_packet, compose_packet_code3, compose_self_delimited, encode_length,
+};
+pub use plc::{
+    conceal_celt, conceal_silk, cross_lap, find_pitch, loss_gain, PlcFlavor, PlcState,
+    PITCH_MAX_LAG, PITCH_MIN_LAG, PLC_CROSS_LAP_SAMPLES, PLC_HISTORY_SAMPLES,
 };
 pub use range_decoder::RangeDecoder;
 pub use range_encoder::RangeEncoder;

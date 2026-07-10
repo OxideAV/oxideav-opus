@@ -162,6 +162,13 @@ pub enum FrameDecodeStatus {
     /// layer (bands 17–21) summed per §4.4. The emitted PCM is real
     /// audio.
     HybridDecoded,
+    /// A **lost** frame concealed by the §4.4 packet-loss concealment
+    /// ([`OpusDecoder::conceal_loss`]): the emitted PCM extrapolates
+    /// the last decoded audio (LPC extrapolation after a SILK-bearing
+    /// frame, pitch-periodic repetition after a CELT-only frame) with
+    /// the §4.4 energy decay across consecutive losses. Not produced
+    /// by `decode_packet` — only by an explicit concealment call.
+    Concealed,
 }
 
 /// The result of decoding one Opus frame: how many per-channel samples
@@ -309,6 +316,14 @@ pub struct OpusDecoder {
     /// CELT entropy-side state (the §4.3.2 per-band energy history and
     /// the carried folding-noise seed), advanced by every CELT frame.
     celt_energy: Option<crate::celt_frame_decode::CeltEnergyState>,
+    /// §4.4 packet-loss concealment state: the trailing output
+    /// history, the consecutive-loss counter, and the pending
+    /// concealment-to-real cross-lap tail.
+    plc: crate::plc::PlcState,
+    /// Frame duration (§3.1 Table 2, tenths of ms) of the most
+    /// recently decoded packet — the duration [`Self::conceal_loss`]
+    /// conceals when the lost packet's own duration is unknown.
+    last_frame_tenths_ms: Option<u16>,
 }
 
 impl OpusDecoder {
@@ -430,12 +445,63 @@ impl OpusDecoder {
             frame_outcomes.push(outcome);
         }
 
+        // §4.4: cross-lap a pending concealment tail into the head of
+        // this (first real post-loss) output, then record the output
+        // as concealment history and re-arm the loss counter.
+        self.plc.apply_tail(&mut pcm, channels as usize);
+        self.plc.feed_decoded(&pcm, channels as usize);
+        self.last_frame_tenths_ms = Some(routing.frame_size_tenths_ms);
+
         Ok(DecodedAudio {
             pcm,
             channels,
             sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
             frame_outcomes,
         })
+    }
+
+    /// Conceal one **lost** packet (RFC 6716 §4.4), producing one
+    /// frame of interleaved 48 kHz PCM extrapolated from the last
+    /// decoded audio.
+    ///
+    /// Call this once per lost packet, in stream position, when no FEC
+    /// recovery is available (when the *next* packet is already in
+    /// hand, prefer [`Self::decode_packet_fec`], which reconstructs
+    /// the lost audio from real bitstream redundancy). The §4.4
+    /// per-mode guidance is followed: after a SILK-only or Hybrid
+    /// frame the concealment is an LPC extrapolation of the previous
+    /// output ([`crate::plc::conceal_silk`]); after a CELT-only frame
+    /// it repeats the pitch-periodic waveform
+    /// ([`crate::plc::conceal_celt`]). Consecutive concealed frames
+    /// decay in energy to the silence floor, and the first packet
+    /// decoded after a concealment run is cross-lapped with the
+    /// concealment's extrapolation tail so both joins are smooth.
+    ///
+    /// The concealed duration is the last decoded packet's §3.1 frame
+    /// duration (a loss in a stream is overwhelmingly likely to have
+    /// the neighbouring packets' geometry); with no decode history at
+    /// all this emits 20 ms of silence. Per §4.5 the concealment is
+    /// for *actual loss*: normative mode transitions in a fully
+    /// received stream must not route through PLC (they either need no
+    /// treatment or carry §4.5.1 redundancy).
+    pub fn conceal_loss(&mut self) -> DecodedAudio {
+        let tenths = self.last_frame_tenths_ms.unwrap_or(200);
+        let per_channel = output_samples_per_channel(tenths);
+        let channels = self.last_channels.unwrap_or(1);
+        let flavor = match self.prev_mode {
+            Some(OperatingMode::CeltOnly) => crate::plc::PlcFlavor::Celt,
+            _ => crate::plc::PlcFlavor::Silk,
+        };
+        let pcm = self.plc.conceal(per_channel, channels as usize, flavor);
+        DecodedAudio {
+            pcm,
+            channels,
+            sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
+            frame_outcomes: vec![FrameOutcome {
+                samples_per_channel: per_channel,
+                status: FrameDecodeStatus::Concealed,
+            }],
+        }
     }
 
     /// Decode one Opus frame, appending its interleaved 48 kHz PCM to
@@ -1114,6 +1180,14 @@ impl OpusDecoder {
                 Err(_) => FecDecodeStatus::DecodeError,
             }
         };
+
+        // A real recovery is stream audio: record it as §4.4
+        // concealment history (and clear the consecutive-loss counter)
+        // so a further loss immediately after the recovered frame
+        // extrapolates from the recovered signal, not from before it.
+        if status == FecDecodeStatus::Recovered {
+            self.plc.feed_decoded(&pcm, channels as usize);
+        }
 
         Ok(FecRecovered {
             pcm,
