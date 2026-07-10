@@ -169,3 +169,66 @@ fn celt_low_latency_2_5ms_matches_reference_waveform() {
         "CELT 2.5 ms stereo waveform SNR {snr:.2} dB below threshold"
     );
 }
+
+/// Hybrid (SILK+CELT) fixture: the stream mode-switches between
+/// Hybrid and CELT-only packets. The main-path decode of both layers
+/// is asserted structurally (every frame decodes to a real-audio
+/// status) and by energy/waveform agreement with the reference decode.
+/// The comparison threshold is deliberately loose: the crate's SILK
+/// §4.2.9 resampler is non-normative (different group delay than the
+/// reference decoder's), and the §4.5.1 redundant-frame cross-lap at
+/// mode switches is not yet synthesized, so bit-level alignment of the
+/// low band is not a valid target — energy parity and positive
+/// correlation are.
+#[test]
+fn hybrid_fb_mono_28kbps_decodes_real_audio() {
+    let stream: &[u8] = include_bytes!("fixtures/hybrid-fb-mono-28kbps.opus");
+    let expected_wav: &[u8] = include_bytes!("fixtures/hybrid-fb-mono-28kbps.expected.wav");
+    let mut packets = ogg_packets(stream);
+    let pre_skip = opus_head_pre_skip(&packets[0]);
+    packets.drain(..2);
+    let mut dec = OpusDecoder::new();
+    let mut pcm: Vec<i16> = Vec::new();
+    let mut hybrid_frames = 0usize;
+    for (i, pk) in packets.iter().enumerate() {
+        let out = dec
+            .decode_packet(pk)
+            .unwrap_or_else(|e| panic!("packet {i}: {e:?}"));
+        for fo in &out.frame_outcomes {
+            assert!(
+                matches!(
+                    fo.status,
+                    FrameDecodeStatus::HybridDecoded
+                        | FrameDecodeStatus::CeltDecoded
+                        | FrameDecodeStatus::CeltSilence
+                ),
+                "packet {i}: unexpected status {:?}",
+                fo.status
+            );
+            if fo.status == FrameDecodeStatus::HybridDecoded {
+                hybrid_frames += 1;
+            }
+        }
+        pcm.extend_from_slice(&out.pcm);
+    }
+    assert!(hybrid_frames > 0, "fixture must exercise the Hybrid path");
+
+    let expected = wav_pcm_payload(expected_wav);
+    let got = &pcm[pre_skip..];
+    let n = expected.len().min(got.len());
+    let (mut sw, mut sg, mut swg) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let w = f64::from(expected[i]);
+        let g = f64::from(got[i]);
+        sw += w * w;
+        sg += g * g;
+        swg += w * g;
+    }
+    let rms_ratio = (sg / sw).sqrt();
+    let corr = swg / (sw.sqrt() * sg.sqrt());
+    assert!(
+        (0.8..1.25).contains(&rms_ratio),
+        "energy parity violated: rms ratio {rms_ratio:.3}"
+    );
+    assert!(corr > 0.5, "waveform correlation too low: {corr:.3}");
+}

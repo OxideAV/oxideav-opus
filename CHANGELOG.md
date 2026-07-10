@@ -19,6 +19,15 @@ All notable changes to `oxideav-opus` are recorded here.
   §4.3.4.1 `bits2pulses` / `pulses2bits` / `get_pulses` cost-cache
   accessors and the `logN400` table; exact-integer 1/8-bit arithmetic
   throughout
+- **Hybrid frames decode end-to-end to real PCM**
+  (`FrameDecodeStatus::HybridDecoded`): the §4.2 SILK layer (WB
+  internal) and the §4.3 CELT layer (bands 17–21) share one range
+  coder, with the §4.5.1 redundancy side information decoded between
+  them (a present redundant frame shrinks the CELT budget; its own
+  5 ms synthesis/cross-lap is a pending refinement) and the two 48 kHz
+  outputs summed per §4.4; validated on the hybrid-fb-mono-28kbps
+  fixture (energy parity with the reference decode; the non-normative
+  SILK resampler bounds waveform alignment)
 - **CELT-only frames decode end-to-end to real PCM**
   (`FrameDecodeStatus::CeltDecoded`): `celt_frame_decode` sequences the
   whole Table-56 entropy layer (silence / post-filter / transient /
