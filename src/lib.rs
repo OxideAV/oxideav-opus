@@ -707,6 +707,7 @@ pub mod celt_post_filter;
 pub mod celt_pulse_cache;
 pub mod celt_pvq_decode;
 pub mod celt_pvq_v;
+pub mod celt_rate_alloc;
 pub mod celt_redundancy;
 pub mod celt_reservations;
 pub mod celt_spreading;

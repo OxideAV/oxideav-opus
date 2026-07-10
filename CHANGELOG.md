@@ -11,6 +11,14 @@ All notable changes to `oxideav-opus` are recorded here.
   resolved to the wrong run. Accessors now use the LM-major mapping and
   a data-internal test pins the trace-§2.3 property that each of the 23
   runs serves exactly one effective band size `N`
+- `celt_rate_alloc`: the §4.3.3 implicit allocation, decode side —
+  the interpolated bits-to-pulses computation over the Table 57 static
+  matrix (coarse quality search, 6-step fine bisection, backward
+  band-skip decode, intensity / dual-stereo symbol decode, per-band
+  fine-energy split with priority flags and balance carry), plus the
+  §4.3.4.1 `bits2pulses` / `pulses2bits` / `get_pulses` cost-cache
+  accessors and the `logN400` table; exact-integer 1/8-bit arithmetic
+  throughout
 - `RangeDecoder::range_size()`: read-only accessor for the §4.1 range
   state `rng`, the carried folding-noise LCG seed of the CELT layer
 - analysed 10 ms packets: `with_packet_duration(bw, 100)` on both encoders
