@@ -19,6 +19,15 @@ All notable changes to `oxideav-opus` are recorded here.
   §4.3.4.1 `bits2pulses` / `pulses2bits` / `get_pulses` cost-cache
   accessors and the `logN400` table; exact-integer 1/8-bit arithmetic
   throughout
+- `celt_band_decode`: the §4.3.4 recursive band decode — PVQ leaf
+  decode with the exact spreading rotation (two-stride lattice), band
+  splitting with entropy-coded split angles (triangular / uniform /
+  step PDFs, bit-exact `bitexact_cos` / `bitexact_log2tan` mid-side
+  weighting), stereo mid/side merge + N=2 orthogonal special case +
+  intensity/inversion, dual-stereo routing, time/frequency Haar
+  recombination with Hadamard block (de)interleaving, spectral folding
+  with the RFC 8251 §9 hybrid-folding update, per-short-block collapse
+  masks, and the §4.3.5 anti-collapse noise injection
 - `RangeDecoder::range_size()`: read-only accessor for the §4.1 range
   state `rng`, the carried folding-noise LCG seed of the CELT layer
 - analysed 10 ms packets: `with_packet_duration(bw, 100)` on both encoders

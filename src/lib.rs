@@ -687,6 +687,7 @@ impl std::error::Error for Error {}
 pub mod celt_alloc_search;
 pub mod celt_alloc_trim;
 pub mod celt_band_boost;
+pub mod celt_band_decode;
 pub mod celt_band_layout;
 pub mod celt_band_shape;
 pub mod celt_band_thresh;
