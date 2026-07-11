@@ -171,17 +171,20 @@ fn celt_low_latency_2_5ms_matches_reference_waveform() {
 }
 
 /// Hybrid (SILK+CELT) fixture: the stream mode-switches between
-/// Hybrid and CELT-only packets. The main-path decode of both layers
-/// is asserted structurally (every frame decodes to a real-audio
-/// status) and by energy/waveform agreement with the reference decode.
-/// The comparison threshold is deliberately loose: the crate's SILK
-/// §4.2.9 resampler is non-normative (different group delay than the
-/// reference decoder's), and the §4.5.1 redundant-frame cross-lap at
-/// mode switches is not yet synthesized, so bit-level alignment of the
-/// low band is not a valid target — energy parity and positive
-/// correlation are.
+/// Hybrid and CELT-only packets. Every frame must decode to a
+/// real-audio status, and the whole stream must reach waveform-level
+/// agreement with the reference decode. The SILK band runs through
+/// the §4.2.9 upsampler whose group delay places it on the CELT
+/// layer's timeline (the encoder pre-delayed the MDCT layer by the
+/// same amount), so the summed §4.4 output is directly comparable:
+/// measured ~37.5 dB whole-stream (the CELT-only segment is
+/// reference-exact; the Hybrid segment carries the §4.2.7.9
+/// reconstruction-arithmetic drift of its SILK band). The 30 dB floor
+/// pins the SILK↔CELT alignment — a single-sample slip of the SILK
+/// band against the CELT band collapses the Hybrid segment to ~19 dB
+/// and the whole stream below the gate.
 #[test]
-fn hybrid_fb_mono_28kbps_decodes_real_audio() {
+fn hybrid_fb_mono_28kbps_matches_reference_waveform() {
     let stream: &[u8] = include_bytes!("fixtures/hybrid-fb-mono-28kbps.opus");
     let expected_wav: &[u8] = include_bytes!("fixtures/hybrid-fb-mono-28kbps.expected.wav");
     let mut packets = ogg_packets(stream);
@@ -214,21 +217,6 @@ fn hybrid_fb_mono_28kbps_decodes_real_audio() {
     assert!(hybrid_frames > 0, "fixture must exercise the Hybrid path");
 
     let expected = wav_pcm_payload(expected_wav);
-    let got = &pcm[pre_skip..];
-    let n = expected.len().min(got.len());
-    let (mut sw, mut sg, mut swg) = (0.0f64, 0.0f64, 0.0f64);
-    for i in 0..n {
-        let w = f64::from(expected[i]);
-        let g = f64::from(got[i]);
-        sw += w * w;
-        sg += g * g;
-        swg += w * g;
-    }
-    let rms_ratio = (sg / sw).sqrt();
-    let corr = swg / (sw.sqrt() * sg.sqrt());
-    assert!(
-        (0.8..1.25).contains(&rms_ratio),
-        "energy parity violated: rms ratio {rms_ratio:.3}"
-    );
-    assert!(corr > 0.5, "waveform correlation too low: {corr:.3}");
+    let snr = snr_db(&expected, &pcm[pre_skip..]);
+    assert!(snr > 30.0, "hybrid waveform SNR {snr:.2} dB < 30");
 }

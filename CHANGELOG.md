@@ -32,6 +32,19 @@ All notable changes to `oxideav-opus` are recorded here.
   SILK fixture sat one input sample early against its reference
   decode (and the Hybrid SILK band sat early against the bit-aligned
   CELT band).
+- **SILK waveform regression gates** (`tests/silk_reference_waveform.rs`):
+  every SILK-bearing fixture stream is decoded end-to-end and compared
+  pre-skip-trimmed against its shipped reference decode as an SNR
+  floor — WB stereo > 55 dB, WB mono (fec-on main path) > 55 dB, MB
+  60 ms > 22 dB, NB mono > 14 dB, silence-low-bitrate > 14 dB — with
+  the WB gates sharp enough that one output sample of misalignment
+  fails them (pinning the §4.2.9 delay calibration and the §4.2.8
+  mono delay). The hybrid fixture's loose energy-parity check is
+  replaced by a real 30 dB whole-stream SNR gate (measured ~37.5 dB)
+  that pins the Hybrid SILK↔CELT alignment. New fixture pairs staged
+  from the corpus: the three SILK `expected.wav` references,
+  `fec-on.expected.wav`, and the `silence-low-bitrate` stream + its
+  reference (near-DTX 6-byte packets, LCG comfort-noise excitation).
 - Fixture-corpus waveform validation (pre-skip-trimmed SNR vs the
   shipped reference decodes): `silk-wb-stereo-20kbps` −4.7 → 68.7 dB,
   `fec-on` (WB mono main path) −5.1 → 71.9 dB, `hybrid-fb-mono-28kbps`

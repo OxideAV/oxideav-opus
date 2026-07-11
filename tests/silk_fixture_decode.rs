@@ -24,13 +24,11 @@
 //!
 //! ## Validation strategy
 //!
-//! RFC 6716 §4.2.9 makes the SILK→48 kHz resampler **non-normative**
-//! ("the resampler itself is non-normative, and a decoder can use any
-//! method it wants"). This crate uses plain linear interpolation while the
-//! reference decoder that produced `expected.wav` uses a
-//! polyphase resampler, so a *bit-exact* PCM comparison against
-//! `expected.wav` is not a meaningful conformance target for SILK output.
-//! These tests therefore validate:
+//! This suite validates routing / structure / signal content; the
+//! waveform-level comparison against each fixture's reference decode
+//! (`expected.wav`) lives in `tests/silk_reference_waveform.rs`, whose
+//! SNR gates pin the §4.2.9 upsampler delay calibration and the
+//! §4.2.8 mono one-sample delay. These tests validate:
 //!
 //! 1. **Packet routing** — every packet's §3.1 TOC parses to the
 //!    fixture's documented mode / bandwidth / channel count.
@@ -40,7 +38,8 @@
 //!    matches the §3 frame-duration arithmetic.
 //! 4. **Signal content** — for the 440 Hz NB sine fixture, a Goertzel
 //!    probe confirms the decoded output is dominated by the 440 Hz tone
-//!    (robust to the resampler / envelope differences noted above).
+//!    (independent of the waveform-level gates, so a failure here
+//!    points at gross routing/synthesis breakage rather than drift).
 //!
 //! The `.opus` fixture streams are committed in `tests/fixtures/` (copied
 //! from the project's `docs/audio/opus/fixtures/` corpus) so the suite is
@@ -201,8 +200,9 @@ fn silk_nb_mono_routes_and_decodes() {
     // The fixture is a 440 Hz sine. Confirm the decoded output is
     // dominated by the 440 Hz bin relative to nearby probe frequencies,
     // over a steady mid-stream window (skip the leading transient /
-    // pre-skip region). This is robust to the §4.2.9 non-normative
-    // resampler: it checks the tone is present and dominant, not exact
+    // pre-skip region). This is independent of the waveform gates in
+    // `silk_reference_waveform.rs`: it checks the tone is present and
+    // dominant, not exact
     // amplitude.
     let window = &pcm[10_000..40_000];
     let m440 = goertzel_mag(window, 440.0, 48_000.0);

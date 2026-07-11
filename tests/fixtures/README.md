@@ -19,7 +19,18 @@ per-stream notes live alongside the originals in
 | `silk-wb-stereo-20kbps.opus`      | 9      | SILK | WB        | stereo   | 20 ms    |
 | `silk-mb-60ms-mono-20kbps.opus`   | 7      | SILK | MB        | mono     | 60 ms    |
 | `fec-on.opus`                     | 9      | SILK | WB        | mono     | 20 ms    |
+| `silence-low-bitrate.opus`        | 1      | SILK | NB        | mono     | 20 ms    |
 | `mode-switching.opus`             | 15/31  | Hybrid/CELT | FB | mono     | 20 ms    |
+
+The SILK-bearing streams also ship their reference decodes
+(`<name>.expected.wav`, 48 kHz s16le, copied from
+`docs/audio/opus/fixtures/<name>/expected.wav`), driving the
+waveform-level SNR regression gates in
+`tests/silk_reference_waveform.rs` — the §4.2.9 upsampler's
+delay calibration and the §4.2.8 mono delay are pinned by them.
+`silence-low-bitrate.opus` is a voice-silence-voice signal at 6 kb/s
+whose silent region produces near-DTX 6-byte packets (LCG-driven
+comfort-noise excitation).
 
 `mode-switching.opus` switches from Hybrid (low-frequency tone) to
 CELT-only (full-band content) mid-stream; the black-box encoder emits
