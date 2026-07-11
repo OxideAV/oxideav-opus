@@ -10,12 +10,12 @@
 //! state carries into the first CELT-only frames — a wrong placement
 //! desynchronizes the inter-coded energy of the whole CELT segment).
 //!
-//! The comparison is segment-aware: the Hybrid segment's low band
-//! rides the crate's non-normative SILK resampler (different group
-//! delay than the reference decoder's), so it is validated by energy
-//! parity; the CELT-only segment and the transition window are fully
-//! normative paths and must match the reference decode at waveform
-//! level. The tiny Ogg walker mirrors `celt_fixture_decode.rs`.
+//! The comparison is segment-aware (Hybrid segment / transition
+//! window / CELT-only segment) plus a whole-stream waveform gate: the
+//! §4.2.9 upsampler's calibrated group delay lands the Hybrid SILK
+//! band on the CELT layer's timeline, so the whole stream measures
+//! ~82 dB against the reference decode. The tiny Ogg walker mirrors
+//! `celt_fixture_decode.rs`.
 
 use oxideav_opus::{FrameDecodeStatus, OpusDecoder};
 
@@ -85,11 +85,13 @@ fn snr_db(want: &[i16], got: &[i16]) -> f64 {
 }
 
 /// The stream decodes end-to-end (both modes report real-audio
-/// statuses), the Hybrid segment holds energy parity, and the
-/// normative transition window + CELT-only segment match the
-/// reference decode at waveform level (they are reference-exact at
-/// ~107-109 dB; the 60 dB thresholds leave margin while still being
-/// unreachable by a structurally wrong transition).
+/// statuses) and every segment matches the reference decode at
+/// waveform level: the Hybrid segment (~80+ dB through the
+/// delay-calibrated §4.2.9 upsampler), the transition window and the
+/// CELT-only segment (reference-exact at ~107–109 dB), and the whole
+/// stream (~82 dB). The thresholds leave margin while still being
+/// unreachable by a structurally wrong transition or a one-sample
+/// SILK↔CELT misalignment.
 #[test]
 fn hybrid_to_celt_switch_with_redundancy_matches_reference() {
     let mut packets = ogg_packets(FIXTURE);
@@ -126,17 +128,15 @@ fn hybrid_to_celt_switch_with_redundancy_matches_reference() {
     let switch = 33_600usize; // 0.7 s at 48 kHz
     assert!(n > switch + 10_000, "decoded stream too short: {n}");
 
-    // Hybrid segment: energy parity (the non-normative SILK resampler
-    // precludes waveform alignment in the low band).
-    let (mut sw, mut sg) = (0.0f64, 0.0f64);
-    for i in 0..switch {
-        sw += f64::from(expected[i]) * f64::from(expected[i]);
-        sg += f64::from(got[i]) * f64::from(got[i]);
-    }
-    let rms_ratio = (sg / sw).sqrt();
+    // Hybrid segment: waveform-level agreement. The §4.2.9 upsampler's
+    // calibrated delay aligns the SILK band with the CELT band, so the
+    // segment is directly comparable (measured ~80+ dB on this
+    // fixture's low tone; 50 dB fails on one sample of SILK↔CELT
+    // misalignment).
+    let hybrid_seg = snr_db(&expected[..switch], &got[..switch]);
     assert!(
-        (0.8..1.25).contains(&rms_ratio),
-        "hybrid-segment energy parity violated: rms ratio {rms_ratio:.3}"
+        hybrid_seg > 50.0,
+        "hybrid-segment SNR {hybrid_seg:.1} dB below threshold"
     );
 
     // Transition window (contains the §4.5.1.4 redundant-frame
@@ -154,4 +154,12 @@ fn hybrid_to_celt_switch_with_redundancy_matches_reference() {
     // CELT-only segment: reference-exact decode.
     let celt = snr_db(&expected[switch + 6_400..n], &got[switch + 6_400..n]);
     assert!(celt > 60.0, "CELT segment SNR {celt:.1} dB below threshold");
+
+    // Whole-stream gate (measured ~82 dB): every segment, every
+    // transition, one number.
+    let whole = snr_db(&expected, got);
+    assert!(
+        whole > 60.0,
+        "whole-stream SNR {whole:.1} dB below threshold"
+    );
 }

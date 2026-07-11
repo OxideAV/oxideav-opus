@@ -204,7 +204,12 @@
 //!   the implied SILK internal rates (NB = 8000 Hz, MB = 12000 Hz,
 //!   WB = 16000 Hz) and the §4.2.9 supported output rates (8 / 12 / 16 /
 //!   24 / 48 kHz). SWB and FB never reach the §4.2.9 SILK stage and are
-//!   rejected with `None`.
+//!   rejected with `None`. The module also carries the actual §4.2.9
+//!   conversion, [`SilkUpsampler`]: a stateful streaming polyphase
+//!   windowed-sinc upsampler to 48 kHz whose per-(bandwidth ×
+//!   [`SilkChannelPath`]) group delay is calibrated black-box against
+//!   the reference decodes of the fixture corpus, with the kernel
+//!   half-width on the §4.2.9 causality cap.
 //!
 //! * Round 18 lands the §4.2.3 SILK packet-level header bits and the
 //!   §4.2.4 per-frame LBRR flags ([`SilkHeaderBits`] / [`silk_frame_count`]).
@@ -949,8 +954,8 @@ pub use silk_packet_encode::{
 pub use silk_resampler::{
     is_supported_output_rate, silk_frame_samples_at_output, silk_frame_samples_internal,
     silk_internal_rate_hz, silk_resampler_delay_ms, silk_resampler_delay_samples_at,
-    REFERENCE_RATE_HZ, SILK_RESAMPLER_DELAY_MS_MB, SILK_RESAMPLER_DELAY_MS_NB,
-    SILK_RESAMPLER_DELAY_MS_WB, SUPPORTED_OUTPUT_RATES_HZ,
+    SilkChannelPath, SilkUpsampler, REFERENCE_RATE_HZ, SILK_RESAMPLER_DELAY_MS_MB,
+    SILK_RESAMPLER_DELAY_MS_NB, SILK_RESAMPLER_DELAY_MS_WB, SUPPORTED_OUTPUT_RATES_HZ,
 };
 pub use silk_stereo::{
     estimate_stereo_weights, interp_phase_samples, stereo_lr_to_ms, stereo_ms_to_lr, MidSideFrame,

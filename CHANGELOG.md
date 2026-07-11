@@ -32,6 +32,12 @@ All notable changes to `oxideav-opus` are recorded here.
   SILK fixture sat one input sample early against its reference
   decode (and the Hybrid SILK band sat early against the bit-aligned
   CELT band).
+- The `mode-switching` suite's Hybrid-segment energy-parity check is
+  upgraded to real waveform gates: Hybrid segment > 50 dB (measured
+  ~80+ dB through the delay-calibrated upsampler) and a whole-stream
+  gate > 60 dB (measured **~82.2 dB** — up from a segment that
+  previously could not be waveform-compared at all). `SilkUpsampler` /
+  `SilkChannelPath` are re-exported at the crate root.
 - **SILK waveform regression gates** (`tests/silk_reference_waveform.rs`):
   every SILK-bearing fixture stream is decoded end-to-end and compared
   pre-skip-trimmed against its shipped reference decode as an SNR
