@@ -23,15 +23,29 @@ regular SILK frame loop, each frame decoded in Table-5 order through
 gains / LSF chain / LTP / excitation with inter-frame state threaded),
 then the §4.2.7.9 LTP / LPC synthesis filters (composed in the
 `silk_synthesis` module with the §4.2.7.9 per-subframe LPC selection and
-cross-frame histories), then a §4.2.9 non-normative resample to 48 kHz
-and i16 conversion. For **stereo**, the §4.2.2 mid/side interleave (mid
+cross-frame histories), then the §4.2.8 mono one-sample delay and the
+§4.2.9 resample to 48 kHz (`SilkUpsampler` — a stateful streaming
+polyphase windowed-sinc upsampler whose per-(bandwidth × path) group
+delay is calibrated black-box against the reference decodes of the
+fixture corpus, history carried across Opus frames) and i16
+conversion. For **stereo**, the §4.2.2 mid/side interleave (mid
 frame then side frame per 20 ms interval, the §4.2.7.2 mid-only flag
 skipping the side frame) is decoded into two independent per-channel
 synthesis states and converted from mid/side to left/right by the §4.2.8
 `silk_stereo` unmixer, run **per SILK interval** with that interval's
 §4.2.7.1 weights and the cross-packet `StereoUnmixState` history. The
 §4.5.2 SILK state reset (CELT→SILK transition) and the §4.2.7.1
-mono→stereo weight reset are applied across packets. **CELT-only packets now decode
+mono→stereo weight reset are applied across packets. **SILK decode is
+waveform-validated against the reference decodes of the fixture
+corpus** (pre-skip-trimmed SNR, gated in
+`tests/silk_reference_waveform.rs`): WB stereo **~69 dB** and the WB
+mono fec-on main path **~72 dB** (waveform-exact up to reconstruction
+arithmetic; one output sample of misalignment collapses these below
+45 dB), MB 60 ms ~28 dB and NB ~19 dB (their ceilings are §4.2.7.9
+*non-bit-exact-by-design* reconstruction drift — the references come
+from a fixed-point reconstruction whose rounding recirculates through
+the LTP feedback on strongly periodic content — not alignment).
+**CELT-only packets now decode
 end-to-end to real PCM** (`FrameDecodeStatus::CeltDecoded`): the whole
 §4.3 Table-56 entropy layer runs with the normative per-symbol budget
 gates (`celt_frame_decode` — silence with the exhausted-budget rule,
@@ -66,9 +80,11 @@ black-box eliminated or fixed). **Hybrid packets decode end-to-end**
 the CELT layer (bands 17–21) share one range coder with the §4.5.1
 redundancy side information decoded between them (the main coder's
 buffer reduced per §4.5.1.3 so its raw bits read from the reduced
-end), and the 48 kHz outputs sum per §4.4 (energy parity with the
-reference decode on `hybrid-fb-mono-28kbps`; low-band waveform
-alignment awaits a group-delay-matched SILK resampler). The **§4.5
+end), and the 48 kHz outputs sum per §4.4 — the SILK band lands on
+the CELT layer's timeline through the delay-calibrated §4.2.9
+upsampler, and `hybrid-fb-mono-28kbps` decodes at **~37.5 dB**
+whole-stream against the reference (CELT-only segment
+reference-exact; gated at 30 dB). The **§4.5
 transition machinery is in place**: the 5 ms redundant CELT frame is
 decoded like a CELT-only frame (own coder, no TOC, carrier channels /
 bandwidth with the MB→WB override) through the stream's single CELT
@@ -233,9 +249,14 @@ Per-stage progress lives in `CHANGELOG.md`.
   streams packet-by-packet through `decode_packet` and validates §3.1 TOC
   routing, whole-stream error-free SILK decode (mono + stereo, NB/MB/WB,
   20/60 ms), §3 sample-count accounting, and 440 Hz dominance on the NB
-  sine fixture. Validation is signal- / structure-based, not bit-exact:
-  the §4.2.9 SILK→48 kHz resampler is non-normative, so the decoded
-  envelope differs from the polyphase-resampled reference decoder.
+  sine fixture.
+- A **SILK waveform regression-gate suite**
+  (`tests/silk_reference_waveform.rs`) that compares each SILK-bearing
+  fixture's pre-skip-trimmed 48 kHz decode against its shipped
+  reference decode as an SNR floor (WB stereo / WB mono > 55 dB,
+  MB > 22 dB, NB > 14 dB, the near-DTX `silence-low-bitrate` stream
+  > 14 dB), pinning the §4.2.9 upsampler delay calibration, the
+  §4.2.8 mono one-sample delay, and the reconstruction accuracy.
 
 **Multistream / multichannel (RFC 7845 §3 / §5.1 / §5.1.1):**
 
@@ -321,7 +342,10 @@ reconstruction → stabilization → interpolation → NLSF→LPC →
 bandwidth-expansion → prediction-gain limiting, §4.2.7.5.2–§4.2.7.5.8),
 LTP parameters (§4.2.7.6), LCG seed (§4.2.7.7), excitation
 (§4.2.7.8), LTP + LPC synthesis filters (§4.2.7.9), stereo unmixing
-(§4.2.8), the §4.2.9 resampler delay budget, and **in-band FEC
+(§4.2.8, including the mono one-sample delay), the §4.2.9 resampler
+(`SilkUpsampler` — streaming polyphase windowed-sinc with
+black-box-calibrated per-(bandwidth × path) group delays over the
+Table 54 budget machinery), and **in-band FEC
 recovery** (§2.1.7 / §4.2.5): `OpusDecoder::decode_packet_fec`
 reconstructs a lost frame's audio from the Low Bit-Rate Redundancy
 (LBRR) frames carried in the next received packet — decoding the §4.2.5
