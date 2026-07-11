@@ -301,6 +301,28 @@ pub struct OpusDecoder {
     /// exactly the RFC's "previous frame in the side channel was not
     /// coded" rules.
     silk_carry_side: SilkChannelCarry,
+    /// §4.2.8 mono one-sample delay carry: "In order to allow seamless
+    /// switching between stereo and mono, mono streams must also
+    /// impose the same one-sample delay" (the stereo unmixing
+    /// formulas read `mid[i-1]` / `side[i-1]`, delaying the stereo
+    /// output by one internal-rate sample; the mono path must match).
+    /// Holds the last internal-rate sample of the previous mono Opus
+    /// frame; zero after a decoder reset ("zeros are used instead").
+    silk_mono_delay: f32,
+    /// §4.2.9 mono upsampler state (SILK internal rate → 48 kHz),
+    /// carried across Opus frames so consecutive frames are seamless
+    /// through the resampling filter. Shared by the SILK-only and
+    /// Hybrid paths (both feed the same mono SILK channel); rebuilt
+    /// on a SILK bandwidth change and history-cleared on a §4.5.2
+    /// SILK reset, mirroring [`Self::silk_synth_mono`].
+    silk_resamp_mono: Option<crate::silk_resampler::SilkUpsampler>,
+    /// §4.2.9 stereo upsampler states for the unmixed **left** and
+    /// **right** channels (resampling runs after the §4.2.8 unmix).
+    /// Lifecycle mirrors [`Self::silk_synth_stereo`].
+    silk_resamp_stereo: Option<(
+        crate::silk_resampler::SilkUpsampler,
+        crate::silk_resampler::SilkUpsampler,
+    )>,
     /// Operating mode of the most recently decoded Opus frame, used to
     /// drive the §4.5.2 SILK state-reset rule ("the SILK state is reset
     /// before every SILK-only or Hybrid frame where the previous frame
@@ -409,6 +431,18 @@ impl OpusDecoder {
                 if let Some(unmix) = self.silk_stereo_unmix.as_mut() {
                     unmix.reset();
                 }
+                // The §4.2.8 mono delay sample and the §4.2.9
+                // resampler history are part of the SILK state: clear
+                // them with the rest ("for the first frame after a
+                // decoder reset, zeros are used instead").
+                self.silk_mono_delay = 0.0;
+                if let Some(up) = self.silk_resamp_mono.as_mut() {
+                    up.reset();
+                }
+                if let Some((l, r)) = self.silk_resamp_stereo.as_mut() {
+                    l.reset();
+                    r.reset();
+                }
                 // §4.2.7.4 / §4.2.7.5.5: "the clamping is skipped after a
                 // decoder reset" and the interpolation factor is forced
                 // to 4 — drop the carried gain / NLSF bases.
@@ -455,6 +489,10 @@ impl OpusDecoder {
             if let Some((mid, side)) = self.silk_synth_stereo.as_mut() {
                 mid.reset();
                 side.reset();
+            }
+            if let Some((l, r)) = self.silk_resamp_stereo.as_mut() {
+                l.reset();
+                r.reset();
             }
             // The mid/side §4.2.7 reconstruction carries follow the same
             // policy as the stereo synthesis state: a channel-count
@@ -611,10 +649,12 @@ impl OpusDecoder {
         let status = if channels == 2 {
             match self.decode_silk_layer_stereo(&mut rd, routing) {
                 Ok((left, right, bandwidth)) => {
-                    // §4.2.9 (non-normative): resample each channel to the
-                    // 48 kHz output rate, then write it interleaved
-                    // (`[L0, R0, L1, R1, …]`) over the reserved silence.
-                    resample_stereo_to_output_i16(
+                    // §4.2.9: upsample each channel to the 48 kHz output
+                    // rate through the carried per-channel resampler
+                    // state (Table 54 group delay), then write it
+                    // interleaved (`[L0, R0, L1, R1, …]`) over the
+                    // reserved silence.
+                    self.resample_silk_stereo_into(
                         &left,
                         &right,
                         bandwidth,
@@ -627,12 +667,12 @@ impl OpusDecoder {
         } else {
             match self.decode_silk_layer_mono(&mut rd, routing) {
                 Ok((internal, bandwidth)) => {
-                    // §4.2.9 (non-normative): resample the internal-rate
-                    // signal to the 48 kHz decoder output rate and write it
-                    // over the reserved silence region. The spec says "the
-                    // resampler itself is non-normative, and a decoder can
-                    // use any method it wants"; we use linear interpolation.
-                    resample_internal_to_output_i16(
+                    // §4.2.9: upsample the internal-rate signal to the
+                    // 48 kHz decoder output rate through the carried
+                    // resampler state and write it over the reserved
+                    // silence region. The filter is non-normative; its
+                    // group delay is the normative Table 54 allocation.
+                    self.resample_silk_mono_into(
                         &internal,
                         bandwidth,
                         &mut pcm[pcm_start..pcm_start + per_channel],
@@ -799,6 +839,9 @@ impl OpusDecoder {
         };
         if need_fresh {
             self.silk_synth_mono = Some(SilkSynthState::new(bandwidth)?);
+            // A bandwidth change re-times the internal-rate signal; the
+            // carried §4.2.8 delay sample belongs to the old rate.
+            self.silk_mono_delay = 0.0;
         }
         let state = self
             .silk_synth_mono
@@ -810,7 +853,84 @@ impl OpusDecoder {
             let frame_out = synthesize_silk_frame(bandwidth, frame_size, decoded, state)?;
             internal.extend_from_slice(&frame_out);
         }
+
+        // §4.2.8: "mono streams must also impose the same one-sample
+        // delay" as the stereo unmixing (whose formulas read
+        // `mid[i-1]` / `side[i-1]`). Shift the internal-rate signal by
+        // one sample, carrying the previous Opus frame's final sample
+        // across the boundary (zero after a decoder reset).
+        if let Some(&last) = internal.last() {
+            internal.rotate_right(1);
+            internal[0] = self.silk_mono_delay;
+            self.silk_mono_delay = last;
+        }
         Ok((internal, bandwidth))
+    }
+
+    /// §4.2.9: upsample one mono Opus frame's internal-rate SILK
+    /// samples to 48 kHz i16 PCM through the **carried** mono
+    /// upsampler state (rebuilt when the SILK bandwidth changes — a
+    /// §4.5.2 reset — mirroring [`Self::silk_synth_mono`]).
+    fn resample_silk_mono_into(
+        &mut self,
+        internal: &[f32],
+        bandwidth: crate::toc::Bandwidth,
+        out: &mut [i16],
+    ) {
+        use crate::silk_resampler::SilkUpsampler;
+        let stale = !matches!(&self.silk_resamp_mono,
+            Some(up) if up.bandwidth() == bandwidth);
+        if stale {
+            self.silk_resamp_mono =
+                SilkUpsampler::new(bandwidth, crate::silk_resampler::SilkChannelPath::Mono);
+        }
+        match self.silk_resamp_mono.as_mut() {
+            Some(up) => resample_through_upsampler_i16(up, internal, out),
+            // Unreachable for real SILK bandwidths (NB/MB/WB always
+            // construct); keep a total fallback.
+            None => resample_linear_i16(internal, out),
+        }
+    }
+
+    /// §4.2.9: upsample one stereo Opus frame's unmixed left/right
+    /// internal-rate channels to interleaved 48 kHz i16 PCM through
+    /// the **carried** per-channel upsampler pair (lifecycle mirrors
+    /// [`Self::silk_synth_stereo`]).
+    fn resample_silk_stereo_into(
+        &mut self,
+        left: &[f32],
+        right: &[f32],
+        bandwidth: crate::toc::Bandwidth,
+        out: &mut [i16],
+    ) {
+        use crate::silk_resampler::SilkUpsampler;
+        let per_channel = out.len() / 2;
+        if per_channel == 0 {
+            return;
+        }
+        let stale = !matches!(&self.silk_resamp_stereo,
+            Some((l, _)) if l.bandwidth() == bandwidth);
+        if stale {
+            let path = crate::silk_resampler::SilkChannelPath::Stereo;
+            self.silk_resamp_stereo =
+                SilkUpsampler::new(bandwidth, path).zip(SilkUpsampler::new(bandwidth, path));
+        }
+        let mut l = vec![0i16; per_channel];
+        let mut r = vec![0i16; per_channel];
+        match self.silk_resamp_stereo.as_mut() {
+            Some((ul, ur)) => {
+                resample_through_upsampler_i16(ul, left, &mut l);
+                resample_through_upsampler_i16(ur, right, &mut r);
+            }
+            None => {
+                resample_linear_i16(left, &mut l);
+                resample_linear_i16(right, &mut r);
+            }
+        }
+        for i in 0..per_channel {
+            out[2 * i] = l[i];
+            out[2 * i + 1] = r[i];
+        }
     }
 
     /// Decode the full §4.2 bitstream of one **stereo** SILK-only Opus
@@ -1351,6 +1471,16 @@ impl OpusDecoder {
             internal.extend_from_slice(&frame_out);
         }
         self.silk_synth_mono = Some(state);
+
+        // §4.2.8 mono one-sample delay, so the recovered interval sits
+        // on the same delayed timeline as the surrounding stream. The
+        // lost frame's true trailing sample is unavailable — use zero
+        // (the reset value) and seed the carry for the next packet.
+        if let Some(&last) = internal.last() {
+            internal.rotate_right(1);
+            internal[0] = 0.0;
+            self.silk_mono_delay = last;
+        }
         Ok(Some((internal, bandwidth)))
     }
 
@@ -1525,10 +1655,11 @@ impl OpusDecoder {
     /// carried CELT state *before* the deferred §4.5.2 main-layer
     /// reset (Figure 18's `R & |H`); an end-position one takes the
     /// §4.5.2 reset itself and its warmed state carries into the next
-    /// CELT-only frame (`!R`). The SILK→48 kHz resample is the
-    /// crate's non-normative linear interpolator, so the low band is
-    /// not bit-aligned with the reference decoder's resampler; the
-    /// CELT band and the assembly are the normative paths.
+    /// CELT-only frame (`!R`). The SILK→48 kHz resample runs through
+    /// the carried §4.2.9 upsampler whose group delay is the
+    /// normative Table 54 allocation, time-aligning the SILK band
+    /// with the CELT band (whose MDCT the encoder pre-delayed by the
+    /// same amount).
     fn decode_hybrid_frame(
         &mut self,
         frame: &[u8],
@@ -1545,11 +1676,15 @@ impl OpusDecoder {
         let mut rd = crate::range_decoder::RangeDecoder::new(frame);
 
         // §4.2 SILK layer (always WB internal for Hybrid), resampled
-        // to 48 kHz into the output region.
+        // to 48 kHz into the output region through the carried
+        // upsampler state. The §4.2.9 Table 54 group delay of the
+        // upsampler is what time-aligns this layer with the CELT
+        // layer below: the encoder pre-delayed the MDCT layer by the
+        // same amount.
         let silk_ok = if channels == 2 {
             match self.decode_silk_layer_stereo(&mut rd, routing) {
                 Ok((left, right, bandwidth)) => {
-                    resample_stereo_to_output_i16(
+                    self.resample_silk_stereo_into(
                         &left,
                         &right,
                         bandwidth,
@@ -1562,7 +1697,7 @@ impl OpusDecoder {
         } else {
             match self.decode_silk_layer_mono(&mut rd, routing) {
                 Ok((internal, bandwidth)) => {
-                    resample_internal_to_output_i16(
+                    self.resample_silk_mono_into(
                         &internal,
                         bandwidth,
                         &mut pcm[pcm_start..pcm_start + per_channel],
@@ -2022,29 +2157,38 @@ impl ChannelDecodeState {
     }
 }
 
-/// Resample one Opus frame's internal-rate SILK samples (`internal`, at
-/// the §4.2.1 SILK internal rate for `bandwidth`) to the 48 kHz decoder
-/// output rate and write the result, converted to signed 16-bit PCM, into
-/// `out` (whose length is the §3.1 48 kHz per-channel sample count).
+/// Resample one Opus frame's internal-rate SILK samples through a §4.2.9
+/// [`crate::silk_resampler::SilkUpsampler`] into signed 16-bit PCM.
 ///
-/// Per RFC 6716 §4.2.9 "the resampler itself is non-normative, and a
-/// decoder can use any method it wants to perform the resampling." We use
-/// linear interpolation between adjacent internal-rate samples — a simple,
-/// total method that introduces only the small distortion the §4.2.7.9
-/// preamble explicitly permits ("small errors should only introduce
-/// proportionally small distortions"). A bit-exact match to a particular
-/// reference resampler is **not** attempted; the RFC defers the kernel
-/// choice to the implementation.
-///
-/// The `internal`-to-`out` length ratio is the integer rate ratio (6 for
-/// NB 8 kHz, 4 for MB 12 kHz, 3 for WB 16 kHz → 48 kHz), so the linear
-/// interpolation positions are exact rationals; no fractional drift
-/// accumulates across frames.
-fn resample_internal_to_output_i16(
+/// `out.len()` must be `internal.len() × factor` (the §3.1 sample-count
+/// arithmetic guarantees this for every well-formed SILK frame); a
+/// mismatched pair falls back to stateless linear interpolation so a
+/// defensive caller can never panic here.
+fn resample_through_upsampler_i16(
+    up: &mut crate::silk_resampler::SilkUpsampler,
     internal: &[f32],
-    bandwidth: crate::toc::Bandwidth,
     out: &mut [i16],
 ) {
+    if out.is_empty() {
+        return;
+    }
+    if internal.is_empty() || internal.len() * up.factor() != out.len() {
+        resample_linear_i16(internal, out);
+        return;
+    }
+    let mut buf = vec![0.0f32; out.len()];
+    up.process(internal, &mut buf);
+    for (o, v) in out.iter_mut().zip(&buf) {
+        *o = f32_to_i16(*v);
+    }
+}
+
+/// Stateless linear-interpolation fallback resampler (zero delay, no
+/// carried history). Only reached for degenerate inputs the §3.1
+/// arithmetic never produces on the main path (empty internal buffer,
+/// non-integer rate ratio) — §4.2.9 permits any method, and this one is
+/// total.
+fn resample_linear_i16(internal: &[f32], out: &mut [i16]) {
     if out.is_empty() {
         return;
     }
@@ -2056,10 +2200,6 @@ fn resample_internal_to_output_i16(
     }
     let in_len = internal.len();
     let out_len = out.len();
-    // The internal-rate sample position for output sample `i` is
-    // `i * in_len / out_len`. Linear-interpolate between the two
-    // bracketing internal samples.
-    let _ = bandwidth; // the rate ratio is implied by in_len / out_len.
     for (i, o) in out.iter_mut().enumerate() {
         let pos = (i as f64) * (in_len as f64) / (out_len as f64);
         let i0 = pos.floor() as usize;
@@ -2071,13 +2211,25 @@ fn resample_internal_to_output_i16(
     }
 }
 
-/// Resample a stereo pair of internal-rate SILK channels (`left` /
-/// `right`, both at the §4.2.1 SILK internal rate for `bandwidth`) to the
-/// 48 kHz output rate and write them **interleaved** (`[L0, R0, L1, R1,
-/// …]`) into `out` (length `2 * per_channel`).
-///
-/// Per RFC 6716 §4.2.9 the resampler is non-normative; we use the same
-/// linear interpolation as the mono path on each channel independently.
+/// Resample one frame's internal-rate SILK samples to 48 kHz through a
+/// **fresh** §4.2.9 upsampler (no carried history) — the FEC recovery
+/// path, which reconstructs a lost frame from a fresh SILK state per
+/// §4.2.5 (mirroring the fresh `SilkSynthState` it synthesizes with).
+fn resample_internal_to_output_i16(
+    internal: &[f32],
+    bandwidth: crate::toc::Bandwidth,
+    out: &mut [i16],
+) {
+    let path = crate::silk_resampler::SilkChannelPath::Mono;
+    match crate::silk_resampler::SilkUpsampler::new(bandwidth, path) {
+        Some(mut up) => resample_through_upsampler_i16(&mut up, internal, out),
+        None => resample_linear_i16(internal, out),
+    }
+}
+
+/// Stereo variant of [`resample_internal_to_output_i16`]: fresh §4.2.9
+/// upsamplers per channel, output **interleaved** (`[L0, R0, L1, R1,
+/// …]`) into `out` (length `2 × per_channel`).
 fn resample_stereo_to_output_i16(
     left: &[f32],
     right: &[f32],
@@ -2088,11 +2240,22 @@ fn resample_stereo_to_output_i16(
     if per_channel == 0 {
         return;
     }
+    let path = crate::silk_resampler::SilkChannelPath::Stereo;
     // Resample each channel into a scratch buffer, then interleave.
     let mut l = vec![0i16; per_channel];
     let mut r = vec![0i16; per_channel];
-    resample_internal_to_output_i16(left, bandwidth, &mut l);
-    resample_internal_to_output_i16(right, bandwidth, &mut r);
+    match crate::silk_resampler::SilkUpsampler::new(bandwidth, path)
+        .zip(crate::silk_resampler::SilkUpsampler::new(bandwidth, path))
+    {
+        Some((mut ul, mut ur)) => {
+            resample_through_upsampler_i16(&mut ul, left, &mut l);
+            resample_through_upsampler_i16(&mut ur, right, &mut r);
+        }
+        None => {
+            resample_linear_i16(left, &mut l);
+            resample_linear_i16(right, &mut r);
+        }
+    }
     for i in 0..per_channel {
         out[2 * i] = l[i];
         out[2 * i + 1] = r[i];

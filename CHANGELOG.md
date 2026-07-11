@@ -4,6 +4,47 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **§4.2.9 real resampler: `SilkUpsampler`**, a stateful streaming
+  polyphase windowed-sinc upsampler (Kaiser-windowed, per-phase
+  DC-normalized, per-(bandwidth × path) group delay, input history
+  carried across Opus frames), replacing the stateless zero-delay
+  linear interpolator on every SILK→48 kHz path (SILK-only mono +
+  stereo, Hybrid, FEC recovery). The §4.2.9 filter is non-normative
+  but its **delay** is what places SILK audio on the 48 kHz timeline:
+  the design delays are calibrated black-box against the reference
+  decodes of the staged fixture corpus (totals of 36/40/39 48 kHz
+  samples for mono NB/MB/WB and 30/36/36 for stereo, the kernel
+  half-width sitting exactly on the §4.2.9 causality cap
+  `floor((1+d₄₈)/U)`). The measured mono−stereo asymmetry is exactly
+  one input sample; the NB/MB stereo rows extrapolate the offset
+  pinned at WB. Carried per-channel in `OpusDecoder` (mono state +
+  stereo pair), history-cleared on the §4.5.2 SILK reset and on a
+  channel-count change, rebuilt on a SILK bandwidth change.
+- **FIX (§4.2.8): the mono one-sample delay was missing.** "In order
+  to allow seamless switching between stereo and mono, mono streams
+  must also impose the same one-sample delay" — the stereo unmixing
+  formulas read `mid[i-1]` / `side[i-1]`, so stereo output leaves
+  §4.2.8 one internal-rate sample late, and the mono path must match.
+  The mono SILK output (SILK-only, Hybrid, and FEC recovery) is now
+  delayed by one internal-rate sample, the trailing sample carried
+  across Opus frames and zeroed on the §4.5.2 reset / bandwidth
+  change ("zeros are used instead"). Found black-box: every mono
+  SILK fixture sat one input sample early against its reference
+  decode (and the Hybrid SILK band sat early against the bit-aligned
+  CELT band).
+- Fixture-corpus waveform validation (pre-skip-trimmed SNR vs the
+  shipped reference decodes): `silk-wb-stereo-20kbps` −4.7 → 68.7 dB,
+  `fec-on` (WB mono main path) −5.1 → 71.9 dB, `hybrid-fb-mono-28kbps`
+  1.4 → 37.5 dB (the SILK band now lands on the CELT layer's
+  timeline), `silk-mb-60ms-mono-20kbps` −3.1 → 27.7 dB,
+  `silk-nb-mono-16kbps` −4.6 → 18.5 dB, `silence-low-bitrate` −4.6 →
+  18.7 dB. The NB/MB ceilings are reconstruction-arithmetic drift, not
+  alignment: §4.2.7.9 explicitly frees the reconstruction from
+  bit-exactness ("small errors should only introduce proportionally
+  small distortions") and the fixture references were produced by a
+  fixed-point reconstruction whose rounding recirculates through the
+  LTP feedback on strongly periodic content.
+
 - §4.5 mode-switching integration suite (`tests/mode_switching_decode.rs`)
   on the embedded `mode-switching` fixture (Hybrid→CELT-only switch
   with encoder-emitted §4.5.1 redundancy): whole-stream decode with
