@@ -1802,10 +1802,20 @@ impl OpusDecoder {
             channels,
             energy,
         );
-        if rd.has_error() || u64::from(rd.tell()) > 8 * frame.len() as u64 {
+        if rd.has_error() {
             // The CELT layer failed: apply the §4.6 whole-frame floor
             // (the crate-wide error convention — an error status is
             // always paired with silence).
+            //
+            // Note that tell() PASSING the frame's bit budget is NOT an
+            // error here: §4.1.2.1 defines reading past the end of the
+            // frame ("if no more input bytes remain, it uses zero bits
+            // instead"), and a real low-budget Hybrid frame can spend
+            // its whole budget on the SILK layer — the CELT layer then
+            // takes the §4.3 exhausted-budget silence path and the
+            // frame's audio is the SILK band alone (observed on the
+            // 72-byte-frame code-1 fixture, whose reference decode
+            // keeps the SILK audio).
             pcm[pcm_start..].fill(0);
             return FrameOutcome {
                 samples_per_channel: per_channel,
@@ -2652,10 +2662,12 @@ mod tests {
     #[test]
     fn pcm_length_matches_routing_for_every_config() {
         // Every Table-2 config decodes to a PCM buffer of the routing's
-        // 48 kHz length × channels. SILK-only and CELT-only configs now
-        // synthesize real audio; the remaining unwired layer (Hybrid)
-        // and every error/silence outcome emit correct-length silence.
-        // This sweep pins the length invariant for all 32 configs.
+        // 48 kHz length × channels. SILK-only, CELT-only, AND Hybrid
+        // configs synthesize real audio (a short junk body is a *legal*
+        // bitstream per §4.1.2.1 — reads past the end use zero bits —
+        // so a successful status may carry non-silent PCM); every
+        // error/silence outcome emits correct-length silence. This
+        // sweep pins the length invariant for all 32 configs.
         let mut dec = OpusDecoder::new();
         for config in 0u8..32 {
             for stereo in [false, true] {
@@ -2665,12 +2677,13 @@ mod tests {
                 let expected = output_samples_per_channel(routing.frame_size_tenths_ms)
                     * out.channels as usize;
                 assert_eq!(out.pcm.len(), expected, "config {config} stereo {stereo}");
-                // Everything except a successfully synthesized SILK or
-                // CELT frame still emits silence.
+                // Everything except a successfully synthesized SILK,
+                // Hybrid, or CELT frame still emits silence.
                 let is_wired = matches!(
                     out.frame_outcomes[0].status,
                     FrameDecodeStatus::SilkParamsDecoded
                         | FrameDecodeStatus::SilkStereoDecoded
+                        | FrameDecodeStatus::HybridDecoded
                         | FrameDecodeStatus::CeltDecoded
                 );
                 if !is_wired {

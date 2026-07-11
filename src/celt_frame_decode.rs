@@ -349,6 +349,19 @@ pub fn decode_celt_frame(
         lm,
     );
 
+    if std::env::var("OPUS_DEBUG_HYBRID").is_ok() {
+        eprintln!(
+            "CELT STAGES: after-alloc tell={} tell_frac={} bits={} coded_bands={} intensity={} pulses={:?} fine={:?}",
+            rd.tell(),
+            rd.tell_frac(),
+            bits,
+            alloc.coded_bands,
+            alloc.intensity,
+            &alloc.pulses[start..end],
+            &alloc.fine_bits[start..end],
+        );
+    }
+
     // §4.3.2.2 fine energy.
     for i in start..end {
         if alloc.fine_bits[i] <= 0 {
@@ -359,6 +372,10 @@ pub fn decode_celt_frame(
             let offset = (q2 + 0.5) / f64::from(1u32 << alloc.fine_bits[i]) - 0.5;
             state.old_band_e[ch][i] += offset;
         }
+    }
+
+    if std::env::var("OPUS_DEBUG_HYBRID").is_ok() {
+        eprintln!("CELT STAGES: after-fine tell={}", rd.tell());
     }
 
     // §4.3.4 band shapes.
@@ -379,6 +396,10 @@ pub fn decode_celt_frame(
         c,
         state.rng,
     );
+
+    if std::env::var("OPUS_DEBUG_HYBRID").is_ok() {
+        eprintln!("CELT STAGES: after-bands tell={}", rd.tell());
+    }
 
     // §4.3.5 anti-collapse bit.
     let anti_collapse_on = anti_collapse_rsv > 0 && rd.dec_bits(1) == 1;

@@ -21,6 +21,18 @@ per-stream notes live alongside the originals in
 | `fec-on.opus`                     | 9      | SILK | WB        | mono     | 20 ms    |
 | `silence-low-bitrate.opus`        | 1      | SILK | NB        | mono     | 20 ms    |
 | `mode-switching.opus`             | 15/31  | Hybrid/CELT | FB | mono     | 20 ms    |
+| `code-0-single-frame.opus`        | 13/15/27/31 | Hybrid/CELT | SWB/FB | mono | 20 ms |
+| `code-1-two-equal-frames.opus`    | 15     | Hybrid | FB      | mono     | 20 ms    |
+| `code-2-two-different-frames.opus`| 31     | CELT | FB        | mono     | 20 ms    |
+| `code-3-arbitrary-frames-with-padding.opus` | 15 | Hybrid | FB | mono   | 20 ms    |
+| `pair-mono-48k-64kbps.opus`       | 31     | CELT | FB        | mono     | 20 ms    |
+| `pair-stereo-48k-64kbps.opus`     | 31     | CELT | FB        | stereo   | 20 ms    |
+
+The §3.2 packing fixtures (`code-*`) and the mono/stereo CELT pair
+drive `tests/packing_fixture_decode.rs`. `code-1` is a degenerate
+repacked stream whose first frame legally overreads its budget into
+§4.1.2.1 zero-fill; reference implementations disagree with each
+other on it, so its gate is structural + a loose floor.
 
 The SILK-bearing streams also ship their reference decodes
 (`<name>.expected.wav`, 48 kHz s16le, copied from

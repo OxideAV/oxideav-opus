@@ -32,6 +32,28 @@ All notable changes to `oxideav-opus` are recorded here.
   SILK fixture sat one input sample early against its reference
   decode (and the Hybrid SILK band sat early against the bit-aligned
   CELT band).
+- **FIX (§4.1.2.1): a Hybrid frame whose SILK layer legally overreads
+  its bit budget was discarded whole.** Reading past the end of the
+  frame is defined behaviour ("if no more input bytes remain, it uses
+  zero bits instead"), and a real low-budget Hybrid frame can spend
+  its entire budget on the SILK layer — the CELT layer must then take
+  the §4.3 exhausted-budget silence path and the frame's audio is the
+  SILK band alone. The decoder treated `tell() > budget` after the
+  CELT layer as a whole-frame `CeltDecodeError` and zeroed the PCM,
+  discarding perfectly good SILK audio (observed on the code-1
+  fixture's 72-byte frames, whose reference decode keeps the SILK
+  band). Only a real range-coder error zeroes the frame now.
+- **§3.2 packing + CELT-pair waveform gates**
+  (`tests/packing_fixture_decode.rs`), staging six more fixture pairs:
+  `code-0-single-frame` (Hybrid/CELT mix, ~72.5 dB, gated > 55),
+  `code-2-two-different-frames` (§3.2.4, measured bit-exact, > 60),
+  `code-3-arbitrary-frames-with-padding` (§3.2.5 VBR + padding,
+  ~37 dB, > 25), `pair-mono-48k-64kbps` (the corpus's only mono
+  CELT-only stream, ~104.6 dB, > 60), `pair-stereo-48k-64kbps`
+  (~111.4 dB, > 60), and the degenerate `code-1-two-equal-frames`
+  (repacked mid-stream frames that overread into §4.1.2.1 zero-fill;
+  black-box validators disagree with *each other* on it at the ~7 dB
+  level, so its gate is structural + a loose floor).
 - The `mode-switching` suite's Hybrid-segment energy-parity check is
   upgraded to real waveform gates: Hybrid segment > 50 dB (measured
   ~80+ dB through the delay-calibrated upsampler) and a whole-stream
