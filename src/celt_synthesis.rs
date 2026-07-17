@@ -392,10 +392,10 @@ impl CeltSynthState {
     /// `per_channel[c]` is channel `c`'s `(shapes, log2_energy)` pair (the
     /// same arguments [`Self::synthesize_channel_into`] takes). The slice
     /// length must equal [`Self::channels`]. Each channel's `N`
-    /// time-domain samples are clamped to `[-1.0, 1.0]`, scaled by `32767`,
-    /// and rounded to `i16` — the same conversion the decoder applies to
-    /// the SILK path so CELT and SILK output share one amplitude
-    /// convention. Returns `channels * N` interleaved samples.
+    /// time-domain samples are scaled by `32768`, saturated to the i16
+    /// range, and rounded ties-to-even — the same conversion the decoder
+    /// applies to the SILK path so CELT and SILK output share one
+    /// amplitude convention. Returns `channels * N` interleaved samples.
     ///
     /// # Errors
     ///
@@ -433,14 +433,15 @@ impl CeltSynthState {
 }
 
 /// Convert one §4.3.7.2-domain time sample to signed 16-bit PCM, matching
-/// the decoder's SILK conversion: clamp to `[-1.0, 1.0]`, scale by
-/// `32767`, round to nearest. A free function so the conversion is shared
-/// and unit-testable.
+/// the decoder's SILK conversion and the RFC 6716 §A reference listing's
+/// output quantization of the normative float signal: scale by `32768`,
+/// saturate to `[-32768, 32767]`, and round to nearest with ties to even.
+/// A free function so the conversion is shared and unit-testable.
 #[inline]
 #[must_use]
 fn celt_sample_to_i16(v: f64) -> i16 {
-    let scaled = (v.clamp(-1.0, 1.0) * 32767.0).round();
-    scaled as i16
+    let scaled = (v * 32768.0).clamp(-32768.0, 32767.0);
+    scaled.round_ties_even() as i16
 }
 
 #[cfg(test)]
@@ -656,15 +657,21 @@ mod tests {
 
     #[test]
     fn sample_to_i16_matches_decoder_convention() {
-        // The shared conversion: clamp to ±1, ×32767, round.
+        // The shared conversion: ×32768, saturate, round ties-to-even.
         assert_eq!(celt_sample_to_i16(0.0), 0);
+        // +1.0 scales to 32768, which saturates at the i16 ceiling.
         assert_eq!(celt_sample_to_i16(1.0), 32767);
-        assert_eq!(celt_sample_to_i16(-1.0), -32767);
-        // Clamp beyond range.
+        assert_eq!(celt_sample_to_i16(-1.0), -32768);
+        // Saturation beyond range.
         assert_eq!(celt_sample_to_i16(2.5), 32767);
-        assert_eq!(celt_sample_to_i16(-3.0), -32767);
+        assert_eq!(celt_sample_to_i16(-3.0), -32768);
         // Rounding to nearest.
-        assert_eq!(celt_sample_to_i16(0.5 / 32767.0 + 0.5), 16384);
+        assert_eq!(celt_sample_to_i16(16384.4 / 32768.0), 16384);
+        assert_eq!(celt_sample_to_i16(16384.6 / 32768.0), 16385);
+        // Exact halves round to even.
+        assert_eq!(celt_sample_to_i16(16384.5 / 32768.0), 16384);
+        assert_eq!(celt_sample_to_i16(16383.5 / 32768.0), 16384);
+        assert_eq!(celt_sample_to_i16(-0.5 / 32768.0), 0);
     }
 
     #[test]

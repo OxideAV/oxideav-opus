@@ -283,7 +283,7 @@ pub struct OpusDecoder {
     /// side sample, and the previous frame's prediction weights), carried
     /// across Opus frames. `None` until the first stereo SILK-only frame;
     /// reset (zeroed) on any §4.2.7.1 mono→stereo transition.
-    silk_stereo_unmix: Option<crate::silk_stereo::StereoUnmixState>,
+    silk_stereo_unmix: Option<crate::silk_stereo::StereoUnmixStateI16>,
     /// Cross-Opus-frame §4.2.7 reconstruction carry for the mono SILK
     /// channel: the last decoded subframe gain (the §4.2.7.4 clamp base,
     /// which persists "in the same channel" across Opus frames) and the
@@ -308,7 +308,7 @@ pub struct OpusDecoder {
     /// output by one internal-rate sample; the mono path must match).
     /// Holds the last internal-rate sample of the previous mono Opus
     /// frame; zero after a decoder reset ("zeros are used instead").
-    silk_mono_delay: f32,
+    silk_mono_delay: i16,
     /// §4.2.9 mono upsampler state (SILK internal rate → 48 kHz),
     /// carried across Opus frames so consecutive frames are seamless
     /// through the resampling filter. Shared by the SILK-only and
@@ -435,7 +435,7 @@ impl OpusDecoder {
                 // resampler history are part of the SILK state: clear
                 // them with the rest ("for the first frame after a
                 // decoder reset, zeros are used instead").
-                self.silk_mono_delay = 0.0;
+                self.silk_mono_delay = 0;
                 if let Some(up) = self.silk_resamp_mono.as_mut() {
                     up.reset();
                 }
@@ -732,12 +732,12 @@ impl OpusDecoder {
         &mut self,
         rd: &mut crate::range_decoder::RangeDecoder<'_>,
         routing: &OpusFrameRouting,
-    ) -> Result<(Vec<f32>, crate::toc::Bandwidth), Error> {
+    ) -> Result<(Vec<i16>, crate::toc::Bandwidth), Error> {
         use crate::silk_decode::{decode_silk_frame, SilkFrameConfig, SilkFrameDecoded};
         use crate::silk_excitation::SilkFrameSize;
         use crate::silk_frame::FrameKind;
         use crate::silk_header::SilkHeaderBits;
-        use crate::silk_synthesis::{synthesize_silk_frame, SilkSynthState};
+        use crate::silk_synthesis::{synthesize_silk_frame_i16, SilkSynthState};
 
         let bandwidth = routing
             .silk_bandwidth
@@ -841,16 +841,16 @@ impl OpusDecoder {
             self.silk_synth_mono = Some(SilkSynthState::new(bandwidth)?);
             // A bandwidth change re-times the internal-rate signal; the
             // carried §4.2.8 delay sample belongs to the old rate.
-            self.silk_mono_delay = 0.0;
+            self.silk_mono_delay = 0;
         }
         let state = self
             .silk_synth_mono
             .as_mut()
             .expect("synth state set above");
 
-        let mut internal = Vec::new();
+        let mut internal: Vec<i16> = Vec::new();
         for decoded in &decoded_frames {
-            let frame_out = synthesize_silk_frame(bandwidth, frame_size, decoded, state)?;
+            let frame_out = synthesize_silk_frame_i16(bandwidth, frame_size, decoded, state)?;
             internal.extend_from_slice(&frame_out);
         }
 
@@ -858,7 +858,9 @@ impl OpusDecoder {
         // delay" as the stereo unmixing (whose formulas read
         // `mid[i-1]` / `side[i-1]`). Shift the internal-rate signal by
         // one sample, carrying the previous Opus frame's final sample
-        // across the boundary (zero after a decoder reset).
+        // across the boundary (zero after a decoder reset). This is the
+        // reference decoder's two-sample output buffering with the
+        // resampler reading from offset 1.
         if let Some(&last) = internal.last() {
             internal.rotate_right(1);
             internal[0] = self.silk_mono_delay;
@@ -873,7 +875,7 @@ impl OpusDecoder {
     /// §4.5.2 reset — mirroring [`Self::silk_synth_mono`]).
     fn resample_silk_mono_into(
         &mut self,
-        internal: &[f32],
+        internal: &[i16],
         bandwidth: crate::toc::Bandwidth,
         out: &mut [i16],
     ) {
@@ -898,8 +900,8 @@ impl OpusDecoder {
     /// [`Self::silk_synth_stereo`]).
     fn resample_silk_stereo_into(
         &mut self,
-        left: &[f32],
-        right: &[f32],
+        left: &[i16],
+        right: &[i16],
         bandwidth: crate::toc::Bandwidth,
         out: &mut [i16],
     ) {
@@ -954,12 +956,12 @@ impl OpusDecoder {
         &mut self,
         rd: &mut crate::range_decoder::RangeDecoder<'_>,
         routing: &OpusFrameRouting,
-    ) -> Result<(Vec<f32>, Vec<f32>, crate::toc::Bandwidth), Error> {
+    ) -> Result<(Vec<i16>, Vec<i16>, crate::toc::Bandwidth), Error> {
         use crate::silk_decode::{decode_silk_frame, SilkFrameDecoded, StereoHeaderContext};
         use crate::silk_excitation::SilkFrameSize;
         use crate::silk_header::SilkHeaderBits;
-        use crate::silk_stereo::{stereo_ms_to_lr, StereoUnmixState, StereoWeightsQ13};
-        use crate::silk_synthesis::{synthesize_silk_frame, SilkSynthState};
+        use crate::silk_stereo::{stereo_ms_to_lr_i16, StereoUnmixStateI16, StereoWeightsQ13};
+        use crate::silk_synthesis::{synthesize_silk_frame_i16, SilkSynthState};
 
         let bandwidth = routing
             .silk_bandwidth
@@ -1121,26 +1123,34 @@ impl OpusDecoder {
         // each interval in turn and concatenate the L/R outputs.
         let unmix = self
             .silk_stereo_unmix
-            .get_or_insert_with(StereoUnmixState::new);
+            .get_or_insert_with(StereoUnmixStateI16::new);
+        let fs_khz = match bandwidth {
+            crate::toc::Bandwidth::Nb => 8usize,
+            crate::toc::Bandwidth::Mb => 12,
+            _ => 16,
+        };
 
-        let mut left = Vec::new();
-        let mut right = Vec::new();
+        let mut left: Vec<i16> = Vec::new();
+        let mut right: Vec<i16> = Vec::new();
         for (idx, mid_frame) in mid_frames.iter().enumerate() {
-            let mid_out = synthesize_silk_frame(bandwidth, frame_size, mid_frame, mid_synth)?;
+            let mid_out = synthesize_silk_frame_i16(bandwidth, frame_size, mid_frame, mid_synth)?;
             let n = mid_out.len();
             let weights = interval_weights[idx];
             let stereo = match &side_frames[idx] {
                 Some(side_frame) => {
                     let side_out =
-                        synthesize_silk_frame(bandwidth, frame_size, side_frame, side_synth)?;
-                    stereo_ms_to_lr(bandwidth, &mid_out, Some(&side_out), weights, unmix)?
+                        synthesize_silk_frame_i16(bandwidth, frame_size, side_frame, side_synth)?;
+                    stereo_ms_to_lr_i16(fs_khz, &mid_out, Some(&side_out), weights, unmix)?
                 }
                 None => {
                     // §4.2.7.2 / §4.5.2: an uncoded side SILK frame clears
-                    // the side LTP buffer; zeros feed the §4.2.8 unmixer
-                    // (`side = None` ⇒ side[i] treated as 0 everywhere).
-                    side_synth.reset();
-                    stereo_ms_to_lr(bandwidth, &mid_out, None, weights, unmix)?
+                    // the side channel's prediction memory (its output
+                    // history and LPC state; the previous-subframe gain
+                    // survives, matching the reference decoder's
+                    // side-channel reset). Zeros feed the §4.2.8 unmixer,
+                    // but the carried side history still applies.
+                    side_synth.reset_prediction_memory();
+                    stereo_ms_to_lr_i16(fs_khz, &mid_out, None, weights, unmix)?
                 }
             };
             debug_assert_eq!(stereo.left.len(), n);
@@ -1396,12 +1406,12 @@ impl OpusDecoder {
         &mut self,
         frame: &[u8],
         routing: &OpusFrameRouting,
-    ) -> Result<Option<(Vec<f32>, crate::toc::Bandwidth)>, Error> {
+    ) -> Result<Option<(Vec<i16>, crate::toc::Bandwidth)>, Error> {
         use crate::range_decoder::RangeDecoder;
         use crate::silk_decode::{decode_silk_frame, SilkFrameDecoded};
         use crate::silk_excitation::SilkFrameSize;
         use crate::silk_header::SilkHeaderBits;
-        use crate::silk_synthesis::{synthesize_silk_frame, SilkSynthState};
+        use crate::silk_synthesis::{synthesize_silk_frame_i16, SilkSynthState};
 
         let bandwidth = routing
             .silk_bandwidth
@@ -1465,9 +1475,9 @@ impl OpusDecoder {
         // self-contained. The resulting history then becomes the carried
         // mono synthesis state for the following real packet.
         let mut state = SilkSynthState::new(bandwidth)?;
-        let mut internal = Vec::new();
+        let mut internal: Vec<i16> = Vec::new();
         for decoded in &lbrr_frames {
-            let frame_out = synthesize_silk_frame(bandwidth, frame_size, decoded, &mut state)?;
+            let frame_out = synthesize_silk_frame_i16(bandwidth, frame_size, decoded, &mut state)?;
             internal.extend_from_slice(&frame_out);
         }
         self.silk_synth_mono = Some(state);
@@ -1478,7 +1488,7 @@ impl OpusDecoder {
         // (the reset value) and seed the carry for the next packet.
         if let Some(&last) = internal.last() {
             internal.rotate_right(1);
-            internal[0] = 0.0;
+            internal[0] = 0;
             self.silk_mono_delay = last;
         }
         Ok(Some((internal, bandwidth)))
@@ -1504,13 +1514,13 @@ impl OpusDecoder {
         &mut self,
         frame: &[u8],
         routing: &OpusFrameRouting,
-    ) -> Result<Option<(Vec<f32>, Vec<f32>, crate::toc::Bandwidth)>, Error> {
+    ) -> Result<Option<(Vec<i16>, Vec<i16>, crate::toc::Bandwidth)>, Error> {
         use crate::range_decoder::RangeDecoder;
         use crate::silk_decode::{decode_silk_frame, SilkFrameDecoded, StereoHeaderContext};
         use crate::silk_excitation::SilkFrameSize;
         use crate::silk_header::SilkHeaderBits;
-        use crate::silk_stereo::{stereo_ms_to_lr, StereoUnmixState, StereoWeightsQ13};
-        use crate::silk_synthesis::{synthesize_silk_frame, SilkSynthState};
+        use crate::silk_stereo::{stereo_ms_to_lr_i16, StereoUnmixStateI16, StereoWeightsQ13};
+        use crate::silk_synthesis::{synthesize_silk_frame_i16, SilkSynthState};
 
         let bandwidth = routing
             .silk_bandwidth
@@ -1610,21 +1620,31 @@ impl OpusDecoder {
         // §4.2.7.9 synthesis + §4.2.8 unmix from fresh state.
         let mut mid_synth = SilkSynthState::new(bandwidth)?;
         let mut side_synth = SilkSynthState::new(bandwidth)?;
-        let mut unmix = StereoUnmixState::new();
-        let mut left = Vec::new();
-        let mut right = Vec::new();
+        let mut unmix = StereoUnmixStateI16::new();
+        let fs_khz = match bandwidth {
+            crate::toc::Bandwidth::Nb => 8usize,
+            crate::toc::Bandwidth::Mb => 12,
+            _ => 16,
+        };
+        let mut left: Vec<i16> = Vec::new();
+        let mut right: Vec<i16> = Vec::new();
         for (idx, mid_frame) in mid_frames.iter().enumerate() {
-            let mid_out = synthesize_silk_frame(bandwidth, frame_size, mid_frame, &mut mid_synth)?;
+            let mid_out =
+                synthesize_silk_frame_i16(bandwidth, frame_size, mid_frame, &mut mid_synth)?;
             let weights = interval_weights[idx];
             let stereo = match &side_frames[idx] {
                 Some(side_frame) => {
-                    let side_out =
-                        synthesize_silk_frame(bandwidth, frame_size, side_frame, &mut side_synth)?;
-                    stereo_ms_to_lr(bandwidth, &mid_out, Some(&side_out), weights, &mut unmix)?
+                    let side_out = synthesize_silk_frame_i16(
+                        bandwidth,
+                        frame_size,
+                        side_frame,
+                        &mut side_synth,
+                    )?;
+                    stereo_ms_to_lr_i16(fs_khz, &mid_out, Some(&side_out), weights, &mut unmix)?
                 }
                 None => {
-                    side_synth.reset();
-                    stereo_ms_to_lr(bandwidth, &mid_out, None, weights, &mut unmix)?
+                    side_synth.reset_prediction_memory();
+                    stereo_ms_to_lr_i16(fs_khz, &mid_out, None, weights, &mut unmix)?
                 }
             };
             left.extend_from_slice(&stereo.left);
@@ -2176,7 +2196,7 @@ impl ChannelDecodeState {
 /// defensive caller can never panic here.
 fn resample_through_upsampler_i16(
     up: &mut crate::silk_resampler::SilkUpsampler,
-    internal: &[f32],
+    internal: &[i16],
     out: &mut [i16],
 ) {
     if out.is_empty() {
@@ -2186,11 +2206,7 @@ fn resample_through_upsampler_i16(
         resample_linear_i16(internal, out);
         return;
     }
-    let mut buf = vec![0.0f32; out.len()];
-    up.process(internal, &mut buf);
-    for (o, v) in out.iter_mut().zip(&buf) {
-        *o = f32_to_i16(*v);
-    }
+    up.process_i16(internal, out);
 }
 
 /// Stateless linear-interpolation fallback resampler (zero delay, no
@@ -2198,7 +2214,7 @@ fn resample_through_upsampler_i16(
 /// arithmetic never produces on the main path (empty internal buffer,
 /// non-integer rate ratio) — §4.2.9 permits any method, and this one is
 /// total.
-fn resample_linear_i16(internal: &[f32], out: &mut [i16]) {
+fn resample_linear_i16(internal: &[i16], out: &mut [i16]) {
     if out.is_empty() {
         return;
     }
@@ -2213,11 +2229,11 @@ fn resample_linear_i16(internal: &[f32], out: &mut [i16]) {
     for (i, o) in out.iter_mut().enumerate() {
         let pos = (i as f64) * (in_len as f64) / (out_len as f64);
         let i0 = pos.floor() as usize;
-        let frac = (pos - i0 as f64) as f32;
-        let s0 = internal[i0.min(in_len - 1)];
-        let s1 = internal[(i0 + 1).min(in_len - 1)];
+        let frac = pos - i0 as f64;
+        let s0 = f64::from(internal[i0.min(in_len - 1)]);
+        let s1 = f64::from(internal[(i0 + 1).min(in_len - 1)]);
         let v = s0 + (s1 - s0) * frac;
-        *o = f32_to_i16(v);
+        *o = v.round_ties_even().clamp(-32768.0, 32767.0) as i16;
     }
 }
 
@@ -2226,7 +2242,7 @@ fn resample_linear_i16(internal: &[f32], out: &mut [i16]) {
 /// path, which reconstructs a lost frame from a fresh SILK state per
 /// §4.2.5 (mirroring the fresh `SilkSynthState` it synthesizes with).
 fn resample_internal_to_output_i16(
-    internal: &[f32],
+    internal: &[i16],
     bandwidth: crate::toc::Bandwidth,
     out: &mut [i16],
 ) {
@@ -2241,8 +2257,8 @@ fn resample_internal_to_output_i16(
 /// upsamplers per channel, output **interleaved** (`[L0, R0, L1, R1,
 /// …]`) into `out` (length `2 × per_channel`).
 fn resample_stereo_to_output_i16(
-    left: &[f32],
-    right: &[f32],
+    left: &[i16],
+    right: &[i16],
     bandwidth: crate::toc::Bandwidth,
     out: &mut [i16],
 ) {
@@ -2270,15 +2286,6 @@ fn resample_stereo_to_output_i16(
         out[2 * i] = l[i];
         out[2 * i + 1] = r[i];
     }
-}
-
-/// Convert a nominal `[-1.0, 1.0]` float sample to signed 16-bit PCM,
-/// rounding to nearest and clamping into the i16 range. The §4.2.7.9.2
-/// output is already clamped to `[-1.0, 1.0]`; the clamp here is a
-/// defensive backstop.
-fn f32_to_i16(v: f32) -> i16 {
-    let scaled = (v.clamp(-1.0, 1.0) * 32767.0).round();
-    scaled as i16
 }
 
 /// Convenience: the channel count for a [`ChannelMapping`].

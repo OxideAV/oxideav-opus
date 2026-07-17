@@ -128,14 +128,14 @@ fn hybrid_to_celt_switch_with_redundancy_matches_reference() {
     let switch = 33_600usize; // 0.7 s at 48 kHz
     assert!(n > switch + 10_000, "decoded stream too short: {n}");
 
-    // Hybrid segment: waveform-level agreement. The §4.2.9 upsampler's
-    // calibrated delay aligns the SILK band with the CELT band, so the
-    // segment is directly comparable (measured ~80+ dB on this
-    // fixture's low tone; 50 dB fails on one sample of SILK↔CELT
-    // misalignment).
+    // Hybrid segment: waveform-level agreement. The reference §4.2.9
+    // resampler puts the (bit-exact) SILK band on the reference
+    // timeline, so only the CELT layer's float arithmetic separates the
+    // decodes (measured ~100 dB; 50 dB fails on one sample of
+    // SILK↔CELT misalignment).
     let hybrid_seg = snr_db(&expected[..switch], &got[..switch]);
     assert!(
-        hybrid_seg > 50.0,
+        hybrid_seg > 80.0,
         "hybrid-segment SNR {hybrid_seg:.1} dB below threshold"
     );
 
@@ -147,19 +147,19 @@ fn hybrid_to_celt_switch_with_redundancy_matches_reference() {
         &got[switch..switch + 6_400],
     );
     assert!(
-        trans > 60.0,
+        trans > 80.0,
         "transition window SNR {trans:.1} dB below threshold"
     );
 
     // CELT-only segment: reference-exact decode.
     let celt = snr_db(&expected[switch + 6_400..n], &got[switch + 6_400..n]);
-    assert!(celt > 60.0, "CELT segment SNR {celt:.1} dB below threshold");
+    assert!(celt > 90.0, "CELT segment SNR {celt:.1} dB below threshold");
 
     // Whole-stream gate (measured ~82 dB): every segment, every
     // transition, one number.
     let whole = snr_db(&expected, got);
     assert!(
-        whole > 60.0,
+        whole > 90.0,
         "whole-stream SNR {whole:.1} dB below threshold"
     );
 }

@@ -17,34 +17,24 @@
 //!   §4.2.1 / §4.2.7.x decode pipeline ([`silk_internal_rate_hz`],
 //!   [`silk_frame_samples_internal`]).
 //!
-//! * The actual sample-rate conversion: [`SilkUpsampler`], a stateful
-//!   streaming polyphase windowed-sinc upsampler from the SILK
-//!   internal rate to 48 kHz. §4.2.9 makes the filter non-normative;
-//!   what matters is the group **delay**, which decides where SILK
-//!   audio lands on the 48 kHz timeline relative to the CELT layer
-//!   of a Hybrid frame and to the RFC 7845 pre-skip. The design
-//!   delays (see [`upsampler_design`]) are calibrated black-box
-//!   against the reference decodes of the staged fixture corpus,
-//!   per bandwidth and per reconstruction path
-//!   ([`SilkChannelPath`]); Table 54 remains the spec's stated
-//!   encoder-side target and is kept as the documented constants
-//!   above.
-//!
-//! The kernel-width choice is forced by the delay: with the group
-//! delay fixed at `d₄₈` 48 kHz samples and the output for one frame
-//! due immediately (the decoder emits each frame's 48 kHz samples as
-//! soon as the frame is decoded, with no lookahead into the next
-//! frame), a symmetric interpolation kernel can reach at most `d₄₈`
-//! output steps into the future, capping its half-width at
-//! `floor((1 + d₄₈)/U)` input samples (`U` = the upsampling factor).
-//! This is the §4.2.9 trade the prose describes ("NB is given a
-//! smaller decoder delay allocation …"): the delay allocation *is*
-//! the filter length budget.
+//! * The actual sample-rate conversion: [`SilkUpsampler`], the SILK
+//!   internal rate → 48 kHz resampler in the exact fixed-point
+//!   arithmetic of the RFC 6716 §A reference listing (1 ms delay
+//!   compensation + 2× allpass upsampling + fractional-phase 8-tap
+//!   FIR interpolation). §4.2.9 makes the filter non-normative, but
+//!   the reference decoder's filter decides where SILK audio lands on
+//!   the 48 kHz timeline relative to the CELT layer of a Hybrid frame
+//!   and to the RFC 7845 pre-skip (the encoder pre-delays the MDCT
+//!   layer to match it, §4.5); reproducing it exactly is what makes
+//!   the decoded SILK waveform sample-align with reference decodes.
+//!   Table 54 remains the spec's stated encoder-side delay target and
+//!   is kept as the documented constants above.
 //!
 //! All numeric values are transcribed from RFC 6716 §4.2 (Table 54
 //! plus the §4.2.9 prose, plus the SILK-internal sample rates implied
-//! by the §4.2.7.x decode pipeline). No external library source was
-//! consulted, paraphrased, or used as a cross-check oracle.
+//! by the §4.2.7.x decode pipeline) and the §A reference listing's
+//! resampler tables. No external library source was consulted,
+//! paraphrased, or used as a cross-check oracle.
 
 use crate::Bandwidth;
 
@@ -212,46 +202,14 @@ pub fn silk_frame_samples_at_output(
 }
 
 // ---------------------------------------------------------------------
-// §4.2.9 streaming upsampler (SILK internal rate → 48 kHz).
+// §4.2.9 resampler (SILK internal rate → 48 kHz), fixed point.
 // ---------------------------------------------------------------------
 
-/// Zeroth-order modified Bessel function of the first kind, by its
-/// power series `Σ ((x/2)^k / k!)²` — the normalization core of the
-/// Kaiser window. Converges rapidly for the argument range used here
-/// (`x ≤ ~12`); terms fall below f64 epsilon after a few dozen steps.
-fn bessel_i0(x: f64) -> f64 {
-    let half = x / 2.0;
-    let mut sum = 1.0f64;
-    let mut term = 1.0f64;
-    for k in 1..64 {
-        term *= (half / k as f64) * (half / k as f64);
-        sum += term;
-        if term < sum * 1e-18 {
-            break;
-        }
-    }
-    sum
-}
-
-/// Normalized sinc: `sin(πx)/(πx)` with the removable singularity at 0.
-fn sinc(x: f64) -> f64 {
-    if x.abs() < 1e-12 {
-        1.0
-    } else {
-        let px = std::f64::consts::PI * x;
-        px.sin() / px
-    }
-}
-
-/// Which SILK reconstruction path feeds the §4.2.9 upsampler. The two
-/// paths carry different upstream delays — the stereo output leaves
-/// the §4.2.8 unmixer one input sample late (its formulas read
-/// `mid[i-1]` / `side[i-1]`), while the mono path's §4.2.8 delay is
-/// imposed explicitly — and the black-box calibration against the
-/// reference decodes of the staged fixture corpus shows the reference
-/// decoder's mono output sits exactly one further input sample later
-/// than its stereo output. Selecting the path picks the filter delay
-/// that lands our total on the reference's timeline.
+/// Which SILK reconstruction path feeds the §4.2.9 resampler. The
+/// reference resampler is path-independent (mono and stereo share one
+/// filter; the §4.2.8 one-sample delay is applied by the caller's
+/// two-sample output buffering), so this only tags the state for
+/// diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SilkChannelPath {
     /// A mono SILK channel (SILK-only mono, Hybrid mono, FEC mono).
@@ -260,220 +218,280 @@ pub enum SilkChannelPath {
     Stereo,
 }
 
-/// Per-(bandwidth × path) §4.2.9 filter design: upsampling factor to
-/// 48 kHz, filter group delay `d₄₈` in 48 kHz samples, the
-/// anti-imaging cutoff as a fraction of the input Nyquist, and the
-/// Kaiser window shape β. The kernel half-width `M` in input samples
-/// follows as the §4.2.9 causality cap `floor((1 + d₄₈)/U)` (see the
-/// module docs).
-///
-/// §4.2.9 makes the filter non-normative and Table 54 gives the delay
-/// the *encoder* targets; a decoder may use more delay. The `d₄₈`
-/// values here are the **measured effective group delays of the
-/// reference decodes** shipped with the staged fixture corpus
-/// (black-box waveform calibration; exact-integer alignment lifts the
-/// WB fixtures from ~44 dB to ~69–72 dB SNR), so decoded SILK lands
-/// sample-aligned with a reference decode trimmed by the RFC 7845
-/// pre-skip, and — for Hybrid — with the CELT layer. Together with
-/// the path's one-input-sample §4.2.8 delay they put the decoder's
-/// total SILK delay at 36/40/39 (mono NB/MB/WB) and 30/36/36 (stereo)
-/// 48 kHz samples. The NB/MB *stereo* rows extrapolate the
-/// mono−stereo = one-input-sample offset measured at WB (the staged
-/// corpus has no NB/MB stereo fixture to pin them directly).
-fn upsampler_design(bw: Bandwidth, path: SilkChannelPath) -> Option<(usize, f64, f64, f64)> {
-    match (bw, path) {
-        // NB 8 kHz → 48 kHz: U = 6 (total 36 = 30 + one 8 kHz sample).
-        (Bandwidth::Nb, SilkChannelPath::Mono) => Some((6, 30.0, 0.92, 5.0)),
-        (Bandwidth::Nb, SilkChannelPath::Stereo) => Some((6, 24.0, 0.92, 5.0)),
-        // MB 12 kHz → 48 kHz: U = 4 (total 40 = 36 + one 12 kHz sample).
-        (Bandwidth::Mb, SilkChannelPath::Mono) => Some((4, 36.0, 0.94, 7.0)),
-        (Bandwidth::Mb, SilkChannelPath::Stereo) => Some((4, 32.0, 0.94, 7.0)),
-        // WB 16 kHz → 48 kHz: U = 3 (total 39 = 36 + one 16 kHz sample).
-        (Bandwidth::Wb, SilkChannelPath::Mono) => Some((3, 36.0, 0.95, 8.0)),
-        (Bandwidth::Wb, SilkChannelPath::Stereo) => Some((3, 33.0, 0.95, 8.0)),
-        (Bandwidth::Swb | Bandwidth::Fb, _) => None,
+/// The §A reference listing's decoder-side delay compensation, in input
+/// samples, for resampling {8, 12, 16} kHz → 48 kHz (the `delay_matrix`
+/// row/column for each SILK internal rate at a 48 kHz output).
+fn decoder_input_delay(fs_in_khz: usize) -> usize {
+    match fs_in_khz {
+        8 => 0,
+        12 => 4,
+        _ => 7, // 16 kHz
     }
 }
 
-/// A stateful streaming upsampler from one SILK internal rate
-/// (8/12/16 kHz) to the 48 kHz decoder output rate — the crate's
-/// §4.2.9 resampler.
+/// Interpolation FIR half-tables for the fractional-phase stage of the
+/// §4.2.9 upsampler (12 phases × 4 taps; the second half of each 8-tap
+/// filter mirrors the table at `11 − index`). Transcribed from the
+/// RFC 6716 §A reference listing's resampler coefficient tables.
+const FRAC_FIR_12: [[i16; 4]; 12] = [
+    [189, -600, 617, 30567],
+    [117, -159, -1070, 29704],
+    [52, 221, -2392, 28276],
+    [-4, 529, -3350, 26341],
+    [-48, 758, -3956, 23973],
+    [-80, 905, -4235, 21254],
+    [-99, 972, -4222, 18278],
+    [-107, 967, -3957, 15143],
+    [-103, 896, -3487, 11950],
+    [-91, 773, -2865, 8798],
+    [-71, 611, -2143, 5784],
+    [-46, 425, -1375, 2996],
+];
+
+/// First (even-phase) 2× allpass coefficient triple, Q16 fractions.
+const UP2_HQ_0: [i32; 3] = [1746, 14986, 39083 - 65536];
+/// Second (odd-phase) 2× allpass coefficient triple, Q16 fractions.
+const UP2_HQ_1: [i32; 3] = [6854, 25769, 55542 - 65536];
+
+/// Number of carried interpolation-history samples (the 8-tap FIR).
+const ORDER_FIR_12: usize = 8;
+/// Batch size in milliseconds (the reference processes 10 ms at a time,
+/// restarting the fractional-index accumulator per batch).
+const MAX_BATCH_MS: usize = 10;
+
+/// A stateful streaming resampler from one SILK internal rate
+/// (8/12/16 kHz) to the 48 kHz decoder output rate — the §4.2.9
+/// resampler, in the exact fixed-point arithmetic of the RFC 6716 §A
+/// reference listing.
 ///
-/// §4.2.9 makes the filter non-normative; what matters is the group
-/// **delay**, which decides where the decoded SILK audio lands on the
-/// 48 kHz timeline relative to the CELT layer of a Hybrid frame and
-/// to the RFC 7845 §4.2 pre-skip. This upsampler's per-(bandwidth ×
-/// path) delays are calibrated black-box against the reference
-/// decodes of the staged fixture corpus (see [`upsampler_design`]),
-/// which lifts the WB fixtures to ~69–72 dB waveform SNR and aligns
-/// the Hybrid SILK band with the (bit-aligned) CELT band.
+/// §4.2.9 makes the filter non-normative, but the *reference decoder's*
+/// filter decides where SILK audio lands on the 48 kHz timeline
+/// relative to the CELT layer of a Hybrid frame and to the RFC 7845
+/// pre-skip (the encoder pre-delays the MDCT layer to match it, §4.5).
+/// Reproducing it exactly is what makes the decoded SILK waveform
+/// sample-align with reference decodes.
 ///
-/// Implementation: a polyphase windowed-sinc interpolator. Output
-/// sample `n` (48 kHz timeline) is the kernel-weighted sum of the
-/// input samples around the input-domain position
-/// `τ(n) = (n − d₄₈)/U`, where `d₄₈` is the Table 54 delay in 48 kHz
-/// samples and `U` the upsampling factor. The `U` fractional phases
-/// are precomputed as tap tables (Kaiser-windowed sinc, per-phase
-/// DC-normalized so constant inputs pass through exactly); the last
-/// `P` input samples are carried across calls so frame boundaries
-/// are seamless. Feeding zeros from a fresh state reproduces the
-/// warm-up transient any delay-matched filter has; the RFC 7845
-/// pre-skip discards it.
+/// Structure (the listing's `UF` path for all three SILK rates):
+///
+/// 1. a 1 ms input delay-compensation buffer (per-rate delay so every
+///    mode has equal total delay),
+/// 2. 2× upsampling by a pair of 3-section allpass chains (even / odd
+///    output phases) with a Q10 internal state, and
+/// 3. fractional-phase 8-tap FIR interpolation from the 2× signal to
+///    the output rate, in 10 ms batches with an 8-sample carried
+///    history.
 #[derive(Debug, Clone)]
 pub struct SilkUpsampler {
     bandwidth: Bandwidth,
     path: SilkChannelPath,
-    /// Filter group delay `d₄₈` in 48 kHz output samples.
-    delay_48k: f64,
-    /// Upsampling factor `U` (48000 / internal rate): 6, 4, or 3.
-    factor: usize,
-    /// Kernel half-width `M` in input samples (2·M taps per phase).
-    half_width: usize,
-    /// Per-phase base offset: for output phase `p`, the first tap
-    /// reads input index `a + offset[p] − M + 1` where `a = n / U`.
-    offsets: [isize; 6],
-    /// Per-phase tap tables, `factor` phases × `2·M` taps, indexed so
-    /// that tap `i` multiplies input sample `q − M + 1 + i`.
-    phases: Vec<Vec<f32>>,
-    /// Carried input history: the last `P` input samples of the
-    /// previous call (`P = M − 1 + ceil(d₄₈/U)`), zeros after a reset.
-    hist: Vec<f32>,
+    fs_in_khz: usize,
+    fs_out_khz: usize,
+    input_delay: usize,
+    batch_size: usize,
+    inv_ratio_q16: i32,
+    /// 2× allpass chain state (Q10), 3 sections × 2 phases.
+    s_iir: [i32; 6],
+    /// Carried tail of the 2×-upsampled signal for the FIR stage.
+    s_fir: [i16; ORDER_FIR_12],
+    /// 1 ms delay-compensation buffer (`fs_in_khz` samples used).
+    delay_buf: [i16; 48],
 }
 
 impl SilkUpsampler {
-    /// Construct an upsampler for one SILK audio bandwidth on one
+    /// Construct a resampler for one SILK audio bandwidth on one
     /// reconstruction path, or `None` for SWB / FB (which never reach
     /// the §4.2.9 SILK resampler).
     pub fn new(bandwidth: Bandwidth, path: SilkChannelPath) -> Option<Self> {
-        let (factor, d48, cutoff, beta) = upsampler_design(bandwidth, path)?;
-        // §4.2.9 causality cap: with each frame's 48 kHz output due as
-        // soon as the frame is decoded, the kernel can reach at most
-        // d₄₈ output samples into the future.
-        let half_width = ((1.0 + d48) / factor as f64).floor() as usize;
-        let d_in = d48 / factor as f64; // …in input samples.
-
-        // History depth: the earliest tap of output n = 0 reads input
-        // index floor(−d_in) − M + 1; carry that many prior samples.
-        let hist_len = (half_width - 1) + d_in.ceil() as usize;
-
-        // Precompute the U phase tables. For output n with phase
-        // p = n mod U and a = n / U, the input-domain position is
-        // τ = a + (p/U − d_in); split into integer offset + fraction.
-        let i0_beta = bessel_i0(beta);
-        let mut offsets = [0isize; 6];
-        let mut phases = Vec::with_capacity(factor);
-        for (p, off_slot) in offsets.iter_mut().enumerate().take(factor) {
-            let t = p as f64 / factor as f64 - d_in;
-            let off = t.floor();
-            let frac = t - off;
-            *off_slot = off as isize;
-            // Tap i multiplies input sample q − M + 1 + i, whose
-            // kernel argument is τ − j = frac + (M − 1 − i).
-            let mut taps = Vec::with_capacity(2 * half_width);
-            let mut sum = 0.0f64;
-            for i in 0..2 * half_width {
-                let x = frac + (half_width as f64 - 1.0) - i as f64;
-                // Kaiser-windowed sinc, cutoff relative to the input
-                // Nyquist. Window support is |x| ≤ M; the extreme tap
-                // arguments stay inside it (|frac + M − 1| < M).
-                let w = {
-                    let r = x / half_width as f64;
-                    if r.abs() >= 1.0 {
-                        0.0
-                    } else {
-                        bessel_i0(beta * (1.0 - r * r).sqrt()) / i0_beta
-                    }
-                };
-                let k = cutoff * sinc(cutoff * x) * w;
-                sum += k;
-                taps.push(k);
-            }
-            // Per-phase DC normalization: constant inputs reproduce
-            // exactly, removing the window's passband ripple at DC.
-            let taps_f32: Vec<f32> = taps.iter().map(|&k| (k / sum) as f32).collect();
-            phases.push(taps_f32);
+        let fs_in_khz = match bandwidth {
+            Bandwidth::Nb => 8,
+            Bandwidth::Mb => 12,
+            Bandwidth::Wb => 16,
+            Bandwidth::Swb | Bandwidth::Fb => return None,
+        };
+        let fs_out_khz = 48;
+        // invRatio_Q16 = ((fs_in << (14 + 1)) / fs_out) << 2, rounded up
+        // until invRatio × fs_out ≥ fs_in << 1 (the 2× upsampled rate).
+        let fs_in_hz = (fs_in_khz as i32) * 1000;
+        let fs_out_hz = (fs_out_khz as i32) * 1000;
+        let mut inv_ratio_q16 = ((fs_in_hz << 15) / fs_out_hz) << 2;
+        while crate::silk_decode_core::smulww(inv_ratio_q16, fs_out_hz) < (fs_in_hz << 1) {
+            inv_ratio_q16 += 1;
         }
-
         Some(Self {
             bandwidth,
             path,
-            delay_48k: d48,
-            factor,
-            half_width,
-            offsets,
-            phases,
-            hist: vec![0.0; hist_len],
+            fs_in_khz,
+            fs_out_khz,
+            input_delay: decoder_input_delay(fs_in_khz),
+            batch_size: fs_in_khz * MAX_BATCH_MS,
+            inv_ratio_q16,
+            s_iir: [0; 6],
+            s_fir: [0; ORDER_FIR_12],
+            delay_buf: [0; 48],
         })
     }
 
-    /// The bandwidth this upsampler was built for (its input rate).
+    /// The bandwidth this resampler was built for (its input rate).
     pub fn bandwidth(&self) -> Bandwidth {
         self.bandwidth
     }
 
-    /// The reconstruction path this upsampler was built for.
+    /// The reconstruction path this resampler was built for.
     pub fn path(&self) -> SilkChannelPath {
         self.path
     }
 
-    /// The filter's group delay in 48 kHz output samples (the
-    /// black-box-calibrated design value; see [`upsampler_design`]).
-    pub fn delay_48k(&self) -> f64 {
-        self.delay_48k
-    }
-
     /// The upsampling factor to 48 kHz (6 / 4 / 3 for NB / MB / WB).
     pub fn factor(&self) -> usize {
-        self.factor
+        self.fs_out_khz / self.fs_in_khz
     }
 
-    /// Clear the carried input history (a §4.5.2 SILK state reset).
+    /// Clear the carried filter state (a §4.5.2 SILK state reset).
     pub fn reset(&mut self) {
-        self.hist.fill(0.0);
+        self.s_iir = [0; 6];
+        self.s_fir = [0; ORDER_FIR_12];
+        self.delay_buf = [0; 48];
     }
 
-    /// Upsample one frame of internal-rate samples to 48 kHz.
+    /// Resample one frame of internal-rate samples to 48 kHz — i16
+    /// domain (the reference decoder's native sample type).
     ///
-    /// `out.len()` must equal `input.len() × factor` (each SILK frame
-    /// produces exactly its 48 kHz worth of output; the design delay
-    /// is *inside* the signal, not extra samples). The input history
-    /// carried from previous calls makes consecutive frames seamless.
-    pub fn process(&mut self, input: &[f32], out: &mut [f32]) {
+    /// `out.len()` must equal `input.len() × factor` and `input` must
+    /// cover at least 1 ms (every SILK frame does).
+    pub fn process_i16(&mut self, input: &[i16], out: &mut [i16]) {
         assert_eq!(
             out.len(),
-            input.len() * self.factor,
+            input.len() * self.factor(),
             "output must be factor × input"
         );
-        let m = self.half_width;
-        let p_len = self.hist.len();
-        // ext = history ++ input; input index j lives at ext[j + P].
-        let mut ext = Vec::with_capacity(p_len + input.len());
-        ext.extend_from_slice(&self.hist);
-        ext.extend_from_slice(input);
+        assert!(input.len() >= self.fs_in_khz, "need at least 1 ms");
+        let n_first = self.fs_in_khz - self.input_delay;
 
-        for (n, o) in out.iter_mut().enumerate() {
-            let p = n % self.factor;
-            let a = (n / self.factor) as isize;
-            let q = a + self.offsets[p];
-            // First tap reads input index q − M + 1 → ext index
-            // q − M + 1 + P (never negative by construction of P, and
-            // the last tap q + M never passes the frame end by the
-            // §4.2.9 causality cap on M).
-            let base = (q - m as isize + 1 + p_len as isize) as usize;
-            let taps = &self.phases[p];
-            let window = &ext[base..base + 2 * m];
-            let mut acc = 0.0f64;
-            for (t, s) in taps.iter().zip(window) {
-                acc += f64::from(*t) * f64::from(*s);
-            }
-            *o = acc as f32;
+        // 1 ms through the delay-compensation buffer…
+        let mut head = [0i16; 48];
+        head[..self.fs_in_khz].copy_from_slice(&self.delay_buf[..self.fs_in_khz]);
+        head[self.input_delay..self.fs_in_khz].copy_from_slice(&input[..n_first]);
+        let (out_head, out_rest) = out.split_at_mut(self.fs_out_khz);
+        self.iir_fir(&head[..self.fs_in_khz], out_head);
+        // …then the rest of the frame directly.
+        // …then the rest of the frame, holding back the final
+        // `input_delay` samples for the next frame's delay buffer.
+        self.iir_fir(&input[n_first..input.len() - self.input_delay], out_rest);
+        // Refill the delay buffer with the frame's tail.
+        self.delay_buf[..self.input_delay]
+            .copy_from_slice(&input[input.len() - self.input_delay..]);
+    }
+
+    /// [`Self::process_i16`] with the crate's `f32` sample convention
+    /// (`value = i16 / 32768`, exact for reconstruction-chain signals).
+    pub fn process(&mut self, input: &[f32], out: &mut [f32]) {
+        let input_i16: Vec<i16> = input
+            .iter()
+            .map(|&v| (v * 32768.0).clamp(-32768.0, 32767.0).round_ties_even() as i16)
+            .collect();
+        let mut out_i16 = vec![0i16; out.len()];
+        self.process_i16(&input_i16, &mut out_i16);
+        for (o, v) in out.iter_mut().zip(&out_i16) {
+            *o = f32::from(*v) / 32768.0;
         }
+    }
 
-        // Carry the trailing P input samples (all-zero history if the
-        // frame was shorter than P — only possible for degenerate
-        // inputs, which real SILK frames never produce).
-        if ext.len() >= p_len {
-            self.hist.copy_from_slice(&ext[ext.len() - p_len..]);
+    /// One `silk_resampler_private_IIR_FIR` pass: 2× allpass upsampling
+    /// into a scratch buffer (8-sample carried history at the front),
+    /// then fractional FIR interpolation to the output rate, in
+    /// batches of at most 10 ms.
+    fn iir_fir(&mut self, input: &[i16], out: &mut [i16]) {
+        let mut buf = vec![0i16; 2 * self.batch_size + ORDER_FIR_12];
+        buf[..ORDER_FIR_12].copy_from_slice(&self.s_fir);
+        let mut in_pos = 0usize;
+        let mut out_pos = 0usize;
+        loop {
+            let n = (input.len() - in_pos).min(self.batch_size);
+            self.up2_hq(
+                &input[in_pos..in_pos + n],
+                &mut buf[ORDER_FIR_12..ORDER_FIR_12 + 2 * n],
+            );
+            let max_index_q16 = (n as i32) << 17;
+            let mut index_q16 = 0i32;
+            while index_q16 < max_index_q16 {
+                let table_index = crate::silk_decode_core::smulwb(index_q16 & 0xffff, 12) as usize;
+                let base = (index_q16 >> 16) as usize;
+                let mut res_q15: i32 = 0;
+                for t in 0..4 {
+                    res_q15 = crate::silk_decode_core::smlabb(
+                        res_q15,
+                        i32::from(buf[base + t]),
+                        i32::from(FRAC_FIR_12[table_index][t]),
+                    );
+                }
+                for t in 0..4 {
+                    res_q15 = crate::silk_decode_core::smlabb(
+                        res_q15,
+                        i32::from(buf[base + 4 + t]),
+                        i32::from(FRAC_FIR_12[11 - table_index][3 - t]),
+                    );
+                }
+                out[out_pos] = crate::silk_decode_core::sat16(
+                    crate::silk_decode_core::rshift_round(res_q15, 15),
+                );
+                out_pos += 1;
+                index_q16 += self.inv_ratio_q16;
+            }
+            in_pos += n;
+            if in_pos < input.len() {
+                buf.copy_within(2 * n..2 * n + ORDER_FIR_12, 0);
+            } else {
+                self.s_fir
+                    .copy_from_slice(&buf[2 * n..2 * n + ORDER_FIR_12]);
+                break;
+            }
+        }
+        debug_assert_eq!(out_pos, out.len(), "§4.2.9 output count");
+    }
+
+    /// 2× upsampling by two 3-section allpass chains with a notch just
+    /// above Nyquist (Q10 internal state).
+    fn up2_hq(&mut self, input: &[i16], out: &mut [i16]) {
+        use crate::silk_decode_core::{rshift_round, sat16, smlawb, smulwb};
+        let s = &mut self.s_iir;
+        for (k, &x) in input.iter().enumerate() {
+            let in32 = i32::from(x) << 10;
+
+            // Even output phase: three allpass sections.
+            let y = in32.wrapping_sub(s[0]);
+            let x0 = smulwb(y, UP2_HQ_0[0]);
+            let out32_1 = s[0].wrapping_add(x0);
+            s[0] = in32.wrapping_add(x0);
+
+            let y = out32_1.wrapping_sub(s[1]);
+            let x1 = smulwb(y, UP2_HQ_0[1]);
+            let out32_2 = s[1].wrapping_add(x1);
+            s[1] = out32_1.wrapping_add(x1);
+
+            let y = out32_2.wrapping_sub(s[2]);
+            let x2 = smlawb(y, y, UP2_HQ_0[2]);
+            let out32_1 = s[2].wrapping_add(x2);
+            s[2] = out32_2.wrapping_add(x2);
+
+            out[2 * k] = sat16(rshift_round(out32_1, 10));
+
+            // Odd output phase.
+            let y = in32.wrapping_sub(s[3]);
+            let x0 = smulwb(y, UP2_HQ_1[0]);
+            let out32_1 = s[3].wrapping_add(x0);
+            s[3] = in32.wrapping_add(x0);
+
+            let y = out32_1.wrapping_sub(s[4]);
+            let x1 = smulwb(y, UP2_HQ_1[1]);
+            let out32_2 = s[4].wrapping_add(x1);
+            s[4] = out32_1.wrapping_add(x1);
+
+            let y = out32_2.wrapping_sub(s[5]);
+            let x2 = smlawb(y, y, UP2_HQ_1[2]);
+            let out32_1 = s[5].wrapping_add(x2);
+            s[5] = out32_2.wrapping_add(x2);
+
+            out[2 * k + 1] = sat16(rshift_round(out32_1, 10));
         }
     }
 }
@@ -762,206 +780,119 @@ mod tests {
             (Bandwidth::Wb, 3),
         ] {
             for path in [SilkChannelPath::Mono, SilkChannelPath::Stereo] {
-                let up = SilkUpsampler::new(bw, path).expect("SILK bandwidth must construct");
-                assert_eq!(up.factor(), factor, "{bw:?} {path:?}");
+                let up = SilkUpsampler::new(bw, path).unwrap();
+                assert_eq!(up.factor(), factor, "{bw:?}");
                 assert_eq!(up.bandwidth(), bw);
                 assert_eq!(up.path(), path);
             }
         }
-        for path in [SilkChannelPath::Mono, SilkChannelPath::Stereo] {
-            assert!(SilkUpsampler::new(Bandwidth::Swb, path).is_none());
-            assert!(SilkUpsampler::new(Bandwidth::Fb, path).is_none());
-        }
+        assert!(SilkUpsampler::new(Bandwidth::Swb, SilkChannelPath::Mono).is_none());
+        assert!(SilkUpsampler::new(Bandwidth::Fb, SilkChannelPath::Stereo).is_none());
     }
 
+    /// The fractional-ratio accumulator step satisfies the reference
+    /// round-up invariant: `invRatio × 48000 ≥ 2 × Fs_in` and it is the
+    /// smallest such value ≥ the truncated base ratio.
     #[test]
-    fn upsampler_design_delays_match_calibrated_totals() {
-        // The black-box-calibrated totals (filter delay + the path's
-        // one-input-sample §4.2.8 delay) on the 48 kHz timeline:
-        // mono 36 / 40 / 39, stereo 30 / 36 / 36 for NB / MB / WB.
-        // The one-input-sample §4.2.8 delay is U samples at 48 kHz.
-        for (bw, mono_total, stereo_total) in [
-            (Bandwidth::Nb, 36.0, 30.0),
-            (Bandwidth::Mb, 40.0, 36.0),
-            (Bandwidth::Wb, 39.0, 36.0),
+    fn upsampler_inv_ratio_round_up_invariant() {
+        use crate::silk_decode_core::smulww;
+        for (bw, fs_in) in [
+            (Bandwidth::Nb, 8000i32),
+            (Bandwidth::Mb, 12000),
+            (Bandwidth::Wb, 16000),
         ] {
-            let mono = SilkUpsampler::new(bw, SilkChannelPath::Mono).unwrap();
-            let stereo = SilkUpsampler::new(bw, SilkChannelPath::Stereo).unwrap();
-            let u = mono.factor() as f64;
-            assert_eq!(mono.delay_48k() + u, mono_total, "{bw:?} mono total");
-            assert_eq!(stereo.delay_48k() + u, stereo_total, "{bw:?} stereo total");
-            // Reference decoder asymmetry: mono sits exactly one input
-            // sample (U samples at 48 kHz) later than stereo.
-            assert_eq!(mono.delay_48k() - stereo.delay_48k(), u);
+            let up = SilkUpsampler::new(bw, SilkChannelPath::Mono).unwrap();
+            let r = up.inv_ratio_q16;
+            assert!(smulww(r, 48000) >= fs_in << 1, "{bw:?}: ratio too small");
+            assert!(
+                smulww(r - 1, 48000) < fs_in << 1,
+                "{bw:?}: ratio not minimal"
+            );
         }
     }
 
+    /// Every frame length produces exactly `factor × len` output
+    /// samples, and processing is deterministic.
     #[test]
-    fn upsampler_kernel_halfwidth_respects_causality_cap() {
-        // The §4.2.9 cap: M ≤ floor((1 + d₄₈)/U). Anything larger
-        // would need input from the *next* frame to produce this
-        // frame's last output samples. Verified behaviourally: the
-        // taps of the highest phase must never reach past the newest
-        // available input sample (checked by `process` slicing — a
-        // violation would panic on the last output of a frame).
+    fn upsampler_output_count_and_determinism() {
         for bw in [Bandwidth::Nb, Bandwidth::Mb, Bandwidth::Wb] {
-            for path in [SilkChannelPath::Mono, SilkChannelPath::Stereo] {
-                let (factor, d48, _, _) = upsampler_design(bw, path).unwrap();
-                let mut up = SilkUpsampler::new(bw, path).unwrap();
-                let cap = ((1.0 + d48) / factor as f64).floor() as usize;
-                assert_eq!(
-                    up.half_width, cap,
-                    "{bw:?} {path:?}: M != causality cap {cap}"
-                );
-                // Behavioural: a one-sample frame is the tightest
-                // causality case (out.len() = U, inputs available = 1).
-                let mut out = vec![0.0f32; factor];
-                up.process(&[1.0], &mut out);
+            let rate = silk_internal_rate_hz(bw).unwrap() as usize;
+            for ms in [10usize, 20, 40, 60] {
+                let n = rate * ms / 1000;
+                let input: Vec<i16> = (0..n).map(|i| ((i * 37) % 2000) as i16 - 1000).collect();
+                let mut a = SilkUpsampler::new(bw, SilkChannelPath::Mono).unwrap();
+                let mut b = SilkUpsampler::new(bw, SilkChannelPath::Mono).unwrap();
+                let mut out_a = vec![0i16; n * a.factor()];
+                let mut out_b = vec![0i16; n * b.factor()];
+                a.process_i16(&input, &mut out_a);
+                b.process_i16(&input, &mut out_b);
+                assert_eq!(out_a, out_b, "{bw:?} {ms}ms");
             }
         }
     }
 
-    // ----------------------------------------------------------------
-    // SilkUpsampler: signal behaviour.
-    // ----------------------------------------------------------------
-
+    /// A DC input settles to (nearly) the same DC value once the
+    /// allpass/FIR chain has warmed up.
     #[test]
-    fn upsampler_passes_dc_exactly_after_warmup() {
+    fn upsampler_passes_dc_after_warmup() {
         for bw in [Bandwidth::Nb, Bandwidth::Mb, Bandwidth::Wb] {
-            for path in [SilkChannelPath::Mono, SilkChannelPath::Stereo] {
-                let mut up = SilkUpsampler::new(bw, path).unwrap();
-                let f = up.factor();
-                let input = vec![0.25f32; 200];
-                let mut out = vec![0.0f32; 200 * f];
-                up.process(&input, &mut out);
-                // After the warm-up (history is zeros), every output
-                // must be exactly the DC value thanks to the per-phase
-                // normalization. Warm-up spans the kernel + delay:
-                // skip the first 120 output samples generously.
-                for (i, &v) in out.iter().enumerate().skip(120) {
-                    assert!(
-                        (v - 0.25).abs() < 1e-6,
-                        "{bw:?} {path:?}: DC not preserved at output {i}: {v}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn upsampler_group_delay_matches_design_delay() {
-        // Feed a unit impulse mid-stream; the output energy centroid
-        // must land at U·t + d₄₈ on the 48 kHz timeline — the design
-        // delay exactly (linear-phase kernel, so the centroid IS the
-        // group delay at all frequencies).
-        for bw in [Bandwidth::Nb, Bandwidth::Mb, Bandwidth::Wb] {
-            for path in [SilkChannelPath::Mono, SilkChannelPath::Stereo] {
-                let mut up = SilkUpsampler::new(bw, path).unwrap();
-                let f = up.factor();
-                let d48 = up.delay_48k();
-                let mut input = vec![0.0f32; 256];
-                input[100] = 1.0;
-                let mut out = vec![0.0f32; 256 * f];
-                up.process(&input, &mut out);
-                let mut wsum = 0.0f64;
-                let mut esum = 0.0f64;
-                for (i, &v) in out.iter().enumerate() {
-                    let e = f64::from(v) * f64::from(v);
-                    wsum += e * i as f64;
-                    esum += e;
-                }
-                let centroid = wsum / esum;
-                let want = 100.0 * f as f64 + d48;
+            let rate = silk_internal_rate_hz(bw).unwrap() as usize;
+            let n = rate / 50; // 20 ms
+            let input = vec![8192i16; n];
+            let mut up = SilkUpsampler::new(bw, SilkChannelPath::Mono).unwrap();
+            let mut out = vec![0i16; n * up.factor()];
+            // Two frames: the second is fully warmed up.
+            up.process_i16(&input, &mut out);
+            up.process_i16(&input, &mut out);
+            let tail = &out[out.len() / 2..];
+            for (i, &v) in tail.iter().enumerate() {
                 assert!(
-                    (centroid - want).abs() < 0.35,
-                    "{bw:?} {path:?}: impulse centroid {centroid:.3} != {want:.3}"
+                    (i32::from(v) - 8192).abs() <= 8,
+                    "{bw:?}: DC error at {i}: {v}"
                 );
             }
         }
     }
 
-    #[test]
-    fn upsampler_reconstructs_in_band_sine_at_design_delay() {
-        // A mid-band sine upsampled must match the analytically
-        // delayed 48 kHz sine: out[n] ≈ sin(2πf·(n − d₄₈)/48000).
-        for (bw, tone_hz) in [
-            (Bandwidth::Nb, 440.0f64),
-            (Bandwidth::Mb, 700.0),
-            (Bandwidth::Wb, 1000.0),
-        ] {
-            for path in [SilkChannelPath::Mono, SilkChannelPath::Stereo] {
-                let mut up = SilkUpsampler::new(bw, path).unwrap();
-                let f = up.factor();
-                let in_rate = 48_000.0 / f as f64;
-                let d48 = up.delay_48k();
-                let n_in = 640usize;
-                let input: Vec<f32> = (0..n_in)
-                    .map(|i| {
-                        (2.0 * std::f64::consts::PI * tone_hz * i as f64 / in_rate).sin() as f32
-                    })
-                    .collect();
-                let mut out = vec![0.0f32; n_in * f];
-                up.process(&input, &mut out);
-                // Compare over a steady window (skip warm-up and tail).
-                let (mut sig, mut err) = (0.0f64, 0.0f64);
-                let tail = out.len() - 200;
-                for (n, &o) in out.iter().enumerate().take(tail).skip(200) {
-                    let want =
-                        (2.0 * std::f64::consts::PI * tone_hz * (n as f64 - d48) / 48_000.0).sin();
-                    let got = f64::from(o);
-                    sig += want * want;
-                    err += (want - got) * (want - got);
-                }
-                let snr = 10.0 * (sig / err).log10();
-                assert!(
-                    snr > 40.0,
-                    "{bw:?} {path:?}: in-band sine SNR {snr:.1} dB too low"
-                );
-            }
-        }
-    }
-
+    /// Streaming two 10 ms halves equals one 20 ms call (the carried
+    /// IIR/FIR/delay state makes frame boundaries seamless).
     #[test]
     fn upsampler_streaming_equals_batch() {
-        // Splitting the input across process() calls (as the decoder
-        // does per Opus frame) must be sample-identical to one big
-        // call: the carried history makes frame boundaries seamless.
         for bw in [Bandwidth::Nb, Bandwidth::Mb, Bandwidth::Wb] {
-            for path in [SilkChannelPath::Mono, SilkChannelPath::Stereo] {
-                let f = SilkUpsampler::new(bw, path).unwrap().factor();
-                // A deterministic pseudo-random-ish signal.
-                let input: Vec<f32> = (0..480u32)
-                    .map(|i| ((i.wrapping_mul(2654435761) >> 16) as f32 / 65536.0) - 0.5)
-                    .collect();
-
-                let mut up_batch = SilkUpsampler::new(bw, path).unwrap();
-                let mut batch = vec![0.0f32; input.len() * f];
-                up_batch.process(&input, &mut batch);
-
-                let mut up_stream = SilkUpsampler::new(bw, path).unwrap();
-                let mut streamed = Vec::with_capacity(batch.len());
-                for chunk in input.chunks(160) {
-                    let mut out = vec![0.0f32; chunk.len() * f];
-                    up_stream.process(chunk, &mut out);
-                    streamed.extend_from_slice(&out);
-                }
-                assert_eq!(batch, streamed, "{bw:?} {path:?}: streaming != batch");
-            }
+            let rate = silk_internal_rate_hz(bw).unwrap() as usize;
+            let n = rate / 50; // 20 ms
+            let input: Vec<i16> = (0..n)
+                .map(|i| (6000.0 * (i as f64 * 0.31).sin()) as i16)
+                .collect();
+            let mut whole = SilkUpsampler::new(bw, SilkChannelPath::Mono).unwrap();
+            let mut split = SilkUpsampler::new(bw, SilkChannelPath::Mono).unwrap();
+            let f = whole.factor();
+            let mut out_whole = vec![0i16; n * f];
+            whole.process_i16(&input, &mut out_whole);
+            let mut out_split = vec![0i16; n * f];
+            let half = n / 2;
+            let (o1, o2) = out_split.split_at_mut(half * f);
+            split.process_i16(&input[..half], o1);
+            split.process_i16(&input[half..], o2);
+            assert_eq!(out_whole, out_split, "{bw:?}");
         }
     }
 
+    /// Reset clears the carried state: decode after reset matches a
+    /// fresh resampler.
     #[test]
     fn upsampler_reset_clears_history() {
-        let mut up = SilkUpsampler::new(Bandwidth::Nb, SilkChannelPath::Mono).unwrap();
-        let input = vec![0.9f32; 160];
-        let mut out = vec![0.0f32; 960];
-        up.process(&input, &mut out);
+        let mut up = SilkUpsampler::new(Bandwidth::Wb, SilkChannelPath::Mono).unwrap();
+        let noise: Vec<i16> = (0..320).map(|i| ((i * 97) % 4000) as i16 - 2000).collect();
+        let mut out = vec![0i16; 960];
+        up.process_i16(&noise, &mut out);
         up.reset();
-        // After a reset, an all-zero input must produce all-zero
-        // output (no residue from the 0.9-DC history).
-        let zeros = vec![0.0f32; 160];
-        up.process(&zeros, &mut out);
-        assert!(out.iter().all(|&v| v == 0.0), "history survived the reset");
+        let mut fresh = SilkUpsampler::new(Bandwidth::Wb, SilkChannelPath::Mono).unwrap();
+        let mut out_reset = vec![0i16; 960];
+        let mut out_fresh = vec![0i16; 960];
+        up.process_i16(&noise, &mut out_reset);
+        fresh.process_i16(&noise, &mut out_fresh);
+        assert_eq!(out_reset, out_fresh);
     }
 
     // ----------------------------------------------------------------

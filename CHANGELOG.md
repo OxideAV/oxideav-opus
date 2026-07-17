@@ -4,6 +4,66 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **SILK decode is now reference-exact** (round 415). The whole SILK
+  reconstruction chain was moved from the RFC's real-number narrative
+  formulas to the exact fixed-point arithmetic of the RFC 6716 §A
+  embedded reference listing (extracted from the staged RFC text and
+  hash-verified; RFC 8251 corrections applied where they touch the
+  decoder), and validated as an instrumented black-box oracle:
+  - **`silk_decode_core`** — the §4.2.7.9 core reconstruction in
+    integer Q-domains: Q14 excitation (our §4.2.7.8.6 `e_Q23[]` is the
+    reference `exc_Q14[] × 2^6`, verified sample-exact), §4.2.7.9.1
+    LTP synthesis in Q13/Q15 with the output-history re-whitening and
+    the per-subframe gain-change state rescaling
+    (`silk_INVERSE32_varQ` / `silk_DIV32_varQ` transcriptions), and
+    §4.2.7.9.2 LPC synthesis in Q14 with `SAT16(round(⋅×Gain_Q10≫8))`
+    output. `synthesize_silk_frame` keeps its seam (its `f32` output
+    is now an exact `xq/32768` image; `synthesize_silk_frame_i16`
+    exposes the native samples), and the decoder's SILK domain is i16
+    end-to-end. The side-channel reset after a mid-only run keeps the
+    previous-subframe gain (only the full §4.5.2 reset re-arms it),
+    matching the reference decoder.
+  - **§4.2.9 resampler** — `SilkUpsampler` re-implemented as the
+    reference decoder's fixed-point resampler (per-rate 1 ms delay
+    compensation, 2× three-section allpass upsampling in Q10,
+    fractional-phase 8-tap FIR interpolation in 10 ms batches, with
+    the RFC 8251 §5 buffer-type correction), replacing the calibrated
+    polyphase windowed-sinc stopgap. Verified sample-identical to the
+    listing's resampler on synthetic vectors at all three rates. This
+    also puts the Hybrid SILK band on the reference timeline with no
+    calibration.
+  - **§4.2.8 stereo unmix** — `stereo_ms_to_lr_i16`, the integer
+    mid/side → left/right conversion (Q8/Q11/Q13 forms, 8 ms
+    interpolation ramp, two-sample buffering with the built-in
+    one-sample delay, carried side history applied even for mid-only
+    intervals), replacing the `f32` formulation on the decode path.
+  - Output conversion: the final float → i16 quantization now matches
+    the §A listing's (`×32768`, saturate, ties-to-even) in both the
+    SILK and CELT paths.
+
+  Measured against an instrumented oracle built from the staged
+  listing (plus the staged RFC 8251 patches): **every pure-SILK test
+  stream decodes bit-exactly** — NB/MB/WB × 10/20/40/60 ms × mono and
+  true mid/side stereo (including mid-only intervals) × 6–40 kb/s,
+  101-packet streams of transient-heavy content — and the docs fixture
+  corpus's SILK streams (`silk-nb`, `silk-mb-60ms`, `silk-wb-stereo`,
+  `fec-on`, `silence-low-bitrate`, `code-1`, `code-3`) are bit-exact
+  end-to-end at 48 kHz. Hybrid and CELT-bearing streams sit at the
+  float-arithmetic noise floor (~71–111 dB). The former "NB ~19 dB /
+  MB ~28 dB non-bit-exact-by-design reconstruction drift" ceilings
+  were an artifact of the float realization and are gone.
+
+- **Fixture references re-anchored to the reference listing.** The
+  embedded `tests/fixtures/*.expected.wav` decodes were regenerated
+  with the §A reference listing decoder (RFC 8251 patches applied) —
+  the previous references came from a third-party black-box decoder
+  whose non-normative §4.2.9 resampler (and pre-8251 hybrid folding)
+  put them on a different timeline, capping the old gates at ~19–72 dB.
+  Every waveform gate was raised accordingly: SILK fixtures to a
+  100 dB floor (bit-exact in practice), CELT/packing fixtures to
+  90–100 dB, the Hybrid fixture to 60 dB, and the mode-switching
+  segments to 80–90 dB.
+
 - Marked all internal SILK/CELT stage-plumbing modules (range coder,
   band shapes, PVQ, resampler internals, transition machinery) and
   their crate-root re-exports `#[doc(hidden)]`; the stable API surface

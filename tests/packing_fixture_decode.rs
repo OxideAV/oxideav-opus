@@ -146,7 +146,7 @@ fn code0_single_frame_matches_reference() {
         include_bytes!("fixtures/code-0-single-frame.opus"),
         include_bytes!("fixtures/code-0-single-frame.expected.wav"),
     );
-    assert!(snr > 55.0, "code-0 SNR {snr:.2} dB < 55");
+    assert!(snr > 90.0, "code-0 SNR {snr:.2} dB < 90");
 }
 
 /// §3.2.4 code-2 CELT FB with an explicit first-frame length: measured
@@ -157,7 +157,7 @@ fn code2_two_different_frames_matches_reference() {
         include_bytes!("fixtures/code-2-two-different-frames.opus"),
         include_bytes!("fixtures/code-2-two-different-frames.expected.wav"),
     );
-    assert!(snr > 60.0, "code-2 SNR {snr:.2} dB < 60");
+    assert!(snr > 90.0, "code-2 SNR {snr:.2} dB < 90");
 }
 
 /// §3.2.5 code-3 Hybrid packet (VBR + padding + 4 frames): measured
@@ -168,7 +168,7 @@ fn code3_padded_vbr_packet_floor() {
         include_bytes!("fixtures/code-3-arbitrary-frames-with-padding.opus"),
         include_bytes!("fixtures/code-3-arbitrary-frames-with-padding.expected.wav"),
     );
-    assert!(snr > 25.0, "code-3 SNR {snr:.2} dB < 25");
+    assert!(snr > 100.0, "code-3 SNR {snr:.2} dB < 100");
 }
 
 /// Mono CELT FB 64 kb/s (the corpus's only mono CELT-only stream):
@@ -179,7 +179,7 @@ fn pair_mono_celt_matches_reference() {
         include_bytes!("fixtures/pair-mono-48k-64kbps.opus"),
         include_bytes!("fixtures/pair-mono-48k-64kbps.expected.wav"),
     );
-    assert!(snr > 60.0, "pair-mono SNR {snr:.2} dB < 60");
+    assert!(snr > 90.0, "pair-mono SNR {snr:.2} dB < 90");
 }
 
 /// Stereo CELT FB 64 kb/s (same source as the mono pair): measured
@@ -190,7 +190,7 @@ fn pair_stereo_celt_matches_reference() {
         include_bytes!("fixtures/pair-stereo-48k-64kbps.opus"),
         include_bytes!("fixtures/pair-stereo-48k-64kbps.expected.wav"),
     );
-    assert!(snr > 60.0, "pair-stereo SNR {snr:.2} dB < 60");
+    assert!(snr > 90.0, "pair-stereo SNR {snr:.2} dB < 90");
 }
 
 /// §3.2.3 code-1 degenerate repacked stream: both Hybrid frames must
@@ -205,5 +205,5 @@ fn code1_degenerate_overread_keeps_silk_audio() {
         include_bytes!("fixtures/code-1-two-equal-frames.opus"),
         include_bytes!("fixtures/code-1-two-equal-frames.expected.wav"),
     );
-    assert!(snr > 3.0, "code-1 SNR {snr:.2} dB < 3");
+    assert!(snr > 100.0, "code-1 SNR {snr:.2} dB < 100");
 }

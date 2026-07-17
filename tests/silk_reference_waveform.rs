@@ -147,70 +147,70 @@ fn silk_fixture_snr(stream: &[u8], expected_wav: &[u8]) -> f64 {
     snr_db(&expected, got)
 }
 
-/// WB stereo (config 9, mid/side): the sharpest gate in the corpus.
-/// Measured ~68.7 dB — waveform-exact up to reconstruction arithmetic.
-/// One output sample of misalignment collapses this below 45 dB, so
-/// the 55 dB floor pins the §4.2.9 stereo-path delay calibration
-/// (total 36 samples at 48 kHz including the §4.2.8 unmixer delay).
+/// WB stereo (config 9, mid/side): decodes **bit-exactly** against the
+/// reference decode (the §4.2.7.9 fixed-point reconstruction, the
+/// integer §4.2.8 unmix and the reference §4.2.9 resampler leave no
+/// arithmetic slack). The 100 dB floor pins bit-exactness with a
+/// margin for any future last-LSB drift.
 #[test]
 fn silk_wb_stereo_waveform_matches_reference() {
     let snr = silk_fixture_snr(
         include_bytes!("fixtures/silk-wb-stereo-20kbps.opus"),
         include_bytes!("fixtures/silk-wb-stereo-20kbps.expected.wav"),
     );
-    assert!(snr > 55.0, "WB stereo waveform SNR {snr:.2} dB < 55");
+    assert!(snr > 100.0, "WB stereo waveform SNR {snr:.2} dB < 100");
 }
 
 /// WB mono main path of the FEC-enabled stream (the §4.2.5 LBRR bits
-/// are consumed but the regular frames decode normally). Measured
-/// ~71.9 dB; the 55 dB floor pins the mono-path delay (total 39
-/// samples at 48 kHz including the §4.2.8 mono one-sample delay — the
-/// fix this suite guards).
+/// are consumed but the regular frames decode normally). Decodes
+/// bit-exactly against the reference decode.
 #[test]
 fn silk_wb_mono_fec_stream_waveform_matches_reference() {
     let snr = silk_fixture_snr(
         include_bytes!("fixtures/fec-on.opus"),
         include_bytes!("fixtures/fec-on.expected.wav"),
     );
-    assert!(snr > 55.0, "WB mono (fec-on) waveform SNR {snr:.2} dB < 55");
+    assert!(
+        snr > 100.0,
+        "WB mono (fec-on) waveform SNR {snr:.2} dB < 100"
+    );
 }
 
-/// MB 60 ms mono (config 7, three SILK frames per packet). Measured
-/// ~27.7 dB — the §4.2.7.9 non-bit-exact reconstruction ceiling for
-/// this content; misalignment by one output sample costs several dB
-/// more, so the floor still pins the MB mono delay (total 40).
+/// MB 60 ms mono (config 7, three SILK frames per packet). Decodes
+/// bit-exactly against the reference decode — the former ~28 dB
+/// "reconstruction drift" ceiling was the float realization of
+/// §4.2.7.9; the fixed-point core removed it.
 #[test]
 fn silk_mb_60ms_waveform_floor() {
     let snr = silk_fixture_snr(
         include_bytes!("fixtures/silk-mb-60ms-mono-20kbps.opus"),
         include_bytes!("fixtures/silk-mb-60ms-mono-20kbps.expected.wav"),
     );
-    assert!(snr > 22.0, "MB 60 ms waveform SNR {snr:.2} dB < 22");
+    assert!(snr > 100.0, "MB 60 ms waveform SNR {snr:.2} dB < 100");
 }
 
-/// NB mono 440 Hz sine (config 1). Measured ~18.5 dB — the strongest
-/// LTP recirculation in the corpus (perfectly periodic content), hence
-/// the deepest reconstruction-drift ceiling. Floor pins the NB mono
-/// delay (total 36) and the reconstruction accuracy.
+/// NB mono 440 Hz sine (config 1) — the strongest LTP recirculation
+/// in the corpus (perfectly periodic content). Decodes bit-exactly
+/// against the reference decode; the LTP feedback recirculates the
+/// *same* rounding as the reference, so nothing drifts.
 #[test]
 fn silk_nb_mono_waveform_floor() {
     let snr = silk_fixture_snr(
         include_bytes!("fixtures/silk-nb-mono-16kbps.opus"),
         include_bytes!("fixtures/silk-nb-mono-16kbps.expected.wav"),
     );
-    assert!(snr > 14.0, "NB mono waveform SNR {snr:.2} dB < 14");
+    assert!(snr > 100.0, "NB mono waveform SNR {snr:.2} dB < 100");
 }
 
 /// NB voice-silence-voice at 6 kb/s: near-DTX 6-byte packets whose
-/// excitation is pure LCG comfort noise. The silent region's reference
-/// is a ±few-LSB noise floor (SNR there is meaningless), but the
-/// active regions pin the low-rate NB decode; measured ~18.7 dB
-/// overall with the silent-region absolute error ≤ 2 LSB.
+/// excitation is pure LCG comfort noise. Decodes bit-exactly against
+/// the reference decode (the LCG sequence and its ±few-LSB noise floor
+/// reproduce sample-for-sample).
 #[test]
 fn silk_silence_low_bitrate_waveform_floor() {
     let snr = silk_fixture_snr(
         include_bytes!("fixtures/silence-low-bitrate.opus"),
         include_bytes!("fixtures/silence-low-bitrate.expected.wav"),
     );
-    assert!(snr > 14.0, "silence-low-bitrate SNR {snr:.2} dB < 14");
+    assert!(snr > 100.0, "silence-low-bitrate SNR {snr:.2} dB < 100");
 }

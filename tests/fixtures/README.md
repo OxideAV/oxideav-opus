@@ -34,12 +34,16 @@ repacked stream whose first frame legally overreads its budget into
 §4.1.2.1 zero-fill; reference implementations disagree with each
 other on it, so its gate is structural + a loose floor.
 
-The SILK-bearing streams also ship their reference decodes
+The streams also ship their reference decodes
 (`<name>.expected.wav`, 48 kHz s16le, copied from
-`docs/audio/opus/fixtures/<name>/expected.wav`), driving the
-waveform-level SNR regression gates in
-`tests/silk_reference_waveform.rs` — the §4.2.9 upsampler's
-delay calibration and the §4.2.8 mono delay are pinned by them.
+`docs/audio/opus/fixtures/<name>/expected.wav`; produced by the
+RFC 6716 §A reference listing decoder with the RFC 8251 corrections
+applied — see the per-fixture `notes.md` in `docs/` for the exact
+extraction + patch + decode recipe). They drive the waveform-level
+SNR regression gates in `tests/silk_reference_waveform.rs`: the SILK
+fixtures decode **bit-exactly** (the §4.2.7.9 fixed-point core, the
+integer §4.2.8 unmix, and the reference §4.2.9 resampler), so those
+gates sit at 100 dB.
 `silence-low-bitrate.opus` is a voice-silence-voice signal at 6 kb/s
 whose silent region produces near-DTX 6-byte packets (LCG-driven
 comfort-noise excitation).

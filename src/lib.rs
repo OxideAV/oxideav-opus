@@ -792,6 +792,8 @@ pub mod redundancy_decode_params;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_decode;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod silk_decode_core;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_encoder;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_excitation;

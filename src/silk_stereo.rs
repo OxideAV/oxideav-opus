@@ -493,6 +493,154 @@ pub fn estimate_stereo_weights(
     })
 }
 
+// ---------------------------------------------------------------------
+// §4.2.8 unmix in the exact fixed point of the §A reference listing.
+// ---------------------------------------------------------------------
+
+/// Cross-frame history for the fixed-point §4.2.8 unmix: the two
+/// trailing mid samples, two trailing side samples, and the previous
+/// frame's Q13 prediction weights — the integer counterpart of
+/// [`StereoUnmixState`], matching the RFC 6716 §A reference listing's
+/// stereo decode state. All zero after a decoder reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StereoUnmixStateI16 {
+    /// `mid[j-2]`, `mid[j-1]` for the upcoming frame (oldest first).
+    s_mid: [i16; 2],
+    /// `side[j-2]`, `side[j-1]` for the upcoming frame.
+    s_side: [i16; 2],
+    /// The previous frame's `(w0_Q13, w1_Q13)`.
+    pred_prev_q13: [i32; 2],
+}
+
+impl StereoUnmixStateI16 {
+    /// A freshly-reset state (all-zero history and weights).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reset to the post-decoder-reset values (§4.2.8 / §4.5.2).
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The previous-frame weights currently held.
+    pub fn prev_weights(&self) -> StereoWeightsQ13 {
+        StereoWeightsQ13 {
+            w0_q13: self.pred_prev_q13[0],
+            w1_q13: self.pred_prev_q13[1],
+        }
+    }
+}
+
+/// One frame of fixed-point stereo output (left, right), each `n`
+/// signed 16-bit samples at the internal SILK rate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StereoFrameI16 {
+    /// Left channel.
+    pub left: Vec<i16>,
+    /// Right channel.
+    pub right: Vec<i16>,
+}
+
+/// RFC 6716 §4.2.8 stereo unmixing in the exact fixed-point arithmetic
+/// of the §A reference listing: convert one frame of decoded mid/side
+/// i16 signals into left/right.
+///
+/// The 8 ms weight-interpolation ramp, the 3-tap low-passed mid
+/// predictor, and the final sum/difference all run in the listing's
+/// Q8/Q11/Q13 integer forms, so the output is bit-exact against the
+/// reference decoder. The frame's output is delayed by one sample
+/// relative to its input (the listing's two-sample buffering with the
+/// resampler reading from offset 1), exactly like the mono path's
+/// §4.2.8 one-sample delay.
+///
+/// * `mid` — the mid channel's §4.2.7.9 reconstruction (`n` samples).
+/// * `side` — the side channel's reconstruction, or `None` when the
+///   side channel is not coded this frame (§4.2.7.2 mid-only flag);
+///   zeros are substituted but the carried side history still applies,
+///   matching the reference decoder.
+/// * `weights` — this frame's §4.2.7.1 Q13 weights.
+/// * `fs_khz` — the internal rate in kHz (8/12/16), fixing the 8 ms
+///   interpolation length.
+///
+/// Errors if `mid` is empty, shorter than the 8 ms ramp, or if `side`
+/// has a different length.
+pub fn stereo_ms_to_lr_i16(
+    fs_khz: usize,
+    mid: &[i16],
+    side: Option<&[i16]>,
+    weights: StereoWeightsQ13,
+    state: &mut StereoUnmixStateI16,
+) -> Result<StereoFrameI16, Error> {
+    use crate::silk_decode_core::{rshift_round, sat16, smlawb, smulbb};
+
+    let n = mid.len();
+    let interp_len = 8 * fs_khz; // STEREO_INTERP_LEN_MS = 8
+    if n < interp_len || n < 2 {
+        return Err(Error::MalformedPacket);
+    }
+    if let Some(s) = side {
+        if s.len() != n {
+            return Err(Error::MalformedPacket);
+        }
+    }
+
+    // x1/x2 with the two-sample carried history at the front.
+    let mut x1 = Vec::with_capacity(n + 2);
+    x1.extend_from_slice(&state.s_mid);
+    x1.extend_from_slice(mid);
+    let mut x2 = Vec::with_capacity(n + 2);
+    x2.extend_from_slice(&state.s_side);
+    match side {
+        Some(s) => x2.extend_from_slice(s),
+        None => x2.resize(n + 2, 0),
+    }
+    state.s_mid = [x1[n], x1[n + 1]];
+    state.s_side = [x2[n], x2[n + 1]];
+
+    // Interpolate predictors over the first 8 ms and add the prediction
+    // to the side channel.
+    let mut pred0_q13 = state.pred_prev_q13[0];
+    let mut pred1_q13 = state.pred_prev_q13[1];
+    let denom_q16 = (1 << 16) / (interp_len as i32);
+    let delta0_q13 = rshift_round(
+        smulbb(weights.w0_q13 - state.pred_prev_q13[0], denom_q16),
+        16,
+    );
+    let delta1_q13 = rshift_round(
+        smulbb(weights.w1_q13 - state.pred_prev_q13[1], denom_q16),
+        16,
+    );
+    let unmix_at = |k: usize, p0: i32, p1: i32, x2k1: i16| -> i16 {
+        // sum = ((x1[k] + x1[k+2] + 2·x1[k+1]) << 9)  — Q11.
+        let sum = (i32::from(x1[k]) + i32::from(x1[k + 2]) + (i32::from(x1[k + 1]) << 1)) << 9;
+        let sum = smlawb(i32::from(x2k1) << 8, sum, p0); // Q8
+        let sum = smlawb(sum, i32::from(x1[k + 1]) << 11, p1); // Q8
+        sat16(rshift_round(sum, 8))
+    };
+    for k in 0..interp_len {
+        pred0_q13 += delta0_q13;
+        pred1_q13 += delta1_q13;
+        x2[k + 1] = unmix_at(k, pred0_q13, pred1_q13, x2[k + 1]);
+    }
+    for k in interp_len..n {
+        x2[k + 1] = unmix_at(k, weights.w0_q13, weights.w1_q13, x2[k + 1]);
+    }
+    state.pred_prev_q13 = [weights.w0_q13, weights.w1_q13];
+
+    // Convert to left/right (sum / difference), n samples from offset 1
+    // (the built-in one-sample delay).
+    let mut left = vec![0i16; n];
+    let mut right = vec![0i16; n];
+    for k in 0..n {
+        let sum = i32::from(x1[k + 1]) + i32::from(x2[k + 1]);
+        let diff = i32::from(x1[k + 1]) - i32::from(x2[k + 1]);
+        left[k] = sat16(sum);
+        right[k] = sat16(diff);
+    }
+    Ok(StereoFrameI16 { left, right })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

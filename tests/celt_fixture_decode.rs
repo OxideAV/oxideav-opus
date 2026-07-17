@@ -154,7 +154,7 @@ fn run_fixture(stream: &'static [u8], expected_wav: &'static [u8], channels_want
 fn celt_fb_stereo_128kbps_matches_reference_waveform() {
     let snr = run_fixture(FIXTURE_FB_STEREO, EXPECTED_FB_STEREO, 2);
     assert!(
-        snr > 60.0,
+        snr > 90.0,
         "CELT FB stereo waveform SNR {snr:.2} dB below threshold"
     );
 }
@@ -165,7 +165,7 @@ fn celt_fb_stereo_128kbps_matches_reference_waveform() {
 fn celt_low_latency_2_5ms_matches_reference_waveform() {
     let snr = run_fixture(FIXTURE_LOW_LATENCY, EXPECTED_LOW_LATENCY, 2);
     assert!(
-        snr > 60.0,
+        snr > 75.0,
         "CELT 2.5 ms stereo waveform SNR {snr:.2} dB below threshold"
     );
 }
@@ -218,5 +218,5 @@ fn hybrid_fb_mono_28kbps_matches_reference_waveform() {
 
     let expected = wav_pcm_payload(expected_wav);
     let snr = snr_db(&expected, &pcm[pre_skip..]);
-    assert!(snr > 30.0, "hybrid waveform SNR {snr:.2} dB < 30");
+    assert!(snr > 60.0, "hybrid waveform SNR {snr:.2} dB < 60");
 }

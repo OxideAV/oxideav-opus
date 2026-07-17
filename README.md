@@ -21,30 +21,30 @@ and stereo SILK-only** packets now decode **end-to-end to real PCM**: the
 §4.2 bitstream decode (the §4.2.3 header bits, the §4.2.5 LBRR / §4.2.6
 regular SILK frame loop, each frame decoded in Table-5 order through
 gains / LSF chain / LTP / excitation with inter-frame state threaded),
-then the §4.2.7.9 LTP / LPC synthesis filters (composed in the
-`silk_synthesis` module with the §4.2.7.9 per-subframe LPC selection and
-cross-frame histories), then the §4.2.8 mono one-sample delay and the
-§4.2.9 resample to 48 kHz (`SilkUpsampler` — a stateful streaming
-polyphase windowed-sinc upsampler whose per-(bandwidth × path) group
-delay is calibrated black-box against the reference decodes of the
-fixture corpus, history carried across Opus frames) and i16
-conversion. For **stereo**, the §4.2.2 mid/side interleave (mid
+then the §4.2.7.9 LTP / LPC synthesis filters in the **exact
+fixed-point arithmetic of the RFC 6716 §A embedded reference listing**
+(`silk_decode_core` — Q14 excitation, Q13/Q15 LTP with output-history
+re-whitening and gain-change state rescaling, Q14 LPC, i16 output; the
+per-subframe LPC selection and all cross-frame histories included),
+then the §4.2.8 mono one-sample delay and the §4.2.9 resample to
+48 kHz (`SilkUpsampler` — the reference decoder's fixed-point
+resampler: per-rate delay compensation, 2× allpass upsampling,
+fractional-phase 8-tap FIR interpolation, with the RFC 8251 §5
+correction). For **stereo**, the §4.2.2 mid/side interleave (mid
 frame then side frame per 20 ms interval, the §4.2.7.2 mid-only flag
 skipping the side frame) is decoded into two independent per-channel
-synthesis states and converted from mid/side to left/right by the §4.2.8
-`silk_stereo` unmixer, run **per SILK interval** with that interval's
-§4.2.7.1 weights and the cross-packet `StereoUnmixState` history. The
+synthesis states and converted from mid/side to left/right by the
+integer §4.2.8 unmixer (`stereo_ms_to_lr_i16`), run **per SILK
+interval** with that interval's §4.2.7.1 weights and the cross-packet
+unmix history. The
 §4.5.2 SILK state reset (CELT→SILK transition) and the §4.2.7.1
 mono→stereo weight reset are applied across packets. **SILK decode is
-waveform-validated against the reference decodes of the fixture
-corpus** (pre-skip-trimmed SNR, gated in
-`tests/silk_reference_waveform.rs`): WB stereo **~69 dB** and the WB
-mono fec-on main path **~72 dB** (waveform-exact up to reconstruction
-arithmetic; one output sample of misalignment collapses these below
-45 dB), MB 60 ms ~28 dB and NB ~19 dB (their ceilings are §4.2.7.9
-*non-bit-exact-by-design* reconstruction drift — the references come
-from a fixed-point reconstruction whose rounding recirculates through
-the LTP feedback on strongly periodic content — not alignment).
+bit-exact against the reference listing's decoder** (RFC 8251
+corrections applied): every pure-SILK fixture and a 100+-stream
+oracle corpus (NB/MB/WB × 10/20/40/60 ms × mono + mid/side stereo ×
+6–40 kb/s, transient-heavy content) reproduces the reference decode
+sample-for-sample at 48 kHz; the gates in
+`tests/silk_reference_waveform.rs` sit at a 100 dB floor.
 **CELT-only packets now decode
 end-to-end to real PCM** (`FrameDecodeStatus::CeltDecoded`): the whole
 §4.3 Table-56 entropy layer runs with the normative per-symbol budget
@@ -70,21 +70,20 @@ with all cross-frame state carried and the §4.5.2 resets applied.
 Validated against the reference decodes of the fixture corpus:
 `celt-fb-stereo-128kbps` (20 ms FB stereo) and `celt-2.5ms-low-latency`
 reconstruct at **~88–108 dB SNR** — i16-quantization-level waveform
-agreement — and a 50+-stream black-box low-bitrate corpus (6–48 kb/s,
-2.5–20 ms, mono/stereo) decodes stationary content reference-exact
-(~100–109 dB; the remaining known seam is transient-heavy content at
-low rates, ~30–50 dB, under investigation — anti-collapse injection,
-the folding seed policy, and the §4.3.3 boost gate have all been
-black-box eliminated or fixed). **Hybrid packets decode end-to-end**
+agreement — and a 60+-stream black-box low-bitrate corpus (6–48 kb/s,
+2.5–20 ms, mono/stereo, transient-heavy content) decodes at the
+float-arithmetic noise floor against the reference listing's decoder
+(~80–111 dB; every packet ≥ 55 dB — the formerly-reported transient
+seam does not reproduce against a reference-lineage decode). **Hybrid packets decode end-to-end**
 (`FrameDecodeStatus::HybridDecoded`): the SILK layer (WB internal) and
 the CELT layer (bands 17–21) share one range coder with the §4.5.1
 redundancy side information decoded between them (the main coder's
 buffer reduced per §4.5.1.3 so its raw bits read from the reduced
-end), and the 48 kHz outputs sum per §4.4 — the SILK band lands on
-the CELT layer's timeline through the delay-calibrated §4.2.9
-upsampler, and `hybrid-fb-mono-28kbps` decodes at **~37.5 dB**
-whole-stream against the reference (CELT-only segment
-reference-exact; gated at 30 dB). The **§4.5
+end), and the 48 kHz outputs sum per §4.4 — the bit-exact SILK band
+lands on the reference timeline through the reference §4.2.9
+resampler, and `hybrid-fb-mono-28kbps` decodes at **~71 dB**
+whole-stream against the reference-listing decode (float-noise floor;
+gated at 60 dB), with hybrid SWB oracle streams at ~93–98 dB. The **§4.5
 transition machinery is in place**: the 5 ms redundant CELT frame is
 decoded like a CELT-only frame (own coder, no TOC, carrier channels /
 bandwidth with the MB→WB override) through the stream's single CELT
@@ -94,9 +93,9 @@ the reset and warms the following CELT frames; a beginning-position
 one continues the previous state ahead of the deferred main-layer
 reset), and the §4.5.1.4 output stitching (first-2.5 ms-as-is +
 power-complementary cross-lap) is applied on both placements — the
-`mode-switching` fixture's Hybrid→CELT transition window decodes at
-~109 dB against the reference, and the CELT-only segment after the
-switch is reference-exact (~107 dB). **Packet-loss concealment
+`mode-switching` fixture decodes at ~103 dB whole-stream against the
+reference-listing decode (hybrid segment, transition window and
+CELT-only segment all at the float-noise floor). **Packet-loss concealment
 (§4.4)** is implemented per the RFC's per-mode guidance
 (`OpusDecoder::conceal_loss`): LPC extrapolation (Burg fit +
 pitch-cyclic residual) after SILK-bearing frames, pitch-periodic
@@ -253,10 +252,11 @@ Per-stage progress lives in `CHANGELOG.md`.
 - A **SILK waveform regression-gate suite**
   (`tests/silk_reference_waveform.rs`) that compares each SILK-bearing
   fixture's pre-skip-trimmed 48 kHz decode against its shipped
-  reference decode as an SNR floor (WB stereo / WB mono > 55 dB,
-  MB > 22 dB, NB > 14 dB, the near-DTX `silence-low-bitrate` stream
-  > 14 dB), pinning the §4.2.9 upsampler delay calibration, the
-  §4.2.8 mono one-sample delay, and the reconstruction accuracy.
+  reference decode (produced by the §A reference listing's decoder
+  with the RFC 8251 corrections) at a **100 dB floor** — the SILK
+  fixtures decode bit-exactly, pinning the fixed-point §4.2.7.9 core,
+  the integer §4.2.8 unmix + mono delay, and the reference §4.2.9
+  resampler.
 
 **Multistream / multichannel (RFC 7845 §3 / §5.1 / §5.1.1):**
 
@@ -343,9 +343,8 @@ bandwidth-expansion → prediction-gain limiting, §4.2.7.5.2–§4.2.7.5.8),
 LTP parameters (§4.2.7.6), LCG seed (§4.2.7.7), excitation
 (§4.2.7.8), LTP + LPC synthesis filters (§4.2.7.9), stereo unmixing
 (§4.2.8, including the mono one-sample delay), the §4.2.9 resampler
-(`SilkUpsampler` — streaming polyphase windowed-sinc with
-black-box-calibrated per-(bandwidth × path) group delays over the
-Table 54 budget machinery), and **in-band FEC
+(`SilkUpsampler` — the reference decoder's fixed-point resampler over
+the Table 54 budget machinery), and **in-band FEC
 recovery** (§2.1.7 / §4.2.5): `OpusDecoder::decode_packet_fec`
 reconstructs a lost frame's audio from the Low Bit-Rate Redundancy
 (LBRR) frames carried in the next received packet — decoding the §4.2.5
@@ -405,8 +404,14 @@ gapped (no PRNG / energy-injection algorithm in the RFC narrative).
 
 The rebuild consults only:
 
-- RFC 6716 — Definition of the Opus Audio Codec.
-- RFC 8251 — Updates to the Opus Audio Codec.
+- RFC 6716 — Definition of the Opus Audio Codec, **including its
+  Appendix A embedded reference listing** (extracted from the staged
+  RFC text itself and hash-verified against the RFC-pinned digest;
+  ratified as staged spec material). An instrumented build of the
+  listing serves as the decode-exactness oracle.
+- RFC 8251 — Updates to the Opus Audio Codec, including the correction
+  patches embedded in its text (applied to the oracle and reflected in
+  the decoder).
 - RFC 7587 — RTP Payload Format for Opus.
 - RFC 7845 — Ogg Encapsulation for Opus.
 - Black-box invocations of the `opusdec` / `opusenc` binaries (not
