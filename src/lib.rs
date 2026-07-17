@@ -689,119 +689,205 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+// Stable public surface: `Error`, the registry entry point (`register`),
+// and the packet/container-level modules: [`decoder`] (`OpusDecoder` +
+// frame/FEC/PLC outcome types), [`toc`], [`frames`], [`framing`],
+// [`framing_self_delim`], [`packet_compose`], [`multistream`], and
+// [`opus_head`]. Every other module is SILK/CELT stage plumbing (range
+// coder, band shapes, PVQ, resampler internals, transition machinery)
+// that is `pub` only so the integration-test and fuzz targets can reach
+// it; those modules are `#[doc(hidden)]` and NOT part of the stable API
+// surface for semver purposes.
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_alloc_search;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_alloc_trim;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_band_boost;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_band_decode;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_band_layout;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_band_shape;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_band_thresh;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_cache_caps50;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_coarse_energy;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_deemphasis;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_denormalise;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_e_prob_model;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_fine_energy;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_frame_decode;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_frame_prefix;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_header;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_imdct;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_laplace;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_log2_frac_table;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_mdct_synthesis;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_mdct_window;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_overlap_add;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_post_filter;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_pulse_cache;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_pvq_decode;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_pvq_v;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_rate_alloc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_redundancy;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_reservations;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_spreading;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_static_alloc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_synthesis;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_tf_adjust;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_tf_decode;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_tf_hadamard;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_transitions;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_trim_offsets;
 pub mod decoder;
 pub mod frames;
 pub mod framing;
 pub mod framing_self_delim;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod mode_transition_reset;
 pub mod multistream;
 pub mod opus_head;
 pub mod packet_compose;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod plc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod range_decoder;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod range_encoder;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod redundancy_decode_params;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_decode;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_encoder;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_excitation;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_excitation_quantize;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_frame;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_gains;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_header;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_lcg_seed;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_log2lin;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_lpc_analysis;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_lpc_synth;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_lpc_to_nlsf;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_lsf_interp;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_lsf_recon;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_lsf_stabilize;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_lsf_stage2;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_lsf_to_lpc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_ltp;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_ltp_analysis;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_ltp_synth;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_nlsf_quantize;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_packet_encode;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_pitch;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_resampler;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_stereo;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_synthesis;
 pub mod toc;
 
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_alloc_search::{
     per_band_eighth_bits_at_q_fp, q_fp_from_components, q_fp_to_components, search_q_fp,
     total_eighth_bits_at_q_fp, AllocSearchError, AllocSearchOutcome, QFpComponents, Q_FP_MAX,
     STATIC_ALLOC_INTERP_RIGHT_SHIFT,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_alloc_trim::{
     alloc_trim_icdf, alloc_trim_is_signalled, alloc_trim_pdf, decode_alloc_trim, frame_eighth_bits,
     AllocTrimError, ALLOC_TRIM_DEFAULT, ALLOC_TRIM_FTB, ALLOC_TRIM_ICDF, ALLOC_TRIM_MAX,
     ALLOC_TRIM_MIN, ALLOC_TRIM_PDF, ALLOC_TRIM_PDF_DENOMINATOR, ALLOC_TRIM_PDF_LEN,
     ALLOC_TRIM_SIGNAL_COST_EIGHTH_BITS, EIGHTH_BITS_PER_BYTE,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_band_boost::{
     band_boost_quanta, decode_band_boosts, BandBoost, BandBoostError, BandBoostOutcome,
     BAND_BOOST_QUANTA_CEIL_MULT, BAND_BOOST_QUANTA_FLOOR_EIGHTH_BITS, DYNALLOC_LOGP_INIT,
     DYNALLOC_LOGP_MIN, DYNALLOC_LOOP_LOGP_AFTER_FIRST,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_band_layout::{
     celt_band_at_hz, celt_band_bins_per_channel, celt_band_start_hz, celt_band_stop_hz,
     celt_end_coded_band, celt_first_coded_band, celt_total_bins_per_channel, CeltFrameSize,
     CELT_MAX_BINS_PER_BAND, CELT_NUM_BANDS, HYBRID_FIRST_CODED_BAND,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_band_thresh::{
     band_min_thresh, band_min_thresh_vec, compute_band_min_thresh, standard_band_window,
     BandThreshError, BAND_THRESH_BINS_DIVISOR, BAND_THRESH_BINS_MULTIPLIER,
     BAND_THRESH_MONO_CHANNELS, BAND_THRESH_PER_CHANNEL_EIGHTH_BITS, BAND_THRESH_STEREO_CHANNELS,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_cache_caps50::{
     cache_caps_offset, cache_caps_row, cache_caps_value, cap_for_band_bits, init_caps,
     CacheCaps50Error, CacheCapsStereo, CACHE_CAPS50, CACHE_CAPS50_LM_COUNT,
     CACHE_CAPS50_STEREO_COUNT, CACHE_CAPS50_STEREO_MONO, CACHE_CAPS50_STEREO_STEREO,
     CACHE_CAPS50_TOTAL_BYTES, INIT_CAPS_BIAS, INIT_CAPS_DIVISOR, INIT_CAPS_MAX_CHANNELS,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_deemphasis::{DeemphasisError, DeemphasisFilter, DEEMPHASIS_ALPHA_P};
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_denormalise::{
     denormalise_band, denormalise_bands, denormalise_gain, DenormaliseError,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_e_prob_model::{
     e_prob_pair, e_prob_row, energy_pred_coef, EProbModelError, EProbPair, EnergyPredCoef,
     EnergyPredictionMode, E_PROB_MODEL, E_PROB_MODEL_BYTES_PER_BAND, E_PROB_MODEL_BYTES_PER_ROW,
@@ -809,32 +895,42 @@ pub use celt_e_prob_model::{
     E_PROB_MODEL_MODE_INTRA, E_PROB_MODEL_TOTAL_BYTES, INTER_PRED_ALPHA_Q15, INTER_PRED_BETA_Q15,
     INTRA_PRED_ALPHA_Q15, INTRA_PRED_BETA_Q15, Q15_ONE,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_frame_prefix::{decode_celt_frame_prefix, CeltFramePrefix, CeltPostFilterParams};
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_header::{CeltHeaderPrefix, CeltPostFilter};
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_laplace::{
     ec_laplace_decode, LAPLACE_DECAY_UNIT, LAPLACE_LOG_MINP, LAPLACE_MINP, LAPLACE_NMIN,
     LAPLACE_TOTAL,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_log2_frac_table::{
     log2_frac, log2_frac_row, Log2FracError, LOG2_FRAC_TABLE, LOG2_FRAC_TABLE_LEN,
     Q3_BITS_PER_WHOLE_BIT,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_mdct_window::{
     basic_window, celt_overlap_window, mdct_window, window_tap, MdctWindowError, BASIC_WINDOW_LEN,
     CELT_OVERLAP_48K,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_overlap_add::{apply_synthesis_window, OverlapAddError, WeightedOverlapAdd};
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_pulse_cache::{
     bits_to_pulses, cache_flat_index, cache_max_pulses, cache_pulse_cost, cache_run_offset,
     PulseCacheError, CACHE_BITS50, CACHE_BITS_LEN, CACHE_INDEX50, CACHE_INDEX_LEN,
     CACHE_INDEX_SENTINEL, CACHE_LM_COUNT, CACHE_MAX_PULSES,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_pvq_decode::{
     decode_pvq_shape, decode_pvq_shape_into, decode_pvq_vector, decode_pvq_vector_into,
     pvq_l1_norm, pvq_l2_norm_squared, pvq_unit_normalize, PvqDecodeError, PvqShapeError,
     PVQ_DECODE_K_MAX, PVQ_DECODE_N_MAX,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_pvq_v::{pvq_codebook_size, PvqVError, PVQ_V_K_MAX, PVQ_V_MAX, PVQ_V_N_MAX};
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_redundancy::{
     decode_redundancy, remaining_bits, whole_bytes_remaining, RedundancyDecision,
     RedundancyPosition, HYBRID_REDUNDANCY_MIN_REMAINING_BITS,
@@ -843,32 +939,39 @@ pub use celt_redundancy::{
     REDUNDANCY_POSITION_ICDF, REDUNDANCY_POSITION_ICDF_FTB,
     SILK_ONLY_REDUNDANCY_MIN_REMAINING_BITS,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_reservations::{
     reserve_block, ReservationError, ReservationOutcome, ANTI_COLLAPSE_HEADROOM_LM_OFFSET,
     ANTI_COLLAPSE_HEADROOM_MULT_EIGHTH_BITS, ANTI_COLLAPSE_LM_MIN_EXCLUSIVE,
     CONSERVATIVE_DEDUCTION_EIGHTH_BITS, ONE_BIT_EIGHTH_BITS,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_spreading::{
     apply_spreading, decode_spread, rotate_in_place, rotate_strided, rotation_angle, rotation_gain,
     spread_f_r, spread_theta, spreading_stride, SpreadingError, SPREAD_FTB, SPREAD_F_R,
     SPREAD_ICDF, SPREAD_MAX, SPREAD_PDF, SPREAD_PDF_DENOMINATOR, SPREAD_PRE_ROTATION_MIN_BLOCK_LEN,
     SPREAD_VALUE_COUNT,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_static_alloc::{
     static_alloc_cell, static_alloc_eighth_bits, static_alloc_row, StaticAllocError, STATIC_ALLOC,
     STATIC_ALLOC_INTERP_STEPS, STATIC_ALLOC_Q_COUNT, STATIC_ALLOC_Q_MAX, STATIC_ALLOC_Q_MIN,
     STATIC_ALLOC_RIGHT_SHIFT, STATIC_ALLOC_TOTAL_CELLS,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_tf_adjust::{
     celt_tf_adjustment, celt_tf_select_can_affect, TfAdjustment, TfDirection,
     TF_ADJUSTMENT_ABS_MAX, TF_ADJUSTMENT_MAX, TF_ADJ_NONTRANSIENT_SELECT0,
     TF_ADJ_NONTRANSIENT_SELECT1, TF_ADJ_TRANSIENT_SELECT0, TF_ADJ_TRANSIENT_SELECT1,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_tf_decode::{decode_tf, TfDecode};
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_transitions::{
     classify_normative_transition, recommended_non_normative, BoundaryOp, NormativeTransition,
     RecommendedNonNormativeTransition,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_trim_offsets::{
     band_n_shortest, band_trim_offset, band_trim_offset_for_band, shortest_frame_size,
     TrimOffsetError, TRIM_OFFSETS_BIAS, TRIM_OFFSETS_DIVISOR, TRIM_OFFSETS_MONO_CHANNELS,
@@ -882,6 +985,7 @@ pub use decoder::{
 pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
 pub use framing::{OperatingMode, OpusFrameRouting, SilkBandwidth};
 pub use framing_self_delim::{parse_self_delimited, SelfDelimitedParse};
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use mode_transition_reset::{decide_state_resets, CeltResetPlacement, StateReset};
 pub use multistream::{
     assemble_multistream_packet, split_multistream_packet, MultistreamAudio, MultistreamDecoder,
@@ -894,69 +998,91 @@ pub use opus_head::{
 pub use packet_compose::{
     compose_packet, compose_packet_code3, compose_self_delimited, encode_length,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use plc::{
     conceal_celt, conceal_silk, cross_lap, find_pitch, loss_gain, PlcFlavor, PlcState,
     PITCH_MAX_LAG, PITCH_MIN_LAG, PLC_CROSS_LAP_SAMPLES, PLC_HISTORY_SAMPLES,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use range_decoder::RangeDecoder;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use range_encoder::RangeEncoder;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use redundancy_decode_params::{
     apply_mb_to_wb_override, redundant_frame_params, CrossLapPlacement, RedundantFrameParams,
     REDUNDANT_CROSS_LAP_TENTHS_MS, REDUNDANT_FRAME_TENTHS_MS,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_decode::{
     decode_silk_frame, encode_silk_frame, SilkFrameConfig, SilkFrameDecoded, SilkFrameSymbols,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_excitation::{
     quantization_offset_q23, shell_block_count, Excitation, ExcitationConfig, ExcitationSymbols,
     SilkFrameSize, MAX_EXCITATION_SAMPLES, MAX_SHELL_BLOCKS, SHELL_BLOCK_SAMPLES,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_frame::{
     FrameKind, QuantizationOffsetType, SignalType, SilkFrameHeader, SilkFrameHeaderConfig,
     SilkHeaderPreGains, SilkHeaderSymbols, StereoPredictionWeights, StereoWeightSymbols,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_gains::{
     GainSymbol, SubframeGain, SubframeGains, SubframeGainsConfig, SILK_MAX_SUBFRAMES,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_header::{
     per_frame_lbrr_pdf, silk_frame_count, PerFrameLbrr, SilkChannelHeader, SilkHeaderBits,
     SILK_MAX_FRAMES_PER_CHANNEL,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_lcg_seed::{decode_lcg_seed, encode_lcg_seed};
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_log2lin::{
     silk_gains_dequant, silk_log2lin, SILK_GAIN_Q16_MAX, SILK_GAIN_Q16_MIN, SILK_LOG_GAIN_BIAS,
     SILK_LOG_GAIN_MULTIPLIER,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_lpc_synth::{
     lpc_synthesis_frame, lpc_synthesis_subframe, subframe_samples, LpcSynthState,
     LPC_SYNTH_MAX_ORDER, LPC_SYNTH_MAX_SUBFRAME_SAMPLES,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_lsf_interp::{LsfInterpContext, LsfInterpolated};
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_lsf_recon::{cb1_q8, NlsfReconstructed};
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_lsf_stabilize::NlsfStabilized;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_lsf_stage2::{
     LsfStage2, D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB, QSTEP_NB_MB_Q16, QSTEP_WB_Q16,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_lsf_to_lpc::{nlsf_to_c_q17, ordering, LpcQ12, LpcQ17};
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_ltp::{
     LagCoding, LagSymbols, LtpConfig, LtpParameters, LtpSymbols, LTP_FILTER_TAPS,
     LTP_MAX_SUBFRAMES, LTP_SCALING_DEFAULT_Q14,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_ltp_synth::{
     ltp_synth_commit_subframe, ltp_synthesis_subframe, LtpSynthState, LtpSynthSubframe,
     LTP_LPC_HISTORY_MAX, LTP_MAX_PITCH_LAG, LTP_OUT_HISTORY_MAX, LTP_SCALE_FRESH_Q14,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_packet_encode::{
     encode_silk_only_packet_mono, encode_silk_only_packet_mono_with_lbrr,
     encode_silk_only_packet_stereo, encode_silk_only_packet_stereo_with_lbrr, StereoIntervalLbrr,
     StereoIntervalScripts, StereoLbrrPredictions, StereoPacketPredictions,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_resampler::{
     is_supported_output_rate, silk_frame_samples_at_output, silk_frame_samples_internal,
     silk_internal_rate_hz, silk_resampler_delay_ms, silk_resampler_delay_samples_at,
     SilkChannelPath, SilkUpsampler, REFERENCE_RATE_HZ, SILK_RESAMPLER_DELAY_MS_MB,
     SILK_RESAMPLER_DELAY_MS_NB, SILK_RESAMPLER_DELAY_MS_WB, SUPPORTED_OUTPUT_RATES_HZ,
 };
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_stereo::{
     estimate_stereo_weights, interp_phase_samples, stereo_lr_to_ms, stereo_ms_to_lr, MidSideFrame,
     StereoDownmixState, StereoFrame, StereoUnmixState, StereoWeightsQ13,

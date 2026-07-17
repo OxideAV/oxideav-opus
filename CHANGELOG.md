@@ -4,6 +4,14 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- Marked all internal SILK/CELT stage-plumbing modules (range coder,
+  band shapes, PVQ, resampler internals, transition machinery) and
+  their crate-root re-exports `#[doc(hidden)]`; the stable API surface
+  is `Error`, `register`, and the packet/container-level modules
+  (`decoder`, `toc`, `frames`, `framing`, `framing_self_delim`,
+  `packet_compose`, `multistream`, `opus_head`). Attributes and
+  comments only — no semantic changes.
+
 - **§4.2.9 real resampler: `SilkUpsampler`**, a stateful streaming
   polyphase windowed-sinc upsampler (Kaiser-windowed, per-phase
   DC-normalized, per-(bandwidth × path) group delay, input history
