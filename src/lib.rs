@@ -205,11 +205,12 @@
 //!   WB = 16000 Hz) and the §4.2.9 supported output rates (8 / 12 / 16 /
 //!   24 / 48 kHz). SWB and FB never reach the §4.2.9 SILK stage and are
 //!   rejected with `None`. The module also carries the actual §4.2.9
-//!   conversion, [`SilkUpsampler`]: a stateful streaming polyphase
-//!   windowed-sinc upsampler to 48 kHz whose per-(bandwidth ×
-//!   [`SilkChannelPath`]) group delay is calibrated black-box against
-//!   the reference decodes of the fixture corpus, with the kernel
-//!   half-width on the §4.2.9 causality cap.
+//!   conversion, [`SilkUpsampler`]: the reference decoder's fixed-point
+//!   resampler to 48 kHz (per-rate delay compensation, 2× allpass
+//!   upsampling, fractional-phase 8-tap FIR interpolation, with the
+//!   RFC 8251 §5 correction), transcribed from the RFC 6716 §A
+//!   reference listing so decoded SILK lands sample-exact on the
+//!   reference timeline.
 //!
 //! * Round 18 lands the §4.2.3 SILK packet-level header bits and the
 //!   §4.2.4 per-frame LBRR flags ([`SilkHeaderBits`] / [`silk_frame_count`]).

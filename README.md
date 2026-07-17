@@ -384,21 +384,12 @@ one `decode_band_shape` call given a band's `(N, K, spread, tf_adjust,
 nb_blocks)`), and the §4.5 redundancy / mode-transition state-reset
 machinery.
 
-The one structural blocker on the CELT-only real-PCM path is the §4.3.3
-**allocation orchestration** (the reference `interp_bits2pulses`:
-reallocation of unused bits with concurrent skip decoding, the
-fine-energy-vs-shape split, and the final reallocation) together with
-the §4.3.4.4 **split-decoding gain precision** ("derived from the
-current allocation"). RFC 6716 §4.3.3 *names* these steps (p. 111) but
-provides no algorithm for them — they live only in the reference
-`rate.c` / `bands.c`, which the clean-room wall bars. Without the
-per-band pulse count `K` they produce, the §4.3.4 shape decode (now
-fully composed) cannot be driven against a real bitstream, so non-silent
-CELT-only frames still emit correct-length silence after consuming their
-prefix + coarse energy. This is a precise docs gap: a clean-room trace
-of `interp_bits2pulses` + the split-gain `qb` derivation would unblock
-the end-to-end CELT path. The §4.3.5 anti-collapse remains separately
-gapped (no PRNG / energy-injection algorithm in the RFC narrative).
+(The §4.3.3 allocation orchestration and the §4.3.5 anti-collapse —
+once listed here as structural blockers — have long been implemented
+in exact integer arithmetic; the historical note is kept only in the
+changelog. With the RFC 6716 §A embedded reference listing ratified as
+staged spec material, no CELT or SILK decode stage remains blocked on
+external documentation.)
 
 ## Clean-room sources
 
