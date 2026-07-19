@@ -750,6 +750,8 @@ pub mod celt_pulse_cache;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_pvq_decode;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod celt_pvq_encode;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_pvq_v;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_rate_alloc;

@@ -241,7 +241,7 @@ fn exp_rotation1(x: &mut [f64], stride: usize, c: f64, s: f64) {
 }
 
 /// The full rotation: `dir = -1` is the decode direction.
-fn exp_rotation(x: &mut [f64], dir: i32, stride: usize, k: i32, spread: u8) {
+pub(crate) fn exp_rotation(x: &mut [f64], dir: i32, stride: usize, k: i32, spread: u8) {
     const SPREAD_FACTOR: [i32; 3] = [15, 10, 5];
     let len = x.len();
     if 2 * (k as usize) >= len || spread == SPREAD_NONE {
@@ -279,7 +279,7 @@ fn exp_rotation(x: &mut [f64], dir: i32, stride: usize, k: i32, spread: u8) {
 }
 
 /// Per-short-block non-zero mask of the integer PVQ vector.
-fn extract_collapse_mask(iy: &[i32], b: usize) -> u32 {
+pub(crate) fn extract_collapse_mask(iy: &[i32], b: usize) -> u32 {
     if b <= 1 {
         return 1;
     }

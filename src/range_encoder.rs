@@ -293,6 +293,82 @@ impl RangeEncoder {
         }
     }
 
+    /// The current range size `rng` (RFC 6716 §5.1.1). After the same
+    /// symbol sequence this equals the decoder's `rng`
+    /// ([`crate::range_decoder::RangeDecoder::range_size`]); the value
+    /// at end-of-frame is the "final range" diagnostic both sides can
+    /// compare.
+    #[must_use]
+    pub fn range_size(&self) -> u32 {
+        self.rng
+    }
+
+    /// Finalize the stream into a **fixed-size** buffer of exactly
+    /// `size` bytes (§5.1.5, `ec_enc_done` with a bounded `storage`):
+    /// range-coder bytes grow from the front, §5.1.3 raw bits from the
+    /// back, and the unused middle is zero — the layout a CELT frame
+    /// requires, where the frame's byte size *is* the entropy budget
+    /// and the §4.1.2 decoder reads the same buffer from both ends.
+    ///
+    /// The final partial raw-bit window is OR-merged into the last raw
+    /// byte exactly as the reference listing's finalization does; when
+    /// the range data and the raw data meet in one byte, the range
+    /// value's trailing free bits absorb the raw bits.
+    ///
+    /// Returns `None` when the coded symbols cannot fit `size` bytes
+    /// (an encoder-side budget-accounting bug: every CELT symbol is
+    /// gated on `tell()` against the same `size * 8` budget).
+    #[must_use]
+    pub fn finish_fixed(mut self, size: usize) -> Option<Vec<u8>> {
+        // Minimum number of terminating bits so the symbols decode
+        // correctly regardless of what follows.
+        let mut l: i32 = 32 - (32 - self.rng.leading_zeros()) as i32;
+        let mut msk: u32 = 0x7FFF_FFFFu32 >> l;
+        let mut end: u32 = self.val.wrapping_add(msk) & !msk;
+        if u64::from(end | msk) >= u64::from(self.val) + u64::from(self.rng) {
+            l += 1;
+            msk >>= 1;
+            end = self.val.wrapping_add(msk) & !msk;
+        }
+        while l > 0 {
+            self.carry_out(end >> 23);
+            end = (end << 8) & 0x7FFF_FFFF;
+            l -= 8;
+        }
+        // Flush the buffered byte / pending carry run.
+        if self.rem >= 0 || self.ext > 0 {
+            self.carry_out(0);
+        }
+
+        let n_range = self.buf.len();
+        let n_raw = self.end_bytes.len();
+        if n_range + n_raw > size {
+            return None;
+        }
+        let mut out = vec![0u8; size];
+        out[..n_range].copy_from_slice(&self.buf);
+        for (i, &b) in self.end_bytes.iter().enumerate() {
+            out[size - 1 - i] = b;
+        }
+        // Remaining partial raw-bit window: OR into the next raw byte.
+        if self.nend_bits > 0 {
+            if n_raw >= size {
+                return None;
+            }
+            let mut window = self.end_window;
+            // If the raw bits share the last range byte, only the
+            // range value's trailing free bits (`-l`) are usable.
+            if n_range + n_raw >= size && (-l as u32) < self.nend_bits {
+                return None;
+            }
+            if n_range + n_raw >= size {
+                window &= (1u32 << (-l)) - 1;
+            }
+            out[size - n_raw - 1] |= window as u8;
+        }
+        Some(out)
+    }
+
     /// Finalize the stream (§5.1.5, `ec_enc_done`) and return the packed
     /// output bytes.
     ///
@@ -427,6 +503,48 @@ mod tests {
 
     /// §5.1: a freshly-initialized encoder reports the same `tell()` as a
     /// freshly-initialized decoder: 1 bit.
+    #[test]
+    fn finish_fixed_shares_one_buffer_between_range_and_raw_bits() {
+        // CELT layout: range symbols from the front, raw bits from the
+        // back, in EXACTLY `size` bytes. Everything must decode back
+        // from that fixed buffer.
+        for size in [6usize, 12, 40] {
+            let mut enc = RangeEncoder::new();
+            let mut lcg = Lcg(size as u64 * 977 + 5);
+            let mut icdf_syms = Vec::new();
+            let mut bit_syms = Vec::new();
+            let mut raw_syms = Vec::new();
+            const ICDF: [u8; 4] = [25, 23, 2, 0];
+            // Fill roughly half the budget with range symbols, a
+            // quarter with raw bits.
+            while enc.tell() + 16 < (size as u32 * 8) / 2 {
+                let k = lcg.below(4) as usize;
+                enc.enc_icdf(k, &ICDF, 5);
+                icdf_syms.push(k);
+                let b = lcg.below(2) == 1;
+                enc.enc_bit_logp(b, 3);
+                bit_syms.push(b);
+            }
+            for _ in 0..size / 4 {
+                let v = lcg.below(16);
+                enc.enc_bits(v, 4);
+                raw_syms.push(v);
+            }
+            assert!(enc.tell() <= size as u32 * 8, "over budget");
+            let buf = enc.finish_fixed(size).expect("fits");
+            assert_eq!(buf.len(), size);
+            let mut rd = RangeDecoder::new(&buf);
+            for (i, &k) in icdf_syms.iter().enumerate() {
+                assert_eq!(rd.dec_icdf(&ICDF, 5) as usize, k, "size {size} icdf #{i}");
+                assert_eq!(rd.dec_bit_logp(3) == 1, bit_syms[i], "size {size} bit #{i}");
+            }
+            for (i, &v) in raw_syms.iter().enumerate() {
+                assert_eq!(rd.dec_bits(4), v, "size {size} raw #{i}");
+            }
+            assert!(!rd.has_error());
+        }
+    }
+
     #[test]
     fn init_tell_is_one() {
         let enc = RangeEncoder::new();

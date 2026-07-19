@@ -159,10 +159,94 @@ pub fn ec_laplace_decode(
     val
 }
 
+/// Encode one signed coarse-energy symbol via the §4.3.2.1 Laplace
+/// model — the exact write-side mirror of [`ec_laplace_decode`],
+/// transcribed from the reference listing's encoder half.
+///
+/// `value` is clamped in place when the coded alphabet cannot represent
+/// it (the flat tail runs out of probability floor ticks near ±32768);
+/// the caller must use the (possibly clamped) value for its own
+/// prediction feedback, exactly as the decoder will reconstruct it.
+pub fn ec_laplace_encode(
+    enc: &mut crate::range_encoder::RangeEncoder,
+    value: &mut i32,
+    mut fs: u32,
+    decay: u32,
+) {
+    let mut fl: u32 = 0;
+    let mut val = *value;
+    if val != 0 {
+        // s = -(val < 0); val = |val| via the two's-complement fold.
+        let s: i32 = if val < 0 { -1 } else { 0 };
+        val = (val + s) ^ s;
+        fl = fs;
+        fs = laplace_get_freq1(fs, decay);
+        // Search the decaying part of the PDF.
+        let mut i: i32 = 1;
+        while fs > 0 && i < val {
+            fs *= 2;
+            fl += fs + 2 * LAPLACE_MINP;
+            fs = (fs * decay) >> 15;
+            i += 1;
+        }
+        if fs == 0 {
+            // Everything beyond this point has probability LAPLACE_MINP.
+            let mut ndi_max: i32 =
+                ((LAPLACE_TOTAL - fl + LAPLACE_MINP - 1) >> LAPLACE_LOG_MINP) as i32;
+            ndi_max = (ndi_max - s) >> 1;
+            let di: i32 = (val - i).min(ndi_max - 1);
+            fl += ((2 * di + 1 + s) as u32) * LAPLACE_MINP;
+            fs = LAPLACE_MINP.min(LAPLACE_TOTAL - fl);
+            *value = (i + di + s) ^ s;
+        } else {
+            fs += LAPLACE_MINP;
+            if s == 0 {
+                // fl += fs & ~s (s == 0 → add; s == -1 → skip).
+                fl += fs;
+            }
+        }
+        debug_assert!(fl + fs <= LAPLACE_TOTAL);
+        debug_assert!(fs > 0);
+    }
+    enc.encode_bin(fl, fl + fs, 15);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::range_decoder::RangeDecoder;
+
+    #[test]
+    fn laplace_encode_decode_roundtrips_over_the_e_prob_surface() {
+        // Every (LM, intra, band) Laplace parameter pair from the
+        // §4.3.2.1 tables, over the full useful qi range: the encoder's
+        // (possibly clamped) value must decode back exactly.
+        use crate::celt_e_prob_model::{e_prob_pair, EnergyPredictionMode};
+        use crate::range_encoder::RangeEncoder;
+        for lm in 0..4u32 {
+            for mode in [EnergyPredictionMode::Inter, EnergyPredictionMode::Intra] {
+                for band in [0u32, 3, 10, 20] {
+                    let pair = e_prob_pair(lm, mode, band).unwrap();
+                    let fs = u32::from(pair.prob) << 7;
+                    let decay = u32::from(pair.decay) << 6;
+                    let mut enc = RangeEncoder::new();
+                    let mut expect = Vec::new();
+                    for q in -40i32..=40 {
+                        let mut v = q;
+                        ec_laplace_encode(&mut enc, &mut v, fs, decay);
+                        expect.push(v);
+                    }
+                    let buf = enc.finish();
+                    let mut rd = RangeDecoder::new(&buf);
+                    for (idx, &want) in expect.iter().enumerate() {
+                        let got = ec_laplace_decode(&mut rd, fs, decay);
+                        assert_eq!(got, want, "lm={lm} band={band} sym#{idx}");
+                    }
+                    assert!(!rd.has_error());
+                }
+            }
+        }
+    }
 
     #[test]
     fn constants_match_table() {

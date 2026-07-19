@@ -4,6 +4,20 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **CELT encoder primitives** (round 418): the §4.3.2.1 Laplace
+  *encoder* (`ec_laplace_encode`, the exact write-side mirror of the
+  decoder including the flat-tail value clamp), the §4.3.4.2 PVQ
+  codeword-index construction (`celt_pvq_encode::encode_pvq_vector`,
+  the exact inverse of the five-step index recovery — exhaustively
+  roundtripped over small codebooks and sampled over the largest legal
+  `V(N, K)` surfaces), the §5.3.4 PVQ pulse search (pyramid projection
+  + greedy `Rxy²/Ryy` refinement) with the spreading-rotation
+  `alg_quant` wrapper, and `RangeEncoder::finish_fixed` — the §5.1.5
+  finalization into a **fixed-size** buffer where range bytes and
+  §5.1.3 raw bits share exactly the frame's bytes (the CELT frame
+  layout; the final partial raw window is OR-merged into the last
+  byte, sharing the range value's free trailing bits when they meet).
+
 - **SILK decode is now reference-exact** (round 415). The whole SILK
   reconstruction chain was moved from the RFC's real-number narrative
   formulas to the exact fixed-point arithmetic of the RFC 6716 §A
