@@ -58,3 +58,15 @@ CELT-only (full-band content) mid-stream; the black-box encoder emits
 `fec-on.opus` was encoded with in-band FEC enabled (`-fec 1
 -packet_loss 10`), so its SILK packets carry §4.2.5 LBRR redundancy of
 the prior frame; it drives the `tests/fec_decode.rs` recovery path.
+
+`multistream-5.1.opus` is the RFC 7845 family-1 5.1 multistream
+fixture (4 streams: FL/FR + BL/BR coupled, FC + LFE mono, CELT-only
+FB 20 ms). Its `multistream-5.1.expected.wav` is the decode by the
+**reference listing's multistream decoder** (`opus_multistream.c`
+from the §A extraction, RFC 8251 patches applied): pre-skip (312)
+dropped, end-trimmed to the 48 000-sample granule length, in the
+RFC 7845 §5.1.1.2 **Vorbis channel order** (FL, FC, FR, BL, BR, LFE)
+— re-anchored 2026-07 from the old third-party lineage (which was in
+WAV channel order). It drives the whole-corpus multistream gate in
+`tests/multistream_decode.rs` (whole-stream ≥ 90 dB, per-channel
+≥ 80 dB; measured ~100 dB).

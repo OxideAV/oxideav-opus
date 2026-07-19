@@ -361,3 +361,71 @@ fn fixture_opus_head_recomposes_byte_identically() {
     let composed = head.compose().expect("compose");
     assert_eq!(composed, bytes);
 }
+
+/// The 5.1 multistream fixture (family 1, 4 streams: 2 coupled +
+/// 2 mono) and its reference decode — produced by the RFC 6716 §A
+/// reference listing's multistream decoder (RFC 8251 patches applied),
+/// pre-skip trimmed, end-trimmed to the granule length, in the
+/// RFC 7845 §5.1.1.2 Vorbis channel order.
+const FIXTURE_MS51: &[u8] = include_bytes!("fixtures/multistream-5.1.opus");
+const FIXTURE_MS51_EXPECTED: &[u8] = include_bytes!("fixtures/multistream-5.1.expected.wav");
+
+#[test]
+fn multistream_51_fixture_decodes_at_the_float_noise_floor() {
+    let packets = ogg_packets(FIXTURE_MS51);
+    let head = OpusHead::parse(&packets[0]).expect("OpusHead");
+    assert_eq!(head.channel_count, 6);
+    assert_eq!(head.mapping_family, 1);
+    assert_eq!(head.mapping.stream_count, 4);
+    assert_eq!(head.mapping.coupled_count, 2);
+    assert_eq!(head.pre_skip, 312);
+
+    let mut dec = MultistreamDecoder::new(head.mapping.clone());
+    let mut pcm: Vec<i16> = Vec::new();
+    for p in &packets[2..] {
+        let out = dec.decode_packet(p).expect("multistream decode");
+        assert_eq!(out.channels, 6);
+        pcm.extend_from_slice(&out.pcm);
+    }
+
+    // Pre-skip + end-trim to the granule length (48 000 samples).
+    let ch = 6usize;
+    let skip = head.pre_skip as usize;
+    assert!(pcm.len() >= (skip + 48_000) * ch, "decode too short");
+    let trimmed = &pcm[skip * ch..(skip + 48_000) * ch];
+
+    // 44-byte canonical WAV header; s16le payload in Vorbis order.
+    let payload = &FIXTURE_MS51_EXPECTED[44..];
+    let want: Vec<i16> = payload
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    assert_eq!(trimmed.len(), want.len());
+
+    // Whole-stream SNR against the reference-listing decode: the
+    // fixture is CELT-only, so our decode sits at the float-noise
+    // floor (~100 dB measured); gate with margin.
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    for (a, b) in trimmed.iter().zip(want.iter()) {
+        let d = f64::from(*a) - f64::from(*b);
+        num += d * d;
+        den += f64::from(*b) * f64::from(*b);
+    }
+    let snr = 10.0 * (den / num.max(1e-30)).log10();
+    assert!(snr > 90.0, "multistream-5.1 SNR {snr:.2} dB < 90");
+
+    // And per channel: every one of the six Vorbis-order channels
+    // reconstructs (no channel-order or routing slip).
+    for c in 0..ch {
+        let mut num_c = 0.0f64;
+        let mut den_c = 0.0f64;
+        for s in 0..48_000 {
+            let d = f64::from(trimmed[s * ch + c]) - f64::from(want[s * ch + c]);
+            num_c += d * d;
+            den_c += f64::from(want[s * ch + c]) * f64::from(want[s * ch + c]);
+        }
+        let snr_c = 10.0 * (den_c / num_c.max(1e-30)).log10();
+        assert!(snr_c > 80.0, "channel {c} SNR {snr_c:.2} dB < 80");
+    }
+}

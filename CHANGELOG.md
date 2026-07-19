@@ -4,6 +4,20 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **multistream-5.1 fixture re-anchored to the reference listing**
+  (round 418). The 5.1 fixture's reference decode was left on the old
+  third-party lineage in the round-415 re-anchor; the staged
+  `docs/audio/opus/fixtures/multistream-5.1/expected.wav` is now the
+  decode of the §A listing's own multistream decoder (RFC 8251
+  patches applied), pre-skip trimmed, end-trimmed to the granule
+  length, in the RFC 7845 §5.1.1.2 Vorbis channel order (the old file
+  was WAV-order and not byte-anchored; its sha256 predated its own
+  bytes). The fixture pair is now embedded in `tests/fixtures/` and a
+  new gate in `tests/multistream_decode.rs` decodes the whole corpus
+  through `MultistreamDecoder`: whole-stream ≥ 90 dB (measured
+  ~100.8 dB) and every one of the six Vorbis-order channels ≥ 80 dB
+  against the listing decode.
+
 - **Hybrid (SILK + CELT) packet encode** (round 418).
   `HybridEncoderMono` (`hybrid_packet_encode`) produces code-0 Hybrid
   packets for configs 12-15 (SWB/FB x 10/20 ms): the WB-internal §4.2
