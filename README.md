@@ -171,6 +171,45 @@ state through the real §4.2.7.9 synthesis chain. Sine, pulse-train
 the real streaming `OpusDecoder` at >10 dB tone-projection SNR on
 the 48 kHz output, with stereo panning preserved.
 
+Round 418 completed the encoder arc beyond SILK: **CELT-mode packet
+encode is real, end to end** (`CeltEncoder`). The full §5.3 stage
+sequence mirrors the §4.3 decoder symbol for symbol — silence flag,
+post-filter (off), transient analysis + short blocks, two-pass
+intra/inter §5.3.2 coarse energy with the decoder-lockstep quantized
+`oldBandE` carry, budget-gated tf flags, the §5.3.4 spreading
+decision, the dynalloc boost loop, trim analysis, the §4.3.3
+allocation with coded skip / intensity / dual-stereo decisions
+(encode→decode roundtrips to identical allocations), fine energy,
+the recursive §4.3.4 band encode (split angles measured from the
+band energies on the step/uniform/triangular PDFs, intensity
+collapse, Haar/Hadamard time reorganisation, PVQ pyramid search +
+exact §4.3.4.2 index construction at the leaves, the decode side's
+exact 1/8-bit budget bookkeeping), the anti-collapse bit, the final
+fine backfill, and the fixed-size §5.1.5 finalization where range
+bytes and raw bits share exactly the frame's bytes. The whole
+configuration matrix encodes — NB/WB/SWB/FB × 2.5/5/10/20 ms × mono
++ stereo at any constant payload 2..=1275 bytes — and every stream
+was validated through BOTH decoders: the crate's own `OpusDecoder`
+(13–46 dB multitone SNR by rate with a monotone rate ladder) and the
+RFC 6716 §A reference-listing decoder (RFC 8251-patched,
+hash-verified extraction), which reconstructs our streams
+identically to ours at 88–108 dB (float-noise floor, max 1 LSB).
+At matched CBR rates on the same content our encoder lands within
+2.7–3.3 dB of the reference listing's own encoder (32→128 kb/s
+sweep). **Hybrid encode works too** (`HybridEncoderMono`, configs
+12–15: SWB/FB × 10/20 ms): the WB SILK layer and the CELT bands
+17.. share one range coder with the §4.5.1.1 redundancy flag coded
+off under the decoder's 37-bit gate, and the two layers sit on one
+timeline (a 165-tap linear-phase 48→16 kHz decimator's 82-sample
+delay + the §4.2.9 resampler's 35 + the §4.2.8 mono delay's 3
+exactly equal the CELT path's 120-sample MDCT-overlap delay; an
+empirical best-lag search returns 120). Hybrid streams decode
+through both decoders as well (the listing decoder agrees with ours
+at 105–108 dB). The SILK layer has no rate control yet, so a payload
+it alone would overflow is rejected cleanly; CELT-mode VBR, stereo
+hybrid, tf analysis, and the encoder-side pitch pre-filter remain
+open.
+
 Differential encoder/decoder testing and a restored cargo-fuzz suite
 (4 coverage-guided targets, incl. an encoder↔decoder range-coder
 roundtrip) have also hardened the decoder: five mis-transcribed rows
@@ -198,8 +237,9 @@ under the §4.2.7.4 packet-loss latitude.
 
 The crate ships a large, individually unit-tested set of SILK and
 CELT building blocks plus a complete RFC 7845 multistream /
-multichannel decode subsystem (1357 lib tests + SILK-fixture,
-multistream, FEC, and CELT synthesis-backend integration suites).
+multichannel decode subsystem (1460+ lib tests + SILK-fixture,
+multistream (incl. the 5.1 reference-listing gate), FEC, CELT
+synthesis-backend, CELT-encode and Hybrid-encode integration suites).
 Per-stage progress lives in `CHANGELOG.md`.
 
 ## What works
@@ -390,6 +430,21 @@ in exact integer arithmetic; the historical note is kept only in the
 changelog. With the RFC 6716 §A embedded reference listing ratified as
 staged spec material, no CELT or SILK decode stage remains blocked on
 external documentation.)
+
+**CELT / Hybrid encode side (RFC 6716 §5.3):** `CeltEncoder`
+(`celt_packet_encode`) — CELT-only code-0 packets over the full
+configuration matrix at any constant payload size, via
+`celt_analysis` (pre-emphasis, forward MDCT, band energies, transient
+detector), `celt_energy_encode` (two-pass coarse + fine + finalise),
+`celt_alloc_encode` (the §4.3.3 allocation, encode side),
+`celt_band_encode` (the recursive §4.3.4 band coder, encode side),
+`celt_pvq_encode` (PVQ search + §4.3.4.2 index construction), the
+§4.3.2.1 Laplace encoder, and `RangeEncoder::finish_fixed` (the
+fixed-size §5.1.5 finalization) — plus `HybridEncoderMono`
+(`hybrid_packet_encode`): the WB SILK layer and CELT bands 17.. on
+one range coder with delay-matched layer alignment. Validated
+through the crate's own decoder and the §A reference-listing decoder
+(88–108 dB agreement between the two decoders on our streams).
 
 ## Clean-room sources
 
