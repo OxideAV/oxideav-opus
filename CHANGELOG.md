@@ -4,6 +4,26 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Hybrid (SILK + CELT) packet encode** (round 418).
+  `HybridEncoderMono` (`hybrid_packet_encode`) produces code-0 Hybrid
+  packets for configs 12-15 (SWB/FB x 10/20 ms): the WB-internal §4.2
+  SILK layer (one frame per packet, §4.2.3 header bits + Table-5 frame
+  through the existing analyzer/writers) and the §4.3 CELT layer
+  (bands 17.., through the new CELT frame encoder) share one range
+  coder, with the §4.5.1.1 Hybrid redundancy flag coded off under the
+  decoder's exact 37-bit gate. The two layers are placed on ONE
+  timeline: a 165-tap linear-phase 48→16 kHz decimator (82-sample
+  group delay) plus the decoder's §4.2.9 WB resampler (35) and §4.2.8
+  mono delay (3) exactly equal the CELT path's 120-sample MDCT-overlap
+  delay — verified empirically (best-lag search returns 120).
+  Validated through the crate's own decoder (HybridDecoded on every
+  frame; 15-19 dB broadband-multitone SNR at 64-112 kb/s) and through
+  the RFC 6716 §A reference-listing decoder, which reconstructs our
+  hybrid streams identically to ours at **105-108 dB** (float-noise
+  floor) across FB/SWB x 10/20 ms. The SILK layer has no rate control
+  yet; a payload the SILK layer alone would overflow is rejected
+  cleanly rather than emitted corrupt.
+
 - **CELT-mode packet encode, end to end** (round 418). `CeltEncoder`
   (`celt_packet_encode`) produces code-0 CELT-only packets for the
   full configuration matrix — NB/WB/SWB/FB × 2.5/5/10/20 ms × mono +

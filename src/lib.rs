@@ -792,6 +792,8 @@ pub mod frames;
 pub mod framing;
 pub mod framing_self_delim;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod hybrid_packet_encode;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod mode_transition_reset;
 pub mod multistream;
 pub mod opus_head;
