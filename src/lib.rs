@@ -704,6 +704,8 @@ pub mod celt_alloc_search;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_alloc_trim;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod celt_analysis;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_band_boost;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_band_decode;
