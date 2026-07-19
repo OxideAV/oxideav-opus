@@ -69,3 +69,9 @@ name = "range_roundtrip"
 path = "fuzz_targets/range_roundtrip.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "celt_encode_roundtrip"
+path = "fuzz_targets/celt_encode_roundtrip.rs"
+test = false
+doc = false

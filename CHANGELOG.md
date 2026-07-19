@@ -4,6 +4,16 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **CELT-encoder fuzz target** (`fuzz/celt_encode_roundtrip`):
+  coverage-guided config × payload × PCM exploration asserting every
+  produced packet decodes cleanly through the streaming decoder with
+  the exact sample count. Pre-hardened locally with a 640-packet
+  full-scale adversarial sweep (white noise, Nyquist square, DC rails,
+  step discontinuities × every bandwidth/frame-size/channel config ×
+  payloads 2..1275) plus a 60-packet mixed-content stereo stress whose
+  streams the reference-listing decoder reproduces at 94.7 dB / max
+  1 LSB.
+
 - **§5.3.4 spreading decision** (round 418): the CELT encoder now runs
   the listing's tonality analysis (per-band magnitude-CDF measure,
   recursive averaging, hysteresis against the previous decision)
