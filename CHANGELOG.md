@@ -4,6 +4,14 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **§5.3.4 spreading decision** (round 418): the CELT encoder now runs
+  the listing's tonality analysis (per-band magnitude-CDF measure,
+  recursive averaging, hysteresis against the previous decision)
+  instead of hardcoding SPREAD_NORMAL; transients and tiny budgets
+  keep the fixed decision exactly as the listing gates them. Oracle
+  re-validated: the reference-listing decoder still reconstructs our
+  streams identically to our decoder (~100 dB).
+
 - **multistream-5.1 fixture re-anchored to the reference listing**
   (round 418). The 5.1 fixture's reference decode was left on the old
   third-party lineage in the round-415 re-anchor; the staged

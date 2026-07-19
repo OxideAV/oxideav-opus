@@ -57,6 +57,10 @@ pub struct CeltEncoderState {
     pub last_coded_bands: usize,
     /// Force an intra frame next (stream start / reset).
     pub force_intra: bool,
+    /// §5.3.4 spreading-decision recursive tonality average.
+    pub tonal_average: i32,
+    /// Previous frame's coded spread decision (hysteresis input).
+    pub spread_decision: u8,
     channels: usize,
     n: usize,
 }
@@ -86,6 +90,8 @@ impl CeltEncoderState {
             consec_transient: 0,
             last_coded_bands: 0,
             force_intra: true,
+            tonal_average: 256,
+            spread_decision: 2,
             channels,
             n,
         }
@@ -111,6 +117,8 @@ impl CeltEncoderState {
         self.consec_transient = 0;
         self.last_coded_bands = 0;
         self.force_intra = true;
+        self.tonal_average = 256;
+        self.spread_decision = 2;
     }
 }
 
@@ -231,9 +239,24 @@ pub fn encode_celt_frame(
         total_bits as u32,
     );
 
-    // §4.3.4.3 spread: SPREAD_NORMAL.
-    let spread: u8 = 2;
+    // §4.3.4.3 spread decision (the listing's tonality analysis; at
+    // full complexity the analysed decision is used except on
+    // transients, which keep SPREAD_NORMAL).
+    let mut spread: u8 = 2; // SPREAD_NORMAL
+    state.spread_decision = 2;
     if i64::from(enc.tell()) + 4 <= total_bits {
+        if !transient {
+            spread = spreading_decision(
+                &x,
+                &mut state.tonal_average,
+                state.spread_decision,
+                end,
+                channels,
+                m,
+                plane,
+            );
+        }
+        state.spread_decision = spread;
         enc.enc_icdf(usize::from(spread), &SPREAD_ICDF, 5);
     }
 
@@ -489,6 +512,68 @@ fn tf_encode(
     }
     for tf in tf_res.iter_mut().take(end).skip(start) {
         *tf = table(tf_select, *tf);
+    }
+}
+
+/// The listing's `spreading_decision`: a rough per-band CDF of the
+/// normalized coefficient magnitudes measures tonality; a recursive
+/// average plus hysteresis against the previous decision maps it to
+/// one of the four Table 59 spread values.
+fn spreading_decision(
+    x: &[f64],
+    average: &mut i32,
+    last_decision: u8,
+    end: usize,
+    channels: usize,
+    m: usize,
+    plane: usize,
+) -> u8 {
+    if m * (band_edge(end) - band_edge(end - 1)) as usize <= 8 {
+        return 0; // SPREAD_NONE
+    }
+    let mut sum = 0i32;
+    let mut nb_bands = 0i32;
+    for c in 0..channels {
+        for i in 0..end {
+            let off = c * plane + m * band_edge(i) as usize;
+            let n = m * band_width(i) as usize;
+            if n <= 8 {
+                continue;
+            }
+            let mut tcount = [0i32; 3];
+            for &v in &x[off..off + n] {
+                let x2n = v * v * n as f64;
+                if x2n < 0.25 {
+                    tcount[0] += 1;
+                }
+                if x2n < 0.0625 {
+                    tcount[1] += 1;
+                }
+                if x2n < 0.015625 {
+                    tcount[2] += 1;
+                }
+            }
+            let tmp = i32::from(2 * tcount[2] >= n as i32)
+                + i32::from(2 * tcount[1] >= n as i32)
+                + i32::from(2 * tcount[0] >= n as i32);
+            sum += tmp * 256;
+            nb_bands += 1;
+        }
+    }
+    debug_assert!(nb_bands > 0);
+    sum /= nb_bands.max(1);
+    // Recursive averaging + hysteresis against the last decision.
+    sum = (sum + *average) >> 1;
+    *average = sum;
+    sum = (3 * sum + (((3 - i32::from(last_decision)) << 7) + 64) + 2) >> 2;
+    if sum < 80 {
+        3 // SPREAD_AGGRESSIVE
+    } else if sum < 256 {
+        2 // SPREAD_NORMAL
+    } else if sum < 384 {
+        1 // SPREAD_LIGHT
+    } else {
+        0 // SPREAD_NONE
     }
 }
 
