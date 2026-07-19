@@ -4,6 +4,39 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **CELT-mode packet encode, end to end** (round 418). `CeltEncoder`
+  (`celt_packet_encode`) produces code-0 CELT-only packets for the
+  full configuration matrix — NB/WB/SWB/FB × 2.5/5/10/20 ms × mono +
+  stereo — at any caller-chosen constant payload size, through the
+  complete §5.3 stage sequence mirroring the §4.3 decoder symbol for
+  symbol: silence flag, post-filter (signalled off), transient
+  analysis + flag, two-pass intra/inter §5.3.2 coarse energy with the
+  decoder-lockstep quantized `oldBandE` carry, budget-gated tf flags,
+  spread, the dynalloc band-boost loop with the listing's
+  band-peak offsets, trim analysis (stereo correlation + spectral
+  tilt), the §4.3.3 allocation with coded skip / intensity /
+  dual-stereo decisions (`celt_alloc_encode` — encode/decode
+  roundtripped to identical `Allocation`s across the parameter
+  surface), fine energy, the recursive §4.3.4 band encode
+  (`celt_band_encode` — split angles from measured band energies via
+  the step/uniform/triangular PDFs, intensity collapse, mono
+  time-splits with the Hadamard/Haar reorganisation, PVQ leaves, the
+  exact decode-side budget bookkeeping), the anti-collapse bit, and
+  the §4.3.2.3 final fine backfill. New analysis front end
+  (`celt_analysis`): §5.3 pre-emphasis (exact §4.3.7.2 inverse),
+  forward MDCT (long + short interleaved blocks; > 120 dB analysis →
+  synthesis round-trip at every LM), §4.3.2 band energies /
+  log-energies / unit-norm shapes, and the listing's transient
+  detector. Validated two ways on a 9-configuration matrix
+  (mono/stereo, all four frame sizes, NB/SWB/FB, click-train
+  transients, 16–256 kb/s): every packet decodes through the crate's
+  own `OpusDecoder` (tone roundtrips 13–46 dB SNR by rate, monotone
+  rate ladder), and the same packets decoded by the **RFC 6716 §A
+  reference-listing decoder** (RFC 8251-patched, hash-verified
+  extraction) agree with our decoder at **88–101 dB / max 1 LSB** —
+  the two decoders reconstruct our streams identically to the
+  float-noise floor.
+
 - **CELT encoder primitives** (round 418): the §4.3.2.1 Laplace
   *encoder* (`ec_laplace_encode`, the exact write-side mirror of the
   decoder including the flat-tail value clamp), the §4.3.4.2 PVQ

@@ -700,6 +700,8 @@ impl std::error::Error for Error {}
 // it; those modules are `#[doc(hidden)]` and NOT part of the stable API
 // surface for semver purposes.
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod celt_alloc_encode;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_alloc_search;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_alloc_trim;
@@ -709,6 +711,8 @@ pub mod celt_analysis;
 pub mod celt_band_boost;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_band_decode;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod celt_band_encode;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_band_layout;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
@@ -726,9 +730,13 @@ pub mod celt_denormalise;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_e_prob_model;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod celt_energy_encode;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_fine_energy;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_frame_decode;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod celt_frame_encode;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_frame_prefix;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
@@ -745,6 +753,8 @@ pub mod celt_mdct_synthesis;
 pub mod celt_mdct_window;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_overlap_add;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod celt_packet_encode;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_post_filter;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
