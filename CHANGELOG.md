@@ -4,6 +4,63 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.14](https://github.com/OxideAV/oxideav-opus/compare/v0.0.13...v0.0.14) - 2026-07-19
+
+### Fixed
+
+- fix §4.3.5 anti-collapse energy references to start at the energy floor
+- fix §3.2.5 frame-count byte to the Figure-5 MSB-first wire layout
+- fix the §4.3.3 band-boost budget gate to the shrinking budget; de-bypass the module
+- fix celt_frame_prefix octave to the Table-56 uniform(6) symbol
+
+### Other
+
+- celt_encode_roundtrip target + adversarial pre-hardening
+- round-418 encoder-arc status (CELT-mode + Hybrid encode, dual-decoder validation, multistream re-anchor)
+- CELT encoder: the listing's §5.3.4 spreading decision
+- gate against the re-anchored reference-listing decode
+- Hybrid (SILK low band + CELT high band) packet encode
+- CELT-mode packet encode, end to end — validated through both decoders
+- CELT analysis front end: §5.3 pre-emphasis, forward MDCT, band energies, transient detector
+- CELT encode primitives: §4.3.2.1 Laplace encoder, §4.3.4.2 PVQ index construction + §5.3.4 pulse search, fixed-size §5.1.5 finalization
+- drop stale §4.3.3/§4.3.5 blocker note; describe the §4.2.9 resampler as the reference fixed-point transcription in the crate docs
+- SILK decode to reference-exact fixed point (RFC 6716 §A listing + RFC 8251)
+- doc(hidden) the internal SILK/CELT plumbing surface
+- FIX §4.1.2.1: keep Hybrid SILK audio on a legal bit-budget overread + §3.2 packing waveform gates
+- whole-stream + Hybrid-segment waveform gates (~82 dB)
+- SILK waveform-validated status (upsampler calibration + gates)
+- SILK waveform regression gates vs the fixture reference decodes
+- §4.2.9 SilkUpsampler (delay-calibrated polyphase resampler) + §4.2.8 mono one-sample delay fix
+- §4.5 mode-switching fixture suite + README status refresh
+- §4.5 transition machinery: redundant CELT frame synthesis + cross-lap
+- §4.4 packet-loss concealment: conceal_loss with per-mode extrapolation
+- document the end-to-end CELT-only + hybrid decode paths
+- hybrid (SILK+CELT) frame assembly
+- end-to-end CELT-only frame decode, validated at ~100 dB against reference decodes
+- §4.3.4 band decode + §4.3.5 anti-collapse port
+- §4.3.3 implicit allocation (decode) — interpolated bits-to-pulses port
+- fix §4.3.4.1 pulse-cache index to the LM-major mapping; expose range_size()
+- document the r391 encoder matrix + streaming-decoder carry
+- silk encoder: 10 ms (2-subframe) packets from PCM
+- appease same_item_push in pad_packet_to chain writer
+- exact-size §3.2.5 CBR padding + encoder CBR mode
+- silk encoder: LBRR (in-band FEC) from PCM for mono + stereo
+- silk encoder: stereo 40/60 ms multi-frame packets from PCM
+- silk encoder: 40/60 ms multi-frame packets from PCM + signal-derived VAD
+- carry §4.2.7.4 gain-clamp base + §4.2.7.5.5 NLSF n0 across Opus frames
+- add CI / crates.io / docs.rs / MIT-license badges
+- fix §4.2.7.6.1/§4.2.7.4/§4.2.7.5.5 carried-state rules after non-voiced and uncoded frames
+- document the §5.2.3 SILK signal-analysis encoder + find_poly decode fix
+- SilkEncoderStereo — analysed stereo packets via §5.2.2 mixing + mid-only escape
+- SilkEncoderMono — analysed PCM → SILK packets, decoder-verified end-to-end
+- closed-loop excitation quantiser (§5.2.3.8 role) with LCG-aware pulse rounding
+- §5.2.3.6 LTP analysis — exact-distortion codebook quantisation
+- §5.2.3.2 pitch analysis + §4.2.7.6.1 lag/contour quantisation
+- §5.2.3.5 NLSF quantizer — analysis NLSF to (I1, I2[]) wire indices
+- analysis-direction LPC → normalized-LSF conversion
+- fix dropped §4.2.7.5.6 symmetric-mirror boundary condition in find_poly
+- §5.2.3.4.2.1 Burg's-method LPC analysis front end
+
 - **CELT-encoder fuzz target** (`fuzz/celt_encode_roundtrip`):
   coverage-guided config × payload × PCM exploration asserting every
   produced packet decodes cleanly through the streaming decoder with
