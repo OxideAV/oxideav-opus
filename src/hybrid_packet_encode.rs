@@ -37,6 +37,11 @@ use crate::Error;
 /// §3.2 maximum Opus frame payload.
 const MAX_FRAME_BYTES: usize = 1275;
 
+/// Minimum CELT-layer tail (bytes past the coded SILK layer) that
+/// [`HybridEncoderMono::encode_packet_elected`] guarantees, so the
+/// §4.3 layer always has a working budget for its gated symbols.
+pub const HYBRID_MIN_CELT_TAIL_BYTES: usize = 12;
+
 /// Decimator FIR half-width at 48 kHz: 165 taps → 82-sample group
 /// delay (see the module docs' alignment budget).
 const DECIM_TAPS: usize = 165;
@@ -176,6 +181,51 @@ impl HybridEncoderMono {
         if !(2..=MAX_FRAME_BYTES).contains(&payload_bytes) {
             return Err(Error::MalformedPacket);
         }
+        let (toc, re) = self.encode_silk_layer(pcm)?;
+        // The SILK layer has no rate control (its quantizer targets a
+        // fixed quality); when it alone exceeds the payload budget the
+        // packet cannot be emitted. The analysis state has already
+        // advanced (as with the SILK CBR helper), so pick payloads
+        // with headroom for the configured content.
+        if re.tell() > payload_bytes as u32 * 8 {
+            return Err(Error::MalformedPacket);
+        }
+        self.finish_with_celt(pcm, toc, re, payload_bytes)
+    }
+
+    /// Encode one packet with a VBR-elected payload size, raising the
+    /// election to the SILK-layer floor when the elected size cannot
+    /// carry the coded SILK frame plus a working CELT tail.
+    ///
+    /// The §4.2 SILK layer is coded first at its natural (quality-
+    /// driven) size; `elected_payload_bytes` is then honoured when it
+    /// leaves room, and otherwise raised to
+    /// `ceil(silk_bits / 8) + HYBRID_MIN_CELT_TAIL_BYTES` (capped at
+    /// the §3.2.1 1275-byte frame limit — a SILK frame that busts even
+    /// that is rejected). Returns the finished packet; its length is
+    /// `1 + actual_payload` where `actual_payload >= 2`.
+    pub fn encode_packet_elected(
+        &mut self,
+        pcm: &[i16],
+        elected_payload_bytes: usize,
+    ) -> Result<Vec<u8>, Error> {
+        if pcm.len() != self.n {
+            return Err(Error::MalformedPacket);
+        }
+        let (toc, re) = self.encode_silk_layer(pcm)?;
+        let silk_bytes = (re.tell() as usize).div_ceil(8);
+        let floor = silk_bytes + HYBRID_MIN_CELT_TAIL_BYTES;
+        if floor > MAX_FRAME_BYTES {
+            return Err(Error::MalformedPacket);
+        }
+        let payload_bytes = elected_payload_bytes.clamp(floor, MAX_FRAME_BYTES);
+        self.finish_with_celt(pcm, toc, re, payload_bytes)
+    }
+
+    /// Phase 1: the §4.2 SILK layer (decimate to the WB internal rate
+    /// and encode one SILK frame — a Hybrid frame carries exactly one)
+    /// on a fresh range coder. Independent of the final payload size.
+    fn encode_silk_layer(&mut self, pcm: &[i16]) -> Result<(u8, RangeEncoder), Error> {
         let toc = OpusTocByte::compose_byte(
             Mode::Hybrid,
             self.bandwidth,
@@ -183,11 +233,7 @@ impl HybridEncoderMono {
             false,
             FrameCountCode::One,
         )?;
-        let total_bits = payload_bytes as u32 * 8;
         let mut re = RangeEncoder::new();
-
-        // §4.2 SILK layer: decimate to the WB internal rate and encode
-        // one SILK frame (a Hybrid frame carries exactly one).
         let pcm48: Vec<f64> = pcm.iter().map(|&v| f64::from(v)).collect();
         let pcm16 = self.decim.process(&pcm48);
         let analyzed = self
@@ -218,23 +264,25 @@ impl HybridEncoderMono {
             stereo: None,
         };
         let _decoded = encode_silk_frame(&mut re, cfg, &analyzed.symbols())?;
+        Ok((toc, re))
+    }
 
-        // §4.5.1.1: the explicit Hybrid redundancy flag, signalled off
-        // (only coded when the 37-bit window is open, mirroring the
-        // decoder's gate).
-        // The SILK layer has no rate control (its quantizer targets a
-        // fixed quality); when it alone exceeds the payload budget the
-        // packet cannot be emitted. The analysis state has already
-        // advanced (as with the SILK CBR helper), so pick payloads
-        // with headroom for the configured content.
-        if re.tell() > total_bits {
-            return Err(Error::MalformedPacket);
-        }
+    /// Phase 2: the §4.5.1.1 redundancy flag (signalled off — only
+    /// coded when the 37-bit window is open, mirroring the decoder's
+    /// gate) and the §4.3 CELT layer (bands 17..) on the same coder,
+    /// finalized to exactly `payload_bytes` bytes.
+    fn finish_with_celt(
+        &mut self,
+        pcm: &[i16],
+        toc: u8,
+        mut re: RangeEncoder,
+        payload_bytes: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let total_bits = payload_bytes as u32 * 8;
+        debug_assert!(re.tell() <= total_bits, "SILK layer over budget");
         if total_bits.saturating_sub(re.tell()) >= HYBRID_REDUNDANCY_MIN_REMAINING_BITS {
             re.enc_icdf(0, &REDUNDANCY_FLAG_ICDF, REDUNDANCY_FLAG_ICDF_FTB);
         }
-
-        // §4.3 CELT layer: bands 17.. on the same coder.
         let _info = encode_celt_frame(
             &mut self.celt,
             &mut re,

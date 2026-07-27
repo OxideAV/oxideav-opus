@@ -135,3 +135,55 @@ fn hybrid_rejects_busted_budget() {
         .collect();
     assert!(enc.encode_packet(&pcm, 20).is_err());
 }
+
+#[test]
+fn hybrid_elected_payload_honours_roomy_elections_exactly() {
+    // When the election leaves room past the SILK floor, the packet
+    // is exactly the elected size and decodes as Hybrid.
+    let mut enc = HybridEncoderMono::new(Bandwidth::Fb, 200).unwrap();
+    let spf = enc.frame_samples();
+    let mut dec = OpusDecoder::new();
+    for f in 0..10 {
+        let pcm: Vec<i16> = (0..spf)
+            .map(|j| sig(f * spf + j).round().clamp(-32768.0, 32767.0) as i16)
+            .collect();
+        let packet = enc.encode_packet_elected(&pcm, 400).expect("encode");
+        assert_eq!(packet.len(), 401, "roomy election must be exact");
+        let out = dec.decode_packet(&packet).expect("decode");
+        assert_eq!(out.samples_per_channel(), spf);
+        assert_eq!(
+            out.frame_outcomes[0].status,
+            FrameDecodeStatus::HybridDecoded
+        );
+    }
+}
+
+#[test]
+fn hybrid_elected_payload_raises_starving_elections_to_the_floor() {
+    // A 2-byte election cannot carry the SILK layer: the size is
+    // raised to the floor instead of erroring, and every raised
+    // packet still decodes as Hybrid with the exact sample count —
+    // across all four Hybrid configs (SWB/FB × 10/20 ms).
+    for bw in [Bandwidth::Swb, Bandwidth::Fb] {
+        for tenths in [100u16, 200] {
+            let mut enc = HybridEncoderMono::new(bw, tenths).unwrap();
+            let spf = enc.frame_samples();
+            let mut dec = OpusDecoder::new();
+            for f in 0..10 {
+                let pcm: Vec<i16> = (0..spf)
+                    .map(|j| sig(f * spf + j).round().clamp(-32768.0, 32767.0) as i16)
+                    .collect();
+                let packet = enc.encode_packet_elected(&pcm, 2).expect("floor raise");
+                assert!(packet.len() > 3, "floor packet is SILK-sized");
+                assert!(packet.len() <= 1276);
+                let out = dec.decode_packet(&packet).expect("decode");
+                assert_eq!(out.samples_per_channel(), spf);
+                assert_eq!(
+                    out.frame_outcomes[0].status,
+                    FrameDecodeStatus::HybridDecoded,
+                    "bw {bw:?} tenths {tenths} frame {f}"
+                );
+            }
+        }
+    }
+}
