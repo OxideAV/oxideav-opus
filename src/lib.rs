@@ -861,6 +861,8 @@ pub mod silk_stereo;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_synthesis;
 pub mod toc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod vbr;
 
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_alloc_search::{

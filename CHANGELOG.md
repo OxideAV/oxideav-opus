@@ -4,6 +4,47 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Opus-level VBR** (round 431): `vbr::VbrRateControl` — per-frame
+  packet-size election under a target-bitrate drift controller
+  (RFC 6716 §2.1.8 / §3.2.1). Unconstrained mode elects
+  `target − drift (+ content bias)` with the drift clamped to ±one
+  frame's target (a long silence cannot bank an unbounded spending
+  spree); constrained mode adds the §2.1.8 "simulates a bit
+  reservoir" discipline — spend above target only what earlier
+  below-target packets actually banked, bank capped at a documented
+  default of 100 ms of target bitrate (the RFC specifies the
+  reservoir concept, not a bound), giving the provable window bound
+  `n·target + cap` for every window of n packets. On top:
+  `vbr::CeltVbrEncoder` (full config matrix — NB/WB/SWB/FB ×
+  2.5/5/10/20 ms × mono/stereo; digital-silence frames collapse to
+  3-byte packets, a PCM-domain transient pre-detector grants a +25%
+  boost the drift later repays) and `vbr::HybridVbrEncoderMono`
+  (configs 12–15; the election rides `encode_packet_elected`, SILK
+  floor raises feed back into the drift). The SILK-only arm's VBR is
+  its natural quality-driven emission (§2.1.8: the LP layer is
+  inherently VBR); election around a target there needs SILK-layer
+  rate control, which remains an open frontier. Integration gates
+  (`tests/vbr_encode_roundtrip.rs`): realized average within 2–5% of
+  target on every arm/LM, exact packet/frame/sample accounting,
+  silence collapse + bounded post-silence spend + reconvergence,
+  transient boosts firing and repaid, the constrained per-window
+  bound holding under adversarial bias, VBR ≥ CBR − 0.7 dB at
+  matched average rate on steady content, and VBR > CBR + 1 dB on
+  mixed tone/silence content at equal total bytes (measured +3.3 dB).
+
+- **Hybrid elected-payload encode** (round 431):
+  `HybridEncoderMono::encode_packet_elected(pcm, elected)` — the VBR
+  entry point. The §4.2 SILK layer (quality-driven, no rate control)
+  is coded first on a fresh range coder; the election is then
+  honoured when it leaves room and otherwise raised to the SILK floor
+  (`ceil(silk_bits/8) + HYBRID_MIN_CELT_TAIL_BYTES`, capped at the
+  §3.2.1 1275-byte frame limit) before the §4.5.1.1 redundancy flag
+  and the §4.3 CELT tail land on the same coder. `encode_packet`
+  (CBR) is re-expressed over the same two phases with identical
+  behaviour. Floor raises are pinned across all four Hybrid configs
+  (SWB/FB × 10/20 ms): a 2-byte election still yields packets that
+  decode as `HybridDecoded` with exact sample counts.
+
 - **`OpusHead` payload-magic registration** (round 431): `register(ctx)`
   now declares the `opus` codec id via
   `CodecInfo::payload_magic(b"OpusHead")` (core 0.1.33), so container
