@@ -324,6 +324,13 @@ Per-stage progress lives in `CHANGELOG.md`.
 - `apply_output_gain` / `PreSkip` — the §5.1 post-decode output-gain
   application (Q7.8 dB, i16-saturating) and the cross-packet pre-skip
   accumulator.
+- `register(ctx)` — the framework registration declares the `opus`
+  codec id with its RFC 7845 §5.1 payload magic (`OpusHead`), so
+  container layers without a codec tag resolve an Opus logical stream
+  from its first payload bytes
+  (`CodecRegistry::resolve_payload_magic_ref`); `OpusTags` and every
+  truncation of the magic are refused by construction (pinned in
+  `tests/registry_resolution.rs`).
 
 **Range coder (RFC 6716 §4.1 / §5.1):** `RangeDecoder` — the shared
 entropy primitive consumed by both layers, including the §4.1.2

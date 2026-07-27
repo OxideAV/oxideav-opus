@@ -1108,9 +1108,38 @@ pub use silk_stereo::{
 };
 pub use toc::{Bandwidth, ChannelMapping, FrameCountCode, Mode, OpusTocByte};
 
-/// No-op codec registration — the orphan-rebuild scaffold registers
-/// nothing into the runtime context until decode / encode paths are
-/// wired up.
-pub fn register(_ctx: &mut RuntimeContext) {}
+/// Codec registration: declares the `opus` codec id together with its
+/// payload-magic claim.
+///
+/// Some carriage formats announce the codec not with a container-level
+/// tag but by the leading bytes of the payload itself — for Opus that
+/// is the fixed 8-octet `OpusHead` signature opening the RFC 7845 §5.1
+/// identification header (the first packet of an Ogg logical stream).
+/// Declaring [`opus_head::OPUS_HEAD_MAGIC`] via
+/// [`oxideav_core::registry::CodecInfo::payload_magic`] lets container
+/// layers resolve such a stream to `opus` through
+/// `CodecRegistry::resolve_payload_magic_ref` / the
+/// [`oxideav_core::CodecResolver`] trait. The prefix is 8 bytes long,
+/// so truncations (`"Opus"`, `"OpusHea"`) and the sibling comment
+/// header signature (`"OpusTags"`, RFC 7845 §5.2) do not resolve.
+///
+/// Registry-level decoder/encoder factories are not wired yet — the
+/// crate's working entry points are the direct APIs
+/// ([`decoder::OpusDecoder`], [`multistream::MultistreamDecoder`], and
+/// the packet encoders) — so this registration carries capability
+/// metadata and the magic claim only (a tag-only registration in
+/// registry terms).
+pub fn register(ctx: &mut RuntimeContext) {
+    let mut caps = oxideav_core::CodecCapabilities::audio("opus_sw");
+    caps.lossy = true;
+    caps.max_sample_rate = Some(48_000);
+    // RFC 7845 §5.1.1 channel mapping: up to 255 output channels.
+    caps.max_channels = Some(255);
+    ctx.codecs.register(
+        oxideav_core::CodecInfo::new(oxideav_core::CodecId::new("opus"))
+            .capabilities(caps)
+            .payload_magic(opus_head::OPUS_HEAD_MAGIC.as_slice()),
+    );
+}
 
 oxideav_core::register!("opus", register);

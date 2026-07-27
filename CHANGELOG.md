@@ -4,6 +4,19 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **`OpusHead` payload-magic registration** (round 431): `register(ctx)`
+  now declares the `opus` codec id via
+  `CodecInfo::payload_magic(b"OpusHead")` (core 0.1.33), so container
+  layers with no codec tag resolve an Opus logical stream from the
+  fixed 8-octet RFC 7845 §5.1 identification-header signature.
+  Capability metadata (lossy audio, 48 kHz, up to 255 mapped output
+  channels per §5.1.1) rides along. `tests/registry_resolution.rs`
+  pins the positive resolutions (full §5.1 header, exact-length magic,
+  the `CodecResolver` dyn surface) and the refusals: the RFC 7845 §5.2
+  `OpusTags` comment header, every proper truncation of the magic
+  (7 bytes down to empty), a corrupted final octet, and unrelated
+  payloads.
+
 - **CELT-encoder fuzz target** (`fuzz/celt_encode_roundtrip`):
   coverage-guided config × payload × PCM exploration asserting every
   produced packet decodes cleanly through the streaming decoder with
