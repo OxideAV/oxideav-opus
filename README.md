@@ -206,13 +206,36 @@ exactly equal the CELT path's 120-sample MDCT-overlap delay; an
 empirical best-lag search returns 120). Hybrid streams decode
 through both decoders as well (the listing decoder agrees with ours
 at 105–108 dB). The SILK layer has no rate control yet, so a payload
-it alone would overflow is rejected cleanly; CELT-mode VBR, stereo
-hybrid, tf analysis, and the encoder-side pitch pre-filter remain
-open.
+it alone would overflow is rejected cleanly.
+
+Round 431 adds **Opus-level VBR** (RFC 6716 §2.1.8 / §3.2.1):
+`vbr::VbrRateControl` elects every code-0 packet's size against a
+target bitrate — unconstrained mode corrects by the accumulated drift
+(clamped to ±one frame's target, so silence cannot bank an unbounded
+spree), constrained mode adds the §2.1.8 bit-reservoir simulation
+(spend above target only what below-target packets banked; bank
+capped at a documented 100 ms default, giving the provable
+`n·target + cap` bound on every n-packet window). `CeltVbrEncoder`
+covers the full CELT matrix with 3-byte digital-silence collapse and
+a transient pre-detect boost the drift repays; `HybridVbrEncoderMono`
+rides the new `encode_packet_elected` (SILK floor raises feed the
+drift); the SILK-only arm's natural quality-driven emission is
+already VBR per §2.1.8 (a 21% transport saving over CBR padding at
+bit-identical decode) but electing it against a target needs
+SILK-layer rate control, which remains open. Realized averages land
+within 2–5% of target on every arm and frame size; at matched
+average rate VBR ≥ CBR on steady content and beats CBR by ~3.3 dB on
+mixed tone/silence content at equal total bytes. A 15-stream VBR
+corpus (CELT NB/WB/SWB/FB × 2.5–20 ms × mono/stereo ×
+constrained/unconstrained + all four Hybrid configs) decodes through
+the §A reference-listing decoder with exact packet and sample counts,
+agreeing with our decoder at 90–107 dB (max 1 LSB). Stereo hybrid,
+tf analysis, and the encoder-side pitch pre-filter remain open.
 
 Differential encoder/decoder testing and a restored cargo-fuzz suite
-(4 coverage-guided targets, incl. an encoder↔decoder range-coder
-roundtrip) have also hardened the decoder: five mis-transcribed rows
+(6 coverage-guided targets, incl. an encoder↔decoder range-coder
+roundtrip and the CELT / VBR encode→decode harnesses) have also
+hardened the decoder: five mis-transcribed rows
 in the §4.2.7.8.3 split tables (now verified cell-by-cell against the
 RFC across all 64 rows), a `dec_bits(32)` shift overflow, a
 §4.2.7.5.8 recurrence i64 overflow on adversarial input, and the
@@ -237,10 +260,11 @@ under the §4.2.7.4 packet-loss latitude.
 
 The crate ships a large, individually unit-tested set of SILK and
 CELT building blocks plus a complete RFC 7845 multistream /
-multichannel decode subsystem (1460+ lib tests + SILK-fixture,
+multichannel decode subsystem (1440+ lib tests + SILK-fixture,
 multistream (incl. the 5.1 reference-listing gate), FEC, CELT
-synthesis-backend, CELT-encode and Hybrid-encode integration suites).
-Per-stage progress lives in `CHANGELOG.md`.
+synthesis-backend, CELT-encode, Hybrid-encode, VBR, and
+registry-resolution integration suites). Per-stage progress lives in
+`CHANGELOG.md`.
 
 ## What works
 
@@ -449,9 +473,21 @@ detector), `celt_energy_encode` (two-pass coarse + fine + finalise),
 §4.3.2.1 Laplace encoder, and `RangeEncoder::finish_fixed` (the
 fixed-size §5.1.5 finalization) — plus `HybridEncoderMono`
 (`hybrid_packet_encode`): the WB SILK layer and CELT bands 17.. on
-one range coder with delay-matched layer alignment. Validated
-through the crate's own decoder and the §A reference-listing decoder
-(88–108 dB agreement between the two decoders on our streams).
+one range coder with delay-matched layer alignment, now including
+`encode_packet_elected` (elected payload with SILK-floor raise).
+Validated through the crate's own decoder and the §A
+reference-listing decoder (88–108 dB agreement between the two
+decoders on our streams).
+
+**Opus-level VBR (RFC 6716 §2.1.8 / §3.2.1):** `vbr::VbrRateControl`
+— the per-frame size election under a target-bitrate drift
+controller, with the constrained-VBR bit-reservoir discipline
+(`elect_packet_bytes` / `commit` / `constrained_ceiling_bits`) — and
+its mode arms `vbr::CeltVbrEncoder` (silence collapse, transient
+boost) and `vbr::HybridVbrEncoderMono` (floor-raise feedback).
+Gated by `tests/vbr_encode_roundtrip.rs` (rate tracking, parity vs
+CBR, the constrained window bound under adversarial bias, exact
+frame accounting) and the `vbr_encode_roundtrip` fuzz target.
 
 ## Clean-room sources
 
