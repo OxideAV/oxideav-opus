@@ -4,6 +4,20 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **VBR-election fuzz target** (`fuzz/vbr_encode_roundtrip`, round
+  431): coverage-guided config × target-bitrate × constrained-flag ×
+  PCM exploration asserting every elected packet decodes cleanly
+  through the streaming decoder with the exact sample count, sizes
+  stay inside the §3.2.1 limits, and constrained-mode packets never
+  outrun the controller's pre-encode reservoir ceiling. Pre-hardened
+  locally (600 s, ~230k runs across the config/bitrate surface,
+  clean). The 15-stream VBR validation
+  corpus (CELT NB/WB/SWB/FB × 2.5–20 ms × mono/stereo ×
+  constrained/unconstrained + all four Hybrid configs) also decodes
+  through the §A reference-listing decoder (RFC 8251-patched,
+  hash-verified extraction) with exact packet/sample counts at
+  90–107 dB agreement with our decoder (max 1 LSB).
+
 - **Opus-level VBR** (round 431): `vbr::VbrRateControl` — per-frame
   packet-size election under a target-bitrate drift controller
   (RFC 6716 §2.1.8 / §3.2.1). Unconstrained mode elects
