@@ -265,9 +265,16 @@ per-band Haar-level L1 metric + budget-λ Viterbi smoothing;
 tf-flagged oracle streams agreeing at 93–99 dB). A new
 `silk_elected_roundtrip` fuzz target hardened the election against
 adversarial content (a §3.2.1 writer overflow at a generous starting
-quality now steps the knob down instead of erroring). The
-encoder-side §5.3.1 pitch pre-filter (postfilter params are still
-signalled off) remains the one open encoder item.
+quality now steps the knob down instead of erroring). Finally, the
+**§5.3.1 pitch pre-filter** is real: the listing's pitch estimator
+(`pitch_downsample` / `pitch_search` / `remove_doubling` with the
+sub-multiple confirmation walk) drives the §4.3.7.1 comb applied as
+the decoder post-filter's inverse, with the full decision ladder and
+octave/period/gain/tapset parameter coding — on voice-like periodic
+content it fires on every frame at the exact true period, buys
++1.0–1.3 dB at equal rate over the pf-off encoder, stays off on
+noise, and the coded streams agree with the reference-listing
+decoder at 81 dB (max 1 LSB). No encoder-arc item remains open.
 
 Differential encoder/decoder testing and a restored cargo-fuzz suite
 (6 coverage-guided targets, incl. an encoder↔decoder range-coder
@@ -546,6 +553,16 @@ listing's per-band Haar-level L1 sparsity metric (`haar1` /
 Viterbi flip-cost smoothing against the Table 60/62 targets;
 `encode_celt_frame` codes the analysed `tf_change` flags
 (`tf_select` stays 0, coded only when the tables diverge).
+
+**CELT §5.3.1 pitch pre-filter:** `celt_prefilter` — the listing's
+pitch estimator (`pitch_downsample` / `pitch_search` /
+`remove_doubling`) and the §4.3.7.1 `comb_filter` in the encoder
+direction (negated gains, crossfaded transitions), driven by the
+listing's decision ladder in `encode_celt_frame` with the
+octave / fine-period / 3-bit-gain / tapset parameter coding;
+`CeltAnalysis` carries the 1024-sample unfiltered comb lookback via
+the two-phase `pre_emphasize` / `finish_frame` API. Hybrid frames
+never run it (the decoder's `start == 0` gate).
 
 ## Clean-room sources
 
