@@ -41,6 +41,9 @@ const ENERGY_FLOOR: f64 = -28.0;
 /// Trim ICDF (Table 58).
 const TRIM_ICDF: [u8; 11] = [126, 124, 119, 109, 87, 41, 19, 9, 4, 2, 0];
 
+/// ICDF for the §4.3.7.1 post-filter tapset `{2, 1, 1}/4`.
+const TAPSET_ICDF: [u8; 3] = [2, 1, 0];
+
 /// Cross-frame CELT encoder state.
 #[derive(Debug, Clone)]
 pub struct CeltEncoderState {
@@ -61,12 +64,18 @@ pub struct CeltEncoderState {
     pub tonal_average: i32,
     /// Previous frame's coded spread decision (hysteresis input).
     pub spread_decision: u8,
+    /// §5.3.1 pre-filter carried period (previous frame's decision).
+    pub prefilter_period: usize,
+    /// §5.3.1 pre-filter carried gain.
+    pub prefilter_gain: f64,
+    /// §5.3.1 pre-filter carried tapset.
+    pub prefilter_tapset: u8,
     channels: usize,
     n: usize,
 }
 
 /// Reported outcome of one frame encode (diagnostics for tests).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CeltFrameEncodeInfo {
     /// The coded silence flag.
     pub silence: bool,
@@ -76,6 +85,13 @@ pub struct CeltFrameEncodeInfo {
     pub intra: bool,
     /// Coded band count from the allocation.
     pub coded_bands: usize,
+    /// Whether the §5.3.1 pitch pre-filter fired (post-filter
+    /// parameters coded on).
+    pub postfilter_on: bool,
+    /// The coded §4.3.7.1 period when the pre-filter fired.
+    pub postfilter_period: usize,
+    /// The coded (dequantized) §4.3.7.1 gain when it fired.
+    pub postfilter_gain: f64,
 }
 
 impl CeltEncoderState {
@@ -92,6 +108,9 @@ impl CeltEncoderState {
             force_intra: true,
             tonal_average: 256,
             spread_decision: 2,
+            prefilter_period: crate::celt_prefilter::COMBFILTER_MINPERIOD,
+            prefilter_gain: 0.0,
+            prefilter_tapset: 0,
             channels,
             n,
         }
@@ -119,6 +138,9 @@ impl CeltEncoderState {
         self.force_intra = true;
         self.tonal_average = 256;
         self.spread_decision = 2;
+        self.prefilter_period = crate::celt_prefilter::COMBFILTER_MINPERIOD;
+        self.prefilter_gain = 0.0;
+        self.prefilter_tapset = 0;
     }
 }
 
@@ -150,16 +172,31 @@ pub fn encode_celt_frame(
     let nb_available_bytes = frame_bytes as i64 - nb_filled_bytes;
     let effective_bytes = nb_available_bytes;
 
-    // Pre-emphasis + input buffering (also detects digital silence).
-    let frame = state.analysis.process_frame(pcm);
+    // Pre-emphasis (also detects digital silence); the frame is
+    // committed below once the §5.3.1 pre-filter decision is known.
+    let pre = state.analysis.pre_emphasize(pcm);
 
-    let silence = frame.silence && tell == 1;
+    let silence = pre.silence && tell == 1;
     if tell == 1 {
         enc.enc_bit_logp(silence, 15);
     }
     if silence {
         // Every remaining gate fails on the decoder side; mirror its
-        // energy-state roll (finish_energy_state with silence).
+        // energy-state roll (finish_energy_state with silence), and
+        // commit the analysis frame with the pre-filter ramping to
+        // off (the decoder's post-filter state does the same).
+        let _ = state.analysis.finish_frame(
+            &pre,
+            crate::celt_analysis::CombTransition {
+                t0: state.prefilter_period,
+                t1: state.prefilter_period,
+                g0: -state.prefilter_gain,
+                g1: 0.0,
+                tapset0: state.prefilter_tapset,
+                tapset1: state.prefilter_tapset,
+            },
+        );
+        state.prefilter_gain = 0.0;
         for ch in 0..2 {
             for i in 0..CELT_NUM_BANDS {
                 state.old_band_e[ch][i] = ENERGY_FLOOR;
@@ -172,15 +209,102 @@ pub fn encode_celt_frame(
             transient: false,
             intra: false,
             coded_bands: 0,
+            postfilter_on: false,
+            postfilter_period: 0,
+            postfilter_gain: 0.0,
         };
     }
     tell = i64::from(enc.tell());
 
-    // §4.3.7.1 post-filter: signalled off.
-    if start == 0 && tell + 16 <= total_bits {
-        enc.enc_bit_logp(false, 1);
-        tell = i64::from(enc.tell());
+    // §5.3.1 pitch pre-filter analysis (CELT-only frames with a
+    // workable budget; the Hybrid arm's SILK layer owns the low band,
+    // so `start != 0` never runs it — matching the decoder's gate).
+    let maxp = crate::celt_prefilter::COMBFILTER_MAXPERIOD;
+    let mut pitch_index = crate::celt_prefilter::COMBFILTER_MINPERIOD;
+    let mut gain1 = 0.0f64;
+    let prefilter_tapset = 0u8; // encoder choice (no HF-tonality input yet)
+    if nb_available_bytes > 12 * channels as i64 && start == 0 {
+        let chans: Vec<&[f64]> = (0..channels)
+            .map(|c| &pre.pre[c * (maxp + n)..(c + 1) * (maxp + n)])
+            .collect();
+        let a = crate::celt_prefilter::prefilter_analysis(
+            &chans,
+            n,
+            state.prefilter_period,
+            state.prefilter_gain,
+        );
+        pitch_index = a.pitch_index;
+        gain1 = a.gain;
     }
+
+    // Gain threshold for enabling the pre-filter (rate/continuity
+    // adjusted, hard floor 0.2 — the listing's ladder).
+    let mut pf_threshold = 0.2f64;
+    if (pitch_index as i64 - state.prefilter_period as i64).abs() * 10 > pitch_index as i64 {
+        pf_threshold += 0.2;
+    }
+    if nb_available_bytes < 25 {
+        pf_threshold += 0.1;
+    }
+    if nb_available_bytes < 35 {
+        pf_threshold += 0.1;
+    }
+    if state.prefilter_gain > 0.4 {
+        pf_threshold -= 0.1;
+    }
+    if state.prefilter_gain > 0.55 {
+        pf_threshold -= 0.1;
+    }
+    pf_threshold = pf_threshold.max(0.2);
+
+    let mut coded_tapset = prefilter_tapset;
+    let mut pf_on = false;
+    if gain1 < pf_threshold {
+        // §4.3.7.1 post-filter: signalled off.
+        if start == 0 && tell + 16 <= total_bits {
+            enc.enc_bit_logp(false, 1);
+        }
+        gain1 = 0.0;
+        pitch_index = state.prefilter_period;
+    } else {
+        // Continuity: reuse the previous gain when close.
+        if (gain1 - state.prefilter_gain).abs() < 0.1 {
+            gain1 = state.prefilter_gain;
+        }
+        let qg = ((0.5 + gain1 * 32.0 / 3.0).floor() as i32 - 1).clamp(0, 7) as u32;
+        enc.enc_bit_logp(true, 1);
+        let pi = (pitch_index + 1) as u32;
+        let octave = (31 - pi.leading_zeros()).saturating_sub(4);
+        enc.enc_uint(octave, 6);
+        enc.enc_bits(pi - (16 << octave), 4 + octave);
+        enc.enc_bits(qg, 3);
+        if i64::from(enc.tell()) + 2 <= total_bits {
+            enc.enc_icdf(usize::from(prefilter_tapset), &TAPSET_ICDF, 2);
+        } else {
+            coded_tapset = 0;
+        }
+        gain1 = 0.09375 * f64::from(qg + 1);
+        pf_on = true;
+    }
+    tell = i64::from(enc.tell());
+
+    // Commit the analysis frame through the §5.3.1 comb (negated
+    // gains: the decoder's post-filter is the inverse), crossfading
+    // from the previous frame's parameters.
+    let frame = state.analysis.finish_frame(
+        &pre,
+        crate::celt_analysis::CombTransition {
+            t0: state.prefilter_period,
+            t1: pitch_index,
+            g0: -state.prefilter_gain,
+            g1: -gain1,
+            tapset0: state.prefilter_tapset,
+            tapset1: coded_tapset,
+        },
+    );
+    state.prefilter_period = pitch_index;
+    state.prefilter_gain = gain1;
+    state.prefilter_tapset = coded_tapset;
 
     // Transient analysis + flag.
     let mut transient = false;
@@ -473,6 +597,9 @@ pub fn encode_celt_frame(
         transient,
         intra,
         coded_bands: alloc.coded_bands,
+        postfilter_on: pf_on,
+        postfilter_period: if pf_on { pitch_index } else { 0 },
+        postfilter_gain: if pf_on { gain1 } else { 0.0 },
     }
 }
 

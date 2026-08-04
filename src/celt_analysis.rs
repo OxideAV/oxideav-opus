@@ -40,16 +40,69 @@ pub const PREEMPH_COEF: f64 = 27853.0 / 32768.0;
 const LOG_E_FLOOR: f64 = -14.0;
 
 /// Streaming pre-emphasis + MDCT input buffering for one CELT encoder
-/// (per-channel §4.3.7 overlap history and §5.3 emphasis memory).
+/// (per-channel §4.3.7 overlap history, §5.3 emphasis memory, and the
+/// §5.3.1 pre-filter's unfiltered lookback).
 #[derive(Debug, Clone)]
 pub struct CeltAnalysis {
     channels: usize,
     n: usize,
-    /// Per-channel trailing `overlap` pre-emphasized samples of the
-    /// previous frame (`in_mem`).
+    /// Per-channel trailing `overlap` PREFILTERED pre-emphasized
+    /// samples of the previous frame (`in_mem`; identical to the
+    /// unfiltered tail when the pre-filter is off).
     in_mem: Vec<f64>,
     /// Per-channel §5.3 pre-emphasis memory.
     preemph_mem: [f64; 2],
+    /// Per-channel UNFILTERED pre-emphasized lookback for the §5.3.1
+    /// pre-filter comb (`prefilter_mem`,
+    /// [`crate::celt_prefilter::COMBFILTER_MAXPERIOD`] samples).
+    prefilter_mem: Vec<f64>,
+}
+
+/// The pre-emphasis half of one frame's analysis: per-channel planar
+/// `[COMBFILTER_MAXPERIOD lookback | N new]` unfiltered
+/// pre-emphasized signal (the §5.3.1 pitch search runs on this), plus
+/// the silence flag.
+#[derive(Debug, Clone)]
+pub struct PreFrame {
+    /// Planar buffers, `channels * (COMBFILTER_MAXPERIOD + n)`.
+    pub pre: Vec<f64>,
+    /// True when every pre-emphasized sample of the frame is zero.
+    pub silence: bool,
+}
+
+/// One §5.3.1 comb transition for [`CeltAnalysis::finish_frame`]:
+/// crossfade from the previous frame's parameters to this frame's
+/// over the first `overlap` samples (gains already negated by the
+/// caller for the pre-filter direction; both zero = passthrough).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CombTransition {
+    /// Previous frame's period (clamped `>= COMBFILTER_MINPERIOD`).
+    pub t0: usize,
+    /// This frame's period (clamped `>= COMBFILTER_MINPERIOD`).
+    pub t1: usize,
+    /// Previous frame's (signed) comb gain.
+    pub g0: f64,
+    /// This frame's (signed) comb gain.
+    pub g1: f64,
+    /// Previous frame's tapset.
+    pub tapset0: u8,
+    /// This frame's tapset.
+    pub tapset1: u8,
+}
+
+impl CombTransition {
+    /// The identity transition (pre-filter off on both sides).
+    #[must_use]
+    pub fn passthrough() -> Self {
+        Self {
+            t0: crate::celt_prefilter::COMBFILTER_MINPERIOD,
+            t1: crate::celt_prefilter::COMBFILTER_MINPERIOD,
+            g0: 0.0,
+            g1: 0.0,
+            tapset0: 0,
+            tapset1: 0,
+        }
+    }
 }
 
 /// One frame's analysis buffers: per-channel planar
@@ -80,6 +133,7 @@ impl CeltAnalysis {
             n,
             in_mem: vec![0.0; channels * overlap],
             preemph_mem: [0.0; 2],
+            prefilter_mem: vec![0.0; channels * crate::celt_prefilter::COMBFILTER_MAXPERIOD],
         }
     }
 
@@ -93,40 +147,83 @@ impl CeltAnalysis {
     pub fn reset(&mut self) {
         self.in_mem.fill(0.0);
         self.preemph_mem = [0.0; 2];
+        self.prefilter_mem.fill(0.0);
     }
 
     /// Pre-emphasize one interleaved i16 frame (`channels * n`
-    /// samples) into the per-channel `[overlap | N]` analysis layout,
-    /// rolling the §4.3.7 overlap history and §5.3 emphasis memory.
-    pub fn process_frame(&mut self, pcm: &[i16]) -> AnalysisFrame {
+    /// samples) into the per-channel `[COMBFILTER_MAXPERIOD | N]`
+    /// pre-filter layout, advancing only the §5.3 emphasis memory
+    /// (the frame is committed by [`Self::finish_frame`]).
+    pub fn pre_emphasize(&mut self, pcm: &[i16]) -> PreFrame {
         assert_eq!(pcm.len(), self.channels * self.n);
-        let overlap = CELT_OVERLAP_48K.min(self.n);
-        let mut ibuf = vec![0.0f64; self.channels * (self.n + overlap)];
+        let maxp = crate::celt_prefilter::COMBFILTER_MAXPERIOD;
+        let mut pre = vec![0.0f64; self.channels * (maxp + self.n)];
         let mut silence = true;
         for c in 0..self.channels {
-            let dst = &mut ibuf[c * (self.n + overlap)..(c + 1) * (self.n + overlap)];
-            dst[..overlap].copy_from_slice(&self.in_mem[c * overlap..(c + 1) * overlap]);
+            let dst = &mut pre[c * (maxp + self.n)..(c + 1) * (maxp + self.n)];
+            dst[..maxp].copy_from_slice(&self.prefilter_mem[c * maxp..(c + 1) * maxp]);
             let mut mem = self.preemph_mem[c];
             for j in 0..self.n {
                 let x = f64::from(pcm[j * self.channels + c]);
                 let v = x + mem;
                 mem = -PREEMPH_COEF * x;
-                dst[overlap + j] = v;
+                dst[maxp + j] = v;
                 if v != 0.0 {
                     silence = false;
                 }
             }
             self.preemph_mem[c] = mem;
+        }
+        PreFrame { pre, silence }
+    }
+
+    /// Commit one pre-emphasized frame: apply the §5.3.1 comb
+    /// transition into the `[overlap | N]` MDCT layout (the overlap
+    /// history holds the PREVIOUS frame's filtered tail), roll the
+    /// filtered `in_mem` and the unfiltered `prefilter_mem`.
+    pub fn finish_frame(&mut self, pf: &PreFrame, comb: CombTransition) -> AnalysisFrame {
+        let overlap = CELT_OVERLAP_48K.min(self.n);
+        let maxp = crate::celt_prefilter::COMBFILTER_MAXPERIOD;
+        let mut ibuf = vec![0.0f64; self.channels * (self.n + overlap)];
+        for c in 0..self.channels {
+            let src = &pf.pre[c * (maxp + self.n)..(c + 1) * (maxp + self.n)];
+            let dst = &mut ibuf[c * (self.n + overlap)..(c + 1) * (self.n + overlap)];
+            dst[..overlap].copy_from_slice(&self.in_mem[c * overlap..(c + 1) * overlap]);
+            let mut filtered = vec![0.0f64; self.n];
+            crate::celt_prefilter::comb_filter(
+                &mut filtered,
+                src,
+                maxp,
+                comb.t0.max(crate::celt_prefilter::COMBFILTER_MINPERIOD),
+                comb.t1.max(crate::celt_prefilter::COMBFILTER_MINPERIOD),
+                self.n,
+                comb.g0,
+                comb.g1,
+                comb.tapset0,
+                comb.tapset1,
+            )
+            .expect("comb geometry is internally consistent");
+            dst[overlap..].copy_from_slice(&filtered);
             self.in_mem[c * overlap..(c + 1) * overlap]
                 .copy_from_slice(&dst[self.n..self.n + overlap]);
+            self.prefilter_mem[c * maxp..(c + 1) * maxp]
+                .copy_from_slice(&src[self.n..self.n + maxp]);
         }
         AnalysisFrame {
             ibuf,
             n: self.n,
             overlap,
             channels: self.channels,
-            silence,
+            silence: pf.silence,
         }
+    }
+
+    /// Pre-emphasize + commit with the pre-filter off (the historical
+    /// single-call analysis path; bit-identical to the pre-split
+    /// behaviour).
+    pub fn process_frame(&mut self, pcm: &[i16]) -> AnalysisFrame {
+        let pf = self.pre_emphasize(pcm);
+        self.finish_frame(&pf, CombTransition::passthrough())
     }
 }
 

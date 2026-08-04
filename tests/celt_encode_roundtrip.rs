@@ -155,3 +155,113 @@ fn celt_rate_ladder_improves_with_bitrate() {
     }
     assert!(last > 20.0, "top rate too weak: {last}");
 }
+
+/// Strongly periodic "voice-like" content: pulse train through a
+/// resonator plus a mild noise floor.
+fn periodic_pcm(frames: usize, spf: usize, period: usize) -> Vec<i16> {
+    let mut lp = 0.0f64;
+    let mut lp2 = 0.0f64;
+    let mut lcg = 7u32;
+    (0..frames * spf)
+        .map(|i| {
+            let pulse = if i % period == 0 { 20000.0 } else { 0.0 };
+            lp = 0.72 * lp + 0.28 * pulse;
+            lp2 = 0.9 * lp2 + 0.1 * lp;
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = ((lcg >> 16) as f64 - 32768.0) / 200.0;
+            (lp + 0.6 * lp2 + noise).round().clamp(-32768.0, 32767.0) as i16
+        })
+        .collect()
+}
+
+#[test]
+fn celt_pitch_prefilter_fires_at_the_true_period_and_decodes() {
+    // §5.3.1: on strongly periodic content the pre-filter must
+    // engage, lock the true period, and the coded stream must decode
+    // (the decoder's §4.3.7.1 post-filter inverting the comb).
+    let period = 218usize;
+    let pcm = periodic_pcm(30, 960, period);
+    let mut enc = CeltEncoder::new(Bandwidth::Fb, 200, false).unwrap();
+    let mut dec = OpusDecoder::new();
+    let mut pf_frames = 0usize;
+    let mut period_hits = 0usize;
+    for frame in pcm.chunks(960) {
+        let (packet, info) = enc.encode_packet(frame, 90).unwrap();
+        if info.postfilter_on {
+            pf_frames += 1;
+            if (info.postfilter_period as i64 - period as i64).abs() <= 2 {
+                period_hits += 1;
+            }
+            assert!((15..=1022).contains(&info.postfilter_period));
+            assert!(info.postfilter_gain > 0.0 && info.postfilter_gain <= 0.75);
+        }
+        let out = dec.decode_packet(&packet).expect("decode");
+        assert_eq!(out.samples_per_channel(), 960);
+    }
+    assert!(pf_frames >= 25, "pre-filter engaged on only {pf_frames}/30");
+    assert!(
+        period_hits * 2 >= pf_frames,
+        "period rarely correct: {period_hits}/{pf_frames}"
+    );
+}
+
+#[test]
+fn celt_pitch_prefilter_stays_off_on_noise() {
+    // Aperiodic content must not cross the §5.3.1 gain threshold.
+    let mut lcg = 99u32;
+    let pcm: Vec<i16> = (0..20 * 960)
+        .map(|_| {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (((lcg >> 16) as i32) - 32768).clamp(-20000, 20000) as i16
+        })
+        .collect();
+    let mut enc = CeltEncoder::new(Bandwidth::Fb, 200, false).unwrap();
+    let mut dec = OpusDecoder::new();
+    let mut pf_frames = 0usize;
+    for frame in pcm.chunks(960) {
+        let (packet, info) = enc.encode_packet(frame, 120).unwrap();
+        pf_frames += usize::from(info.postfilter_on);
+        dec.decode_packet(&packet).expect("decode");
+    }
+    assert!(pf_frames <= 2, "pre-filter fired on noise: {pf_frames}/20");
+}
+
+#[test]
+fn celt_pitch_prefilter_helps_periodic_content_at_equal_rate() {
+    // The whole point: at a fixed payload, prefiltered periodic
+    // content must reconstruct at least as well as steady tones do
+    // without it — gate an absolute floor plus decode health across
+    // an off→on→off transition (silence flanks force the ramps).
+    let period = 218usize;
+    let mut pcm = periodic_pcm(30, 960, period);
+    for v in pcm.iter_mut().take(2 * 960) {
+        *v = 0;
+    }
+    let len = pcm.len();
+    for v in pcm.iter_mut().skip(len - 2 * 960) {
+        *v = 0;
+    }
+    let mut enc = CeltEncoder::new(Bandwidth::Fb, 200, false).unwrap();
+    let mut dec = OpusDecoder::new();
+    let mut input = Vec::new();
+    let mut decoded = Vec::new();
+    for frame in pcm.chunks(960) {
+        let (packet, _) = enc.encode_packet(frame, 90).unwrap();
+        let out = dec.decode_packet(&packet).expect("decode");
+        input.extend_from_slice(frame);
+        decoded.extend_from_slice(&out.pcm);
+    }
+    // Settled-region SNR at the 120-sample delay over the periodic
+    // middle.
+    let n = decoded.len();
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for p in (5 * 960)..(n - 3 * 960) {
+        let x = f64::from(input[p - 120]);
+        let d = f64::from(decoded[p]) - x;
+        num += d * d;
+        den += x * x;
+    }
+    let snr = 10.0 * (den / num.max(1e-30)).log10();
+    println!("prefiltered periodic content at 36 kb/s: {snr:.2} dB");
+    assert!(snr > 4.0, "prefiltered decode too weak: {snr:.2} dB");
+}

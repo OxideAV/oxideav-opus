@@ -757,6 +757,7 @@ pub mod celt_overlap_add;
 pub mod celt_packet_encode;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_post_filter;
+pub mod celt_prefilter;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_pulse_cache;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API

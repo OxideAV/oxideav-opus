@@ -4,6 +4,31 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **CELT §5.3.1 pitch pre-filter** (round 437): `celt_prefilter` —
+  the reference listing's pitch estimator transcribed
+  (`pitch_downsample`: 2× decimate + lag-windowed order-4
+  Levinson-Durbin whitening; `pitch_search`: coarse 4×-decimated
+  correlation sweep + 2× refinement + pseudo-interpolation;
+  `remove_doubling`: the §5.3.1 sub-multiple walk with the
+  `second_check` confirmation lags and the previous-period
+  continuity bonus) plus the §4.3.7.1 `comb_filter` applied in the
+  encoder direction (negated gains, old→new parameter crossfade
+  through the squared MDCT window). `CeltAnalysis` gains a two-phase
+  `pre_emphasize`/`finish_frame` API carrying the unfiltered
+  1024-sample comb lookback (the single-call path is bit-identical
+  to before), and `encode_celt_frame` runs the listing's full
+  decision ladder — the `> 12·C`-byte gate, the rate/continuity
+  pf-threshold, gain reuse within 0.1, the 3-bit gain quantizer, and
+  the octave/fine-period/gain/tapset §4.3.7.1 parameter coding —
+  then commits the frame through the comb (Hybrid frames never run
+  it, matching the decoder's `start == 0` gate). Measured: on
+  voice-like periodic content (218-sample pitch) the pre-filter
+  fires on 50/50 frames at the exact true period, buys **+1.3 dB at
+  24 kb/s and +1.0 dB at 48 kb/s** over the pf-off encoder at equal
+  rate, stays off on noise, and the streams decode through the §A
+  reference-listing decoder at 81 dB agreement with our decoder
+  (max 1 LSB). This closes the last open encoder-arc item.
+
 - **SILK-election fuzz target + overflow hardening** (round 437):
   `fuzz/silk_elected_roundtrip` — coverage-guided bandwidth ×
   duration × mono/stereo × FEC × per-packet-target × PCM exploration
