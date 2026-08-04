@@ -4,6 +4,21 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **CELT encoder tf analysis** (round 437): `celt_tf_analysis` — the
+  reference listing's §4.3.4.5 encoder-side `tf_analysis`
+  transcribed (per-band Haar-level L1 sparsity metric with the
+  width-dependent bias, the byte-budget λ ladder, the Viterbi
+  flip-cost smoothing against the Table 60/62 select-0 targets, the
+  `< 15·C`-byte starved-frame default; `tf_select` stays 0 as the
+  listing's analysis emits). `encode_celt_frame` now codes the
+  analysed per-band `tf_change` flags instead of all-zero, and the
+  §4.3.4.5 Haar reorganisation actually engages in encoded streams:
+  on half-bin-offset tone + click content, 313/420 band decisions
+  flag nonzero, and a 4-stream oracle set (FB 20 ms mono + stereo,
+  WB 10 ms, FB 5 ms) decodes through the §A reference-listing
+  decoder at **93–99 dB** agreement with our decoder (max 1 LSB) —
+  the tf-flagged band-encode path is bit-consistent end to end.
+
 - **Stereo Hybrid VBR arm** (round 437):
   `vbr::HybridVbrEncoderStereo` — the [`VbrRateControl`] election on
   [`HybridEncoderStereo::encode_packet_elected`], stereo SILK-layer

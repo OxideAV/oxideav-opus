@@ -206,9 +206,20 @@ pub fn encode_celt_frame(
         let _ = freq;
     }
 
-    // tf_res: no per-band time-frequency changes (a valid encoder
-    // choice; the flags still consume their budgeted bits).
-    let mut tf_res = [0i32; CELT_NUM_BANDS];
+    // §4.3.4.5 per-band time-frequency analysis (the listing's
+    // `tf_analysis`): per-band Haar-level L1 sparsity metric +
+    // budget-λ Viterbi smoothing; `tf_select` stays 0 exactly as the
+    // listing's analysis emits.
+    let mut tf_res = crate::celt_tf_analysis::tf_analysis(
+        &x,
+        plane,
+        channels,
+        start,
+        end,
+        transient,
+        effective_bytes,
+        lm as usize,
+    );
 
     // §5.3.2 coarse energy (two-pass intra/inter).
     let mut error: EnergyGrid = [[0.0; CELT_NUM_BANDS]; 2];
@@ -228,7 +239,7 @@ pub fn encode_celt_frame(
         true,
     );
 
-    // §4.3.1 tf encode (all-zero changes, tf_select = 0).
+    // §4.3.1 tf encode (the analysed changes; tf_select = 0).
     tf_encode(
         enc,
         start,

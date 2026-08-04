@@ -779,6 +779,7 @@ pub mod celt_static_alloc;
 pub mod celt_synthesis;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_tf_adjust;
+pub mod celt_tf_analysis;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_tf_decode;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
