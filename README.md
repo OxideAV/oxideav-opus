@@ -218,19 +218,56 @@ capped at a documented 100 ms default, giving the provable
 `n·target + cap` bound on every n-packet window). `CeltVbrEncoder`
 covers the full CELT matrix with 3-byte digital-silence collapse and
 a transient pre-detect boost the drift repays; `HybridVbrEncoderMono`
-rides the new `encode_packet_elected` (SILK floor raises feed the
-drift); the SILK-only arm's natural quality-driven emission is
-already VBR per §2.1.8 (a 21% transport saving over CBR padding at
-bit-identical decode) but electing it against a target needs
-SILK-layer rate control, which remains open. Realized averages land
-within 2–5% of target on every arm and frame size; at matched
-average rate VBR ≥ CBR on steady content and beats CBR by ~3.3 dB on
-mixed tone/silence content at equal total bytes. A 15-stream VBR
-corpus (CELT NB/WB/SWB/FB × 2.5–20 ms × mono/stereo ×
+rides `encode_packet_elected` (SILK floor raises feed the drift).
+Realized averages land within 2–5% of target on every arm and frame
+size; at matched average rate VBR ≥ CBR on steady content and beats
+CBR by ~3.3 dB on mixed tone/silence content at equal total bytes. A
+15-stream VBR corpus (CELT NB/WB/SWB/FB × 2.5–20 ms × mono/stereo ×
 constrained/unconstrained + all four Hybrid configs) decodes through
 the §A reference-listing decoder with exact packet and sample counts,
-agreeing with our decoder at 90–107 dB (max 1 LSB). Stereo hybrid,
-tf analysis, and the encoder-side pitch pre-filter remain open.
+agreeing with our decoder at 90–107 dB (max 1 LSB).
+
+Round 437 closes the remaining encoder-arc frontiers. **SILK-layer
+rate control** (the §5.2.3.9 "iterative loop around the noise shaping
+quantizer and entropy coding"):
+`SilkEncoderMono/Stereo::encode_packet_elected` searches the
+excitation-pulse-RMS knob with a warm-started secant over cloned
+full-packet trial encodes, adopting the largest packet not exceeding
+the election (floor-raising when even the coarsest quantization
+overshoots — the drift accounting repays it). Below the default
+quality the **§5.2.3.8 noise shaping quantizer** engages: the
+§5.2.3.7 `Wana` prefilter on the target (quantized predictor chirped
+by `g_ana = 0.95 − 0.01·C`), the `a_syn`-filtered quantized-history
+feedback in every pulse decision (`g_syn = 0.95 + 0.01·C`, the
+stable `1/Wsyn` noise loop), and a linear `(r − q)² + λ·|q|` rate
+penalty — the pure closed-loop tracker's noise-chasing equilibrium
+(≈ 1 pulse/sample) made voiced rate irreducible by gain coarsening
+alone, and the default path stays bit-identical to before. Measured:
+the knob spans ~16–200 bytes/packet (WB 20 ms); elections land at
+96–98% of target across NB/WB mono and stereo (+FEC); all elected
+oracle streams decode **bit-exactly** through the §A
+reference-listing decoder. On top sit the **SILK-only VBR arms**
+(`vbr::SilkVbrEncoderMono` / `SilkVbrEncoderStereo`: realized
+averages within 0.1% of target at NB 12 k / WB 20–32 k / 40–60 ms /
+stereo 28 k constrained + FEC; silence collapses to the header floor
+with the post-silence spree bounded at 2× target; a 5-stream oracle
+set decodes bit-exactly), **stereo Hybrid encode**
+(`HybridEncoderStereo`, configs 12–15 stereo: the §5.2.2 mixing
+front end + two-channel §4.2.3 header + mid/side frames and the
+stereo CELT bands 17.. on one range coder at the mono arm's
+120-sample timeline; L 16.4 / R 12.4 dB at FB 20 ms 144 kb/s,
+oracle agreement 104–107 dB) with its **VBR arm**
+(`vbr::HybridVbrEncoderStereo`, exact-on-target averages, 103–106 dB
+oracle), and the **§4.3.4.5 CELT tf analysis** (the listing's
+per-band Haar-level L1 metric + budget-λ Viterbi smoothing;
+`encode_celt_frame` now codes real per-band `tf_change` flags —
+313/420 band decisions fire on half-bin tone + click content — with
+tf-flagged oracle streams agreeing at 93–99 dB). A new
+`silk_elected_roundtrip` fuzz target hardened the election against
+adversarial content (a §3.2.1 writer overflow at a generous starting
+quality now steps the knob down instead of erroring). The
+encoder-side §5.3.1 pitch pre-filter (postfilter params are still
+signalled off) remains the one open encoder item.
 
 Differential encoder/decoder testing and a restored cargo-fuzz suite
 (6 coverage-guided targets, incl. an encoder↔decoder range-coder
@@ -471,9 +508,10 @@ detector), `celt_energy_encode` (two-pass coarse + fine + finalise),
 `celt_band_encode` (the recursive §4.3.4 band coder, encode side),
 `celt_pvq_encode` (PVQ search + §4.3.4.2 index construction), the
 §4.3.2.1 Laplace encoder, and `RangeEncoder::finish_fixed` (the
-fixed-size §5.1.5 finalization) — plus `HybridEncoderMono`
-(`hybrid_packet_encode`): the WB SILK layer and CELT bands 17.. on
-one range coder with delay-matched layer alignment, now including
+fixed-size §5.1.5 finalization) — plus `HybridEncoderMono` /
+`HybridEncoderStereo` (`hybrid_packet_encode`): the WB SILK layer
+(mono, or the §5.2.2-mixed mid/side stereo pair) and CELT bands 17..
+on one range coder with delay-matched layer alignment, each with
 `encode_packet_elected` (elected payload with SILK-floor raise).
 Validated through the crate's own decoder and the §A
 reference-listing decoder (88–108 dB agreement between the two
@@ -484,10 +522,30 @@ decoders on our streams).
 controller, with the constrained-VBR bit-reservoir discipline
 (`elect_packet_bytes` / `commit` / `constrained_ceiling_bits`) — and
 its mode arms `vbr::CeltVbrEncoder` (silence collapse, transient
-boost) and `vbr::HybridVbrEncoderMono` (floor-raise feedback).
-Gated by `tests/vbr_encode_roundtrip.rs` (rate tracking, parity vs
-CBR, the constrained window bound under adversarial bias, exact
-frame accounting) and the `vbr_encode_roundtrip` fuzz target.
+boost), `vbr::HybridVbrEncoderMono` / `HybridVbrEncoderStereo`
+(floor-raise feedback), and `vbr::SilkVbrEncoderMono` /
+`SilkVbrEncoderStereo` (the election driving the SILK-layer rate
+control, FEC riding inside the elected sizes). Gated by
+`tests/vbr_encode_roundtrip.rs` (rate tracking, parity vs CBR, the
+constrained window bound under adversarial bias, silence
+banking/repayment, exact frame accounting) and the
+`vbr_encode_roundtrip` / `silk_elected_roundtrip` fuzz targets.
+
+**SILK-layer rate control (§5.2.3.8 / §5.2.3.9):**
+`ChannelAnalyzer::set_pulse_target` (the quantization-rate knob) +
+`SilkEncoderMono/Stereo::encode_packet_elected` (the size election
+over cloned trial encodes) on the noise shaping quantizer
+(`PulseRateControl` — the λ rate penalty and the `a_syn`
+quantized-history shaping feedback; `Wana`-prefiltered targets, the
+signal-RMS gain floor). The default (non-elected) encoders are
+bit-identical to the pure closed-loop tracker.
+
+**CELT encoder tf analysis (§4.3.4.5):** `celt_tf_analysis` — the
+listing's per-band Haar-level L1 sparsity metric (`haar1` /
+`l1_metric` with the width bias), the byte-budget λ ladder, and the
+Viterbi flip-cost smoothing against the Table 60/62 targets;
+`encode_celt_frame` codes the analysed `tf_change` flags
+(`tf_select` stays 0, coded only when the tables diverge).
 
 ## Clean-room sources
 
