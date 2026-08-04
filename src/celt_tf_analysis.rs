@@ -254,6 +254,6 @@ mod tests {
             }
         }
         let r = tf_analysis(&x, plane, 1, 0, 21, false, 200, lm);
-        assert!(r[..21].iter().any(|&v| v == 1), "{r:?}");
+        assert!(r[..21].contains(&1), "{r:?}");
     }
 }
