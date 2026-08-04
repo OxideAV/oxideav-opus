@@ -74,6 +74,45 @@ pub struct LtpFrameParams {
     pub ltp_scaling_q14: u16,
 }
 
+/// Rate-control knobs of the §5.2.3.8 pulse decisions — the encoder
+/// freedoms the SILK-layer rate control drives. The default is the
+/// pure closed-loop tracker (full quality, prior behaviour).
+///
+/// The pure closed loop spends roughly one pulse per sample
+/// cancelling its own previous rounding noise — and the resonant
+/// §4.2.7.9 synthesis recursion amplifies that noise back into every
+/// following decision — so coarsening the §4.2.7.4 gains alone
+/// cannot push the coded pulse rate below the noise-chasing
+/// equilibrium. §5.2.3.8's noise shaping quantizer names the two
+/// mechanisms that break it (per §5.2.3.9 adjusted "in an iterative
+/// loop" for rate control):
+///
+/// * `lambda_pulses` — the linear rate penalty on each pulse
+///   decision: candidate `q` costs `(r − q)² + λ·|q|` (in pulse
+///   units), so noise-level corrections quantize to zero while large
+///   signal-driven residuals still code (see [`choose_pulse`]).
+/// * `a_syn` — the §5.2.3.3 synthesis-shaping coefficients (the
+///   quantized predictor bandwidth-expanded by `g_syn`). When
+///   present, each pulse target ADDS the a_syn-filtered quantized
+///   history: the reconstruction then satisfies
+///   `xq ≈ (1/Wsyn)(target) + (1/Wsyn)(gain·ε)`, i.e. the coded
+///   signal re-colors the (Wana-prefiltered) target through the
+///   stable chirped synthesis filter and the quantization noise is
+///   shaped by the same stable `1/Wsyn` — no resonant noise chase,
+///   because the §4.2.7.9 predictions cancel identically between
+///   the pulse target and the reconstruction. The caller passes the
+///   `Wana`-prefiltered signal as `target` in this mode (§5.2.3.7).
+///   `None` = the pure closed-loop tracker on the raw target.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PulseRateControl {
+    /// Linear per-pulse rate penalty λ, in pulse units (`>= 0`).
+    pub lambda_pulses: f32,
+    /// §5.2.3.3 synthesis-shaping coefficients (`a_syn[k]` applied to
+    /// the quantized history at delay `k + 1`), or `None` for the
+    /// pure closed loop.
+    pub a_syn: Option<Vec<f32>>,
+}
+
 /// Result of quantizing one SILK frame's excitation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExcitationQuantized {
@@ -101,6 +140,9 @@ pub struct ExcitationQuantized {
 /// * `ltp` — `Some` iff `signal_type == Voiced`.
 /// * `target` — the frame's target signal at the internal rate
 ///   (`num_subframes * subframe_samples(bandwidth)` samples).
+/// * `rate` — the [`PulseRateControl`] knobs
+///   ([`PulseRateControl::default`] = the pure closed-loop tracker;
+///   see that type for the low-rate behaviour).
 /// * `ltp_state` / `lpc_state` — the carried §4.2.7.9 histories;
 ///   updated through the real synthesis functions so they end the
 ///   frame exactly as a decoder's would.
@@ -115,6 +157,7 @@ pub fn quantize_excitation_frame(
     a_q12: &[i32],
     ltp: Option<&LtpFrameParams>,
     target: &[f32],
+    rate: &PulseRateControl,
     ltp_state: &mut LtpSynthState,
     lpc_state: &mut LpcSynthState,
 ) -> Result<ExcitationQuantized, Error> {
@@ -147,6 +190,13 @@ pub fn quantize_excitation_frame(
     let mut e_q23_all: Vec<i32> = Vec::with_capacity(frame_len);
     let mut reconstructed = vec![0.0f32; frame_len];
 
+    if rate
+        .a_syn
+        .as_ref()
+        .is_some_and(|a_syn| a_syn.len() != d_lpc)
+    {
+        return Err(Error::MalformedPacket);
+    }
     ltp_state.start_frame();
 
     for s in 0..num_subframes {
@@ -198,16 +248,25 @@ pub fn quantize_excitation_frame(
                     }
                 }
             }
-            // LPC prediction from the quantized local history.
+            // LPC prediction from the quantized local history, and
+            // — in shaped mode — the §5.2.3.8 n_AR synthesis-shaping
+            // feedback of that same history (see
+            // [`PulseRateControl::a_syn`]).
             let mut lpc_pred = 0.0f32;
+            let mut n_ar = 0.0f32;
             for (k, &af) in a_f.iter().enumerate() {
                 // lpc[i - k - 1]: local index hist_len + i - k - 1.
                 let idx = hist_len + i - k - 1;
                 lpc_pred += lpc_local[idx] * af;
+                if let Some(a_syn) = &rate.a_syn {
+                    n_ar += lpc_local[idx] * a_syn[k];
+                }
             }
 
-            // Desired residual and excitation target (Q23).
-            let desired_res = (target[s * n + i] - lpc_pred) * inv_gain;
+            // Desired residual and excitation target (Q23). In
+            // shaped mode the target signal is the Wana-prefiltered
+            // input and n_AR re-colors it through 1/Wsyn.
+            let desired_res = (target[s * n + i] + n_ar - lpc_pred) * inv_gain;
             let e_target_q23 = (desired_res - res_base) * 8_388_608.0;
 
             // §4.2.7.8.6 LCG: the flip decision precedes the e_raw
@@ -215,7 +274,7 @@ pub fn quantize_excitation_frame(
             seed = seed.wrapping_mul(196_314_165).wrapping_add(907_633_515);
             let flip = (seed & 0x8000_0000) != 0;
             let want = if flip { -e_target_q23 } else { e_target_q23 };
-            let e_raw = choose_pulse(want, offset_q23);
+            let e_raw = choose_pulse(want, offset_q23, rate.lambda_pulses);
             seed = seed.wrapping_add(e_raw as u32);
 
             // Decoder-identical reconstruction of this sample's e_Q23.
@@ -319,33 +378,47 @@ pub fn quantize_excitation_frame(
     })
 }
 
-/// Pick the `e_raw` whose §4.2.7.8.6 pre-flip reconstruction
-/// `(e_raw << 8) - sign(e_raw)*20 + offset` lands closest to `want`
-/// (Q23). The reconstruction is monotone in `e_raw`, so the floor and
-/// ceiling of the linear estimate, plus zero, cover the optimum.
-fn choose_pulse(want: f32, offset_q23: i32) -> i32 {
+/// Pick the `e_raw` minimizing the rate-penalized cost
+/// `(recon − want)² + λ·|e_raw|` (the §5.2.3.8 quantizer's
+/// rate/distortion measure, in Q23² with `λ = 256²·lambda_pulses`),
+/// where the §4.2.7.8.6 pre-flip reconstruction is
+/// `(e_raw << 8) - sign(e_raw)*20 + offset` (Q23). The linear
+/// magnitude penalty widens the zero region and shifts every
+/// boundary toward zero by `λ/2` pulses; the resulting per-sample
+/// bias is safe because the shaped feedback loop (see
+/// [`PulseRateControl::shape_gain`]) is damped. `lambda_pulses == 0`
+/// reduces to nearest-reconstruction rounding. The cost is convex in
+/// `e_raw` on each side of zero, so the floor/ceiling of the
+/// unpenalized and the λ-shifted estimates, plus zero, cover the
+/// optimum.
+fn choose_pulse(want: f32, offset_q23: i32, lambda_pulses: f32) -> i32 {
     let est = (want - offset_q23 as f32) / 256.0;
     let lo = est.floor() as i32;
-    let mut best = (0i32, recon_err(0, want, offset_q23));
-    for cand in [lo, lo + 1] {
+    let lambda = 256.0 * 256.0 * lambda_pulses.max(0.0);
+    // λ shifts the optimum toward zero by λ/(2·256²) pulses.
+    let shift = 0.5 * lambda_pulses.max(0.0) * if est >= 0.0 { 1.0 } else { -1.0 };
+    let lo_s = (est - shift).floor() as i32;
+    let mut best = (0i32, pulse_cost(0, want, offset_q23, lambda));
+    for cand in [lo, lo + 1, lo_s, lo_s + 1] {
         let c = cand.clamp(-MAX_PULSE_MAGNITUDE, MAX_PULSE_MAGNITUDE);
-        let err = recon_err(c, want, offset_q23);
-        if err < best.1 {
-            best = (c, err);
+        let cost = pulse_cost(c, want, offset_q23, lambda);
+        if cost < best.1 {
+            best = (c, cost);
         }
     }
     best.0
 }
 
 #[inline]
-fn recon_err(e_raw: i32, want: f32, offset_q23: i32) -> f32 {
+fn pulse_cost(e_raw: i32, want: f32, offset_q23: i32, lambda: f32) -> f32 {
     let sign_e = match e_raw.cmp(&0) {
         core::cmp::Ordering::Less => -1,
         core::cmp::Ordering::Greater => 1,
         core::cmp::Ordering::Equal => 0,
     };
     let r = (e_raw << 8) - sign_e * 20 + offset_q23;
-    (r as f32 - want).abs()
+    let err = r as f32 - want;
+    err * err + lambda * e_raw.unsigned_abs() as f32
 }
 
 #[cfg(test)]
@@ -412,6 +485,7 @@ mod tests {
             &a_q12,
             None,
             &target,
+            &PulseRateControl::default(),
             &mut ltp_state,
             &mut lpc_state,
         )
@@ -509,6 +583,7 @@ mod tests {
                 &a_q12,
                 Some(&ltp),
                 &target,
+                &PulseRateControl::default(),
                 &mut ltp_state,
                 &mut lpc_state,
             )
@@ -543,6 +618,7 @@ mod tests {
             &a_q12,
             None,
             &target,
+            &PulseRateControl::default(),
             &mut ltp_state,
             &mut lpc_state,
         )
@@ -585,6 +661,7 @@ mod tests {
             &a_q12,
             None,
             &target,
+            &PulseRateControl::default(),
             &mut ltp_state,
             &mut lpc_state,
         )
@@ -612,6 +689,7 @@ mod tests {
             &a_q12,
             None,
             &target,
+            &PulseRateControl::default(),
             &mut ltp_state,
             &mut lpc_state,
         )
@@ -627,6 +705,7 @@ mod tests {
             &a_q12,
             None,
             &target,
+            &PulseRateControl::default(),
             &mut ltp_state,
             &mut lpc_state,
         )

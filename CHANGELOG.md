@@ -4,6 +4,38 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **SILK-layer rate control** (round 437): the encoder arc's open
+  frontier — electing a SILK-only packet's size against a byte
+  target — is closed. `ChannelAnalyzer::set_pulse_target` exposes
+  the quantization-rate knob (the excitation-pulse RMS the §4.2.7.4
+  gain selection aims for), and
+  `SilkEncoderMono/Stereo::encode_packet_elected` searches it with a
+  warm-started secant iteration over full-packet trial encodes on
+  cloned state (≤ 6 attempts), adopting the largest packet not
+  exceeding the election (or the smallest achievable under
+  floor-raise semantics — the §5.2.3.9 "iterative loop around the
+  noise shaping quantizer and entropy coding"). Below the default
+  quality the §5.2.3.8 noise shaping quantizer engages: the §5.2.3.7
+  `Wana` prefilter on the target (quantized predictor chirped by the
+  §5.2.3.3 `g_ana = 0.95 − 0.01·C`), the `a_syn`-filtered
+  quantized-history feedback in each pulse decision (`g_syn = 0.95 +
+  0.01·C`), and a linear per-pulse rate penalty
+  (`(r − q)² + λ·|q|`), with the residual gain estimate floored at a
+  fraction of the subframe signal RMS. The pure closed-loop tracker
+  had a noise-chasing equilibrium near one pulse per sample —
+  coarsening the gains alone could not reduce voiced-frame rate at
+  all — while the shaped loop's noise transfer `1/Wsyn` is stable by
+  construction (the §4.2.7.9 predictions cancel identically between
+  pulse target and reconstruction), so bits now scale with the
+  signal. The default (non-elected) path is bit-identical to the
+  prior encoder. Measured on mixed tone+noise content: the knob
+  spans ~16–200 bytes/packet (WB 20 ms), elections land at 96–98% of
+  target across NB/WB mono (25/45/80-byte targets) and WB stereo
+  (50/90-byte, FEC on), and all 8 elected oracle streams decode
+  **bit-exactly** (max diff 0) through the §A reference-listing
+  decoder (RFC 8251-patched, hash-verified extraction). Quality is
+  monotone in the granted rate (unit-gated).
+
 - **VBR-election fuzz target** (`fuzz/vbr_encode_roundtrip`, round
   431): coverage-guided config × target-bitrate × constrained-flag ×
   PCM exploration asserting every elected packet decodes cleanly

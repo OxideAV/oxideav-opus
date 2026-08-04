@@ -59,7 +59,7 @@
 use crate::silk_decode::SilkFrameSymbols;
 use crate::silk_excitation::{ExcitationSymbols, SilkFrameSize};
 use crate::silk_excitation_quantize::{
-    quantize_excitation_frame, ExcitationQuantized, LtpFrameParams,
+    quantize_excitation_frame, ExcitationQuantized, LtpFrameParams, PulseRateControl,
 };
 use crate::silk_frame::{
     QuantizationOffsetType, SignalType, SilkHeaderSymbols, StereoPredictionWeights,
@@ -85,14 +85,43 @@ use crate::silk_stereo::{stereo_lr_to_ms, StereoDownmixState, StereoWeightsQ13};
 use crate::toc::Bandwidth;
 use crate::Error;
 
-/// Target RMS of the excitation pulses (`e_raw`) the gain selection
-/// aims for — the bitrate/precision knob of this encoder.
+/// Default target RMS of the excitation pulses (`e_raw`) the gain
+/// selection aims for — the bitrate/precision knob of this encoder
+/// (adjustable per packet via [`ChannelAnalyzer::set_pulse_target`];
+/// the SILK-layer rate control's quantization-rate knob).
 const TARGET_PULSE_RMS: f64 = 2.0;
 
-/// Reduced pulse target for §4.2.5 LBRR (in-band FEC) re-encodes: the
-/// redundant copy spends roughly half the pulse budget of the regular
-/// frames (§2.1.7 codes the previous frame "at a lower bitrate").
-const LBRR_PULSE_RMS: f64 = 1.0;
+/// §4.2.5 LBRR (in-band FEC) re-encodes run at half the regular pulse
+/// target: the redundant copy spends roughly half the pulse budget of
+/// the regular frames (§2.1.7 codes the previous frame "at a lower
+/// bitrate").
+const LBRR_RATE_RATIO: f64 = 0.5;
+
+/// Lowest selectable pulse target: the excitation carries almost no
+/// pulses and the packet approaches its header-bits floor.
+const PULSE_TARGET_MIN: f64 = 1.0 / 16.0;
+
+/// Highest selectable pulse target (finer quantization saturates the
+/// perceptual return well before this).
+const PULSE_TARGET_MAX: f64 = 64.0;
+
+/// Attempt budget of the [`SilkEncoderMono::encode_packet_elected`]
+/// quality search (each attempt is one full-packet trial encode on a
+/// cloned state).
+const ELECT_MAX_ATTEMPTS: usize = 6;
+
+/// The election accepts a packet no larger than the target whose size
+/// reaches this fraction of it.
+const ELECT_ACCEPT_FRACTION: f64 = 0.94;
+
+/// Rate-controlled gain floor: the per-subframe residual estimate is
+/// floored at this fraction of the subframe's signal RMS (see the
+/// gain-selection comments).
+const RATE_RESIDUAL_FLOOR: f64 = 0.05;
+
+/// Growth slope of the rate-control λ (per unit of pulse-target
+/// ratio beyond the default; see the §5.2.3.9 iterative-loop role).
+const RATE_LAMBDA_SLOPE: f64 = 0.2;
 
 /// Initial bandwidth-expansion chirp applied to the Burg predictor
 /// before LSF conversion.
@@ -177,10 +206,17 @@ pub struct ChannelAnalyzer {
     /// packet boundary (the first frame of an Opus frame always codes
     /// its lag absolutely).
     prev_lag: Option<i32>,
-    /// Target excitation-pulse RMS of the gain selection
-    /// ([`TARGET_PULSE_RMS`] normally, [`LBRR_PULSE_RMS`] for a
-    /// re-armed LBRR re-encoder).
+    /// Target excitation-pulse RMS of the gain selection — the
+    /// quantization-rate knob ([`TARGET_PULSE_RMS`] by default,
+    /// adjustable via [`ChannelAnalyzer::set_pulse_target`], halved
+    /// by [`LBRR_RATE_RATIO`] on a re-armed LBRR re-encoder).
     pulse_rms: f64,
+    /// Set by [`Self::set_pulse_target`] (the rate-control election
+    /// path): engages the §5.2.3.8 noise-shaped quantizer for pulse
+    /// targets below the default. Default-quality encoders (and their
+    /// LBRR re-encoders) never set it, so their behaviour is exactly
+    /// the pure closed-loop tracker.
+    rate_control: bool,
     /// When set (LBRR re-encoders), active frames are coded UNVOICED —
     /// the LBRR sequence synthesizes from a fresh §4.2.7.9 state on
     /// both sides, so an LTP filter would predict from an all-zero
@@ -209,6 +245,7 @@ impl ChannelAnalyzer {
             prev_log_gain: None,
             prev_lag: None,
             pulse_rms: TARGET_PULSE_RMS,
+            rate_control: false,
             force_unvoiced: false,
         })
     }
@@ -238,8 +275,24 @@ impl ChannelAnalyzer {
         self.lpc_state.reset();
         self.prev_log_gain = None;
         self.prev_lag = None;
-        self.pulse_rms = LBRR_PULSE_RMS;
+        self.pulse_rms *= LBRR_RATE_RATIO;
         self.force_unvoiced = true;
+    }
+
+    /// The current excitation-pulse RMS target — the SILK-layer
+    /// quantization-rate knob (higher → finer excitation → more bits).
+    #[must_use]
+    pub fn pulse_target(&self) -> f64 {
+        self.pulse_rms
+    }
+
+    /// Set the excitation-pulse RMS target (clamped to the encoder's
+    /// selectable range). The §4.2.7.4 gain selection scales each
+    /// subframe's coded gain so the pulses land on this RMS, which is
+    /// how the rate control trades quantization precision for bits.
+    pub fn set_pulse_target(&mut self, rms: f64) {
+        self.pulse_rms = rms.clamp(PULSE_TARGET_MIN, PULSE_TARGET_MAX);
+        self.rate_control = true;
     }
 
     /// Mark a §4.2.4 LBRR-flag gap (an interval with no LBRR frame):
@@ -435,7 +488,24 @@ impl ChannelAnalyzer {
                 }
                 energy += v * v;
             }
-            let rms = (energy / n as f64).sqrt();
+            let mut rms = (energy / n as f64).sqrt();
+            // Rate-controlled encodes floor the residual estimate at
+            // a fraction of the subframe's SIGNAL level: on strongly
+            // predictable content the open-loop residual can be
+            // arbitrarily small, which would pin the gain at its
+            // minimum and leave the whole (physically signal-scaled)
+            // coding-noise floor to be coded in enormous pulse units.
+            // Flooring keeps the quantization step proportional to
+            // the signal, so the λ deadzone actually zeroes the
+            // noise-level corrections.
+            if self.rate_control && self.pulse_rms < TARGET_PULSE_RMS {
+                let sig_energy: f64 = pcm[s * n..(s + 1) * n]
+                    .iter()
+                    .map(|&v| (v as f64) * (v as f64))
+                    .sum();
+                let sig_rms = (sig_energy / n as f64).sqrt();
+                rms = rms.max(sig_rms * RATE_RESIDUAL_FLOOR);
+            }
             // e_raw ≈ res * 2^31 / gain_Q16 (see the module docs of
             // silk_excitation_quantize): gain that lands the pulses on
             // the target RMS.
@@ -471,6 +541,57 @@ impl ChannelAnalyzer {
         self.prev_log_gain = Some(gains.last_log_gain());
 
         // ---- 5. Closed-loop excitation (§5.2.3.8 role). ----
+        // Rate-control knobs (see [`PulseRateControl`]): pulse
+        // targets below the default engage the §5.2.3.8 noise
+        // shaping quantizer — the §5.2.3.7 Wana prefilter on the
+        // target, the a_syn feedback in the pulse decisions, and a
+        // linear λ penalty that grows as the target shrinks; at/above
+        // the default target the pure closed-loop tracker runs
+        // unchanged.
+        let ratio = if self.rate_control {
+            (TARGET_PULSE_RMS / self.pulse_rms).max(1.0)
+        } else {
+            1.0
+        };
+        let (rate, quant_target) = if ratio <= 1.0 {
+            (PulseRateControl::default(), pcm.to_vec())
+        } else {
+            // §5.2.3.3: coding quality C in [0, 1]; the chirps
+            // g_ana = 0.95 − 0.01·C and g_syn = 0.95 + 0.01·C.
+            let c = (self.pulse_rms / TARGET_PULSE_RMS).clamp(0.0, 1.0);
+            let g_ana = 0.95 - 0.01 * c;
+            let g_syn = 0.95 + 0.01 * c;
+            let chirped = |g: f64| -> Vec<f32> {
+                let mut f = g;
+                a_hat
+                    .iter()
+                    .map(|&a| {
+                        let v = (a * f) as f32;
+                        f *= g;
+                        v
+                    })
+                    .collect()
+            };
+            let a_ana = chirped(g_ana);
+            let a_syn = chirped(g_syn);
+            // §5.2.3.7 prefilter: Wana applied to the input (FIR over
+            // the frame with the real input history in `buf`).
+            let mut xpre = Vec::with_capacity(frame_len);
+            for i in 0..frame_len {
+                let mut v = buf[hist_len + i];
+                for (k, &af) in a_ana.iter().enumerate() {
+                    v -= af as f64 * buf[hist_len + i - k - 1];
+                }
+                xpre.push(v as f32);
+            }
+            (
+                PulseRateControl {
+                    lambda_pulses: (RATE_LAMBDA_SLOPE * (ratio - 1.0)) as f32,
+                    a_syn: Some(a_syn),
+                },
+                xpre,
+            )
+        };
         let lcg_seed = 0u8;
         let ExcitationQuantized {
             e_raw,
@@ -486,7 +607,8 @@ impl ChannelAnalyzer {
             &gains_q16_arr[..num_subframes],
             &a_q12,
             ltp_params.as_ref(),
-            pcm,
+            &quant_target,
+            &rate,
             &mut self.ltp_state,
             &mut self.lpc_state,
         )?;
@@ -736,6 +858,29 @@ impl SilkEncoderMono {
         let mut out = self.encode_packet(pcm)?;
         out.packet = crate::packet_compose::pad_packet_to(&out.packet, target_bytes)?;
         Ok(out)
+    }
+
+    /// [`Self::encode_packet`] under SILK-layer rate control: the
+    /// excitation-pulse-RMS knob is searched (full-packet trial
+    /// encodes on cloned state) so the emitted packet's TOTAL size
+    /// (TOC included) is the largest achievable not exceeding
+    /// `elected_bytes`; when even the coarsest quantization exceeds
+    /// the election (the coded frames' header-bits floor), the
+    /// smallest achievable packet is returned instead and the caller's
+    /// drift accounting repays the excess. The adopted knob is carried
+    /// as the next election's warm start.
+    pub fn encode_packet_elected(
+        &mut self,
+        pcm: &[f32],
+        elected_bytes: usize,
+    ) -> Result<EncodedSilkPacket, Error> {
+        let start = self.channel.pulse_target();
+        let (adopted, pkt) = elect_packet_encode(self, start, elected_bytes, |enc, q| {
+            enc.channel.set_pulse_target(q);
+            enc.encode_packet(pcm)
+        })?;
+        *self = adopted;
+        Ok(pkt)
     }
 }
 
@@ -1091,6 +1236,111 @@ impl SilkEncoderStereo {
         out.packet = crate::packet_compose::pad_packet_to(&out.packet, target_bytes)?;
         Ok(out)
     }
+
+    /// [`Self::encode_packet`] under SILK-layer rate control (see
+    /// [`SilkEncoderMono::encode_packet_elected`]): both channels'
+    /// quantization knobs move together in the search, and the
+    /// adopted knob warm-starts the next election.
+    pub fn encode_packet_elected(
+        &mut self,
+        left: &[f32],
+        right: &[f32],
+        next_lr: Option<(f32, f32)>,
+        elected_bytes: usize,
+    ) -> Result<EncodedSilkPacket, Error> {
+        let start = self.mid.pulse_target();
+        let (adopted, pkt) = elect_packet_encode(self, start, elected_bytes, |enc, q| {
+            enc.mid.set_pulse_target(q);
+            enc.side.set_pulse_target(q);
+            enc.encode_packet(left, right, next_lr)
+        })?;
+        *self = adopted;
+        Ok(pkt)
+    }
+}
+
+/// SILK-layer rate control: search the excitation-pulse-RMS knob so
+/// one packet's emitted size lands on `target_bytes` (total bytes,
+/// TOC included), electing among up to [`ELECT_MAX_ATTEMPTS`]
+/// full-packet trial encodes on cloned encoder state.
+///
+/// `encode(state, pulse_target)` must set the knob on the clone and
+/// run the ordinary packet encode. The election adopts the attempt
+/// whose packet is the largest not exceeding the target (quantization
+/// precision is monotone in size, so that is the closest-from-below
+/// attempt); when even the coarsest quantization overshoots — the
+/// header-bits floor of the coded frames exceeds the target — the
+/// smallest achieved packet is adopted instead (floor-raise
+/// semantics: the caller's drift accounting repays the excess, as
+/// with the Hybrid arm's SILK floor). Returns the adopted state (its
+/// analyzers carry the adopted knob as the next packet's warm start)
+/// and the packet.
+///
+/// The size-vs-knob relation is close to affine over a packet
+/// (excitation pulses dominate the varying cost), so the search is a
+/// warm-started secant iteration in the knob, clamped to
+/// [`PULSE_TARGET_MIN`]..[`PULSE_TARGET_MAX`].
+fn elect_packet_encode<S, F>(
+    state: &S,
+    start_pulse_target: f64,
+    target_bytes: usize,
+    encode: F,
+) -> Result<(S, EncodedSilkPacket), Error>
+where
+    S: Clone,
+    F: Fn(&mut S, f64) -> Result<EncodedSilkPacket, Error>,
+{
+    let target = target_bytes.max(2) as f64;
+    let mut q = start_pulse_target.clamp(PULSE_TARGET_MIN, PULSE_TARGET_MAX);
+    // (knob, size) evaluations for the secant update.
+    let mut evals: Vec<(f64, f64)> = Vec::with_capacity(ELECT_MAX_ATTEMPTS);
+    // Best attempt not exceeding the target (largest size).
+    let mut best_under: Option<(S, EncodedSilkPacket)> = None;
+    // Smallest attempt overall (the floor-raise fallback).
+    let mut smallest: Option<(S, EncodedSilkPacket)> = None;
+    for _ in 0..ELECT_MAX_ATTEMPTS {
+        let mut cand = state.clone();
+        let pkt = encode(&mut cand, q)?;
+        let size = pkt.packet.len() as f64;
+        if size <= target
+            && best_under
+                .as_ref()
+                .map_or(true, |(_, b)| pkt.packet.len() > b.packet.len())
+        {
+            best_under = Some((cand.clone(), pkt.clone()));
+        }
+        if smallest
+            .as_ref()
+            .map_or(true, |(_, b)| pkt.packet.len() < b.packet.len())
+        {
+            smallest = Some((cand, pkt));
+        }
+        if size <= target && size >= ELECT_ACCEPT_FRACTION * target {
+            break;
+        }
+        evals.push((q, size));
+        // Next knob: secant through the two most recent distinct
+        // evaluations, multiplicative bootstrap otherwise. A flat
+        // size response (inactive content at its header floor) stops
+        // the search.
+        let next = if evals.len() >= 2 {
+            let (q1, s1) = evals[evals.len() - 2];
+            let (q2, s2) = evals[evals.len() - 1];
+            if (s2 - s1).abs() < 0.51 {
+                break;
+            }
+            q2 + (target - s2) * (q2 - q1) / (s2 - s1)
+        } else {
+            q * (target / size).clamp(0.25, 4.0)
+        };
+        let next = next.clamp(q / 4.0, q * 4.0);
+        let next = next.clamp(PULSE_TARGET_MIN, PULSE_TARGET_MAX);
+        if (next - q).abs() < 1e-6 {
+            break;
+        }
+        q = next;
+    }
+    best_under.or(smallest).ok_or(Error::MalformedPacket)
 }
 
 /// Map a desired linear Q16 gain to the §4.2.7.4 `log_gain` index
@@ -1411,6 +1661,156 @@ mod tests {
         let steady = &snrs[1..];
         let avg = steady.iter().sum::<f64>() / steady.len() as f64;
         assert!(avg > 8.0, "multi-frame tracking SNR too low: {avg:.1} dB");
+    }
+
+    /// Deterministic mixed test content: tone + harmonic + a small
+    /// noise floor (so the rate ladder is continuous, unlike a pure
+    /// tone whose low-rate packets ride the LTP oscillator alone).
+    fn mixed_sig(i: usize, rate_hz: f64) -> f32 {
+        let t = i as f64 / rate_hz;
+        let mut x = 0.25 * (core::f64::consts::TAU * 400.0 * t).sin()
+            + 0.1 * (core::f64::consts::TAU * 1250.0 * t + 0.7).sin();
+        let mut lcg = (i as u32)
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        lcg ^= lcg >> 13;
+        x += 0.03 * ((lcg & 0xffff) as f64 / 32768.0 - 1.0);
+        x as f32
+    }
+
+    /// SILK-layer rate control (mono): elected packet sizes must track
+    /// the byte target across a spread of targets, decode end-to-end,
+    /// and quality must be monotone in the granted rate.
+    #[test]
+    fn elected_sizes_track_targets_mono() {
+        let bw = Bandwidth::Wb;
+        let mut proj_by_target = Vec::new();
+        for &target in &[30usize, 50, 90] {
+            let mut enc = SilkEncoderMono::new(bw).unwrap();
+            let flen = enc.frame_samples();
+            let mut dec = OpusDecoder::new();
+            let mut decoded_48k: Vec<f64> = Vec::new();
+            let mut sizes = Vec::new();
+            for pkt_idx in 0..20 {
+                let pcm: Vec<f32> = (0..flen)
+                    .map(|i| mixed_sig(pkt_idx * flen + i, 16_000.0))
+                    .collect();
+                let out = enc.encode_packet_elected(&pcm, target).unwrap();
+                // The election lands at or just under the target; a
+                // flat local size response may leave the best attempt
+                // a hair over (the drift accounting repays it).
+                assert!(
+                    out.packet.len() <= target + target / 12 + 1,
+                    "target {target}: packet {} far over the election",
+                    out.packet.len()
+                );
+                sizes.push(out.packet.len());
+                let audio = dec.decode_packet(&out.packet).unwrap();
+                decoded_48k.extend(audio.pcm.iter().map(|&v| v as f64 / 32768.0));
+            }
+            // Steady-state (post-warmup) sizes sit close under target.
+            let steady = &sizes[3..];
+            let avg = steady.iter().sum::<usize>() as f64 / steady.len() as f64;
+            assert!(
+                avg >= 0.75 * target as f64 && avg <= 1.02 * target as f64,
+                "target {target}: avg size {avg:.1} off target"
+            );
+            let tail = &decoded_48k[decoded_48k.len() / 3..];
+            let (_, proj) = sine_projection(tail, 400.0, 48_000.0);
+            proj_by_target.push(proj);
+        }
+        // More rate must not lose quality (1 dB measurement slack).
+        assert!(
+            proj_by_target[2] + 1.0 >= proj_by_target[0],
+            "quality ladder inverted: {proj_by_target:?}"
+        );
+        assert!(
+            proj_by_target[0] > 3.0,
+            "lowest-rate election unusable: {proj_by_target:?}"
+        );
+    }
+
+    /// A target below the coded frames' floor is floor-raised: the
+    /// packet exceeds the election but stays minimal and decodes.
+    #[test]
+    fn elected_tiny_target_floor_raises() {
+        let bw = Bandwidth::Nb;
+        let mut enc = SilkEncoderMono::new(bw).unwrap();
+        let flen = enc.frame_samples();
+        let mut dec = OpusDecoder::new();
+        let mut floor_sizes = Vec::new();
+        for pkt_idx in 0..6 {
+            let pcm: Vec<f32> = (0..flen)
+                .map(|i| mixed_sig(pkt_idx * flen + i, 8_000.0))
+                .collect();
+            let out = enc.encode_packet_elected(&pcm, 5).unwrap();
+            floor_sizes.push(out.packet.len());
+            dec.decode_packet(&out.packet).unwrap();
+        }
+        // The coarsest quantization's floor for a 20 ms NB frame is
+        // well under the natural-quality size but above 5 bytes.
+        for &s in &floor_sizes {
+            assert!((6..=30).contains(&s), "floor-raised size {s}");
+        }
+    }
+
+    /// SILK-layer rate control (stereo): elected sizes track the
+    /// target and the stereo image survives the decode.
+    #[test]
+    fn elected_sizes_track_target_stereo() {
+        let bw = Bandwidth::Wb;
+        let target = 80usize;
+        let mut enc = SilkEncoderStereo::new(bw).unwrap();
+        let flen = enc.frame_samples();
+        let gen = |i: usize| -> (f32, f32) {
+            let s = mixed_sig(i, 16_000.0);
+            (s, 0.4 * s)
+        };
+        let mut dec = OpusDecoder::new();
+        let mut sizes = Vec::new();
+        let mut l48 = Vec::new();
+        let mut r48 = Vec::new();
+        for pkt_idx in 0..20 {
+            let mut left = Vec::with_capacity(flen);
+            let mut right = Vec::with_capacity(flen);
+            for i in 0..flen {
+                let (l, r) = gen(pkt_idx * flen + i);
+                left.push(l);
+                right.push(r);
+            }
+            let next = gen((pkt_idx + 1) * flen);
+            let out = enc
+                .encode_packet_elected(&left, &right, Some(next), target)
+                .unwrap();
+            assert!(
+                out.packet.len() <= target + target / 12 + 1,
+                "packet {} far over the election",
+                out.packet.len()
+            );
+            sizes.push(out.packet.len());
+            let audio = dec.decode_packet(&out.packet).unwrap();
+            assert_eq!(audio.channels, 2);
+            for pair in audio.pcm.chunks_exact(2) {
+                l48.push(pair[0] as f64 / 32768.0);
+                r48.push(pair[1] as f64 / 32768.0);
+            }
+        }
+        let steady = &sizes[3..];
+        let avg = steady.iter().sum::<usize>() as f64 / steady.len() as f64;
+        assert!(
+            avg >= 0.70 * target as f64 && avg <= 1.02 * target as f64,
+            "stereo avg size {avg:.1} off target {target}"
+        );
+        // Both channels carry the tone, and the L > R panning holds.
+        let lt = &l48[l48.len() / 3..];
+        let rt = &r48[r48.len() / 3..];
+        let (la, lproj) = sine_projection(lt, 400.0, 48_000.0);
+        let (ra, rproj) = sine_projection(rt, 400.0, 48_000.0);
+        assert!(
+            lproj > 3.0 && rproj > 1.5,
+            "projections {lproj:.1}/{rproj:.1}"
+        );
+        assert!(la > ra, "panning lost: L {la:.4} vs R {ra:.4}");
     }
 
     /// The per-frame §4.2.3 VAD flags come from the signal: a 60 ms
