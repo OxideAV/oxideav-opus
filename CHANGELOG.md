@@ -4,6 +4,21 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **SILK-election fuzz target + overflow hardening** (round 437):
+  `fuzz/silk_elected_roundtrip` — coverage-guided bandwidth ×
+  duration × mono/stereo × FEC × per-packet-target × PCM exploration
+  asserting every elected packet decodes cleanly with the exact §3
+  sample count inside the §3.2.1 limits. Its first finding is fixed:
+  an election attempt whose packet writer overran the 1275-byte
+  frame limit (adversarial full-scale content at a generous starting
+  quality, 40/60 ms stereo + FEC) propagated the writer's error out
+  of `encode_packet_elected` instead of treating it as a "too big"
+  outcome — the search now drops the knob hard and continues,
+  erroring only when no quality produces a packet at all.
+  Pre-hardened locally (480 s / 43.5k runs clean, plus 240 s each on
+  the `vbr_encode_roundtrip` and `celt_encode_roundtrip` targets
+  against the new tf-analysis path, clean).
+
 - **CELT encoder tf analysis** (round 437): `celt_tf_analysis` — the
   reference listing's §4.3.4.5 encoder-side `tf_analysis`
   transcribed (per-band Haar-level L1 sparsity metric with the

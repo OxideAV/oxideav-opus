@@ -1298,9 +1298,27 @@ where
     let mut best_under: Option<(S, EncodedSilkPacket)> = None;
     // Smallest attempt overall (the floor-raise fallback).
     let mut smallest: Option<(S, EncodedSilkPacket)> = None;
+    let mut last_err = Error::MalformedPacket;
     for _ in 0..ELECT_MAX_ATTEMPTS {
         let mut cand = state.clone();
-        let pkt = encode(&mut cand, q)?;
+        // An attempt can overrun the §3.2.1 frame limit inside the
+        // packet writer (adversarial content at a generous quality):
+        // that is a "too big" outcome, not a failure — drop the knob
+        // hard and keep searching. Only a search that never produces
+        // a packet at all errors out.
+        let pkt = match encode(&mut cand, q) {
+            Ok(pkt) => pkt,
+            Err(e) => {
+                last_err = e;
+                evals.clear();
+                let next = (q / 4.0).max(PULSE_TARGET_MIN);
+                if (next - q).abs() < 1e-9 {
+                    break;
+                }
+                q = next;
+                continue;
+            }
+        };
         let size = pkt.packet.len() as f64;
         if size <= target
             && best_under
@@ -1340,7 +1358,7 @@ where
         }
         q = next;
     }
-    best_under.or(smallest).ok_or(Error::MalformedPacket)
+    best_under.or(smallest).ok_or(last_err)
 }
 
 /// Map a desired linear Q16 gain to the §4.2.7.4 `log_gain` index

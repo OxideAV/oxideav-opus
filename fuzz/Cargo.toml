@@ -81,3 +81,10 @@ name = "vbr_encode_roundtrip"
 path = "fuzz_targets/vbr_encode_roundtrip.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "silk_elected_roundtrip"
+path = "fuzz_targets/silk_elected_roundtrip.rs"
+test = false
+doc = false
+bench = false
