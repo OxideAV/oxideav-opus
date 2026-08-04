@@ -33,7 +33,8 @@
 //!
 //! * **CELT-only** ([`CeltVbrEncoder`]) — full election range
 //!   (silence collapse to a 3-byte packet, transient boost).
-//! * **Hybrid** ([`HybridVbrEncoderMono`]) — the election is applied
+//! * **Hybrid** ([`HybridVbrEncoderMono`] / [`HybridVbrEncoderStereo`])
+//!   — the election is applied
 //!   to the CELT tail; the quality-driven §4.2 SILK layer imposes a
 //!   per-frame floor
 //!   ([`crate::hybrid_packet_encode::HYBRID_MIN_CELT_TAIL_BYTES`]
@@ -56,7 +57,7 @@
 
 use crate::celt_frame_encode::CeltFrameEncodeInfo;
 use crate::celt_packet_encode::CeltEncoder;
-use crate::hybrid_packet_encode::HybridEncoderMono;
+use crate::hybrid_packet_encode::{HybridEncoderMono, HybridEncoderStereo};
 use crate::silk_encoder::{SilkEncoderMono, SilkEncoderStereo};
 use crate::toc::Bandwidth;
 use crate::Error;
@@ -409,6 +410,60 @@ impl HybridVbrEncoderMono {
     /// The SILK layer may raise the election to its floor; the
     /// returned packet's length is the actual size, and the raise is
     /// charged to the drift so later frames repay it.
+    pub fn encode_frame(&mut self, pcm: &[i16]) -> Result<Vec<u8>, Error> {
+        let elected = self.rc.elect_packet_bytes(0.0);
+        let packet = self.enc.encode_packet_elected(pcm, elected - 1)?;
+        self.rc.commit(packet.len());
+        Ok(packet)
+    }
+}
+
+/// A stereo Hybrid VBR packet encoder: [`HybridEncoderStereo`]
+/// driven by a [`VbrRateControl`] election, with the stereo SILK
+/// layer's floor raise feeding back into the drift (see
+/// [`HybridVbrEncoderMono`]).
+#[derive(Debug, Clone)]
+pub struct HybridVbrEncoderStereo {
+    enc: HybridEncoderStereo,
+    rc: VbrRateControl,
+}
+
+impl HybridVbrEncoderStereo {
+    /// New stereo Hybrid VBR encoder (SWB/FB × 10/20 ms, per
+    /// [`HybridEncoderStereo::new`]) targeting `target_bitrate_bps`.
+    pub fn new(
+        bandwidth: Bandwidth,
+        frame_tenths_ms: u16,
+        target_bitrate_bps: u32,
+        constrained: bool,
+    ) -> Result<Self, Error> {
+        let enc = HybridEncoderStereo::new(bandwidth, frame_tenths_ms)?;
+        let rc = VbrRateControl::new(target_bitrate_bps, frame_tenths_ms, constrained)?;
+        Ok(Self { enc, rc })
+    }
+
+    /// 48 kHz samples per channel per packet (`encode_frame` consumes
+    /// `2 * frame_samples()` interleaved samples).
+    #[must_use]
+    pub fn frame_samples(&self) -> usize {
+        self.enc.frame_samples()
+    }
+
+    /// The rate controller (drift / reservoir state inspection).
+    #[must_use]
+    pub fn rate_control(&self) -> &VbrRateControl {
+        &self.rc
+    }
+
+    /// Reset all carried state (§4.5.2).
+    pub fn reset(&mut self) {
+        self.enc.reset();
+        self.rc.reset();
+    }
+
+    /// Encode one packet of interleaved L/R 48 kHz PCM at a
+    /// VBR-elected size; a SILK-layer floor raise is charged to the
+    /// drift so later frames repay it.
     pub fn encode_frame(&mut self, pcm: &[i16]) -> Result<Vec<u8>, Error> {
         let elected = self.rc.elect_packet_bytes(0.0);
         let packet = self.enc.encode_packet_elected(pcm, elected - 1)?;

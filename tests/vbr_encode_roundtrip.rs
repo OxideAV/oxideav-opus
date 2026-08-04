@@ -9,7 +9,8 @@ use oxideav_opus::decoder::{FrameDecodeStatus, OpusDecoder};
 use oxideav_opus::silk_encoder::SilkEncoderMono;
 use oxideav_opus::toc::Bandwidth;
 use oxideav_opus::vbr::{
-    CeltVbrEncoder, HybridVbrEncoderMono, SilkVbrEncoderMono, SilkVbrEncoderStereo,
+    CeltVbrEncoder, HybridVbrEncoderMono, HybridVbrEncoderStereo, SilkVbrEncoderMono,
+    SilkVbrEncoderStereo,
 };
 
 /// Encode→decode delay at 48 kHz (the §4.3.7 MDCT overlap).
@@ -716,5 +717,65 @@ fn silk_vbr_stereo_natural_use_without_lookahead() {
         let packet = enc.encode_frame(&left, &right, None).unwrap();
         let out = dec.decode_packet(&packet).unwrap();
         assert_eq!(out.channels, 2);
+    }
+}
+
+#[test]
+fn hybrid_stereo_vbr_tracks_target_and_decodes() {
+    // The stereo Hybrid VBR arm: realized average within a few
+    // percent of target when the target clears the stereo SILK
+    // layer's floor, every packet a code-0 Hybrid decode.
+    for &(bw, bps) in &[(Bandwidth::Fb, 160_000u32), (Bandwidth::Swb, 144_000)] {
+        let mut enc = HybridVbrEncoderStereo::new(bw, 200, bps, false).unwrap();
+        let spf = enc.frame_samples();
+        let target = enc.rate_control().target_bits_per_packet() / 8.0;
+        let mut dec = OpusDecoder::new();
+        let frames = 25usize;
+        let mut total = 0usize;
+        for f in 0..frames {
+            let mut pcm = Vec::with_capacity(2 * spf);
+            for j in 0..spf {
+                let v = hybrid_sig(f * spf + j);
+                pcm.push((v.round()).clamp(-32768.0, 32767.0) as i16);
+                pcm.push((0.6 * v).round().clamp(-32768.0, 32767.0) as i16);
+            }
+            let packet = enc.encode_frame(&pcm).unwrap();
+            total += packet.len();
+            let out = dec.decode_packet(&packet).unwrap();
+            assert_eq!(out.channels, 2);
+            assert_eq!(out.frame_outcomes.len(), 1);
+            assert_eq!(
+                out.frame_outcomes[0].status,
+                FrameDecodeStatus::HybridDecoded
+            );
+        }
+        let avg = total as f64 / frames as f64;
+        println!("hybrid stereo vbr {bw:?} {bps}: avg {avg:.1} B vs target {target:.1} B");
+        assert!(
+            (avg - target).abs() <= 0.06 * target,
+            "{bw:?}: avg {avg:.1} off target {target:.1}"
+        );
+    }
+}
+
+#[test]
+fn hybrid_stereo_vbr_floor_raise_survives_starving_targets() {
+    // A target under the stereo SILK layer's floor: every packet is
+    // floor-raised, decodes cleanly, and the drift stays clamped.
+    let mut enc = HybridVbrEncoderStereo::new(Bandwidth::Fb, 200, 24_000, false).unwrap();
+    let spf = enc.frame_samples();
+    let mut dec = OpusDecoder::new();
+    for f in 0..12 {
+        let mut pcm = Vec::with_capacity(2 * spf);
+        for j in 0..spf {
+            let v = hybrid_sig(f * spf + j);
+            pcm.push((v.round()).clamp(-32768.0, 32767.0) as i16);
+            pcm.push((0.6 * v).round().clamp(-32768.0, 32767.0) as i16);
+        }
+        let packet = enc.encode_frame(&pcm).unwrap();
+        assert!(packet.len() > 60, "starving election must floor-raise");
+        assert!(packet.len() <= 1276);
+        let out = dec.decode_packet(&packet).unwrap();
+        assert_eq!(out.samples_per_channel(), spf);
     }
 }

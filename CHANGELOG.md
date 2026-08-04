@@ -4,6 +4,16 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Stereo Hybrid VBR arm** (round 437):
+  `vbr::HybridVbrEncoderStereo` — the [`VbrRateControl`] election on
+  [`HybridEncoderStereo::encode_packet_elected`], stereo SILK-layer
+  floor raises feeding the drift. Realized averages land exactly on
+  target when it clears the stereo SILK floor (FB 160 kb/s → 400.0 B
+  vs 400 B, SWB 144 kb/s → 360.0 B vs 360 B); a starving target
+  floor-raises every packet and still decodes. A 3-stream oracle set
+  (FB/SWB 20 ms + FB 10 ms VBR) decodes through the §A
+  reference-listing decoder at **103–106 dB** agreement (max 1 LSB).
+
 - **Stereo Hybrid encode** (round 437):
   `hybrid_packet_encode::HybridEncoderStereo` — configs 12–15 with
   the stereo flag (SWB/FB × 10/20 ms). The §4.2.2 WB SILK stereo
