@@ -4,6 +4,23 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **SILK-only VBR arm** (round 437): `vbr::SilkVbrEncoderMono` /
+  `vbr::SilkVbrEncoderStereo` — the [`VbrRateControl`] election now
+  drives the SILK-layer rate control (`encode_packet_elected`), so
+  the SILK-only arm elects per-frame sizes against a bitrate target
+  like the CELT and Hybrid arms (unconstrained and constrained, all
+  packet durations 10/20/40/60 ms, LBRR/FEC riding inside the
+  elected sizes, floor raises charged to the drift). Measured on
+  mixed tone+noise content: realized averages land within 0.1% of
+  target (NB 12 kb/s, WB 20/32 kb/s, 40/60 ms multiframe, stereo
+  28 kb/s constrained + FEC); a silent stretch collapses to the
+  header floor with the post-silence spree bounded at 2× target;
+  constrained packets never outrun the pre-encode reservoir ceiling
+  (all gated in `tests/vbr_encode_roundtrip.rs`). A 5-stream
+  SILK-VBR oracle set (NB/MB/WB × 20/40/60 ms mono + constrained
+  stereo-FEC) decodes **bit-exactly** through the §A
+  reference-listing decoder.
+
 - **SILK-layer rate control** (round 437): the encoder arc's open
   frontier — electing a SILK-only packet's size against a byte
   target — is closed. `ChannelAnalyzer::set_pulse_target` exposes

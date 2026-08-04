@@ -40,14 +40,13 @@
 //!   past the coded SILK bits), and floor raises feed back into the
 //!   drift so the average still tracks the target when it is
 //!   reachable.
-//! * **SILK-only** — the §4.2 layer is inherently VBR (§2.1.8: "the
-//!   LP layer is VBR"): [`crate::silk_encoder::SilkEncoderMono`] /
-//!   `SilkEncoderStereo` already emit natural quality-driven sizes,
-//!   which IS the Opus-level VBR emission for that arm. Electing a
-//!   per-frame size around a bitrate target additionally requires
-//!   SILK-layer rate control (a quantization-rate knob), which the
-//!   crate does not have yet — that frontier is documented, not
-//!   faked, so no SILK wrapper appears here.
+//! * **SILK-only** ([`SilkVbrEncoderMono`] / [`SilkVbrEncoderStereo`])
+//!   — the §4.2 layer is inherently VBR (§2.1.8: "the LP layer is
+//!   VBR"); the election drives the SILK-layer rate control
+//!   (`encode_packet_elected`, the §5.2.3.9 iterative loop around
+//!   the noise shaping quantizer), and a floor-raised packet (one
+//!   whose coarsest quantization still exceeds the election) feeds
+//!   back into the drift like the Hybrid arm's SILK floor.
 //!
 //! ## Provenance
 //!
@@ -58,6 +57,7 @@
 use crate::celt_frame_encode::CeltFrameEncodeInfo;
 use crate::celt_packet_encode::CeltEncoder;
 use crate::hybrid_packet_encode::HybridEncoderMono;
+use crate::silk_encoder::{SilkEncoderMono, SilkEncoderStereo};
 use crate::toc::Bandwidth;
 use crate::Error;
 
@@ -414,6 +414,131 @@ impl HybridVbrEncoderMono {
         let packet = self.enc.encode_packet_elected(pcm, elected - 1)?;
         self.rc.commit(packet.len());
         Ok(packet)
+    }
+}
+
+/// A mono SILK-only VBR packet encoder: [`SilkEncoderMono`] driven
+/// by a [`VbrRateControl`] election through the SILK-layer rate
+/// control (see the module docs).
+#[derive(Debug, Clone)]
+pub struct SilkVbrEncoderMono {
+    enc: SilkEncoderMono,
+    rc: VbrRateControl,
+}
+
+impl SilkVbrEncoderMono {
+    /// New mono SILK-only VBR encoder for one SILK internal
+    /// bandwidth (NB / MB / WB) and packet duration
+    /// (`packet_tenths_ms` in 100 / 200 / 400 / 600), targeting
+    /// `target_bitrate_bps` on the wire, constrained per
+    /// [`VbrRateControl`].
+    pub fn new(
+        bandwidth: Bandwidth,
+        packet_tenths_ms: u16,
+        target_bitrate_bps: u32,
+        constrained: bool,
+    ) -> Result<Self, Error> {
+        let enc = SilkEncoderMono::with_packet_duration(bandwidth, packet_tenths_ms)?;
+        let rc = VbrRateControl::new(target_bitrate_bps, packet_tenths_ms, constrained)?;
+        Ok(Self { enc, rc })
+    }
+
+    /// Per-packet input length at the SILK internal rate.
+    #[must_use]
+    pub fn frame_samples(&self) -> usize {
+        self.enc.frame_samples()
+    }
+
+    /// The rate controller (drift / reservoir state inspection).
+    #[must_use]
+    pub fn rate_control(&self) -> &VbrRateControl {
+        &self.rc
+    }
+
+    /// Enable / disable §4.2.5 LBRR (in-band FEC) emission (see
+    /// [`SilkEncoderMono::set_fec`]; the redundancy rides inside the
+    /// elected sizes).
+    pub fn set_fec(&mut self, enabled: bool) {
+        self.enc.set_fec(enabled);
+    }
+
+    /// Reset all carried state (§4.5.2).
+    pub fn reset(&mut self) {
+        self.enc.reset();
+        self.rc.reset();
+    }
+
+    /// Encode one packet of mono internal-rate PCM at a VBR-elected
+    /// size. A floor raise (the coarsest quantization exceeding the
+    /// election) is charged to the drift so later frames repay it.
+    pub fn encode_frame(&mut self, pcm: &[f32]) -> Result<Vec<u8>, Error> {
+        let elected = self.rc.elect_packet_bytes(0.0);
+        let out = self.enc.encode_packet_elected(pcm, elected)?;
+        self.rc.commit(out.packet.len());
+        Ok(out.packet)
+    }
+}
+
+/// A stereo SILK-only VBR packet encoder (see [`SilkVbrEncoderMono`]).
+#[derive(Debug, Clone)]
+pub struct SilkVbrEncoderStereo {
+    enc: SilkEncoderStereo,
+    rc: VbrRateControl,
+}
+
+impl SilkVbrEncoderStereo {
+    /// New stereo SILK-only VBR encoder (see
+    /// [`SilkVbrEncoderMono::new`]).
+    pub fn new(
+        bandwidth: Bandwidth,
+        packet_tenths_ms: u16,
+        target_bitrate_bps: u32,
+        constrained: bool,
+    ) -> Result<Self, Error> {
+        let enc = SilkEncoderStereo::with_packet_duration(bandwidth, packet_tenths_ms)?;
+        let rc = VbrRateControl::new(target_bitrate_bps, packet_tenths_ms, constrained)?;
+        Ok(Self { enc, rc })
+    }
+
+    /// Per-packet input length per channel at the internal rate.
+    #[must_use]
+    pub fn frame_samples(&self) -> usize {
+        self.enc.frame_samples()
+    }
+
+    /// The rate controller (drift / reservoir state inspection).
+    #[must_use]
+    pub fn rate_control(&self) -> &VbrRateControl {
+        &self.rc
+    }
+
+    /// Enable / disable §4.2.5 LBRR emission (see
+    /// [`SilkVbrEncoderMono::set_fec`]).
+    pub fn set_fec(&mut self, enabled: bool) {
+        self.enc.set_fec(enabled);
+    }
+
+    /// Reset all carried state (§4.5.2).
+    pub fn reset(&mut self) {
+        self.enc.reset();
+        self.rc.reset();
+    }
+
+    /// Encode one packet of stereo internal-rate PCM at a VBR-elected
+    /// size (`next_lr` is the §4.2.8 one-sample lookahead; see
+    /// [`SilkEncoderStereo::encode_packet`]).
+    pub fn encode_frame(
+        &mut self,
+        left: &[f32],
+        right: &[f32],
+        next_lr: Option<(f32, f32)>,
+    ) -> Result<Vec<u8>, Error> {
+        let elected = self.rc.elect_packet_bytes(0.0);
+        let out = self
+            .enc
+            .encode_packet_elected(left, right, next_lr, elected)?;
+        self.rc.commit(out.packet.len());
+        Ok(out.packet)
     }
 }
 

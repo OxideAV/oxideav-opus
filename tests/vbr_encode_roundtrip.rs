@@ -8,7 +8,9 @@ use oxideav_opus::celt_packet_encode::CeltEncoder;
 use oxideav_opus::decoder::{FrameDecodeStatus, OpusDecoder};
 use oxideav_opus::silk_encoder::SilkEncoderMono;
 use oxideav_opus::toc::Bandwidth;
-use oxideav_opus::vbr::{CeltVbrEncoder, HybridVbrEncoderMono};
+use oxideav_opus::vbr::{
+    CeltVbrEncoder, HybridVbrEncoderMono, SilkVbrEncoderMono, SilkVbrEncoderStereo,
+};
 
 /// Encode→decode delay at 48 kHz (the §4.3.7 MDCT overlap).
 const DELAY: usize = 120;
@@ -524,4 +526,195 @@ fn vbr_streams_have_exact_frame_accounting() {
     }
     assert_eq!(n_packets, 9);
     assert_eq!(n_samples, 9 * spf);
+}
+
+/// Deterministic mixed internal-rate content for the SILK arm: tone +
+/// harmonic + a small noise floor (a continuous rate ladder, unlike a
+/// pure tone).
+fn silk_sig(i: usize, rate_hz: f64) -> f32 {
+    let t = i as f64 / rate_hz;
+    let mut x = 0.25 * (2.0 * std::f64::consts::PI * 400.0 * t).sin()
+        + 0.1 * (2.0 * std::f64::consts::PI * 1250.0 * t + 0.7).sin();
+    let mut lcg = (i as u32)
+        .wrapping_mul(1_664_525)
+        .wrapping_add(1_013_904_223);
+    lcg ^= lcg >> 13;
+    x += 0.03 * ((lcg & 0xffff) as f64 / 32768.0 - 1.0);
+    x as f32
+}
+
+#[test]
+fn silk_vbr_mono_tracks_target_and_decodes() {
+    // The elected SILK-only arm: realized average within a few
+    // percent of target, every packet decoding with the exact §3
+    // sample count.
+    for &(bw, rate_hz, bps) in &[
+        (Bandwidth::Nb, 8_000.0, 12_000u32),
+        (Bandwidth::Wb, 16_000.0, 20_000),
+        (Bandwidth::Wb, 16_000.0, 32_000),
+    ] {
+        let mut enc = SilkVbrEncoderMono::new(bw, 200, bps, false).unwrap();
+        let spf = enc.frame_samples();
+        let target = enc.rate_control().target_bits_per_packet() / 8.0;
+        let mut dec = OpusDecoder::new();
+        let frames = 40usize;
+        let mut total = 0usize;
+        for f in 0..frames {
+            let frame: Vec<f32> = (0..spf).map(|i| silk_sig(f * spf + i, rate_hz)).collect();
+            let packet = enc.encode_frame(&frame).unwrap();
+            total += packet.len();
+            let out = dec.decode_packet(&packet).unwrap();
+            assert_eq!(out.samples_per_channel(), 960);
+            assert_eq!(out.channels, 1);
+        }
+        let avg = total as f64 / frames as f64;
+        println!("silk vbr {bw:?} {bps} b/s: avg {avg:.1} B vs target {target:.1} B");
+        assert!(
+            (avg - target).abs() <= 0.08 * target,
+            "{bw:?} {bps}: avg {avg:.1} off target {target:.1}"
+        );
+    }
+}
+
+#[test]
+fn silk_vbr_stereo_tracks_target_with_fec() {
+    let mut enc = SilkVbrEncoderStereo::new(Bandwidth::Wb, 200, 28_000, false).unwrap();
+    enc.set_fec(true);
+    let spf = enc.frame_samples();
+    let target = enc.rate_control().target_bits_per_packet() / 8.0;
+    let mut dec = OpusDecoder::new();
+    let frames = 40usize;
+    let mut total = 0usize;
+    for f in 0..frames {
+        let mut left = Vec::with_capacity(spf);
+        let mut right = Vec::with_capacity(spf);
+        for i in 0..spf {
+            let v = silk_sig(f * spf + i, 16_000.0);
+            left.push(v);
+            right.push(0.4 * v);
+        }
+        let nv = silk_sig((f + 1) * spf, 16_000.0);
+        let packet = enc
+            .encode_frame(&left, &right, Some((nv, 0.4 * nv)))
+            .unwrap();
+        total += packet.len();
+        let out = dec.decode_packet(&packet).unwrap();
+        assert_eq!(out.samples_per_channel(), 960);
+        assert_eq!(out.channels, 2);
+    }
+    let avg = total as f64 / frames as f64;
+    println!("silk vbr stereo+fec: avg {avg:.1} B vs target {target:.1} B");
+    assert!(
+        (avg - target).abs() <= 0.10 * target,
+        "stereo avg {avg:.1} off target {target:.1}"
+    );
+}
+
+#[test]
+fn silk_vbr_constrained_never_outruns_the_reservoir() {
+    // Constrained discipline on the SILK arm: no packet exceeds the
+    // controller's pre-encode ceiling (the content's floor sits well
+    // below the target, so floor raises cannot bust it).
+    let mut enc = SilkVbrEncoderMono::new(Bandwidth::Wb, 200, 24_000, true).unwrap();
+    let spf = enc.frame_samples();
+    let mut dec = OpusDecoder::new();
+    for f in 0..60 {
+        let ceiling_bits = enc.rate_control().constrained_ceiling_bits();
+        let frame: Vec<f32> = (0..spf).map(|i| silk_sig(f * spf + i, 16_000.0)).collect();
+        let packet = enc.encode_frame(&frame).unwrap();
+        assert!(
+            (packet.len() * 8) as f64 <= ceiling_bits + 8.0,
+            "packet {} bits outran ceiling {ceiling_bits}",
+            packet.len() * 8
+        );
+        dec.decode_packet(&packet).unwrap();
+    }
+}
+
+#[test]
+fn silk_vbr_silence_banks_and_repays() {
+    // A silent stretch collapses to near-floor packets; the drift
+    // clamp bounds the post-silence spree to 2x target.
+    let mut enc = SilkVbrEncoderMono::new(Bandwidth::Wb, 200, 24_000, false).unwrap();
+    let spf = enc.frame_samples();
+    let target = enc.rate_control().target_bits_per_packet() / 8.0;
+    let mut dec = OpusDecoder::new();
+    let mut sizes = Vec::new();
+    for f in 0..30 {
+        let silent = (10..20).contains(&f);
+        let frame: Vec<f32> = (0..spf)
+            .map(|i| {
+                if silent {
+                    0.0
+                } else {
+                    silk_sig(f * spf + i, 16_000.0)
+                }
+            })
+            .collect();
+        let packet = enc.encode_frame(&frame).unwrap();
+        sizes.push(packet.len());
+        dec.decode_packet(&packet).unwrap();
+    }
+    // Silent packets sit far below target (inactive frames at the
+    // header floor)...
+    let silent_avg = sizes[12..20].iter().sum::<usize>() as f64 / 8.0;
+    assert!(
+        silent_avg < 0.4 * target,
+        "silent packets {silent_avg:.1} B did not collapse (target {target:.1})"
+    );
+    // ...and every packet ever emitted obeys the drift-clamped bound.
+    for &s in &sizes {
+        assert!(
+            (s as f64) <= 2.0 * target + 1.0,
+            "post-silence spree {s} B busts the 2x-target clamp"
+        );
+    }
+}
+
+#[test]
+fn silk_vbr_multiframe_durations_track_target() {
+    // 40 ms and 60 ms packets (2-3 SILK frames per §4.2.2): the
+    // election spans the whole packet; frame accounting stays exact.
+    for &(tenths, samples48) in &[(400u16, 1920usize), (600, 2880)] {
+        let mut enc = SilkVbrEncoderMono::new(Bandwidth::Wb, tenths, 20_000, false).unwrap();
+        let spf = enc.frame_samples();
+        let target = enc.rate_control().target_bits_per_packet() / 8.0;
+        let mut dec = OpusDecoder::new();
+        let frames = 20usize;
+        let mut total = 0usize;
+        for f in 0..frames {
+            let frame: Vec<f32> = (0..spf).map(|i| silk_sig(f * spf + i, 16_000.0)).collect();
+            let packet = enc.encode_frame(&frame).unwrap();
+            total += packet.len();
+            let out = dec.decode_packet(&packet).unwrap();
+            assert_eq!(out.samples_per_channel(), samples48);
+        }
+        let avg = total as f64 / frames as f64;
+        println!("silk vbr {tenths} tenths-ms: avg {avg:.1} B vs target {target:.1} B");
+        assert!(
+            (avg - target).abs() <= 0.08 * target,
+            "{tenths}: avg {avg:.1} off target {target:.1}"
+        );
+    }
+}
+
+#[test]
+fn silk_vbr_stereo_natural_use_without_lookahead() {
+    // Stream-end ergonomics: None lookahead on every frame still
+    // tracks and decodes.
+    let mut enc = SilkVbrEncoderStereo::new(Bandwidth::Nb, 200, 16_000, false).unwrap();
+    let spf = enc.frame_samples();
+    let mut dec = OpusDecoder::new();
+    for f in 0..10 {
+        let mut left = Vec::with_capacity(spf);
+        let mut right = Vec::with_capacity(spf);
+        for i in 0..spf {
+            let v = silk_sig(f * spf + i, 8_000.0);
+            left.push(v);
+            right.push(-v);
+        }
+        let packet = enc.encode_frame(&left, &right, None).unwrap();
+        let out = dec.decode_packet(&packet).unwrap();
+        assert_eq!(out.channels, 2);
+    }
 }
