@@ -27,10 +27,14 @@ use crate::celt_redundancy::{
     HYBRID_REDUNDANCY_MIN_REMAINING_BITS, REDUNDANCY_FLAG_ICDF, REDUNDANCY_FLAG_ICDF_FTB,
 };
 use crate::range_encoder::RangeEncoder;
-use crate::silk_decode::{encode_silk_frame, SilkFrameConfig};
-use crate::silk_encoder::ChannelAnalyzer;
+use crate::silk_decode::{encode_silk_frame, SilkFrameConfig, StereoHeaderContext};
+use crate::silk_encoder::{ChannelAnalyzer, MID_ONLY_SIDE_RMS};
 use crate::silk_excitation::SilkFrameSize;
+use crate::silk_frame::{StereoPredictionWeights, StereoWeightSymbols};
 use crate::silk_header::{PerFrameLbrr, SilkChannelHeader, SilkHeaderBits};
+use crate::silk_stereo::{
+    estimate_stereo_weights, stereo_lr_to_ms, StereoDownmixState, StereoWeightsQ13,
+};
 use crate::toc::{Bandwidth, FrameCountCode, Mode, OpusTocByte};
 use crate::Error;
 
@@ -271,6 +275,295 @@ impl HybridEncoderMono {
     /// coded when the 37-bit window is open, mirroring the decoder's
     /// gate) and the §4.3 CELT layer (bands 17..) on the same coder,
     /// finalized to exactly `payload_bytes` bytes.
+    fn finish_with_celt(
+        &mut self,
+        pcm: &[i16],
+        toc: u8,
+        mut re: RangeEncoder,
+        payload_bytes: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let total_bits = payload_bytes as u32 * 8;
+        debug_assert!(re.tell() <= total_bits, "SILK layer over budget");
+        if total_bits.saturating_sub(re.tell()) >= HYBRID_REDUNDANCY_MIN_REMAINING_BITS {
+            re.enc_icdf(0, &REDUNDANCY_FLAG_ICDF, REDUNDANCY_FLAG_ICDF_FTB);
+        }
+        let _info = encode_celt_frame(
+            &mut self.celt,
+            &mut re,
+            pcm,
+            payload_bytes,
+            crate::celt_band_layout::HYBRID_FIRST_CODED_BAND,
+            self.end_band,
+            self.lm,
+        );
+        debug_assert!(re.tell() <= total_bits, "hybrid CELT layer bust");
+        let body = re
+            .finish_fixed(payload_bytes)
+            .ok_or(Error::MalformedPacket)?;
+        let mut packet = Vec::with_capacity(1 + payload_bytes);
+        packet.push(toc);
+        packet.extend_from_slice(&body);
+        Ok(packet)
+    }
+}
+
+/// A stereo Hybrid packet encoder (configs 12–15 with the stereo
+/// flag): the §4.2.2 WB SILK stereo layer (one mid frame with the
+/// §4.2.7.1 weights + §4.2.7.2 mid-only escape, then the side frame)
+/// and the stereo §4.3 CELT layer for bands 17.., sharing one range
+/// coder on the mono encoder's delay-matched timeline (the §4.2.8
+/// stereo unmix carries the same one-sample internal-rate delay as
+/// the mono path).
+#[derive(Debug, Clone)]
+pub struct HybridEncoderStereo {
+    mid: ChannelAnalyzer,
+    side: ChannelAnalyzer,
+    downmix: StereoDownmixState,
+    /// Previous packet's trailing raw-mid sample (the §4.2.8 `p0`
+    /// boundary term of the weight estimate).
+    prev_mid: f32,
+    celt: CeltEncoderState,
+    decim_l: Decimator48To16,
+    decim_r: Decimator48To16,
+    bandwidth: Bandwidth,
+    frame_tenths_ms: u16,
+    silk_frame_size: SilkFrameSize,
+    end_band: usize,
+    lm: i32,
+    n: usize,
+}
+
+impl HybridEncoderStereo {
+    /// New stereo Hybrid encoder. `bandwidth` is SWB or FB;
+    /// `frame_tenths_ms` is 100 or 200 (10 / 20 ms).
+    pub fn new(bandwidth: Bandwidth, frame_tenths_ms: u16) -> Result<Self, Error> {
+        let end_band = match bandwidth {
+            Bandwidth::Swb => 19,
+            Bandwidth::Fb => 21,
+            _ => return Err(Error::MalformedPacket),
+        };
+        let (lm, silk_frame_size) = match frame_tenths_ms {
+            100 => (2i32, SilkFrameSize::TenMs),
+            200 => (3, SilkFrameSize::TwentyMs),
+            _ => return Err(Error::MalformedPacket),
+        };
+        let _ = OpusTocByte::compose_byte(
+            Mode::Hybrid,
+            bandwidth,
+            frame_tenths_ms,
+            true,
+            FrameCountCode::One,
+        )?;
+        let n = 120usize << lm;
+        Ok(Self {
+            mid: ChannelAnalyzer::new(Bandwidth::Wb)?,
+            side: ChannelAnalyzer::new(Bandwidth::Wb)?,
+            downmix: StereoDownmixState::new(),
+            prev_mid: 0.0,
+            celt: CeltEncoderState::new(2, n),
+            decim_l: Decimator48To16::new(),
+            decim_r: Decimator48To16::new(),
+            bandwidth,
+            frame_tenths_ms,
+            silk_frame_size,
+            end_band,
+            lm,
+            n,
+        })
+    }
+
+    /// 48 kHz samples per channel per packet (`pcm` is interleaved
+    /// L/R, so `encode_packet` consumes `2 * frame_samples()`).
+    #[must_use]
+    pub fn frame_samples(&self) -> usize {
+        self.n
+    }
+
+    /// Reset all carried state (§4.5.2).
+    pub fn reset(&mut self) {
+        self.mid.reset();
+        self.side.reset();
+        self.downmix.reset();
+        self.prev_mid = 0.0;
+        self.celt.reset();
+        self.decim_l.reset();
+        self.decim_r.reset();
+    }
+
+    /// Encode one packet: `pcm` holds `2 * frame_samples()` interleaved
+    /// L/R 48 kHz samples; the packet is `1 + payload_bytes` bytes
+    /// (code 0). As with the mono encoder, a payload the SILK layer
+    /// alone overflows is rejected (the analysis state has already
+    /// advanced).
+    pub fn encode_packet(&mut self, pcm: &[i16], payload_bytes: usize) -> Result<Vec<u8>, Error> {
+        if pcm.len() != 2 * self.n {
+            return Err(Error::MalformedPacket);
+        }
+        if !(2..=MAX_FRAME_BYTES).contains(&payload_bytes) {
+            return Err(Error::MalformedPacket);
+        }
+        let (toc, re) = self.encode_silk_layer(pcm)?;
+        if re.tell() > payload_bytes as u32 * 8 {
+            return Err(Error::MalformedPacket);
+        }
+        self.finish_with_celt(pcm, toc, re, payload_bytes)
+    }
+
+    /// Encode one packet with a VBR-elected payload size (see
+    /// [`HybridEncoderMono::encode_packet_elected`]).
+    pub fn encode_packet_elected(
+        &mut self,
+        pcm: &[i16],
+        elected_payload_bytes: usize,
+    ) -> Result<Vec<u8>, Error> {
+        if pcm.len() != 2 * self.n {
+            return Err(Error::MalformedPacket);
+        }
+        let (toc, re) = self.encode_silk_layer(pcm)?;
+        let silk_bytes = (re.tell() as usize).div_ceil(8);
+        let floor = silk_bytes + HYBRID_MIN_CELT_TAIL_BYTES;
+        if floor > MAX_FRAME_BYTES {
+            return Err(Error::MalformedPacket);
+        }
+        let payload_bytes = elected_payload_bytes.clamp(floor, MAX_FRAME_BYTES);
+        self.finish_with_celt(pcm, toc, re, payload_bytes)
+    }
+
+    /// Phase 1: the §4.2.2 stereo SILK layer on a fresh range coder —
+    /// decimate L/R to the WB internal rate, run the §5.2.2 stereo
+    /// mixing front end (weight estimate → quantize → exact §4.2.8
+    /// downmix with the QUANTIZED pair), analyse mid and side, and
+    /// write header bits + mid frame (+ side frame unless mid-only),
+    /// mirroring the decoder's single-interval stereo walk.
+    fn encode_silk_layer(&mut self, pcm: &[i16]) -> Result<(u8, RangeEncoder), Error> {
+        let toc = OpusTocByte::compose_byte(
+            Mode::Hybrid,
+            self.bandwidth,
+            self.frame_tenths_ms,
+            true,
+            FrameCountCode::One,
+        )?;
+        let mut re = RangeEncoder::new();
+        let mut l48 = Vec::with_capacity(self.n);
+        let mut r48 = Vec::with_capacity(self.n);
+        for pair in pcm.chunks_exact(2) {
+            l48.push(f64::from(pair[0]));
+            r48.push(f64::from(pair[1]));
+        }
+        let l16 = self.decim_l.process(&l48);
+        let r16 = self.decim_r.process(&r48);
+        let flen = l16.len();
+
+        // §5.2.2 stereo mixing (one §4.2.2 interval per Hybrid frame).
+        let mid_raw: Vec<f32> = l16.iter().zip(&r16).map(|(&a, &b)| (a + b) / 2.0).collect();
+        let side_raw: Vec<f32> = l16.iter().zip(&r16).map(|(&a, &b)| (a - b) / 2.0).collect();
+        let mid_next = mid_raw[flen - 1];
+        let target = estimate_stereo_weights(&mid_raw, &side_raw, self.prev_mid, mid_next)?;
+        let weight_symbols = StereoWeightSymbols::quantize(StereoPredictionWeights {
+            w0_q13: target.w0_q13,
+            w1_q13: target.w1_q13,
+        });
+        let decoded_w = weight_symbols.weights();
+        let ms = stereo_lr_to_ms(
+            Bandwidth::Wb,
+            &l16,
+            &r16,
+            StereoWeightsQ13 {
+                w0_q13: decoded_w.w0_q13,
+                w1_q13: decoded_w.w1_q13,
+            },
+            None,
+            &mut self.downmix,
+        )?;
+        self.prev_mid = mid_raw[flen - 1];
+
+        // §4.2.7.2 mid-only decision.
+        let side_energy: f64 = ms.side.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        let code_side = (side_energy / flen as f64).sqrt() > MID_ONLY_SIDE_RMS;
+
+        // Per-channel analysis (each Hybrid frame is a fresh Opus
+        // frame: first-in-packet threading, decoder carry kept inert
+        // by the analyzers' gain floors).
+        let mut mid_frame = self
+            .mid
+            .analyze_frame_sized(&ms.mid, true, self.silk_frame_size)?;
+        mid_frame.header.stereo = Some(weight_symbols);
+        let side_frame = if code_side {
+            Some(
+                self.side
+                    .analyze_frame_sized(&ms.side, true, self.silk_frame_size)?,
+            )
+        } else {
+            // Mid-only: the decoder clears the side carried state
+            // after the uncoded side frame — mirror it.
+            self.side.reset();
+            None
+        };
+        let side_active = side_frame
+            .as_ref()
+            .is_some_and(|f| f.header.frame_type >= 2);
+        // §4.2.7.2: flag present iff the side VAD is clear for the
+        // interval; set iff no side frame is coded at all.
+        mid_frame.header.mid_only_flag = if side_active {
+            None
+        } else {
+            Some(side_frame.is_none())
+        };
+        // A coded-but-inactive side frame keeps the flag present and
+        // cleared; the frame itself still rides the bitstream.
+
+        let header = SilkHeaderBits {
+            num_silk_frames: 1,
+            mid: SilkChannelHeader {
+                vad_flags: u8::from(mid_frame.header.frame_type >= 2),
+                lbrr_flag: false,
+            },
+            side: Some(SilkChannelHeader {
+                vad_flags: u8::from(side_active),
+                lbrr_flag: false,
+            }),
+            per_frame_lbrr: PerFrameLbrr { mid: 0, side: 0 },
+        };
+        header.encode(&mut re)?;
+
+        let stereo_ctx = StereoHeaderContext {
+            has_mid_only_flag: !side_active,
+        };
+        let mid_cfg = SilkFrameConfig {
+            bandwidth: Bandwidth::Wb,
+            frame_size: self.silk_frame_size,
+            voice_active: mid_frame.header.frame_type >= 2,
+            first_subframe_independent: true,
+            previous_log_gain: None,
+            previous_primary_lag: None,
+            ltp_scaling_present: true,
+            lsf_interp_after_reset: true,
+            previous_nlsf_q15: None,
+            previous_nlsf_len: 0,
+            stereo: Some(stereo_ctx),
+        };
+        let _ = encode_silk_frame(&mut re, mid_cfg, &mid_frame.symbols())?;
+        if let Some(side) = &side_frame {
+            let side_cfg = SilkFrameConfig {
+                bandwidth: Bandwidth::Wb,
+                frame_size: self.silk_frame_size,
+                voice_active: side_active,
+                first_subframe_independent: true,
+                previous_log_gain: None,
+                previous_primary_lag: None,
+                ltp_scaling_present: true,
+                lsf_interp_after_reset: true,
+                previous_nlsf_q15: None,
+                previous_nlsf_len: 0,
+                stereo: None,
+            };
+            let _ = encode_silk_frame(&mut re, side_cfg, &side.symbols())?;
+        }
+        Ok((toc, re))
+    }
+
+    /// Phase 2: identical to the mono encoder's (§4.5.1.1 redundancy
+    /// flag off + stereo §4.3 CELT layer on the same coder).
     fn finish_with_celt(
         &mut self,
         pcm: &[i16],

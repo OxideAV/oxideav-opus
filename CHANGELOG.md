@@ -4,6 +4,26 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Stereo Hybrid encode** (round 437):
+  `hybrid_packet_encode::HybridEncoderStereo` — configs 12–15 with
+  the stereo flag (SWB/FB × 10/20 ms). The §4.2.2 WB SILK stereo
+  layer runs the §5.2.2 mixing front end per packet (least-squares
+  §4.2.7.1 weight estimate → exhaustive codebook quantize → the
+  exact §4.2.8 downmix with the QUANTIZED pair), writes the
+  two-channel §4.2.3 header bits, the mid frame (weights +
+  gated §4.2.7.2 mid-only escape) and the side frame on the shared
+  range coder, then the §4.5.1.1 redundancy flag (off) and the
+  stereo §4.3 CELT layer for bands 17.. — on the mono arm's
+  delay-matched timeline (the §4.2.8 stereo unmix carries the same
+  one-sample internal-rate delay). `encode_packet_elected` gives the
+  VBR arms the same floor-raise semantics as mono. Validated through
+  both decoders: 7 integration gates (FB/SWB × 10/20 ms SNR at the
+  120-sample delay, monotone rate ladder, mid-only escape on
+  identical channels, elected-payload flows) and a 3-stream oracle
+  set decoding through the §A reference-listing decoder at
+  **104–107 dB** agreement with our decoder (max 1 LSB,
+  float-noise floor — the same corridor as the mono Hybrid arm).
+
 - **SILK-only VBR arm** (round 437): `vbr::SilkVbrEncoderMono` /
   `vbr::SilkVbrEncoderStereo` — the [`VbrRateControl`] election now
   drives the SILK-layer rate control (`encode_packet_elected`), so

@@ -129,7 +129,7 @@ const ANALYSIS_CHIRP: f64 = 0.996;
 
 /// Side-channel RMS below which a stereo interval is coded mid-only
 /// (§4.2.7.2).
-const MID_ONLY_SIDE_RMS: f64 = 1.0e-4;
+pub(crate) const MID_ONLY_SIDE_RMS: f64 = 1.0e-4;
 
 /// Frame RMS below which a frame is coded INACTIVE (§4.2.7.3 frame
 /// type 0, VAD flag clear) — the signal-derived §4.2.3 VAD decision.
