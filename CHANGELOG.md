@@ -4,6 +4,39 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **SILK §5.2.3.8 delayed-decision NSQ** (round 442):
+  `silk_nsq_del_dec::quantize_excitation_frame_del_dec` — the
+  reference listing's multi-state noise-shaping-quantizer trellis: up
+  to 4 parallel states seeded with distinct §4.2.7.7 LCG dither seeds
+  (`(k + seed) & 3`), each sample forking every state on its two best
+  quantization-level candidates under the single-state quantiser's
+  `(recon − want)² + λ·|q|` cost with K-best survivor pruning (the
+  listing's replace-worst rule generalized), and the frame-final
+  winner electing the coded seed symbol (two uniform bits either way
+  — a rate-free election). Each state carries its own cloned
+  §4.2.7.9 synthesis mirrors advanced through the real chain, so the
+  decision horizon spans the whole frame with no early-commitment
+  delay (the listing's bounded decision delay serves its fixed-size
+  shared buffers; §5.2.3.8 is encoder freedom). Armed via
+  `ChannelAnalyzer::set_nsq_delayed_decision` /
+  `SilkEncoderMono/Stereo::set_nsq_delayed_decision`: every frame
+  then runs BOTH quantisers and adopts the measured-RD winner (the
+  new `ExcitationQuantized::rd_q23` whole-frame cost), so the
+  election only ever takes measured wins; the default (1-state)
+  encoders stay bit-identical to before. Measured on speech-like
+  content at equal elected rate (SILK-layer rate control on): the
+  4-state trellis buys **+0.8..+1.2 dB** reconstruction SNR (WB
+  40/60/25 B and NB 30 B targets; 2 states already take most of it),
+  and at default quality it holds SNR while shaving ~2.4% rate. Five
+  delayed-decision oracle streams (WB elected 40 B, WB elected 25 B +
+  FEC, WB default-quality, NB 60 ms multiframe elected, WB stereo
+  elected) decode **bit-exactly** through the §A reference-listing
+  decoder at 48 kHz. Gated by `tests/nsq_del_dec_roundtrip.rs` (the
+  equal-rate win, the never-regress default-quality election, §3
+  sample accounting) and unit gates (1-state ≡ single-state
+  quantiser, trellis RD never worse across seeds/content, wire +
+  carried-state roundtrip of the winning trajectory).
+
 - **CELT §5.3.1 pitch pre-filter** (round 437): `celt_prefilter` —
   the reference listing's pitch estimator transcribed
   (`pitch_downsample`: 2× decimate + lag-windowed order-4

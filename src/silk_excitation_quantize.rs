@@ -128,6 +128,12 @@ pub struct ExcitationQuantized {
     /// The reconstruction the decoder will produce for this frame
     /// (from the real §4.2.7.9 synthesis chain).
     pub reconstructed: Vec<f32>,
+    /// Measured whole-frame rate/distortion cost: the sum of the
+    /// per-sample `(recon − want)² + λ·|e_raw|` quantizer costs (Q23²
+    /// units — see [`choose_pulse`]'s cost). Comparable across
+    /// quantizer variants run on the same frame (the §5.2.3.8
+    /// delayed-decision election's measure).
+    pub rd_q23: f64,
 }
 
 /// Quantize one SILK frame's excitation closed-loop against `target`.
@@ -189,6 +195,7 @@ pub fn quantize_excitation_frame(
     let mut e_raw_all: Vec<i32> = Vec::with_capacity(frame_len);
     let mut e_q23_all: Vec<i32> = Vec::with_capacity(frame_len);
     let mut reconstructed = vec![0.0f32; frame_len];
+    let mut rd_q23 = 0.0f64;
 
     if rate
         .a_syn
@@ -275,6 +282,12 @@ pub fn quantize_excitation_frame(
             let flip = (seed & 0x8000_0000) != 0;
             let want = if flip { -e_target_q23 } else { e_target_q23 };
             let e_raw = choose_pulse(want, offset_q23, rate.lambda_pulses);
+            rd_q23 += f64::from(pulse_cost(
+                e_raw,
+                want,
+                offset_q23,
+                256.0 * 256.0 * rate.lambda_pulses.max(0.0),
+            ));
             seed = seed.wrapping_add(e_raw as u32);
 
             // Decoder-identical reconstruction of this sample's e_Q23.
@@ -325,6 +338,40 @@ pub fn quantize_excitation_frame(
     let shell_blocks = shell_block_count(bandwidth, frame_size)?;
     e_raw_all.resize(shell_blocks * SHELL_BLOCK_SAMPLES, 0);
 
+    let (lsb_counts, rate_level) = finish_excitation_symbols(
+        bandwidth,
+        frame_size,
+        signal_type,
+        qoff_type,
+        lcg_seed,
+        &e_raw_all,
+    )?;
+
+    Ok(ExcitationQuantized {
+        e_raw: e_raw_all,
+        lsb_counts,
+        rate_level,
+        reconstructed,
+        rd_q23,
+    })
+}
+
+/// Derive the per-shell-block extra-LSB depths and the measured-size
+/// §4.2.7.8.1 rate level for a whole frame's `e_raw` (shared by the
+/// single-state and delayed-decision quantizers). `e_raw_all` must
+/// already be padded to whole shell blocks.
+pub(crate) fn finish_excitation_symbols(
+    bandwidth: Bandwidth,
+    frame_size: SilkFrameSize,
+    signal_type: SignalType,
+    qoff_type: QuantizationOffsetType,
+    lcg_seed: u8,
+    e_raw_all: &[i32],
+) -> Result<(Vec<u8>, u8), Error> {
+    let shell_blocks = shell_block_count(bandwidth, frame_size)?;
+    if e_raw_all.len() != shell_blocks * SHELL_BLOCK_SAMPLES {
+        return Err(Error::MalformedPacket);
+    }
     // Per-block LSB depth: smallest L with sum(mag >> L) <= 16.
     let mut lsb_counts = vec![0u8; shell_blocks];
     for (block, slot) in lsb_counts.iter_mut().enumerate() {
@@ -361,7 +408,7 @@ pub fn quantize_excitation_frame(
         let symbols = ExcitationSymbols {
             rate_level: rl,
             lsb_counts: &lsb_counts,
-            e_raw: &e_raw_all,
+            e_raw: e_raw_all,
         };
         Excitation::encode(&mut re, ex_cfg, &symbols)?;
         let len = re.finish().len();
@@ -369,13 +416,7 @@ pub fn quantize_excitation_frame(
             best = (rl, len);
         }
     }
-
-    Ok(ExcitationQuantized {
-        e_raw: e_raw_all,
-        lsb_counts,
-        rate_level: best.0,
-        reconstructed,
-    })
+    Ok((lsb_counts, best.0))
 }
 
 /// Pick the `e_raw` minimizing the rate-penalized cost
@@ -409,8 +450,41 @@ fn choose_pulse(want: f32, offset_q23: i32, lambda_pulses: f32) -> i32 {
     best.0
 }
 
+/// The best and second-best `e_raw` candidates under the same
+/// rate-penalized cost as [`choose_pulse`] — the two quantization
+/// level candidates each §5.2.3.8 delayed-decision state forks on
+/// (the reference listing's `q1` / `q2` pair, generalized to the
+/// λ-shifted candidate set). Returns `[(e_raw, cost); 2]` with
+/// distinct values, best first.
+pub(crate) fn choose_pulse_pair(want: f32, offset_q23: i32, lambda_pulses: f32) -> [(i32, f32); 2] {
+    let est = (want - offset_q23 as f32) / 256.0;
+    let lo = est.floor() as i32;
+    let lambda = 256.0 * 256.0 * lambda_pulses.max(0.0);
+    let shift = 0.5 * lambda_pulses.max(0.0) * if est >= 0.0 { 1.0 } else { -1.0 };
+    let lo_s = (est - shift).floor() as i32;
+    let mut best = (0i32, pulse_cost(0, want, offset_q23, lambda));
+    let mut second: Option<(i32, f32)> = None;
+    for cand in [lo, lo + 1, lo_s, lo_s + 1, lo - 1, lo + 2] {
+        let c = cand.clamp(-MAX_PULSE_MAGNITUDE, MAX_PULSE_MAGNITUDE);
+        if c == best.0 || second.is_some_and(|(s, _)| s == c) {
+            continue;
+        }
+        let cost = pulse_cost(c, want, offset_q23, lambda);
+        if cost < best.1 {
+            second = Some(best);
+            best = (c, cost);
+        } else if second.map_or(true, |(_, sc)| cost < sc) {
+            second = Some((c, cost));
+        }
+    }
+    // `second` is always filled: the candidate list holds at least
+    // two distinct values besides zero.
+    let second = second.unwrap_or((best.0 + 1, f32::INFINITY));
+    [best, second]
+}
+
 #[inline]
-fn pulse_cost(e_raw: i32, want: f32, offset_q23: i32, lambda: f32) -> f32 {
+pub(crate) fn pulse_cost(e_raw: i32, want: f32, offset_q23: i32, lambda: f32) -> f32 {
     let sign_e = match e_raw.cmp(&0) {
         core::cmp::Ordering::Less => -1,
         core::cmp::Ordering::Greater => 1,

@@ -76,6 +76,7 @@ use crate::silk_ltp::{contour_offsets, lag_range, LtpSymbols, LTP_MAX_SUBFRAMES}
 use crate::silk_ltp_analysis::ltp_analysis;
 use crate::silk_ltp_synth::LtpSynthState;
 use crate::silk_nlsf_quantize::quantize_nlsf;
+use crate::silk_nsq_del_dec::{quantize_excitation_frame_del_dec, MAX_DEL_DEC_STATES};
 use crate::silk_packet_encode::{
     encode_silk_only_packet_mono_with_lbrr, encode_silk_only_packet_stereo_with_lbrr,
     StereoIntervalLbrr, StereoIntervalScripts,
@@ -223,6 +224,12 @@ pub struct ChannelAnalyzer {
     /// history: no prediction gain, and the closed-loop pulses would
     /// have to carry the entire un-predicted signal at enormous rate.
     force_unvoiced: bool,
+    /// §5.2.3.8 delayed-decision state count (1 = the single-state
+    /// closed-loop quantiser, the default; 2–4 arm the per-frame
+    /// election between the single-state quantiser and the
+    /// multi-state trellis — see
+    /// [`ChannelAnalyzer::set_nsq_delayed_decision`]).
+    nsq_states: usize,
 }
 
 impl ChannelAnalyzer {
@@ -247,6 +254,7 @@ impl ChannelAnalyzer {
             pulse_rms: TARGET_PULSE_RMS,
             rate_control: false,
             force_unvoiced: false,
+            nsq_states: 1,
         })
     }
 
@@ -293,6 +301,18 @@ impl ChannelAnalyzer {
     pub fn set_pulse_target(&mut self, rms: f64) {
         self.pulse_rms = rms.clamp(PULSE_TARGET_MIN, PULSE_TARGET_MAX);
         self.rate_control = true;
+    }
+
+    /// Arm the §5.2.3.8 delayed-decision noise shaping quantiser with
+    /// `n_states` trellis states (clamped to `1..=4`; the §4.2.7.7
+    /// seed alphabet bounds useful diversity at 4). With `n_states >
+    /// 1` every frame runs BOTH the single-state quantiser and the
+    /// multi-state trellis and adopts the measured-RD winner (the
+    /// trellis additionally elects the frame's coded seed). `1`
+    /// restores the default single-state quantiser, whose output is
+    /// bit-identical to the pre-election encoder.
+    pub fn set_nsq_delayed_decision(&mut self, n_states: usize) {
+        self.nsq_states = n_states.clamp(1, MAX_DEL_DEC_STATES);
     }
 
     /// Mark a §4.2.4 LBRR-flag gap (an interval with no LBRR frame):
@@ -592,26 +612,83 @@ impl ChannelAnalyzer {
                 xpre,
             )
         };
-        let lcg_seed = 0u8;
-        let ExcitationQuantized {
-            e_raw,
-            lsb_counts,
-            rate_level,
-            reconstructed,
-        } = quantize_excitation_frame(
-            self.bandwidth,
-            frame_size,
-            signal_type,
-            QuantizationOffsetType::Low,
+        // §5.2.3.8 delayed decision (opt-in): run BOTH the single-state
+        // quantiser and the multi-state trellis on cloned §4.2.7.9
+        // mirrors and adopt the measured-RD winner — the election is
+        // per frame, on the same `(recon − want)² + λ·|q|` measure both
+        // quantisers minimize. The trellis elects the §4.2.7.7 seed
+        // (two uniform bits either way, so the election is rate-free).
+        let (
+            ExcitationQuantized {
+                e_raw,
+                lsb_counts,
+                rate_level,
+                reconstructed,
+                rd_q23: _,
+            },
             lcg_seed,
-            &gains_q16_arr[..num_subframes],
-            &a_q12,
-            ltp_params.as_ref(),
-            &quant_target,
-            &rate,
-            &mut self.ltp_state,
-            &mut self.lpc_state,
-        )?;
+        ) = if self.nsq_states > 1 {
+            let mut ltp_single = self.ltp_state.clone();
+            let mut lpc_single = self.lpc_state.clone();
+            let single = quantize_excitation_frame(
+                self.bandwidth,
+                frame_size,
+                signal_type,
+                QuantizationOffsetType::Low,
+                0,
+                &gains_q16_arr[..num_subframes],
+                &a_q12,
+                ltp_params.as_ref(),
+                &quant_target,
+                &rate,
+                &mut ltp_single,
+                &mut lpc_single,
+            )?;
+            let mut ltp_dd = self.ltp_state.clone();
+            let mut lpc_dd = self.lpc_state.clone();
+            let dd = quantize_excitation_frame_del_dec(
+                self.bandwidth,
+                frame_size,
+                signal_type,
+                QuantizationOffsetType::Low,
+                0,
+                self.nsq_states,
+                &gains_q16_arr[..num_subframes],
+                &a_q12,
+                ltp_params.as_ref(),
+                &quant_target,
+                &rate,
+                &mut ltp_dd,
+                &mut lpc_dd,
+            )?;
+            if dd.quantized.rd_q23 < single.rd_q23 {
+                self.ltp_state = ltp_dd;
+                self.lpc_state = lpc_dd;
+                (dd.quantized, dd.lcg_seed)
+            } else {
+                self.ltp_state = ltp_single;
+                self.lpc_state = lpc_single;
+                (single, 0)
+            }
+        } else {
+            (
+                quantize_excitation_frame(
+                    self.bandwidth,
+                    frame_size,
+                    signal_type,
+                    QuantizationOffsetType::Low,
+                    0,
+                    &gains_q16_arr[..num_subframes],
+                    &a_q12,
+                    ltp_params.as_ref(),
+                    &quant_target,
+                    &rate,
+                    &mut self.ltp_state,
+                    &mut self.lpc_state,
+                )?,
+                0,
+            )
+        };
 
         // Roll the input history.
         self.hist.extend(pcm.iter().map(|&v| v as f64));
@@ -750,6 +827,15 @@ impl SilkEncoderMono {
         if !enabled {
             self.pending_fec = None;
         }
+    }
+
+    /// Arm the §5.2.3.8 delayed-decision noise shaping quantiser (see
+    /// [`ChannelAnalyzer::set_nsq_delayed_decision`]): every frame
+    /// elects between the single-state quantiser and an `n_states`
+    /// trellis on the measured rate/distortion cost. `1` (the
+    /// default) restores the bit-identical single-state encoder.
+    pub fn set_nsq_delayed_decision(&mut self, n_states: usize) {
+        self.channel.set_nsq_delayed_decision(n_states);
     }
 
     /// Per-packet input length: the packet duration at the internal
@@ -968,6 +1054,14 @@ impl SilkEncoderStereo {
         if !enabled {
             self.pending_fec = None;
         }
+    }
+
+    /// Arm the §5.2.3.8 delayed-decision noise shaping quantiser on
+    /// both coded channels (see
+    /// [`ChannelAnalyzer::set_nsq_delayed_decision`]).
+    pub fn set_nsq_delayed_decision(&mut self, n_states: usize) {
+        self.mid.set_nsq_delayed_decision(n_states);
+        self.side.set_nsq_delayed_decision(n_states);
     }
 
     /// Per-packet input length per channel (the packet duration at the

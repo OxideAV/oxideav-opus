@@ -853,6 +853,8 @@ pub mod silk_ltp_synth;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_nlsf_quantize;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod silk_nsq_del_dec;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_packet_encode;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_pitch;
