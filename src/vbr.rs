@@ -339,6 +339,14 @@ impl CeltVbrEncoder {
         self.predetect.reset();
     }
 
+    /// Enable / disable the §5.3.1 tapset election inside the elected
+    /// encodes (see [`CeltEncoder::set_tapset_election`]; the VBR arm
+    /// calls one packet encode per frame, so the election's lockstep
+    /// mirror tracks the emitted stream exactly).
+    pub fn set_tapset_election(&mut self, enabled: bool) {
+        self.enc.set_tapset_election(enabled);
+    }
+
     /// Encode one frame of interleaved 48 kHz PCM at a VBR-elected
     /// size. Returns the packet (its length is the election) and the
     /// CELT frame info.
@@ -517,6 +525,13 @@ impl SilkVbrEncoderMono {
         self.enc.set_fec(enabled);
     }
 
+    /// Arm the §5.2.3.8 delayed-decision noise shaping quantiser
+    /// inside the elected encodes (see
+    /// [`SilkEncoderMono::set_nsq_delayed_decision`]).
+    pub fn set_nsq_delayed_decision(&mut self, n_states: usize) {
+        self.enc.set_nsq_delayed_decision(n_states);
+    }
+
     /// Reset all carried state (§4.5.2).
     pub fn reset(&mut self) {
         self.enc.reset();
@@ -571,6 +586,13 @@ impl SilkVbrEncoderStereo {
     /// [`SilkVbrEncoderMono::set_fec`]).
     pub fn set_fec(&mut self, enabled: bool) {
         self.enc.set_fec(enabled);
+    }
+
+    /// Arm the §5.2.3.8 delayed-decision noise shaping quantiser on
+    /// both coded channels (see
+    /// [`SilkEncoderStereo::set_nsq_delayed_decision`]).
+    pub fn set_nsq_delayed_decision(&mut self, n_states: usize) {
+        self.enc.set_nsq_delayed_decision(n_states);
     }
 
     /// Reset all carried state (§4.5.2).

@@ -7,7 +7,9 @@
 //! `OpusDecoder` with the exact per-frame sample count. A panic,
 //! a packet the decoder rejects, or a range-coder desync inside the
 //! decode is an encoder (or decoder) bug — arbitrary PCM at any legal
-//! payload size must always produce a conforming stream.
+//! payload size must always produce a conforming stream. (Round
+//! 442: the input also selects a forced §4.3.7.1 tapset or the
+//! §5.3.1 tapset election, mirror decoder included.)
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_opus::celt_packet_encode::CeltEncoder;
@@ -38,6 +40,14 @@ fuzz_target!(|data: &[u8]| {
     let Ok(mut enc) = CeltEncoder::new(bandwidth, tenths, stereo) else {
         return;
     };
+    // Round 442: exercise the §5.3.1 tapset paths — a forced tapset
+    // or the full measured election with its lockstep mirror decoder.
+    match (cfg >> 5) & 3 {
+        0 => {}
+        1 => enc.set_tapset(1),
+        2 => enc.set_tapset(2),
+        _ => enc.set_tapset_election(true),
+    }
     let mut dec = OpusDecoder::new();
     let spf = enc.frame_samples();
     let ch = enc.channels();

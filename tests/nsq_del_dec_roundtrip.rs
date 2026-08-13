@@ -21,6 +21,7 @@
 use oxideav_opus::decoder::OpusDecoder;
 use oxideav_opus::silk_encoder::SilkEncoderMono;
 use oxideav_opus::toc::Bandwidth;
+use oxideav_opus::vbr::SilkVbrEncoderMono;
 
 fn snr_db(reference: &[f32], test: &[f32]) -> f64 {
     let mut sig = 0.0f64;
@@ -177,4 +178,32 @@ fn default_quality_with_trellis_never_regresses() {
     for p in &p_dd {
         assert_eq!(dec.decode_packet(p).unwrap().samples_per_channel(), 960);
     }
+}
+
+/// The SILK VBR arm rides the delayed-decision knob: realized rate
+/// stays on target and every packet decodes with exact accounting.
+/// (The corresponding oracle stream decodes bit-exactly through the
+/// reference-listing decoder out-of-tree.)
+#[test]
+fn vbr_arm_with_delayed_decision_stays_on_target() {
+    let pcm = speech_like(16000, 2.0);
+    let mut enc = SilkVbrEncoderMono::new(Bandwidth::Wb, 200, 20000, true).unwrap();
+    enc.set_nsq_delayed_decision(4);
+    let mut dec = OpusDecoder::new();
+    let mut total = 0usize;
+    let mut packets = 0usize;
+    for chunk in pcm.chunks_exact(320) {
+        let packet = enc.encode_frame(chunk).unwrap();
+        total += packet.len();
+        packets += 1;
+        let out = dec.decode_packet(&packet).unwrap();
+        assert_eq!(out.samples_per_channel(), 960);
+    }
+    // 20 kb/s at 20 ms = 50 B/packet; the election lands within a
+    // few percent of target.
+    let avg = total as f64 / packets as f64;
+    assert!(
+        (avg - 50.0).abs() < 3.0,
+        "VBR+dd average {avg:.1} B/pkt off the 50 B target"
+    );
 }

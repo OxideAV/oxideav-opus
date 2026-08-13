@@ -7,6 +7,8 @@
 //! MUST decode cleanly through the streaming `OpusDecoder` with the
 //! exact §3 sample count and stay inside the §3.2.1 limits. The
 //! election may floor-raise above a starving target but must never
+//! (round 442: the input also arms the §5.2.3.8 delayed-decision
+//! trellis on 1/2/4 states, exercising the per-frame NSQ election)
 //! exceed the §3.2.1 maximum or fail on arbitrary PCM — a panic or a
 //! decode error is a rate-control (or noise-shaping-quantizer) bug.
 
@@ -33,6 +35,13 @@ fuzz_target!(|data: &[u8]| {
     };
     let stereo = (cfg >> 4) & 1 == 1;
     let fec = (cfg >> 5) & 1 == 1;
+    // §5.2.3.8 delayed-decision states (round 442): 1 (single-state),
+    // 2 or 4 trellis states elected per frame.
+    let nsq_states = match (cfg >> 6) & 3 {
+        0 | 1 => 1usize,
+        2 => 2,
+        _ => 4,
+    };
 
     let rest: Vec<u8> = it.collect();
     if rest.len() < 4 {
@@ -50,6 +59,7 @@ fuzz_target!(|data: &[u8]| {
             return;
         };
         enc.set_fec(fec);
+        enc.set_nsq_delayed_decision(nsq_states);
         let spf = enc.frame_samples();
         let mut pos = 0usize;
         for _ in 0..max_packets {
@@ -82,6 +92,7 @@ fuzz_target!(|data: &[u8]| {
             return;
         };
         enc.set_fec(fec);
+        enc.set_nsq_delayed_decision(nsq_states);
         let spf = enc.frame_samples();
         let mut pos = 0usize;
         for _ in 0..max_packets {
