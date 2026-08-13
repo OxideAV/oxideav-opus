@@ -4,6 +4,32 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **CELT §5.3.1 tapset election** (round 442):
+  `CeltEncoder::set_tapset_election` — the §4.3.7.1 post-filter
+  tapset is now a measured election instead of the hardwired 0: on
+  every pre-filter-firing frame the encoder trial-encodes the frame
+  with each tapset (0/1/2) at the same payload size, decodes each
+  trial through a clone of a mirror `OpusDecoder` held in stream
+  lockstep, and commits the tapset whose decode measures the best
+  SNR against the delay-aligned input (quality at equal rate; ties
+  fall to tapset 0). `CeltEncoderState` carries the new
+  `tapset_request` knob (`CeltEncoder::set_tapset` forces a fixed
+  choice), `CeltFrameEncodeInfo` reports the coded
+  `postfilter_tapset`, the pf-off/silence paths now roll the carried
+  tapset to 0 exactly like the decoder's synthesis state, and
+  `OpusDecoder` is `Clone` (the election's trial mechanism). The
+  default encoder stays bit-identical to the tapset-0 encoder.
+  Measured on periodic content (FB 20 ms mono, 40/90 B): the
+  election lands within ±0.1 dB of the best fixed tapset per
+  content while beating the old tapset-0 choice by **+0.2..+1.7 dB**
+  at equal rate (sharp short-period content elects tapset 2 on most
+  frames; smoother content mixes all three), and a tapset-elected
+  oracle stream agrees with the §A reference-listing decoder at
+  **103 dB / max 1 LSB** (the float-noise corridor). Gated by
+  `tests/tapset_election_roundtrip.rs` (the equal-rate win over
+  tapset 0, nonzero tapsets genuinely coded, tracking the best
+  fixed arm, default-path bit-identity).
+
 - **SILK §5.2.3.8 delayed-decision NSQ** (round 442):
   `silk_nsq_del_dec::quantize_excitation_frame_del_dec` — the
   reference listing's multi-state noise-shaping-quantizer trellis: up

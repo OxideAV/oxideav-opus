@@ -260,7 +260,7 @@ pub struct FecRecovered {
 /// and is threaded into the per-frame decode as those paths land. Today
 /// the carried state is minimal (it grows as each layer is wired), but
 /// the type is the stable home for it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct OpusDecoder {
     /// Channel count of the most recently decoded packet, if any. Used
     /// only for the §4.5.2 mono↔stereo transition reset bookkeeping the

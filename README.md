@@ -276,6 +276,33 @@ content it fires on every frame at the exact true period, buys
 noise, and the coded streams agree with the reference-listing
 decoder at 81 dB (max 1 LSB). No encoder-arc item remains open.
 
+Round 442 works the encoder-quality tail with two new elections.
+The **§5.2.3.8 delayed-decision NSQ**
+(`silk_nsq_del_dec::quantize_excitation_frame_del_dec`, armed via
+`set_nsq_delayed_decision`) runs the reference listing's multi-state
+trellis — up to 4 states on distinct §4.2.7.7 dither seeds, two
+quantization-level candidates per state per sample, K-best pruning,
+the winner electing the frame's coded seed (two uniform bits either
+way, so the election is rate-free) — with each state carrying its own
+§4.2.7.9 synthesis mirrors, so the decision horizon spans the whole
+frame. Every frame elects between the single-state quantiser and the
+trellis on the measured `(recon − want)² + λ·|q|` frame cost, so only
+measured wins are adopted and the 1-state default stays bit-identical.
+Measured: **+0.8–1.2 dB** at equal elected rate on speech-like content
+(WB 25/40/60 B, NB 30 B; 2 states already take most of it), rate −2.4%
+at equal SNR on the default-quality path, and five delayed-decision
+oracle streams (elected mono / FEC / default / 60 ms multiframe /
+stereo) decode **bit-exactly** through the §A reference-listing
+decoder. The **§5.3.1 tapset election**
+(`CeltEncoder::set_tapset_election`) replaces the hardwired
+post-filter tapset 0: each pre-filter-firing frame is trial-encoded
+per tapset at the same payload, decoded through a clone of a lockstep
+mirror decoder, and the measured-SNR winner is committed — **+0.2–1.7
+dB** at equal rate over the fixed-0 encoder on periodic content
+(within ±0.1 dB of the best fixed tapset per content), the elected
+streams agreeing with the reference-listing decoder at 103 dB (max
+1 LSB).
+
 Differential encoder/decoder testing and a restored cargo-fuzz suite
 (6 coverage-guided targets, incl. an encoder↔decoder range-coder
 roundtrip and the CELT / VBR encode→decode harnesses) have also
@@ -547,6 +574,15 @@ quantized-history shaping feedback; `Wana`-prefiltered targets, the
 signal-RMS gain floor). The default (non-elected) encoders are
 bit-identical to the pure closed-loop tracker.
 
+**SILK delayed-decision NSQ (§5.2.3.8):**
+`silk_nsq_del_dec::quantize_excitation_frame_del_dec` — the
+multi-state trellis (dither-diverse states, two candidates per
+sample, K-best pruning, winner-elected §4.2.7.7 seed) over per-state
+§4.2.7.9 synthesis mirrors; armed per encoder via
+`set_nsq_delayed_decision`, elected per frame against the
+single-state quantiser on the measured `rd_q23` cost
+(`tests/nsq_del_dec_roundtrip.rs`).
+
 **CELT encoder tf analysis (§4.3.4.5):** `celt_tf_analysis` — the
 listing's per-band Haar-level L1 sparsity metric (`haar1` /
 `l1_metric` with the width bias), the byte-budget λ ladder, and the
@@ -562,7 +598,12 @@ listing's decision ladder in `encode_celt_frame` with the
 octave / fine-period / 3-bit-gain / tapset parameter coding;
 `CeltAnalysis` carries the 1024-sample unfiltered comb lookback via
 the two-phase `pre_emphasize` / `finish_frame` API. Hybrid frames
-never run it (the decoder's `start == 0` gate).
+never run it (the decoder's `start == 0` gate). The coded tapset is
+an election (`CeltEncoder::set_tapset_election`): per-tapset trial
+encodes at the frame's payload size, each decoded through a clone of
+a lockstep mirror `OpusDecoder`, best measured SNR committed
+(`set_tapset` forces a fixed choice;
+`tests/tapset_election_roundtrip.rs`).
 
 ## Clean-room sources
 

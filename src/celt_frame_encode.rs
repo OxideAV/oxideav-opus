@@ -70,6 +70,11 @@ pub struct CeltEncoderState {
     pub prefilter_gain: f64,
     /// §5.3.1 pre-filter carried tapset.
     pub prefilter_tapset: u8,
+    /// §4.3.7.1 tapset the encoder codes when the pre-filter fires —
+    /// the §5.3.1 encoder freedom (0..=2; the tapset-election arm of
+    /// [`crate::celt_packet_encode::CeltEncoder`] drives it by
+    /// measured rate/quality trials, default 0).
+    pub tapset_request: u8,
     channels: usize,
     n: usize,
 }
@@ -92,6 +97,8 @@ pub struct CeltFrameEncodeInfo {
     pub postfilter_period: usize,
     /// The coded (dequantized) §4.3.7.1 gain when it fired.
     pub postfilter_gain: f64,
+    /// The coded §4.3.7.1 tapset when it fired (0 otherwise).
+    pub postfilter_tapset: u8,
 }
 
 impl CeltEncoderState {
@@ -111,6 +118,7 @@ impl CeltEncoderState {
             prefilter_period: crate::celt_prefilter::COMBFILTER_MINPERIOD,
             prefilter_gain: 0.0,
             prefilter_tapset: 0,
+            tapset_request: 0,
             channels,
             n,
         }
@@ -197,6 +205,7 @@ pub fn encode_celt_frame(
             },
         );
         state.prefilter_gain = 0.0;
+        state.prefilter_tapset = 0;
         for ch in 0..2 {
             for i in 0..CELT_NUM_BANDS {
                 state.old_band_e[ch][i] = ENERGY_FLOOR;
@@ -212,6 +221,7 @@ pub fn encode_celt_frame(
             postfilter_on: false,
             postfilter_period: 0,
             postfilter_gain: 0.0,
+            postfilter_tapset: 0,
         };
     }
     tell = i64::from(enc.tell());
@@ -222,7 +232,7 @@ pub fn encode_celt_frame(
     let maxp = crate::celt_prefilter::COMBFILTER_MAXPERIOD;
     let mut pitch_index = crate::celt_prefilter::COMBFILTER_MINPERIOD;
     let mut gain1 = 0.0f64;
-    let prefilter_tapset = 0u8; // encoder choice (no HF-tonality input yet)
+    let prefilter_tapset = state.tapset_request.min(2); // §5.3.1 encoder choice
     if nb_available_bytes > 12 * channels as i64 && start == 0 {
         let chans: Vec<&[f64]> = (0..channels)
             .map(|c| &pre.pre[c * (maxp + n)..(c + 1) * (maxp + n)])
@@ -260,12 +270,15 @@ pub fn encode_celt_frame(
     let mut coded_tapset = prefilter_tapset;
     let mut pf_on = false;
     if gain1 < pf_threshold {
-        // §4.3.7.1 post-filter: signalled off.
+        // §4.3.7.1 post-filter: signalled off. The decoder's carried
+        // tapset rolls to 0 on an off frame; mirror it (inert for the
+        // comb — the gain is 0 — but keeps the state in lockstep).
         if start == 0 && tell + 16 <= total_bits {
             enc.enc_bit_logp(false, 1);
         }
         gain1 = 0.0;
         pitch_index = state.prefilter_period;
+        coded_tapset = 0;
     } else {
         // Continuity: reuse the previous gain when close.
         if (gain1 - state.prefilter_gain).abs() < 0.1 {
@@ -600,6 +613,7 @@ pub fn encode_celt_frame(
         postfilter_on: pf_on,
         postfilter_period: if pf_on { pitch_index } else { 0 },
         postfilter_gain: if pf_on { gain1 } else { 0.0 },
+        postfilter_tapset: if pf_on { coded_tapset } else { 0 },
     }
 }
 

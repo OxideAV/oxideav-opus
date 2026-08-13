@@ -14,12 +14,29 @@
 //! §A.1). No external library source was consulted.
 
 use crate::celt_frame_encode::{encode_celt_frame, CeltEncoderState, CeltFrameEncodeInfo};
+use crate::decoder::OpusDecoder;
 use crate::range_encoder::RangeEncoder;
 use crate::toc::{Bandwidth, FrameCountCode, Mode, OpusTocByte};
 use crate::Error;
 
 /// The §3.2 maximum Opus frame payload.
 const MAX_FRAME_BYTES: usize = 1275;
+
+/// The fixed encode→decode chain delay of the CELT path: the 2.5 ms
+/// §4.3.7 MDCT-overlap delay at 48 kHz (the tapset election's
+/// reference alignment).
+const CELT_CHAIN_DELAY: usize = 120;
+
+/// The §5.3.1 tapset election's carried machinery: a mirror decoder
+/// in stream lockstep (every emitted packet is fed to it) plus the
+/// delay-aligned input history the trial decodes are scored against.
+#[derive(Debug, Clone)]
+struct TapsetElection {
+    mirror: OpusDecoder,
+    /// Last [`CELT_CHAIN_DELAY`] input samples per channel
+    /// (interleaved) — the reference head for the next frame.
+    hist: Vec<i16>,
+}
 
 /// A CELT-only packet encoder for one stream configuration.
 #[derive(Debug, Clone)]
@@ -30,6 +47,7 @@ pub struct CeltEncoder {
     stereo: bool,
     end_band: usize,
     lm: i32,
+    tapset_election: Option<TapsetElection>,
 }
 
 impl CeltEncoder {
@@ -69,6 +87,7 @@ impl CeltEncoder {
             stereo,
             end_band,
             lm,
+            tapset_election: None,
         })
     }
 
@@ -87,6 +106,39 @@ impl CeltEncoder {
     /// Reset all carried state (stream start / §4.5.2).
     pub fn reset(&mut self) {
         self.state.reset();
+        let channels = self.channels();
+        if let Some(el) = &mut self.tapset_election {
+            *el = Self::fresh_election(channels);
+        }
+    }
+
+    /// Force the §4.3.7.1 tapset coded when the §5.3.1 pre-filter
+    /// fires (0..=2; default 0). Ignored while the tapset election is
+    /// enabled — the election overwrites it per frame.
+    pub fn set_tapset(&mut self, tapset: u8) {
+        self.state.tapset_request = tapset.min(2);
+    }
+
+    /// Enable / disable the §5.3.1 **tapset election**: on every
+    /// frame where the pitch pre-filter fires, the frame is
+    /// trial-encoded with each §4.3.7.1 tapset (0/1/2) at the same
+    /// payload size, each trial is decoded through a clone of a
+    /// mirror decoder held in stream lockstep, and the tapset whose
+    /// decode measures the best SNR against the (delay-aligned) input
+    /// is committed — quality measured at equal rate, ties resolved
+    /// toward tapset 0. Enable BEFORE the first packet (or right
+    /// after [`Self::reset`]); enabling mid-stream re-arms the mirror
+    /// from a fresh decoder, which only re-converges after the next
+    /// stream reset.
+    pub fn set_tapset_election(&mut self, enabled: bool) {
+        self.tapset_election = enabled.then(|| Self::fresh_election(self.channels()));
+    }
+
+    fn fresh_election(channels: usize) -> TapsetElection {
+        TapsetElection {
+            mirror: OpusDecoder::new(),
+            hist: vec![0i16; channels * CELT_CHAIN_DELAY],
+        }
     }
 
     /// Encode one frame of interleaved 48 kHz PCM
@@ -113,16 +165,34 @@ impl CeltEncoder {
             self.stereo,
             FrameCountCode::One,
         )?;
+        if self.tapset_election.is_none() {
+            let mut state = core::mem::replace(&mut self.state, CeltEncoderState::new(1, 120));
+            let r = Self::encode_with_state(
+                toc,
+                &mut state,
+                pcm,
+                payload_bytes,
+                self.end_band,
+                self.lm,
+            );
+            self.state = state;
+            return r;
+        }
+        self.encode_packet_tapset_elected(toc, pcm, payload_bytes)
+    }
+
+    /// One frame encode against an explicit state (the trial-encode
+    /// primitive of the tapset election).
+    fn encode_with_state(
+        toc: u8,
+        state: &mut CeltEncoderState,
+        pcm: &[i16],
+        payload_bytes: usize,
+        end_band: usize,
+        lm: i32,
+    ) -> Result<(Vec<u8>, CeltFrameEncodeInfo), Error> {
         let mut enc = RangeEncoder::new();
-        let info = encode_celt_frame(
-            &mut self.state,
-            &mut enc,
-            pcm,
-            payload_bytes,
-            0,
-            self.end_band,
-            self.lm,
-        );
+        let info = encode_celt_frame(state, &mut enc, pcm, payload_bytes, 0, end_band, lm);
         debug_assert!(enc.tell() as usize <= payload_bytes * 8, "budget bust");
         let payload = enc
             .finish_fixed(payload_bytes)
@@ -131,6 +201,96 @@ impl CeltEncoder {
         packet.push(toc);
         packet.extend_from_slice(&payload);
         Ok((packet, info))
+    }
+
+    /// The §5.3.1 tapset election (see [`Self::set_tapset_election`]):
+    /// trial-encode the frame per tapset, decode each trial on a clone
+    /// of the lockstep mirror decoder, adopt the measured-SNR winner
+    /// at the frame's fixed payload size, then advance the real
+    /// mirror with the committed packet.
+    fn encode_packet_tapset_elected(
+        &mut self,
+        toc: u8,
+        pcm: &[i16],
+        payload_bytes: usize,
+    ) -> Result<(Vec<u8>, CeltFrameEncodeInfo), Error> {
+        // Trial 0 also decides whether the pre-filter fires at all
+        // (the pf decision does not depend on the tapset).
+        let mut best_state = self.state.clone();
+        best_state.tapset_request = 0;
+        let (mut best_packet, mut best_info) = Self::encode_with_state(
+            toc,
+            &mut best_state,
+            pcm,
+            payload_bytes,
+            self.end_band,
+            self.lm,
+        )?;
+
+        if best_info.postfilter_on {
+            let el = self.tapset_election.as_ref().expect("election armed");
+            // Delay-aligned reference: the previous frame's tail plus
+            // this frame's head (the chain's fixed 2.5 ms delay).
+            let ch = self.channels();
+            let n_i = ch * self.frame_samples();
+            let mut reference: Vec<i16> = Vec::with_capacity(n_i);
+            reference.extend_from_slice(&el.hist);
+            reference.extend_from_slice(&pcm[..n_i - el.hist.len()]);
+
+            let mut best_snr = Self::trial_snr(&el.mirror, &best_packet, &reference)?;
+            for tapset in 1..=2u8 {
+                let mut state = self.state.clone();
+                state.tapset_request = tapset;
+                let (packet, info) = Self::encode_with_state(
+                    toc,
+                    &mut state,
+                    pcm,
+                    payload_bytes,
+                    self.end_band,
+                    self.lm,
+                )?;
+                debug_assert!(info.postfilter_on, "pf decision is tapset-independent");
+                let snr = Self::trial_snr(&el.mirror, &packet, &reference)?;
+                if snr > best_snr {
+                    best_snr = snr;
+                    best_state = state;
+                    best_packet = packet;
+                    best_info = info;
+                }
+            }
+        }
+
+        // Commit the winner: adopt its state, advance the lockstep
+        // mirror, roll the delay history.
+        self.state = best_state;
+        let el = self.tapset_election.as_mut().expect("election armed");
+        let _ = el.mirror.decode_packet(&best_packet)?;
+        let keep = el.hist.len();
+        el.hist.clear();
+        el.hist.extend_from_slice(&pcm[pcm.len() - keep..]);
+        Ok((best_packet, best_info))
+    }
+
+    /// SNR of one trial packet's decode (on a clone of the lockstep
+    /// mirror) against the delay-aligned input reference.
+    fn trial_snr(mirror: &OpusDecoder, packet: &[u8], reference: &[i16]) -> Result<f64, Error> {
+        let mut dec = mirror.clone();
+        let out = dec.decode_packet(packet)?;
+        if out.pcm.len() != reference.len() {
+            return Err(Error::MalformedPacket);
+        }
+        let mut sig = 0.0f64;
+        let mut err = 0.0f64;
+        for (&r, &t) in reference.iter().zip(out.pcm.iter()) {
+            let rf = f64::from(r);
+            let tf = f64::from(t);
+            sig += rf * rf;
+            err += (rf - tf) * (rf - tf);
+        }
+        if err == 0.0 {
+            return Ok(150.0);
+        }
+        Ok(10.0 * (sig / err).log10())
     }
 }
 

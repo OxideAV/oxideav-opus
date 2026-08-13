@@ -274,7 +274,7 @@ pub enum PlcFlavor {
 /// Decoder-side concealment state: the per-channel 48 kHz output
 /// history, the consecutive-loss counter driving the §4.4 energy
 /// decay, and the pending cross-lap tail for the next decoded frame.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PlcState {
     /// Per-channel trailing output history (up to
     /// [`PLC_HISTORY_SAMPLES`] each), in the `i16 / 32768` float
