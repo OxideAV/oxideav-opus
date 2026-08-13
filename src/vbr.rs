@@ -408,6 +408,12 @@ impl HybridVbrEncoderMono {
         &self.rc
     }
 
+    /// Arm the §5.2.3.8 delayed-decision noise shaping quantiser on
+    /// the Hybrid SILK layer inside the elected encodes.
+    pub fn set_nsq_delayed_decision(&mut self, n_states: usize) {
+        self.enc.set_nsq_delayed_decision(n_states);
+    }
+
     /// Reset all carried state (§4.5.2).
     pub fn reset(&mut self) {
         self.enc.reset();
@@ -461,6 +467,12 @@ impl HybridVbrEncoderStereo {
     #[must_use]
     pub fn rate_control(&self) -> &VbrRateControl {
         &self.rc
+    }
+
+    /// Arm the §5.2.3.8 delayed-decision noise shaping quantiser on
+    /// the Hybrid SILK layer inside the elected encodes.
+    pub fn set_nsq_delayed_decision(&mut self, n_states: usize) {
+        self.enc.set_nsq_delayed_decision(n_states);
     }
 
     /// Reset all carried state (§4.5.2).

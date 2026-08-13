@@ -169,6 +169,14 @@ impl HybridEncoderMono {
         self.n
     }
 
+    /// Arm the §5.2.3.8 delayed-decision noise shaping quantiser on
+    /// the Hybrid SILK layer (see
+    /// [`ChannelAnalyzer::set_nsq_delayed_decision`]; the CELT bands
+    /// 17.. are unaffected).
+    pub fn set_nsq_delayed_decision(&mut self, n_states: usize) {
+        self.analyzer.set_nsq_delayed_decision(n_states);
+    }
+
     /// Reset all carried state (§4.5.2).
     pub fn reset(&mut self) {
         self.analyzer.reset();
@@ -380,6 +388,14 @@ impl HybridEncoderStereo {
     }
 
     /// Reset all carried state (§4.5.2).
+    /// Arm the §5.2.3.8 delayed-decision noise shaping quantiser on
+    /// both channels of the Hybrid SILK layer (see
+    /// [`ChannelAnalyzer::set_nsq_delayed_decision`]).
+    pub fn set_nsq_delayed_decision(&mut self, n_states: usize) {
+        self.mid.set_nsq_delayed_decision(n_states);
+        self.side.set_nsq_delayed_decision(n_states);
+    }
+
     pub fn reset(&mut self) {
         self.mid.reset();
         self.side.reset();

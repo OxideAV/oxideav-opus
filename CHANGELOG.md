@@ -4,16 +4,20 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
-- **Election knobs on the VBR arms + fuzz coverage** (round 442):
-  `vbr::SilkVbrEncoderMono/Stereo::set_nsq_delayed_decision` and
-  `vbr::CeltVbrEncoder::set_tapset_election` forward the two new
-  elections into the VBR paths (the CELT VBR arm runs exactly one
-  packet encode per frame, so the tapset election's lockstep mirror
-  tracks the emitted stream). Oracle coverage widened to eight
+- **Election knobs on the VBR and Hybrid arms + fuzz coverage**
+  (round 442): `vbr::SilkVbrEncoderMono/Stereo` and
+  `HybridEncoderMono/Stereo` (+ their VBR arms) gain
+  `set_nsq_delayed_decision`, and `vbr::CeltVbrEncoder` gains
+  `set_tapset_election`, forwarding the two new elections into the
+  VBR and Hybrid paths (the CELT VBR arm runs exactly one packet
+  encode per frame, so the tapset election's lockstep mirror tracks
+  the emitted stream; the Hybrid SILK layer's WB analyzer takes the
+  trellis directly). Oracle coverage widened to eight
   delayed-decision SILK streams (adding MB 10 ms, WB 40 ms 2-state,
   and the WB 20 kb/s constrained-VBR arm — all **bit-exact** through
-  the §A reference-listing decoder) and a tapset-elected CELT VBR
-  stream (90 dB / max 1 LSB). The `silk_elected_roundtrip` and
+  the §A reference-listing decoder), a delayed-decision Hybrid FB
+  stream (113 dB / max 1 LSB) and a tapset-elected CELT VBR stream
+  (90 dB / max 1 LSB). The `silk_elected_roundtrip` and
   `celt_encode_roundtrip` fuzz targets now drive the delayed-decision
   state count (1/2/4) and the tapset paths (forced 1/2 + the full
   election with its mirror decoder); both ran locally 240 s clean.
