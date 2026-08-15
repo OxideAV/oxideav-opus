@@ -92,6 +92,48 @@ use crate::Error;
 /// the SILK-layer rate control's quantization-rate knob).
 const TARGET_PULSE_RMS: f64 = 2.0;
 
+/// §2.1.7 loss-optimised LBRR: expected loss percentages at or below
+/// this bound keep redundancy on "perceptually important" intervals
+/// only (onsets — §2.1.7 names "onsets or transients" as the FEC
+/// candidates); higher loss protects every active interval.
+const LBRR_ONSET_ONLY_MAX_LOSS_PERC: u8 = 10;
+
+/// §2.1.7 loss-optimised LBRR: onset detection — an interval is an
+/// onset when its RMS at least doubles the previous interval's, or
+/// when the previous interval was inactive.
+const LBRR_ONSET_RMS_RATIO: f64 = 2.0;
+
+/// §2.1.7 loss-optimised LBRR: the redundancy rate ratio the loss
+/// knob ramps toward at high expected loss (the RFC fixes no number
+/// — "usually encoded with a lower bitrate" — so the ramp endpoints
+/// are this crate's documented, measured choice).
+const LBRR_MAX_RATE_RATIO: f64 = 0.9;
+
+/// Map an expected §2.1.7 packet-loss percentage to the LBRR rate
+/// ratio: the [`LBRR_RATE_RATIO`] default through moderate loss, then
+/// a linear ramp to [`LBRR_MAX_RATE_RATIO`] at 50%+ expected loss
+/// (heavier loss shifts the elected budget from the primary encoding
+/// toward the redundancy that will actually be heard).
+fn lbrr_ratio_for_loss(loss_perc: u8) -> f64 {
+    let t =
+        ((f64::from(loss_perc) - f64::from(LBRR_ONSET_ONLY_MAX_LOSS_PERC)) / 40.0).clamp(0.0, 1.0);
+    LBRR_RATE_RATIO + t * (LBRR_MAX_RATE_RATIO - LBRR_RATE_RATIO)
+}
+
+/// §2.1.7 onset test for the loss-optimised LBRR importance gate.
+fn lbrr_interval_is_onset(rms: f64, prev_rms: f64) -> bool {
+    prev_rms < ACTIVITY_RMS || rms >= LBRR_ONSET_RMS_RATIO * prev_rms
+}
+
+/// RMS of one internal-rate interval.
+fn interval_rms(pcm: &[f32]) -> f64 {
+    if pcm.is_empty() {
+        return 0.0;
+    }
+    let e: f64 = pcm.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+    (e / pcm.len() as f64).sqrt()
+}
+
 /// §4.2.5 LBRR (in-band FEC) re-encodes run at half the regular pulse
 /// target: the redundant copy spends roughly half the pulse budget of
 /// the regular frames (§2.1.7 codes the previous frame "at a lower
@@ -230,6 +272,11 @@ pub struct ChannelAnalyzer {
     /// multi-state trellis — see
     /// [`ChannelAnalyzer::set_nsq_delayed_decision`]).
     nsq_states: usize,
+    /// §4.2.5 / §2.1.7 LBRR rate ratio applied by
+    /// [`Self::rearm_for_lbrr`] ([`LBRR_RATE_RATIO`] by default; the
+    /// loss-optimised mode raises it toward
+    /// [`LBRR_MAX_RATE_RATIO`]).
+    lbrr_ratio: f64,
 }
 
 impl ChannelAnalyzer {
@@ -255,6 +302,7 @@ impl ChannelAnalyzer {
             rate_control: false,
             force_unvoiced: false,
             nsq_states: 1,
+            lbrr_ratio: LBRR_RATE_RATIO,
         })
     }
 
@@ -283,8 +331,17 @@ impl ChannelAnalyzer {
         self.lpc_state.reset();
         self.prev_log_gain = None;
         self.prev_lag = None;
-        self.pulse_rms *= LBRR_RATE_RATIO;
+        self.pulse_rms *= self.lbrr_ratio;
         self.force_unvoiced = true;
+    }
+
+    /// Set the §4.2.5 LBRR rate ratio applied when a clone of this
+    /// analyzer is [re-armed](Self::rearm_for_lbrr) as an LBRR
+    /// re-encoder (clamped to `0.25..=1.0`; default
+    /// [`LBRR_RATE_RATIO`]). The §2.1.7 loss-optimised mode drives it
+    /// from the expected loss percentage.
+    pub fn set_lbrr_rate_ratio(&mut self, ratio: f64) {
+        self.lbrr_ratio = ratio.clamp(0.25, 1.0);
     }
 
     /// The current excitation-pulse RMS target — the SILK-layer
@@ -788,6 +845,13 @@ pub struct SilkEncoderMono {
     silk_frame_size: SilkFrameSize,
     fec: bool,
     pending_fec: Option<PendingFecMono>,
+    /// §2.1.7 expected packet-loss percentage (0 = the loss knob is
+    /// unset: legacy LBRR behaviour, every active interval at the
+    /// default rate ratio).
+    loss_perc: u8,
+    /// Previous LBRR-processed interval's RMS (the §2.1.7 onset
+    /// baseline), carried across packets in pending order.
+    lbrr_prev_rms: f64,
 }
 
 impl SilkEncoderMono {
@@ -813,6 +877,8 @@ impl SilkEncoderMono {
             silk_frame_size,
             fec: false,
             pending_fec: None,
+            loss_perc: 0,
+            lbrr_prev_rms: 0.0,
         })
     }
 
@@ -838,6 +904,28 @@ impl SilkEncoderMono {
         self.channel.set_nsq_delayed_decision(n_states);
     }
 
+    /// §2.1.7 loss-optimised LBRR: declare the expected packet-loss
+    /// percentage (clamped to `0..=100`). With FEC enabled
+    /// ([`Self::set_fec`]) the knob shapes the redundancy:
+    ///
+    /// * `1..=10` — LBRR rides only on "perceptually important"
+    ///   intervals (§2.1.7: onsets — an interval whose RMS at least
+    ///   doubles its predecessor's, or that follows an inactive one),
+    ///   freeing elected budget for the primary encoding when losses
+    ///   are rare;
+    /// * `11..=100` — every active interval carries LBRR and the
+    ///   redundancy rate ratio ramps linearly from the default
+    ///   [`LBRR_RATE_RATIO`] toward [`LBRR_MAX_RATE_RATIO`] at 50%+
+    ///   (heavier loss shifts bits toward the copy that will actually
+    ///   be heard);
+    /// * `0` (default) — the knob is unset: legacy behaviour, bit
+    ///   identical to before.
+    pub fn set_packet_loss_perc(&mut self, loss_perc: u8) {
+        self.loss_perc = loss_perc.min(100);
+        self.channel
+            .set_lbrr_rate_ratio(lbrr_ratio_for_loss(self.loss_perc));
+    }
+
     /// Per-packet input length: the packet duration at the internal
     /// rate (20 ms = 160 NB / 240 MB / 320 WB samples, times the 1-3
     /// SILK frames per packet; half that for a 10 ms packet).
@@ -850,6 +938,7 @@ impl SilkEncoderMono {
     pub fn reset(&mut self) {
         self.channel.reset();
         self.pending_fec = None;
+        self.lbrr_prev_rms = 0.0;
     }
 
     /// Encode one packet's worth (20 / 40 / 60 ms) of mono
@@ -878,8 +967,16 @@ impl SilkEncoderMono {
                 let mut lbrr_first = true;
                 let mut out = Vec::with_capacity(self.frames_per_packet);
                 for chunk in pending.pcm.chunks_exact(flen) {
+                    // §2.1.7 loss-optimised importance gate: at low
+                    // expected loss only onset intervals carry LBRR
+                    // (the analysis still runs so the re-encoder's
+                    // carried history matches the ungated walk).
+                    let rms = interval_rms(chunk);
+                    let important = !(1..=LBRR_ONSET_ONLY_MAX_LOSS_PERC).contains(&self.loss_perc)
+                        || lbrr_interval_is_onset(rms, self.lbrr_prev_rms);
+                    self.lbrr_prev_rms = rms;
                     let f = la.analyze_frame_sized(chunk, lbrr_first, self.silk_frame_size)?;
-                    if f.header.frame_type >= 2 {
+                    if f.header.frame_type >= 2 && important {
                         lbrr_first = false;
                         out.push(Some(f));
                     } else {
@@ -1014,6 +1111,12 @@ pub struct SilkEncoderStereo {
     silk_frame_size: SilkFrameSize,
     fec: bool,
     pending_fec: Option<PendingFecStereo>,
+    /// §2.1.7 expected packet-loss percentage (0 = knob unset).
+    loss_perc: u8,
+    /// Previous LBRR-processed interval's MID RMS (the §2.1.7 onset
+    /// baseline; the mid channel carries the onset decision for the
+    /// whole interval).
+    lbrr_prev_rms: f64,
 }
 
 impl SilkEncoderStereo {
@@ -1044,6 +1147,8 @@ impl SilkEncoderStereo {
             silk_frame_size,
             fec: false,
             pending_fec: None,
+            loss_perc: 0,
+            lbrr_prev_rms: 0.0,
         })
     }
 
@@ -1064,6 +1169,17 @@ impl SilkEncoderStereo {
         self.side.set_nsq_delayed_decision(n_states);
     }
 
+    /// §2.1.7 loss-optimised LBRR (see
+    /// [`SilkEncoderMono::set_packet_loss_perc`]): the onset gate is
+    /// decided on the mid channel per §4.2.2 interval, and the rate
+    /// ratio applies to both channels' re-encoders.
+    pub fn set_packet_loss_perc(&mut self, loss_perc: u8) {
+        self.loss_perc = loss_perc.min(100);
+        let ratio = lbrr_ratio_for_loss(self.loss_perc);
+        self.mid.set_lbrr_rate_ratio(ratio);
+        self.side.set_lbrr_rate_ratio(ratio);
+    }
+
     /// Per-packet input length per channel (the packet duration at the
     /// internal rate).
     pub fn frame_samples(&self) -> usize {
@@ -1078,6 +1194,7 @@ impl SilkEncoderStereo {
         self.downmix.reset();
         self.prev_mid = 0.0;
         self.pending_fec = None;
+        self.lbrr_prev_rms = 0.0;
     }
 
     /// Encode one packet's worth (20 / 40 / 60 ms) of stereo
@@ -1117,10 +1234,17 @@ impl SilkEncoderStereo {
                     let mut mids = Vec::with_capacity(self.frames_per_packet);
                     let mut sides = Vec::with_capacity(self.frames_per_packet);
                     for iv in &pending.intervals {
+                        // §2.1.7 loss-optimised importance gate on the
+                        // mid channel (see the mono path).
+                        let rms = interval_rms(&iv.mid_pcm);
+                        let important = !(1..=LBRR_ONSET_ONLY_MAX_LOSS_PERC)
+                            .contains(&self.loss_perc)
+                            || lbrr_interval_is_onset(rms, self.lbrr_prev_rms);
+                        self.lbrr_prev_rms = rms;
                         // Side first: the mid LBRR frame's §4.2.7.2
                         // flag depends on whether a side LBRR frame
                         // actually rides this interval.
-                        let side_frame = if iv.side_active {
+                        let side_frame = if iv.side_active && important {
                             let sf = ls.analyze_frame_sized(
                                 &iv.side_pcm,
                                 side_first,
@@ -1141,7 +1265,7 @@ impl SilkEncoderStereo {
                         };
                         let mf =
                             lm.analyze_frame_sized(&iv.mid_pcm, mid_first, self.silk_frame_size)?;
-                        if mf.header.frame_type >= 2 {
+                        if mf.header.frame_type >= 2 && important {
                             let mut mf = mf;
                             mf.header.stereo = Some(iv.weights);
                             // §4.2.7.2 on an LBRR mid frame: the flag

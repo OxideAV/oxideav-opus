@@ -4,6 +4,30 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **§2.1.7 loss-optimised LBRR mode** (round 445):
+  `SilkEncoderMono/Stereo::set_packet_loss_perc` (forwarded by the
+  SILK VBR arms) shapes the §4.2.5 redundancy from the declared
+  expected packet-loss percentage. At low loss (1..=10%) LBRR rides
+  only on "perceptually important" intervals per §2.1.7's "onsets or
+  transients" guidance (an interval whose RMS at least doubles its
+  predecessor's, or that follows an inactive one; the stereo gate is
+  decided on the mid channel per §4.2.2 interval) — measured on
+  onset-rich speech at an elected 40 B: carriers thin **143 → 10**
+  while steady-state clean quality gains **+2.0 dB** at a slightly
+  lower average rate. Above 10% every active interval is protected
+  and the LBRR rate ratio ramps linearly from the 0.5 default to
+  0.9 at 50%+ (`ChannelAnalyzer::set_lbrr_rate_ratio`; the RFC
+  fixes no number — "usually encoded with a lower bitrate" — so the
+  ramp endpoints are documented crate choices): recoveries track
+  the clean decode **+1.6 dB** better at 50% than at the default
+  ratio with identical coverage and rate inside the same election,
+  and the expected quality under the declared loss model favours
+  the knob's operating point. `set_packet_loss_perc(0)` (and never
+  touching the knob) stays bit-identical to the legacy FEC
+  behaviour. Gated end-to-end in `tests/loss_optimized_fec.rs`
+  (mono elected / stereo / VBR arms, exact accounting, real
+  `decode_packet_fec` recoveries on the gated streams).
+
 - **Delayed-decision NSQ × LBRR / Hybrid composition measured and
   pinned** (round 445): the r442 election is now gated through both
   remaining composition paths. (1) *Inside the §4.2.5 LBRR re-encode

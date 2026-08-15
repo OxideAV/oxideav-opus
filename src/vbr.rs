@@ -544,6 +544,13 @@ impl SilkVbrEncoderMono {
         self.enc.set_nsq_delayed_decision(n_states);
     }
 
+    /// §2.1.7 loss-optimised LBRR (see
+    /// [`SilkEncoderMono::set_packet_loss_perc`]; the reshaped
+    /// redundancy still rides inside the elected sizes).
+    pub fn set_packet_loss_perc(&mut self, loss_perc: u8) {
+        self.enc.set_packet_loss_perc(loss_perc);
+    }
+
     /// Reset all carried state (§4.5.2).
     pub fn reset(&mut self) {
         self.enc.reset();
@@ -605,6 +612,12 @@ impl SilkVbrEncoderStereo {
     /// [`SilkEncoderStereo::set_nsq_delayed_decision`]).
     pub fn set_nsq_delayed_decision(&mut self, n_states: usize) {
         self.enc.set_nsq_delayed_decision(n_states);
+    }
+
+    /// §2.1.7 loss-optimised LBRR (see
+    /// [`SilkEncoderStereo::set_packet_loss_perc`]).
+    pub fn set_packet_loss_perc(&mut self, loss_perc: u8) {
+        self.enc.set_packet_loss_perc(loss_perc);
     }
 
     /// Reset all carried state (§4.5.2).
