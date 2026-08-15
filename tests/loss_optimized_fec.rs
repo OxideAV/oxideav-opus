@@ -92,7 +92,7 @@ fn run_arm(pcm: &[f32], loss_perc: u8) -> (f64, f64, usize, f64, Vec<Vec<u8>>) {
         }
         for (&r, &t) in chunk.iter().zip(recon[k * 320..(k + 1) * 320].iter()) {
             csig += f64::from(r) * f64::from(r);
-            cerr += f64::from(r - t) * f64::from(r - t);
+            cerr += (f64::from(r) - f64::from(t)).powi(2);
         }
     }
     let clean_snr = 10.0 * (csig / cerr).log10();
@@ -120,7 +120,7 @@ fn run_arm(pcm: &[f32], loss_perc: u8) -> (f64, f64, usize, f64, Vec<Vec<u8>>) {
                 carriers += 1;
                 for (&c, &r) in clean[k][240..].iter().zip(fec.pcm[240..].iter()) {
                     sig += f64::from(c) * f64::from(c);
-                    err += f64::from(c - r) * f64::from(c - r);
+                    err += (f64::from(c) - f64::from(r)).powi(2);
                 }
             }
             let _ = dec.decode_packet(&packets[k + 1]).unwrap();

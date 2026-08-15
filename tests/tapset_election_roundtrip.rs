@@ -78,7 +78,7 @@ fn run_arm(pcm: &[i16], payload: usize, arm: &str) -> (f64, usize, [usize; 3], V
         reference.extend_from_slice(&chunk[..960 - 120]);
         for (&r, &t) in reference.iter().zip(out.pcm.iter()) {
             sig += f64::from(r) * f64::from(r);
-            err += f64::from(r - t) * f64::from(r - t);
+            err += (f64::from(r) - f64::from(t)).powi(2);
         }
         hist.copy_from_slice(&chunk[960 - 120..]);
         packets.push(packet);

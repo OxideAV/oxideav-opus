@@ -250,7 +250,7 @@ fn lbrr_rearmed_analyzer_still_elects_the_trellis() {
             seeds.push(f.lcg_seed);
             for (&r, &t) in chunk.iter().zip(f.reconstructed.iter()) {
                 sig += f64::from(r) * f64::from(r);
-                err += f64::from(r - t) * f64::from(r - t);
+                err += (f64::from(r) - f64::from(t)).powi(2);
             }
         }
         (seeds, 10.0 * (sig / err).log10())
@@ -325,7 +325,7 @@ fn fec_recovery_composes_with_delayed_decision() {
                 // fresh §4.2.9 resampler; both arms share it.
                 for (&c, &r) in clean[k][240..].iter().zip(fec.pcm[240..].iter()) {
                     sig += f64::from(c) * f64::from(c);
-                    err += f64::from(c - r) * f64::from(c - r);
+                    err += (f64::from(c) - f64::from(r)).powi(2);
                 }
                 recovered += 1;
                 let _ = dec.decode_packet(&packets[k + 1]).unwrap();
@@ -391,7 +391,7 @@ fn hybrid_delayed_decision_measured_end_to_end() {
             reference.extend_from_slice(&chunk[..960 - 120]);
             for (&r, &t) in reference.iter().zip(out.pcm.iter()) {
                 sig += f64::from(r) * f64::from(r);
-                err += f64::from(r - t) * f64::from(r - t);
+                err += (f64::from(r) - f64::from(t)).powi(2);
             }
             hist.copy_from_slice(&chunk[960 - 120..]);
             packets.push(packet);
