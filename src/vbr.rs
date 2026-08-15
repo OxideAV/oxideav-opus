@@ -347,6 +347,11 @@ impl CeltVbrEncoder {
         self.enc.set_tapset_election(enabled);
     }
 
+    /// Complexity ladder (0..=10; see [`CeltEncoder::set_complexity`]).
+    pub fn set_complexity(&mut self, complexity: u8) {
+        self.enc.set_complexity(complexity);
+    }
+
     /// Encode one frame of interleaved 48 kHz PCM at a VBR-elected
     /// size. Returns the packet (its length is the election) and the
     /// CELT frame info.
@@ -414,6 +419,12 @@ impl HybridVbrEncoderMono {
         self.enc.set_nsq_delayed_decision(n_states);
     }
 
+    /// Complexity ladder (0..=10; see
+    /// [`HybridEncoderMono::set_complexity`]).
+    pub fn set_complexity(&mut self, complexity: u8) {
+        self.enc.set_complexity(complexity);
+    }
+
     /// Reset all carried state (§4.5.2).
     pub fn reset(&mut self) {
         self.enc.reset();
@@ -473,6 +484,12 @@ impl HybridVbrEncoderStereo {
     /// the Hybrid SILK layer inside the elected encodes.
     pub fn set_nsq_delayed_decision(&mut self, n_states: usize) {
         self.enc.set_nsq_delayed_decision(n_states);
+    }
+
+    /// Complexity ladder (0..=10; see
+    /// [`HybridEncoderMono::set_complexity`]).
+    pub fn set_complexity(&mut self, complexity: u8) {
+        self.enc.set_complexity(complexity);
     }
 
     /// Reset all carried state (§4.5.2).
@@ -551,6 +568,12 @@ impl SilkVbrEncoderMono {
         self.enc.set_packet_loss_perc(loss_perc);
     }
 
+    /// Complexity ladder (0..=10; see
+    /// [`SilkEncoderMono::set_complexity`]).
+    pub fn set_complexity(&mut self, complexity: u8) {
+        self.enc.set_complexity(complexity);
+    }
+
     /// Reset all carried state (§4.5.2).
     pub fn reset(&mut self) {
         self.enc.reset();
@@ -618,6 +641,12 @@ impl SilkVbrEncoderStereo {
     /// [`SilkEncoderStereo::set_packet_loss_perc`]).
     pub fn set_packet_loss_perc(&mut self, loss_perc: u8) {
         self.enc.set_packet_loss_perc(loss_perc);
+    }
+
+    /// Complexity ladder (0..=10; see
+    /// [`SilkEncoderStereo::set_complexity`]).
+    pub fn set_complexity(&mut self, complexity: u8) {
+        self.enc.set_complexity(complexity);
     }
 
     /// Reset all carried state (§4.5.2).

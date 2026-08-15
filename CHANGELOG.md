@@ -4,6 +4,24 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Complexity ladder** (round 445): one `set_complexity(0..=10)`
+  knob on every packet encoder (`CeltEncoder`,
+  `SilkEncoderMono/Stereo`, `HybridEncoderMono/Stereo`, and all five
+  VBR arms) mapping onto the measured election machinery — RFC 6716
+  leaves encoder complexity free, so the rungs are documented crate
+  choices. CELT: `0..=1` skips the §5.3.1 pitch pre-filter analysis
+  entirely (new `CeltEncoderState::prefilter_enabled` switch; the
+  post-filter is signalled off), `2..=7` runs the full decision
+  ladder (the untouched default), `8..=10` arms the §5.3.1 tapset
+  election. SILK: `0..=4` the single-state §5.2.3.8 quantiser
+  (default), `5..=7` a 2-state trellis, `8..=10` the 4-state
+  trellis; Hybrid forwards the SILK mapping (its frames never run
+  the pre-filter). Measured monotone at equal rate: CELT
+  **14.6 / 19.1 / 20.3 dB** at rungs 0/4/10 (periodic content,
+  40 B), SILK **9.0 / 9.8 / 10.2 dB** at rungs 0/7/10 (speech,
+  elected 40 B); untouched encoders are bit-identical to the
+  documented default rung. Gated in `tests/complexity_ladder.rs`.
+
 - **§2.1.7 loss-optimised LBRR mode** (round 445):
   `SilkEncoderMono/Stereo::set_packet_loss_perc` (forwarded by the
   SILK VBR arms) shapes the §4.2.5 redundancy from the declared

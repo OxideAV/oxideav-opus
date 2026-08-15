@@ -177,6 +177,15 @@ impl HybridEncoderMono {
         self.analyzer.set_nsq_delayed_decision(n_states);
     }
 
+    /// Complexity ladder (0..=10; see
+    /// [`crate::silk_encoder::SilkEncoderMono::set_complexity`]) —
+    /// maps to the SILK layer's delayed-decision state count. A
+    /// Hybrid frame never runs the §5.3.1 pre-filter (the decoder's
+    /// `start == 0` gate), so the CELT rungs do not apply.
+    pub fn set_complexity(&mut self, complexity: u8) {
+        self.set_nsq_delayed_decision(crate::silk_encoder::silk_states_for_complexity(complexity));
+    }
+
     /// Reset all carried state (§4.5.2).
     pub fn reset(&mut self) {
         self.analyzer.reset();
@@ -394,6 +403,12 @@ impl HybridEncoderStereo {
     pub fn set_nsq_delayed_decision(&mut self, n_states: usize) {
         self.mid.set_nsq_delayed_decision(n_states);
         self.side.set_nsq_delayed_decision(n_states);
+    }
+
+    /// Complexity ladder (0..=10; see
+    /// [`HybridEncoderMono::set_complexity`]) on both channels.
+    pub fn set_complexity(&mut self, complexity: u8) {
+        self.set_nsq_delayed_decision(crate::silk_encoder::silk_states_for_complexity(complexity));
     }
 
     pub fn reset(&mut self) {

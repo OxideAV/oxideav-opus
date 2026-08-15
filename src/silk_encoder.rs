@@ -120,6 +120,18 @@ fn lbrr_ratio_for_loss(loss_perc: u8) -> f64 {
     LBRR_RATE_RATIO + t * (LBRR_MAX_RATE_RATIO - LBRR_RATE_RATIO)
 }
 
+/// Complexity-ladder rung → §5.2.3.8 delayed-decision state count
+/// (RFC 6716 leaves encoder complexity free; the rungs are documented
+/// crate choices — r442 measured 2 states taking most of the trellis
+/// win and 4 the rest).
+pub(crate) fn silk_states_for_complexity(complexity: u8) -> usize {
+    match complexity.min(10) {
+        0..=4 => 1,
+        5..=7 => 2,
+        _ => 4,
+    }
+}
+
 /// §2.1.7 onset test for the loss-optimised LBRR importance gate.
 fn lbrr_interval_is_onset(rms: f64, prev_rms: f64) -> bool {
     prev_rms < ACTIVITY_RMS || rms >= LBRR_ONSET_RMS_RATIO * prev_rms
@@ -926,6 +938,15 @@ impl SilkEncoderMono {
             .set_lbrr_rate_ratio(lbrr_ratio_for_loss(self.loss_perc));
     }
 
+    /// Complexity ladder (0..=10): maps to the §5.2.3.8
+    /// delayed-decision state count — `0..=4` the single-state
+    /// quantiser (the untouched default, complexity 4), `5..=7` a
+    /// 2-state trellis, `8..=10` the full 4-state trellis. Overrides
+    /// an earlier [`Self::set_nsq_delayed_decision`] call.
+    pub fn set_complexity(&mut self, complexity: u8) {
+        self.set_nsq_delayed_decision(silk_states_for_complexity(complexity));
+    }
+
     /// Per-packet input length: the packet duration at the internal
     /// rate (20 ms = 160 NB / 240 MB / 320 WB samples, times the 1-3
     /// SILK frames per packet; half that for a 10 ms packet).
@@ -1178,6 +1199,12 @@ impl SilkEncoderStereo {
         let ratio = lbrr_ratio_for_loss(self.loss_perc);
         self.mid.set_lbrr_rate_ratio(ratio);
         self.side.set_lbrr_rate_ratio(ratio);
+    }
+
+    /// Complexity ladder (0..=10; see
+    /// [`SilkEncoderMono::set_complexity`]) on both coded channels.
+    pub fn set_complexity(&mut self, complexity: u8) {
+        self.set_nsq_delayed_decision(silk_states_for_complexity(complexity));
     }
 
     /// Per-packet input length per channel (the packet duration at the

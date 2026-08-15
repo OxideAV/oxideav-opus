@@ -75,6 +75,11 @@ pub struct CeltEncoderState {
     /// [`crate::celt_packet_encode::CeltEncoder`] drives it by
     /// measured rate/quality trials, default 0).
     pub tapset_request: u8,
+    /// §5.3.1 pre-filter analysis switch (default on): the complexity
+    /// ladder's low rungs skip the per-frame pitch search entirely
+    /// and signal the post-filter off — pure encoder freedom, the
+    /// wire stays valid.
+    pub prefilter_enabled: bool,
     channels: usize,
     n: usize,
 }
@@ -119,6 +124,7 @@ impl CeltEncoderState {
             prefilter_gain: 0.0,
             prefilter_tapset: 0,
             tapset_request: 0,
+            prefilter_enabled: true,
             channels,
             n,
         }
@@ -233,7 +239,7 @@ pub fn encode_celt_frame(
     let mut pitch_index = crate::celt_prefilter::COMBFILTER_MINPERIOD;
     let mut gain1 = 0.0f64;
     let prefilter_tapset = state.tapset_request.min(2); // §5.3.1 encoder choice
-    if nb_available_bytes > 12 * channels as i64 && start == 0 {
+    if state.prefilter_enabled && nb_available_bytes > 12 * channels as i64 && start == 0 {
         let chans: Vec<&[f64]> = (0..channels)
             .map(|c| &pre.pre[c * (maxp + n)..(c + 1) * (maxp + n)])
             .collect();

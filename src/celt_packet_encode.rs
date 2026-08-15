@@ -119,6 +119,20 @@ impl CeltEncoder {
         self.state.tapset_request = tapset.min(2);
     }
 
+    /// Complexity ladder (0..=10; RFC 6716 leaves encoder complexity
+    /// free, so the rungs are documented crate choices): `0..=1`
+    /// skips the §5.3.1 pitch pre-filter analysis entirely (the
+    /// post-filter is signalled off); `2..=7` runs the pre-filter's
+    /// full decision ladder (the untouched default — complexity 4);
+    /// `8..=10` additionally arms the §5.3.1 tapset election (three
+    /// trial encodes + mirror decodes per pre-filter-firing frame).
+    /// Overrides an earlier [`Self::set_tapset_election`] call.
+    pub fn set_complexity(&mut self, complexity: u8) {
+        let c = complexity.min(10);
+        self.state.prefilter_enabled = c >= 2;
+        self.set_tapset_election(c >= 8);
+    }
+
     /// Enable / disable the §5.3.1 **tapset election**: on every
     /// frame where the pitch pre-filter fires, the frame is
     /// trial-encoded with each §4.3.7.1 tapset (0/1/2) at the same
