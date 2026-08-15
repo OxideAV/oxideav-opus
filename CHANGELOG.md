@@ -4,6 +4,24 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Tapset-election × VBR silence-collapse interaction pinned**
+  (round 445): the r442-flagged untested interaction — the §5.3.1
+  tapset election's lockstep mirror decoder must survive the VBR
+  arm's digital-silence collapse (3-byte packets the mirror still
+  decodes to stay in stream lockstep) — is now gated in
+  `tests/tapset_election_roundtrip.rs`. Measured on silence-gapped
+  periodic content: the elected `vbr::CeltVbrEncoder` stream keeps
+  its silence frames at the 3-byte minimum, elects identical
+  per-frame sizes to the default arm (the election never perturbs
+  the rate), keeps coding nonzero tapsets on BOTH sides of the gap,
+  and beats the tapset-0 default by **+1.7 dB whole-stream /
+  +1.9 dB post-silence** at 16 kb/s (gated at +0.5 dB — a
+  silence-desynced mirror would mis-measure every post-silence
+  trial and forfeit the win). The CBR shape (fixed 40 B payloads,
+  the §4.3 silence flag coded inside the fixed payload, pf off on
+  silence frames) wins **+1.2 dB** post-silence under the same
+  gate.
+
 - **Election knobs on the VBR and Hybrid arms + fuzz coverage**
   (round 442): `vbr::SilkVbrEncoderMono/Stereo` and
   `HybridEncoderMono/Stereo` (+ their VBR arms) gain
