@@ -303,6 +303,34 @@ dB** at equal rate over the fixed-0 encoder on periodic content
 streams agreeing with the reference-listing decoder at 103 dB (max
 1 LSB).
 
+Round 445 closes the r442 followups and lands three new encoder
+surfaces. The **delayed-decision × LBRR / Hybrid composition** is
+measured and gated: the trellis election runs inside the §4.2.5 LBRR
+re-encode itself (elected seeds ride on 7/10 LBRR frames), FEC
+recoveries track the clean decode **+1.0 dB** better at equal elected
+rate, and Hybrid framing composes at parity with byte-identical
+elected sizes. The **tapset-election × VBR silence-collapse
+interaction** (flagged untested in r442) is pinned: the lockstep
+mirror survives 3-byte silence packets, winning **+1.7 dB
+whole-stream / +1.9 dB post-silence** over tapset-0 at 16 kb/s across
+a silence gap (oracle: 102.9 dB / max 1 LSB on the silence-gapped
+elected VBR stream). The **§2.1.7 loss-optimised LBRR mode**
+(`set_packet_loss_perc`, SILK + Hybrid + VBR arms) shapes redundancy
+from the declared loss: onsets-only at ≤10% (carriers 143 → 10,
+**+2.0 dB** clean at equal elected rate), a 0.5 → 0.9 rate-ratio ramp
+above (recoveries **+1.6 dB** at the 50% point; three loss-optimised
+oracle streams decode **bit-exactly**). The **complexity ladder**
+(`set_complexity(0..=10)` on every encoder arm) maps the election
+machinery onto one knob — measured monotone: CELT 14.6 / 19.1 /
+20.3 dB at rungs 0/4/10, SILK 9.0 / 9.8 / 10.2 dB — with untouched
+encoders bit-identical to the documented default rung. And **Hybrid
+in-band FEC** closes the LBRR story across every SILK-bearing mode:
+mono and stereo Hybrid packets carry the §4.2.5 redundancy on the
+shared range coder (stereo with the §4.2.7.1 weights on the LBRR mid
+frame), `decode_packet_fec` recovers the 0–8 kHz LP band, and the FEC
+streams agree with the reference-listing decoder at **112–113 dB**
+(max 1 LSB).
+
 Differential encoder/decoder testing and a restored cargo-fuzz suite
 (6 coverage-guided targets, incl. an encoder↔decoder range-coder
 roundtrip and the CELT / VBR encode→decode harnesses) have also
@@ -589,6 +617,30 @@ listing's per-band Haar-level L1 sparsity metric (`haar1` /
 Viterbi flip-cost smoothing against the Table 60/62 targets;
 `encode_celt_frame` codes the analysed `tf_change` flags
 (`tf_select` stays 0, coded only when the tables diverge).
+
+**§2.1.7 loss-optimised LBRR (`set_packet_loss_perc`):** on every
+FEC-capable arm (`SilkEncoderMono/Stereo`, `HybridEncoderMono/Stereo`,
+their VBR arms) — expected loss ≤10% keeps redundancy on onset
+intervals only (an interval whose RMS at least doubles its
+predecessor's, or that follows an inactive one; stereo decides on the
+mid channel), higher loss protects every active interval with the
+LBRR rate ratio ramping from 0.5 to 0.9 at 50%+
+(`ChannelAnalyzer::set_lbrr_rate_ratio`); 0 / untouched is
+bit-identical legacy FEC (`tests/loss_optimized_fec.rs`).
+
+**Hybrid in-band FEC (`HybridEncoderMono/Stereo::set_fec`):** the
+§4.2.5 LBRR re-encode of the previous packet's WB SILK band riding
+the shared range coder ahead of the regular SILK frame(s) — stereo
+with the §4.2.7.1 weight quintuple on the LBRR mid frame and the
+§4.2.5 mid/side interleave — recovered as the 0–8 kHz LP band via
+`decode_packet_fec`.
+
+**Complexity ladder (`set_complexity(0..=10)`, every encoder arm):**
+one knob over the election machinery — CELT rungs gate the §5.3.1
+pre-filter analysis (0..=1 off) and the tapset election (8..=10 on);
+SILK rungs pick the §5.2.3.8 state count (1/2/4); Hybrid forwards the
+SILK mapping. Untouched defaults are bit-identical to rung 4
+(`tests/complexity_ladder.rs`).
 
 **CELT §5.3.1 pitch pre-filter:** `celt_prefilter` — the listing's
 pitch estimator (`pitch_downsample` / `pitch_search` /
