@@ -334,3 +334,144 @@ fn stereo_and_vbr_arms_ride_the_loss_knob() {
         "VBR + loss knob average {avg:.1} B/pkt out of range"
     );
 }
+
+/// r445: Hybrid packets carry LBRR too — the WB SILK layer's §4.2.5
+/// redundancy rides in front of the regular SILK frame on the shared
+/// range coder, the stream still decodes end-to-end, and a dropped
+/// packet's SILK band recovers through `decode_packet_fec` (the
+/// recovery is the 0–8 kHz LP layer per §2.1.7). The loss knob's
+/// onset gate thins hybrid carriers exactly like the SILK-only path.
+#[test]
+fn hybrid_fec_emits_recovers_and_takes_the_loss_knob() {
+    use oxideav_opus::hybrid_packet_encode::HybridEncoderMono;
+
+    // 48 kHz speech-like content (dip envelope for onsets).
+    let f32pcm = speech_like(48000, 3.0);
+    let pcm: Vec<i16> = f32pcm
+        .iter()
+        .map(|&v| (v * 24000.0).clamp(-30000.0, 30000.0) as i16)
+        .collect();
+
+    let run = |fec: bool, loss: u8| -> (usize, Vec<Vec<u8>>) {
+        let mut enc = HybridEncoderMono::new(Bandwidth::Fb, 200).unwrap();
+        enc.set_fec(fec);
+        enc.set_packet_loss_perc(loss);
+        let mut dec = OpusDecoder::new();
+        let mut carriers = 0usize;
+        let mut packets = Vec::new();
+        for (ki, chunk) in pcm.chunks_exact(960).enumerate() {
+            let packet = enc
+                .encode_packet_elected(chunk, 120)
+                .unwrap_or_else(|e| panic!("packet {ki} (fec {fec} loss {loss}): {e:?}"));
+            if OpusDecoder::new()
+                .decode_packet_fec(&packet)
+                .unwrap()
+                .status
+                == FecDecodeStatus::Recovered
+            {
+                carriers += 1;
+            }
+            // The whole stream (LBRR included) must decode normally.
+            let out = dec.decode_packet(&packet).unwrap();
+            assert_eq!(out.samples_per_channel(), 960);
+            packets.push(packet);
+        }
+        (carriers, packets)
+    };
+
+    // FEC off: no packet carries LBRR (and the encoder is unchanged).
+    let (car_off, _) = run(false, 0);
+    assert_eq!(car_off, 0);
+
+    // FEC on: active intervals carry LBRR; the onset gate thins them.
+    let (car_on, pkts_on) = run(true, 0);
+    assert!(car_on > 50, "hybrid LBRR must ride: {car_on} carriers");
+    let (car_onset, _) = run(true, 5);
+    assert!(
+        car_onset * 2 <= car_on && car_onset > 0,
+        "hybrid onset gate: {car_onset} vs {car_on} carriers"
+    );
+
+    // A real loss: drop packet k, recover its SILK band from packet
+    // k+1, and compare the recovery against the clean decode's low
+    // band energy-wise (the recovery is only the LP layer, so exact
+    // waveform SNR does not apply — gate that it is real audio, not
+    // silence, with the exact sample count).
+    let k = 30usize;
+    let mut dec = OpusDecoder::new();
+    for p in &pkts_on[..k] {
+        let _ = dec.decode_packet(p).unwrap();
+    }
+    let fec = dec.decode_packet_fec(&pkts_on[k + 1]).unwrap();
+    assert_eq!(fec.status, FecDecodeStatus::Recovered);
+    assert_eq!(fec.pcm.len(), 960);
+    let energy: f64 = fec.pcm.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+    assert!(energy > 1.0e6, "recovered SILK band is silence: {energy}");
+    // And the stream continues after the recovery.
+    let out = dec.decode_packet(&pkts_on[k + 1]).unwrap();
+    assert_eq!(out.samples_per_channel(), 960);
+}
+
+/// r445: the stereo Hybrid arm's LBRR — mid/side redundancy frames
+/// ride in front of the regular stereo walk (mid LBRR carries the
+/// §4.2.7.1 weights and the gated §4.2.7.2 flag), the stream decodes
+/// end-to-end, and a dropped packet recovers two-channel SILK-band
+/// audio through `decode_packet_fec`.
+#[test]
+fn stereo_hybrid_fec_emits_and_recovers() {
+    use oxideav_opus::hybrid_packet_encode::HybridEncoderStereo;
+
+    let f32pcm = speech_like(48000, 2.0);
+    let pcm: Vec<i16> = f32pcm
+        .iter()
+        .flat_map(|&v| {
+            let l = (v * 24000.0).clamp(-30000.0, 30000.0) as i16;
+            let r = (v * 12000.0).clamp(-30000.0, 30000.0) as i16;
+            [l, r]
+        })
+        .collect();
+
+    let mut enc = HybridEncoderStereo::new(Bandwidth::Fb, 200).unwrap();
+    enc.set_fec(true);
+    let mut dec = OpusDecoder::new();
+    let mut carriers = 0usize;
+    let mut packets = Vec::new();
+    for chunk in pcm.chunks_exact(2 * 960) {
+        let packet = enc.encode_packet_elected(chunk, 200).unwrap();
+        if OpusDecoder::new()
+            .decode_packet_fec(&packet)
+            .unwrap()
+            .status
+            == FecDecodeStatus::Recovered
+        {
+            carriers += 1;
+        }
+        let out = dec.decode_packet(&packet).unwrap();
+        assert_eq!(out.samples_per_channel(), 960);
+        assert_eq!(out.channels, 2);
+        packets.push(packet);
+    }
+    assert!(carriers > 30, "stereo hybrid LBRR must ride: {carriers}");
+
+    // A real two-channel recovery.
+    let k = 25usize;
+    let mut dec = OpusDecoder::new();
+    for p in &packets[..k] {
+        let _ = dec.decode_packet(p).unwrap();
+    }
+    let fec = dec.decode_packet_fec(&packets[k + 1]).unwrap();
+    assert_eq!(fec.status, FecDecodeStatus::Recovered);
+    assert_eq!(fec.channels, 2);
+    assert_eq!(fec.pcm.len(), 2 * 960);
+    // Both channels carry real audio with the panned imbalance
+    // preserved (L was encoded twice as loud as R).
+    let (mut el, mut er) = (0.0f64, 0.0f64);
+    for pair in fec.pcm.chunks_exact(2) {
+        el += f64::from(pair[0]) * f64::from(pair[0]);
+        er += f64::from(pair[1]) * f64::from(pair[1]);
+    }
+    assert!(el > 1.0e6 && er > 1.0e5, "recovered channels: {el} / {er}");
+    assert!(el > er, "panning must survive the recovery");
+    let out = dec.decode_packet(&packets[k + 1]).unwrap();
+    assert_eq!(out.samples_per_channel(), 960);
+}

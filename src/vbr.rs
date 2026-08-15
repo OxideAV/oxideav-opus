@@ -425,6 +425,19 @@ impl HybridVbrEncoderMono {
         self.enc.set_complexity(complexity);
     }
 
+    /// Enable / disable §4.2.5 LBRR (in-band FEC) emission on the
+    /// Hybrid SILK layer (the redundancy rides inside the elected
+    /// sizes; see [`HybridEncoderMono::set_fec`]).
+    pub fn set_fec(&mut self, enabled: bool) {
+        self.enc.set_fec(enabled);
+    }
+
+    /// §2.1.7 loss-optimised LBRR (see
+    /// [`HybridEncoderMono::set_packet_loss_perc`]).
+    pub fn set_packet_loss_perc(&mut self, loss_perc: u8) {
+        self.enc.set_packet_loss_perc(loss_perc);
+    }
+
     /// Reset all carried state (§4.5.2).
     pub fn reset(&mut self) {
         self.enc.reset();
@@ -490,6 +503,19 @@ impl HybridVbrEncoderStereo {
     /// [`HybridEncoderMono::set_complexity`]).
     pub fn set_complexity(&mut self, complexity: u8) {
         self.enc.set_complexity(complexity);
+    }
+
+    /// Enable / disable §4.2.5 LBRR (in-band FEC) emission on the
+    /// Hybrid SILK layer (the redundancy rides inside the elected
+    /// sizes; see [`HybridEncoderMono::set_fec`]).
+    pub fn set_fec(&mut self, enabled: bool) {
+        self.enc.set_fec(enabled);
+    }
+
+    /// §2.1.7 loss-optimised LBRR (see
+    /// [`HybridEncoderMono::set_packet_loss_perc`]).
+    pub fn set_packet_loss_perc(&mut self, loss_perc: u8) {
+        self.enc.set_packet_loss_perc(loss_perc);
     }
 
     /// Reset all carried state (§4.5.2).

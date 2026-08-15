@@ -96,7 +96,7 @@ const TARGET_PULSE_RMS: f64 = 2.0;
 /// this bound keep redundancy on "perceptually important" intervals
 /// only (onsets — §2.1.7 names "onsets or transients" as the FEC
 /// candidates); higher loss protects every active interval.
-const LBRR_ONSET_ONLY_MAX_LOSS_PERC: u8 = 10;
+pub(crate) const LBRR_ONSET_ONLY_MAX_LOSS_PERC: u8 = 10;
 
 /// §2.1.7 loss-optimised LBRR: onset detection — an interval is an
 /// onset when its RMS at least doubles the previous interval's, or
@@ -114,7 +114,7 @@ const LBRR_MAX_RATE_RATIO: f64 = 0.9;
 /// a linear ramp to [`LBRR_MAX_RATE_RATIO`] at 50%+ expected loss
 /// (heavier loss shifts the elected budget from the primary encoding
 /// toward the redundancy that will actually be heard).
-fn lbrr_ratio_for_loss(loss_perc: u8) -> f64 {
+pub(crate) fn lbrr_ratio_for_loss(loss_perc: u8) -> f64 {
     let t =
         ((f64::from(loss_perc) - f64::from(LBRR_ONSET_ONLY_MAX_LOSS_PERC)) / 40.0).clamp(0.0, 1.0);
     LBRR_RATE_RATIO + t * (LBRR_MAX_RATE_RATIO - LBRR_RATE_RATIO)
@@ -133,12 +133,12 @@ pub(crate) fn silk_states_for_complexity(complexity: u8) -> usize {
 }
 
 /// §2.1.7 onset test for the loss-optimised LBRR importance gate.
-fn lbrr_interval_is_onset(rms: f64, prev_rms: f64) -> bool {
+pub(crate) fn lbrr_interval_is_onset(rms: f64, prev_rms: f64) -> bool {
     prev_rms < ACTIVITY_RMS || rms >= LBRR_ONSET_RMS_RATIO * prev_rms
 }
 
 /// RMS of one internal-rate interval.
-fn interval_rms(pcm: &[f32]) -> f64 {
+pub(crate) fn interval_rms(pcm: &[f32]) -> f64 {
     if pcm.is_empty() {
         return 0.0;
     }

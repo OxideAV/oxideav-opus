@@ -48,6 +48,13 @@ fuzz_target!(|data: &[u8]| {
         2 => enc.set_tapset(2),
         _ => enc.set_tapset_election(true),
     }
+    // Round 445: the complexity ladder (bit 7 selects an extreme rung
+    // — 0 disables the §5.3.1 pre-filter analysis, 10 arms the tapset
+    // election; either overrides the tapset selection above, which
+    // remains exercised by inputs with the bit clear).
+    if (cfg >> 7) & 1 == 1 {
+        enc.set_complexity(if cfg & 1 == 1 { 10 } else { 0 });
+    }
     let mut dec = OpusDecoder::new();
     let spf = enc.frame_samples();
     let ch = enc.channels();

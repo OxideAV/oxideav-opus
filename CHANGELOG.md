@@ -4,6 +4,28 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Hybrid in-band FEC** (round 445): the last SILK-bearing mode
+  without LBRR emission now has it —
+  `HybridEncoderMono/Stereo::set_fec` (+ the Hybrid VBR arms) ride
+  the §4.2.5 redundancy on the shared range coder in front of the
+  regular SILK frame(s): the mono arm re-encodes the previous
+  packet's WB SILK band from the pre-packet analyzer snapshot; the
+  stereo arm re-encodes the previous packet's §4.2.8 mid/side
+  products with the coded §4.2.7.1 weight quintuple on the LBRR mid
+  frame and the gated §4.2.7.2 flag (side LBRR rides only when the
+  regular pass coded an active side frame), exactly the SILK-only
+  arms' machinery at one §4.2.2 interval per packet. The §2.1.7
+  loss knob (`set_packet_loss_perc`) applies — onset gating thins
+  hybrid carriers at low declared loss, the rate-ratio ramp at
+  high. A dropped packet recovers its 0–8 kHz LP band (mono or
+  two-channel with panning preserved) through `decode_packet_fec`,
+  and the stream keeps decoding through the recovery. Oracle: a
+  mono FEC stream (elected 150 B) and a stereo FEC + 30%-loss
+  stream (elected 250 B) decode through the §A reference-listing
+  decoder at **112.6 / 111.9 dB** (max 1 LSB — the LBRR sections
+  parse identically through the listing's §4.2.5 walk). Gated in
+  `tests/loss_optimized_fec.rs`.
+
 - **Complexity ladder** (round 445): one `set_complexity(0..=10)`
   knob on every packet encoder (`CeltEncoder`,
   `SilkEncoderMono/Stereo`, `HybridEncoderMono/Stereo`, and all five

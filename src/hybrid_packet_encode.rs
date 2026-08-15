@@ -28,7 +28,10 @@ use crate::celt_redundancy::{
 };
 use crate::range_encoder::RangeEncoder;
 use crate::silk_decode::{encode_silk_frame, SilkFrameConfig, StereoHeaderContext};
-use crate::silk_encoder::{ChannelAnalyzer, MID_ONLY_SIDE_RMS};
+use crate::silk_encoder::{
+    interval_rms, lbrr_interval_is_onset, lbrr_ratio_for_loss, AnalyzedFrame, ChannelAnalyzer,
+    LBRR_ONSET_ONLY_MAX_LOSS_PERC, MID_ONLY_SIDE_RMS,
+};
 use crate::silk_excitation::SilkFrameSize;
 use crate::silk_frame::{StereoPredictionWeights, StereoWeightSymbols};
 use crate::silk_header::{PerFrameLbrr, SilkChannelHeader, SilkHeaderBits};
@@ -125,6 +128,24 @@ pub struct HybridEncoderMono {
     end_band: usize,
     lm: i32,
     n: usize,
+    /// §4.2.5 LBRR (in-band FEC) emission switch.
+    fec: bool,
+    /// The previous packet's internal-rate PCM + pre-packet analyzer
+    /// snapshot (see [`crate::silk_encoder::SilkEncoderMono`]).
+    pending_fec: Option<PendingFecHybridMono>,
+    /// §2.1.7 expected packet-loss percentage (0 = knob unset).
+    loss_perc: u8,
+    /// Previous LBRR-processed interval's RMS (§2.1.7 onset baseline).
+    lbrr_prev_rms: f64,
+}
+
+/// The previous Hybrid packet's material a FEC-enabled encoder keeps
+/// so the NEXT packet can carry its §4.2.5 LBRR re-encode of the WB
+/// SILK layer.
+#[derive(Debug, Clone)]
+struct PendingFecHybridMono {
+    pcm16: Vec<f32>,
+    analyzer: ChannelAnalyzer,
 }
 
 impl HybridEncoderMono {
@@ -160,6 +181,10 @@ impl HybridEncoderMono {
             end_band,
             lm,
             n,
+            fec: false,
+            pending_fec: None,
+            loss_perc: 0,
+            lbrr_prev_rms: 0.0,
         })
     }
 
@@ -167,6 +192,30 @@ impl HybridEncoderMono {
     #[must_use]
     pub fn frame_samples(&self) -> usize {
         self.n
+    }
+
+    /// Enable / disable §4.2.5 LBRR (in-band FEC) emission on the WB
+    /// SILK layer: when on, every packet after the first carries a
+    /// reduced-rate re-encode of the previous packet's SILK band
+    /// (recoverable with
+    /// [`crate::decoder::OpusDecoder::decode_packet_fec`] — the
+    /// recovery is the 0–8 kHz LP layer, §2.1.7's re-encoded speech
+    /// information). Disabling drops any pending redundancy.
+    pub fn set_fec(&mut self, enabled: bool) {
+        self.fec = enabled;
+        if !enabled {
+            self.pending_fec = None;
+        }
+    }
+
+    /// §2.1.7 loss-optimised LBRR (see
+    /// [`crate::silk_encoder::SilkEncoderMono::set_packet_loss_perc`]):
+    /// the onset gate and the redundancy rate-ratio ramp on the
+    /// Hybrid SILK layer's LBRR.
+    pub fn set_packet_loss_perc(&mut self, loss_perc: u8) {
+        self.loss_perc = loss_perc.min(100);
+        self.analyzer
+            .set_lbrr_rate_ratio(lbrr_ratio_for_loss(self.loss_perc));
     }
 
     /// Arm the §5.2.3.8 delayed-decision noise shaping quantiser on
@@ -191,6 +240,8 @@ impl HybridEncoderMono {
         self.analyzer.reset();
         self.celt.reset();
         self.decim.reset();
+        self.pending_fec = None;
+        self.lbrr_prev_rms = 0.0;
     }
 
     /// Encode one packet: `pcm` holds `frame_samples()` mono 48 kHz
@@ -257,6 +308,32 @@ impl HybridEncoderMono {
         let mut re = RangeEncoder::new();
         let pcm48: Vec<f64> = pcm.iter().map(|&v| f64::from(v)).collect();
         let pcm16 = self.decim.process(&pcm48);
+
+        // §4.2.5 / §2.1.7: this packet's LBRR frame is a reduced-rate
+        // re-encode of the PREVIOUS packet's SILK band, from the
+        // pre-packet analyzer snapshot (exactly the SILK-only path,
+        // one frame per Hybrid packet). The §2.1.7 importance gate
+        // applies at low declared loss.
+        let lbrr_frame: Option<AnalyzedFrame> = match self.pending_fec.take() {
+            Some(pending) => {
+                let mut la = pending.analyzer;
+                la.rearm_for_lbrr();
+                let rms = interval_rms(&pending.pcm16);
+                let important = !(1..=LBRR_ONSET_ONLY_MAX_LOSS_PERC).contains(&self.loss_perc)
+                    || lbrr_interval_is_onset(rms, self.lbrr_prev_rms);
+                self.lbrr_prev_rms = rms;
+                let f = la.analyze_frame_sized(&pending.pcm16, true, self.silk_frame_size)?;
+                (f.header.frame_type >= 2 && important).then_some(f)
+            }
+            None => None,
+        };
+        if self.fec {
+            self.pending_fec = Some(PendingFecHybridMono {
+                pcm16: pcm16.clone(),
+                analyzer: self.analyzer.clone(),
+            });
+        }
+
         let analyzed = self
             .analyzer
             .analyze_frame_sized(&pcm16, true, self.silk_frame_size)?;
@@ -265,12 +342,35 @@ impl HybridEncoderMono {
             num_silk_frames: 1,
             mid: SilkChannelHeader {
                 vad_flags: u8::from(vad),
-                lbrr_flag: false,
+                lbrr_flag: lbrr_frame.is_some(),
             },
             side: None,
-            per_frame_lbrr: PerFrameLbrr { mid: 0, side: 0 },
+            // n = 1: the global LBRR flag IS the per-frame flag.
+            per_frame_lbrr: PerFrameLbrr {
+                mid: u8::from(lbrr_frame.is_some()),
+                side: 0,
+            },
         };
         header.encode(&mut re)?;
+        // §4.2.5: the LBRR frame precedes the regular frame, coded
+        // like a first-in-sequence active frame (independent gain,
+        // absolute lag, §4.2.7.6.3 scaling present).
+        if let Some(lf) = &lbrr_frame {
+            let cfg = SilkFrameConfig {
+                bandwidth: Bandwidth::Wb,
+                frame_size: self.silk_frame_size,
+                voice_active: true,
+                first_subframe_independent: true,
+                previous_log_gain: None,
+                previous_primary_lag: None,
+                ltp_scaling_present: true,
+                lsf_interp_after_reset: true,
+                previous_nlsf_q15: None,
+                previous_nlsf_len: 0,
+                stereo: None,
+            };
+            let _ = encode_silk_frame(&mut re, cfg, &lf.symbols())?;
+        }
         let cfg = SilkFrameConfig {
             bandwidth: Bandwidth::Wb,
             frame_size: self.silk_frame_size,
@@ -348,6 +448,31 @@ pub struct HybridEncoderStereo {
     end_band: usize,
     lm: i32,
     n: usize,
+    /// §4.2.5 LBRR (in-band FEC) emission switch.
+    fec: bool,
+    /// The previous packet's mix products + pre-packet analyzer
+    /// snapshots (see [`crate::silk_encoder::SilkEncoderStereo`]).
+    pending_fec: Option<PendingFecHybridStereo>,
+    /// §2.1.7 expected packet-loss percentage (0 = knob unset).
+    loss_perc: u8,
+    /// Previous LBRR-processed interval's MID RMS (§2.1.7 onset
+    /// baseline).
+    lbrr_prev_rms: f64,
+}
+
+/// The previous stereo Hybrid packet's material a FEC-enabled encoder
+/// keeps: the §4.2.8 downmix products and coded weights from the
+/// regular pass (so the redundant copy codes the identical mix),
+/// whether an ACTIVE side frame was coded, and the pre-packet
+/// analyzer snapshots.
+#[derive(Debug, Clone)]
+struct PendingFecHybridStereo {
+    mid_pcm: Vec<f32>,
+    side_pcm: Vec<f32>,
+    side_active: bool,
+    weights: StereoWeightSymbols,
+    mid_analyzer: ChannelAnalyzer,
+    side_analyzer: ChannelAnalyzer,
 }
 
 impl HybridEncoderStereo {
@@ -386,7 +511,31 @@ impl HybridEncoderStereo {
             end_band,
             lm,
             n,
+            fec: false,
+            pending_fec: None,
+            loss_perc: 0,
+            lbrr_prev_rms: 0.0,
         })
+    }
+
+    /// Enable / disable §4.2.5 LBRR (in-band FEC) emission on the WB
+    /// SILK stereo layer (see [`HybridEncoderMono::set_fec`]).
+    pub fn set_fec(&mut self, enabled: bool) {
+        self.fec = enabled;
+        if !enabled {
+            self.pending_fec = None;
+        }
+    }
+
+    /// §2.1.7 loss-optimised LBRR (see
+    /// [`HybridEncoderMono::set_packet_loss_perc`]): the onset gate
+    /// is decided on the mid channel, the rate ratio applies to both
+    /// channels'"'"' re-encoders.
+    pub fn set_packet_loss_perc(&mut self, loss_perc: u8) {
+        self.loss_perc = loss_perc.min(100);
+        let ratio = lbrr_ratio_for_loss(self.loss_perc);
+        self.mid.set_lbrr_rate_ratio(ratio);
+        self.side.set_lbrr_rate_ratio(ratio);
     }
 
     /// 48 kHz samples per channel per packet (`pcm` is interleaved
@@ -419,6 +568,8 @@ impl HybridEncoderStereo {
         self.celt.reset();
         self.decim_l.reset();
         self.decim_r.reset();
+        self.pending_fec = None;
+        self.lbrr_prev_rms = 0.0;
     }
 
     /// Encode one packet: `pcm` holds `2 * frame_samples()` interleaved
@@ -512,6 +663,52 @@ impl HybridEncoderStereo {
         let side_energy: f64 = ms.side.iter().map(|&v| (v as f64) * (v as f64)).sum();
         let code_side = (side_energy / flen as f64).sqrt() > MID_ONLY_SIDE_RMS;
 
+        // §4.2.5 / §2.1.7: this packet's LBRR frames re-encode the
+        // PREVIOUS packet's mid/side products from the pre-packet
+        // analyzer snapshots (exactly the SILK-only stereo path, one
+        // §4.2.2 interval per Hybrid packet). Side first — the mid
+        // LBRR frame's §4.2.7.2 flag depends on whether a side LBRR
+        // frame actually rides.
+        let (lbrr_mid, lbrr_side): (Option<AnalyzedFrame>, Option<AnalyzedFrame>) =
+            match self.pending_fec.take() {
+                Some(pending) => {
+                    let mut lm = pending.mid_analyzer;
+                    let mut ls = pending.side_analyzer;
+                    lm.rearm_for_lbrr();
+                    ls.rearm_for_lbrr();
+                    let rms = interval_rms(&pending.mid_pcm);
+                    let important = !(1..=LBRR_ONSET_ONLY_MAX_LOSS_PERC).contains(&self.loss_perc)
+                        || lbrr_interval_is_onset(rms, self.lbrr_prev_rms);
+                    self.lbrr_prev_rms = rms;
+                    let side_frame = if pending.side_active && important {
+                        let sf =
+                            ls.analyze_frame_sized(&pending.side_pcm, true, self.silk_frame_size)?;
+                        (sf.header.frame_type >= 2).then_some(sf)
+                    } else {
+                        None
+                    };
+                    let mf =
+                        lm.analyze_frame_sized(&pending.mid_pcm, true, self.silk_frame_size)?;
+                    let mid_frame = if mf.header.frame_type >= 2 && important {
+                        let mut mf = mf;
+                        mf.header.stereo = Some(pending.weights);
+                        // §4.2.7.2 on an LBRR mid frame: present (and
+                        // SET) iff no side LBRR frame rides.
+                        mf.header.mid_only_flag = if side_frame.is_some() {
+                            None
+                        } else {
+                            Some(true)
+                        };
+                        Some(mf)
+                    } else {
+                        None
+                    };
+                    (mid_frame, side_frame)
+                }
+                None => (None, None),
+            };
+        let fec_snapshot = self.fec.then(|| (self.mid.clone(), self.side.clone()));
+
         // Per-channel analysis (each Hybrid frame is a fresh Opus
         // frame: first-in-packet threading, decoder carry kept inert
         // by the analyzers' gain floors).
@@ -543,19 +740,73 @@ impl HybridEncoderStereo {
         // A coded-but-inactive side frame keeps the flag present and
         // cleared; the frame itself still rides the bitstream.
 
+        // Arm the NEXT packet's redundancy from THIS packet's mix
+        // products and pre-packet snapshots.
+        if let Some((mid_analyzer, side_analyzer)) = fec_snapshot {
+            self.pending_fec = Some(PendingFecHybridStereo {
+                mid_pcm: ms.mid.clone(),
+                side_pcm: ms.side.clone(),
+                side_active,
+                weights: weight_symbols,
+                mid_analyzer,
+                side_analyzer,
+            });
+        }
+
         let header = SilkHeaderBits {
             num_silk_frames: 1,
             mid: SilkChannelHeader {
                 vad_flags: u8::from(mid_frame.header.frame_type >= 2),
-                lbrr_flag: false,
+                lbrr_flag: lbrr_mid.is_some(),
             },
             side: Some(SilkChannelHeader {
                 vad_flags: u8::from(side_active),
-                lbrr_flag: false,
+                lbrr_flag: lbrr_side.is_some(),
             }),
-            per_frame_lbrr: PerFrameLbrr { mid: 0, side: 0 },
+            // n = 1: the global LBRR flags ARE the per-frame flags.
+            per_frame_lbrr: PerFrameLbrr {
+                mid: u8::from(lbrr_mid.is_some()),
+                side: u8::from(lbrr_side.is_some()),
+            },
         };
         header.encode(&mut re)?;
+
+        // §4.2.5: the LBRR frames precede the regular frames, mid
+        // then side, each coded like a first-in-sequence active frame.
+        if let Some(lf) = &lbrr_mid {
+            let cfg = SilkFrameConfig {
+                bandwidth: Bandwidth::Wb,
+                frame_size: self.silk_frame_size,
+                voice_active: true,
+                first_subframe_independent: true,
+                previous_log_gain: None,
+                previous_primary_lag: None,
+                ltp_scaling_present: true,
+                lsf_interp_after_reset: true,
+                previous_nlsf_q15: None,
+                previous_nlsf_len: 0,
+                stereo: Some(StereoHeaderContext {
+                    has_mid_only_flag: lbrr_side.is_none(),
+                }),
+            };
+            let _ = encode_silk_frame(&mut re, cfg, &lf.symbols())?;
+        }
+        if let Some(sf) = &lbrr_side {
+            let cfg = SilkFrameConfig {
+                bandwidth: Bandwidth::Wb,
+                frame_size: self.silk_frame_size,
+                voice_active: true,
+                first_subframe_independent: true,
+                previous_log_gain: None,
+                previous_primary_lag: None,
+                ltp_scaling_present: true,
+                lsf_interp_after_reset: true,
+                previous_nlsf_q15: None,
+                previous_nlsf_len: 0,
+                stereo: None,
+            };
+            let _ = encode_silk_frame(&mut re, cfg, &sf.symbols())?;
+        }
 
         let stereo_ctx = StereoHeaderContext {
             has_mid_only_flag: !side_active,

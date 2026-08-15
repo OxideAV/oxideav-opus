@@ -11,6 +11,9 @@
 //! trellis on 1/2/4 states, exercising the per-frame NSQ election)
 //! exceed the §3.2.1 maximum or fail on arbitrary PCM — a panic or a
 //! decode error is a rate-control (or noise-shaping-quantizer) bug.
+//! Round 445: a second config byte drives the §2.1.7 loss-optimised
+//! LBRR knob (`set_packet_loss_perc`, 0..=100 — the onset gate and
+//! the redundancy rate-ratio ramp both ride inside the election).
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_opus::decoder::OpusDecoder;
@@ -43,6 +46,12 @@ fuzz_target!(|data: &[u8]| {
         _ => 4,
     };
 
+    let Some(loss_byte) = it.next() else {
+        return;
+    };
+    // §2.1.7 loss knob: 0..=100 (values above 100 clamp inside).
+    let loss_perc = loss_byte % 101;
+
     let rest: Vec<u8> = it.collect();
     if rest.len() < 4 {
         return;
@@ -60,6 +69,7 @@ fuzz_target!(|data: &[u8]| {
         };
         enc.set_fec(fec);
         enc.set_nsq_delayed_decision(nsq_states);
+        enc.set_packet_loss_perc(loss_perc);
         let spf = enc.frame_samples();
         let mut pos = 0usize;
         for _ in 0..max_packets {
@@ -93,6 +103,7 @@ fuzz_target!(|data: &[u8]| {
         };
         enc.set_fec(fec);
         enc.set_nsq_delayed_decision(nsq_states);
+        enc.set_packet_loss_perc(loss_perc);
         let spf = enc.frame_samples();
         let mut pos = 0usize;
         for _ in 0..max_packets {
