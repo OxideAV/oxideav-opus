@@ -4,6 +4,28 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Delayed-decision NSQ × LBRR / Hybrid composition measured and
+  pinned** (round 445): the r442 election is now gated through both
+  remaining composition paths. (1) *Inside the §4.2.5 LBRR re-encode
+  itself*: an LBRR-rearmed analyzer (fresh §4.2.7.9 state, halved
+  pulse target, forced-unvoiced coding) still runs the per-frame
+  trellis election — measured: elected nonzero §4.2.7.7 seeds on
+  7/10 LBRR frames with reconstruction parity (the election only
+  adopts measured wins). (2) *End-to-end FEC*: on an elected 40 B WB
+  FEC stream with every 7th packet dropped and recovered through
+  `decode_packet_fec`, the 4-state arm's recoveries track the clean
+  decode **+1.0 dB** better than the single-state arm at equal
+  elected rate (2.2 vs 1.2 dB — the absolute figure reflects LBRR's
+  forced-unvoiced coding of voiced content, a waveform-phase
+  difference by design). (3) *Hybrid framing*: elected mono Hybrid
+  FB streams at a fixed 250 B election are byte-count-identical
+  between the arms with genuinely different packets (the trellis
+  runs inside the Hybrid SILK layer) at end-to-end parity, 21.6 dB
+  — at a fixed Hybrid payload the SILK RD election's rate savings
+  only rebudget the CELT tail, so the composed gain is bounded and
+  the gate is never-regress. All in
+  `tests/nsq_del_dec_roundtrip.rs`.
+
 - **Tapset-election × VBR silence-collapse interaction pinned**
   (round 445): the r442-flagged untested interaction — the §5.3.1
   tapset election's lockstep mirror decoder must survive the VBR
