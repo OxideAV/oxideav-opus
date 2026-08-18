@@ -83,7 +83,7 @@ use crate::silk_packet_encode::{
 };
 use crate::silk_pitch::{pitch_analysis, quantize_lag};
 use crate::silk_stereo::{stereo_lr_to_ms, StereoDownmixState, StereoWeightsQ13};
-use crate::toc::Bandwidth;
+use crate::toc::{Bandwidth, FrameCountCode, Mode, OpusTocByte};
 use crate::Error;
 
 /// Default target RMS of the excitation pulses (`e_raw`) the gain
@@ -189,6 +189,95 @@ pub(crate) const MID_ONLY_SIDE_RMS: f64 = 1.0e-4;
 /// Frame RMS below which a frame is coded INACTIVE (§4.2.7.3 frame
 /// type 0, VAD flag clear) — the signal-derived §4.2.3 VAD decision.
 const ACTIVITY_RMS: f64 = 1.0e-3;
+
+/// §2.1.9: "When DTX is enabled, only one frame is encoded every
+/// 400 milliseconds." — the refresh cadence of a DTX run: once this
+/// much suppressed time has accumulated, one packet is coded so the
+/// decoder's comfort-noise floor stays current.
+const DTX_REFRESH_MS: u32 = 400;
+
+/// Consecutive fully-inactive packets the encoder still TRANSMITS
+/// before the first §2.1.9 suppression (a documented crate choice —
+/// RFC 6716 constrains only the wire format and the refresh cadence).
+/// The hangover carries the §4.2.5 LBRR of the last active packet in
+/// a coded packet and hands the decoder-side §4.4 hold a coded
+/// noise-floor landing before the stream goes quiet.
+const DTX_HANGOVER_PACKETS: u32 = 2;
+
+/// §2.1.9 DTX driver shared by the encoder arms: decides, per packet,
+/// whether to suppress it (replace it with the 1-byte TOC-only marker
+/// — a single §3.2.1 zero-length frame) instead of transmitting the
+/// coded packet.
+///
+/// A packet is suppressed when DTX is enabled, every §4.2.2 interval
+/// of it sits below the [`ACTIVITY_RMS`] activity floor, no §4.2.5
+/// LBRR redundancy of an active packet is pending, at least
+/// [`DTX_HANGOVER_PACKETS`] consecutive inactive packets have been
+/// transmitted first, and less than [`DTX_REFRESH_MS`] of suppressed
+/// time has accumulated since the last coded packet.
+#[derive(Debug, Clone, Default)]
+struct DtxState {
+    enabled: bool,
+    /// Consecutive fully-inactive packets seen (coded or suppressed).
+    inactive_run: u32,
+    /// Suppressed time since the last coded packet, in ms.
+    suppressed_ms: u32,
+    /// At least one packet was suppressed since the last coded one:
+    /// the next coded packet is a DTX *resume* (see
+    /// [`Self::take_resume`]).
+    resumed: bool,
+}
+
+impl DtxState {
+    /// Advance the driver by one packet and return whether that
+    /// packet is suppressed. Must be called exactly once per
+    /// `encode_packet`, before any state-carrying analysis.
+    fn step(&mut self, all_inactive: bool, lbrr_pending_active: bool, packet_ms: u32) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if !all_inactive {
+            self.inactive_run = 0;
+            self.suppressed_ms = 0;
+            return false;
+        }
+        self.inactive_run = self.inactive_run.saturating_add(1);
+        if lbrr_pending_active || self.inactive_run <= DTX_HANGOVER_PACKETS {
+            self.suppressed_ms = 0;
+            return false;
+        }
+        if self.suppressed_ms >= DTX_REFRESH_MS {
+            // §2.1.9 refresh: code this packet.
+            self.suppressed_ms = 0;
+            return false;
+        }
+        self.suppressed_ms += packet_ms;
+        self.resumed = true;
+        true
+    }
+
+    /// Whether the packet being coded is the FIRST coded packet after
+    /// one or more suppressed ones (clears the flag). A decoder's
+    /// §4.2.7.9 output history at that point is its own §4.4
+    /// concealment — non-normative, so different decoders legitimately
+    /// hold different signals there. The resume packet's first frame
+    /// is therefore coded WITHOUT LTP (unvoiced type): its
+    /// reconstruction depends only on coded bits (the residual LPC
+    /// memory is concealment-level, vanishing against active
+    /// content), and every later frame's 18 ms LTP window lies inside
+    /// coded output again — the §4.2.7.6.3 error-containment intent,
+    /// applied at the encoder.
+    fn take_resume(&mut self) -> bool {
+        std::mem::take(&mut self.resumed)
+    }
+
+    /// Drop the run counters (encoder reset / DTX toggled).
+    fn reset(&mut self) {
+        self.inactive_run = 0;
+        self.suppressed_ms = 0;
+        self.resumed = false;
+    }
+}
 
 /// One channel's fully analysed SILK frame: every Table-5 symbol
 /// (owned) plus the encoder's decode-mirror monitoring.
@@ -329,6 +418,22 @@ impl ChannelAnalyzer {
         self.lpc_state.reset();
         self.prev_log_gain = None;
         self.prev_lag = None;
+    }
+
+    /// Roll the input history past one frame the encoder decided NOT
+    /// to transmit (§2.1.9 DTX suppression): the analysis lookback
+    /// stays contiguous with the true signal while every
+    /// decoder-authoritative mirror — the §4.2.7.9 synthesis
+    /// histories and the cross-packet §4.2.7.4 clamp base — stays
+    /// FROZEN, because the decoder decodes nothing for a §3.2.1
+    /// zero-length frame and its state does not advance either. The
+    /// first coded frame after a DTX run therefore reconstructs
+    /// bit-exactly on both sides.
+    pub fn skip_frame_untransmitted(&mut self, pcm: &[f32]) {
+        let keep = self.hist.len();
+        self.hist.extend(pcm.iter().map(|&v| f64::from(v)));
+        let cut = self.hist.len() - keep;
+        self.hist.drain(..cut);
     }
 
     /// Re-arm a CLONE of a channel analyzer as the §4.2.5 LBRR
@@ -800,13 +905,27 @@ impl ChannelAnalyzer {
 /// One encoded packet plus the encoder's decode-mirror monitoring.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncodedSilkPacket {
-    /// The complete code-0 SILK-only Opus packet (TOC + payload).
+    /// The complete code-0 SILK-only Opus packet (TOC + payload). A
+    /// §2.1.9 DTX-suppressed packet is the 1-byte TOC-only marker
+    /// (one §3.2.1 zero-length frame) — see [`Self::is_dtx`].
     pub packet: Vec<u8>,
     /// The internal-rate signal the decoder will reconstruct for this
-    /// packet (mono: the channel; stereo: the MID channel).
+    /// packet (mono: the channel; stereo: the MID channel). All-zero
+    /// for a DTX marker (the decoder holds its §4.4 concealment).
     pub reconstructed: Vec<f32>,
     /// Whether the (mid) frame was coded voiced.
     pub voiced: bool,
+}
+
+impl EncodedSilkPacket {
+    /// Whether this packet is a §2.1.9 DTX marker (a 1-byte TOC-only
+    /// packet whose single §3.2.1 frame has length zero). A transport
+    /// implementing true discontinuous transmission MAY drop it
+    /// entirely; packet-preserving transports forward it as-is.
+    #[must_use]
+    pub fn is_dtx(&self) -> bool {
+        self.packet.len() == 1
+    }
 }
 
 /// Map an analysed-encoder packet duration to its §4.2.2 layout: a
@@ -864,6 +983,8 @@ pub struct SilkEncoderMono {
     /// Previous LBRR-processed interval's RMS (the §2.1.7 onset
     /// baseline), carried across packets in pending order.
     lbrr_prev_rms: f64,
+    /// §2.1.9 DTX driver.
+    dtx: DtxState,
 }
 
 impl SilkEncoderMono {
@@ -891,7 +1012,24 @@ impl SilkEncoderMono {
             pending_fec: None,
             loss_perc: 0,
             lbrr_prev_rms: 0.0,
+            dtx: DtxState::default(),
         })
+    }
+
+    /// Enable / disable §2.1.9 discontinuous transmission: when on,
+    /// a packet whose every §4.2.2 interval sits below the §4.2.3
+    /// activity floor is (after a short transmitted hangover)
+    /// replaced by the 1-byte TOC-only DTX marker — one §3.2.1
+    /// zero-length frame — with one real packet still coded every
+    /// 400 ms ("only one frame is encoded every 400 milliseconds")
+    /// as the comfort-noise refresh. While packets are suppressed
+    /// the decoder-authoritative mirrors are frozen (the decoder
+    /// decodes nothing for a zero-length frame), so the first coded
+    /// packet after a DTX run re-converges bit-exactly. Off (the
+    /// default) is bit-identical to the pre-DTX encoder.
+    pub fn set_dtx(&mut self, enabled: bool) {
+        self.dtx.enabled = enabled;
+        self.dtx.reset();
     }
 
     /// Enable / disable §4.2.5 LBRR (in-band FEC) emission: when on,
@@ -960,6 +1098,7 @@ impl SilkEncoderMono {
         self.channel.reset();
         self.pending_fec = None;
         self.lbrr_prev_rms = 0.0;
+        self.dtx.reset();
     }
 
     /// Encode one packet's worth (20 / 40 / 60 ms) of mono
@@ -973,6 +1112,46 @@ impl SilkEncoderMono {
             return Err(Error::MalformedPacket);
         }
         let flen = frame_size_samples(bandwidth, self.silk_frame_size)?;
+
+        // §2.1.9 DTX: decide BEFORE any state-carrying analysis. The
+        // activity gate is the same signal-derived §4.2.3 floor the
+        // analysis codes as frame type 0; a pending §4.2.5 redundancy
+        // of an ACTIVE packet always forces transmission.
+        let all_inactive = pcm
+            .chunks_exact(flen)
+            .all(|c| interval_rms(c) < ACTIVITY_RMS);
+        let lbrr_pending_active = self.pending_fec.as_ref().is_some_and(|p| {
+            p.pcm
+                .chunks_exact(flen)
+                .any(|c| interval_rms(c) >= ACTIVITY_RMS)
+        });
+        if self.dtx.step(
+            all_inactive,
+            lbrr_pending_active,
+            u32::from(self.packet_tenths_ms) / 10,
+        ) {
+            // Suppressed: roll the analysis lookback past the silent
+            // input, freeze every decoder-authoritative mirror, drop
+            // the (inactive) pending redundancy, and emit the 1-byte
+            // TOC-only marker (one §3.2.1 zero-length frame).
+            for chunk in pcm.chunks_exact(flen) {
+                self.channel.skip_frame_untransmitted(chunk);
+                self.lbrr_prev_rms = interval_rms(chunk);
+            }
+            self.pending_fec = None;
+            let toc = OpusTocByte::compose_byte(
+                Mode::SilkOnly,
+                bandwidth,
+                self.packet_tenths_ms,
+                false,
+                FrameCountCode::One,
+            )?;
+            return Ok(EncodedSilkPacket {
+                packet: vec![toc],
+                reconstructed: vec![0.0; pcm.len()],
+                voiced: false,
+            });
+        }
 
         // §4.2.5 / §2.1.7: the LBRR frames riding in THIS packet are a
         // reduced-rate re-encode of the PREVIOUS packet's intervals,
@@ -1017,13 +1196,20 @@ impl SilkEncoderMono {
             });
         }
 
+        // First coded packet after a DTX run: its first frame carries
+        // no LTP (see [`DtxState::take_resume`]) so both sides
+        // re-converge regardless of what the decoder's §4.4 hold put
+        // in its output history.
+        let dtx_resume = self.dtx.take_resume();
         let mut frames = Vec::with_capacity(self.frames_per_packet);
         for (k, chunk) in pcm.chunks_exact(flen).enumerate() {
+            self.channel.force_unvoiced = dtx_resume && k == 0;
             frames.push(
                 self.channel
                     .analyze_frame_sized(chunk, k == 0, self.silk_frame_size)?,
             );
         }
+        self.channel.force_unvoiced = false;
         let symbols: Vec<_> = frames.iter().map(AnalyzedFrame::symbols).collect();
         let lbrr_symbols: Vec<Option<SilkFrameSymbols<'_>>> = lbrr_frames
             .iter()
@@ -1060,7 +1246,12 @@ impl SilkEncoderMono {
         target_bytes: usize,
     ) -> Result<EncodedSilkPacket, Error> {
         let mut out = self.encode_packet(pcm)?;
-        out.packet = crate::packet_compose::pad_packet_to(&out.packet, target_bytes)?;
+        // A §2.1.9 DTX marker is never padded to the CBR size — the
+        // point of the marker is that (almost) nothing is sent; a
+        // transport doing true DTX drops it entirely.
+        if !out.is_dtx() {
+            out.packet = crate::packet_compose::pad_packet_to(&out.packet, target_bytes)?;
+        }
         Ok(out)
     }
 
@@ -1138,6 +1329,8 @@ pub struct SilkEncoderStereo {
     /// baseline; the mid channel carries the onset decision for the
     /// whole interval).
     lbrr_prev_rms: f64,
+    /// §2.1.9 DTX driver.
+    dtx: DtxState,
 }
 
 impl SilkEncoderStereo {
@@ -1170,7 +1363,17 @@ impl SilkEncoderStereo {
             pending_fec: None,
             loss_perc: 0,
             lbrr_prev_rms: 0.0,
+            dtx: DtxState::default(),
         })
+    }
+
+    /// Enable / disable §2.1.9 discontinuous transmission (see
+    /// [`SilkEncoderMono::set_dtx`]): the activity gate runs on both
+    /// the mid and side downmix per §4.2.2 interval, and the marker
+    /// carries the stereo TOC flag.
+    pub fn set_dtx(&mut self, enabled: bool) {
+        self.dtx.enabled = enabled;
+        self.dtx.reset();
     }
 
     /// Enable / disable §4.2.5 LBRR (in-band FEC) emission (see
@@ -1222,6 +1425,7 @@ impl SilkEncoderStereo {
         self.prev_mid = 0.0;
         self.pending_fec = None;
         self.lbrr_prev_rms = 0.0;
+        self.dtx.reset();
     }
 
     /// Encode one packet's worth (20 / 40 / 60 ms) of stereo
@@ -1242,6 +1446,62 @@ impl SilkEncoderStereo {
             return Err(Error::MalformedPacket);
         }
         let flen = frame_size_samples(self.bandwidth, self.silk_frame_size)?;
+
+        // §2.1.9 DTX: decide BEFORE any state-carrying analysis. The
+        // activity gate runs on the raw mid/side downmix per §4.2.2
+        // interval — a packet is a suppression candidate only when
+        // both sit below the §4.2.3 activity floor everywhere.
+        let all_inactive = (0..self.frames_per_packet).all(|k| {
+            let l = &left[k * flen..(k + 1) * flen];
+            let r = &right[k * flen..(k + 1) * flen];
+            let (mut me, mut se) = (0.0f64, 0.0f64);
+            for (&a, &b) in l.iter().zip(r) {
+                let m = (f64::from(a) + f64::from(b)) / 2.0;
+                let s = (f64::from(a) - f64::from(b)) / 2.0;
+                me += m * m;
+                se += s * s;
+            }
+            (me / flen as f64).sqrt() < ACTIVITY_RMS && (se / flen as f64).sqrt() < ACTIVITY_RMS
+        });
+        let lbrr_pending_active = self.pending_fec.as_ref().is_some_and(|p| {
+            p.intervals
+                .iter()
+                .any(|iv| iv.side_active || interval_rms(&iv.mid_pcm) >= ACTIVITY_RMS)
+        });
+        if self.dtx.step(
+            all_inactive,
+            lbrr_pending_active,
+            u32::from(self.packet_tenths_ms) / 10,
+        ) {
+            // Suppressed: roll both analysis lookbacks past the
+            // silent mid/side signals, freeze the decoder-visible
+            // mirrors (both channels' §4.2.7.9 state, the §4.2.7.4
+            // clamp bases, and the §4.2.7.1 unmix-interp history),
+            // and emit the stereo 1-byte TOC-only marker.
+            for k in 0..self.frames_per_packet {
+                let l = &left[k * flen..(k + 1) * flen];
+                let r = &right[k * flen..(k + 1) * flen];
+                let mid: Vec<f32> = l.iter().zip(r).map(|(&a, &b)| (a + b) / 2.0).collect();
+                let side: Vec<f32> = l.iter().zip(r).map(|(&a, &b)| (a - b) / 2.0).collect();
+                self.mid.skip_frame_untransmitted(&mid);
+                self.side.skip_frame_untransmitted(&side);
+                self.lbrr_prev_rms = interval_rms(&mid);
+                self.prev_mid = mid[flen - 1];
+            }
+            self.pending_fec = None;
+            let toc = OpusTocByte::compose_byte(
+                Mode::SilkOnly,
+                self.bandwidth,
+                self.packet_tenths_ms,
+                true,
+                FrameCountCode::One,
+            )?;
+            return Ok(EncodedSilkPacket {
+                packet: vec![toc],
+                reconstructed: vec![0.0; total_len],
+                voiced: false,
+            });
+        }
 
         // §4.2.5 / §2.1.7: re-encode the PREVIOUS packet's intervals as
         // this packet's LBRR frames, from the pre-packet analyzer
@@ -1327,7 +1587,12 @@ impl SilkEncoderStereo {
         let mut side_frames: Vec<Option<AnalyzedFrame>> =
             Vec::with_capacity(self.frames_per_packet);
 
+        // First coded packet after a DTX run: no LTP on the first
+        // interval's frames (see [`DtxState::take_resume`]).
+        let dtx_resume = self.dtx.take_resume();
         for k in 0..self.frames_per_packet {
+            self.mid.force_unvoiced = dtx_resume && k == 0;
+            self.side.force_unvoiced = dtx_resume && k == 0;
             let l = &left[k * flen..(k + 1) * flen];
             let r = &right[k * flen..(k + 1) * flen];
             // The §4.2.8 one-sample lookahead: the next interval's
@@ -1424,6 +1689,8 @@ impl SilkEncoderStereo {
                 });
             }
         }
+        self.mid.force_unvoiced = false;
+        self.side.force_unvoiced = false;
         if let Some((mid_analyzer, side_analyzer)) = fec_snapshot {
             self.pending_fec = Some(PendingFecStereo {
                 intervals: fec_intervals,
@@ -1478,7 +1745,10 @@ impl SilkEncoderStereo {
         target_bytes: usize,
     ) -> Result<EncodedSilkPacket, Error> {
         let mut out = self.encode_packet(left, right, next_lr)?;
-        out.packet = crate::packet_compose::pad_packet_to(&out.packet, target_bytes)?;
+        // A §2.1.9 DTX marker is never padded to the CBR size.
+        if !out.is_dtx() {
+            out.packet = crate::packet_compose::pad_packet_to(&out.packet, target_bytes)?;
+        }
         Ok(out)
     }
 
@@ -1564,6 +1834,11 @@ where
                 continue;
             }
         };
+        // A §2.1.9 DTX marker is knob-independent: adopt it
+        // immediately (no election to run over a 1-byte packet).
+        if pkt.is_dtx() {
+            return Ok((cand, pkt));
+        }
         let size = pkt.packet.len() as f64;
         if size <= target
             && best_under

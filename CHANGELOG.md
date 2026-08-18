@@ -4,6 +4,46 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **§2.1.9 DTX on the SILK encoder arms** (round 448):
+  `SilkEncoderMono/Stereo::set_dtx` — a packet whose every §4.2.2
+  interval sits below the §4.2.3 activity floor is, after a
+  2-packet transmitted hangover (a documented crate choice: it
+  carries the §4.2.5 LBRR of the last active packet and lands the
+  decoder's §4.4 hold on a coded noise floor), replaced by the
+  1-byte TOC-only marker — one §3.2.1 zero-length frame — with one
+  real packet still coded every 400 ms of suppression ("only one
+  frame is encoded every 400 milliseconds", §2.1.9) as the
+  comfort-noise refresh. While packets are suppressed the encoder
+  freezes every decoder-authoritative mirror (the §4.2.7.9
+  synthesis histories, the §4.2.7.4 clamp base, the §4.2.7.1
+  unmix-interp history) and only rolls the analysis lookback — the
+  decoder decodes nothing for a zero-length frame, so its state
+  freezes identically and coded packets re-converge exactly. The
+  first coded frame after a DTX run additionally carries no LTP
+  (unvoiced type): a decoder's output history there is its own
+  non-normative §4.4 concealment, so the resume frame's
+  reconstruction must not depend on it (the §4.2.7.6.3
+  error-containment intent applied at the encoder). Elected / VBR
+  paths adopt the marker without an election; CBR never pads a
+  marker. Off — and DTX-on over fully active content — is
+  bit-identical to before. Measured (voice | 3 s silence | voice,
+  WB 20 ms): 141/150 silent-run packets suppressed, silent-run
+  bytes at 16% of the DTX-off run; §A reference-listing decoder
+  accepts the mono and stereo DTX streams with exact packet/sample
+  counts, decodes them **bit-exactly up to the first suppression**,
+  holds its own comfort floor across the run (both decoders at the
+  silence floor), and re-converges monotonically after resume (the
+  residual gap is the listing decoder's own non-normative
+  post-concealment smoothing). The reverse direction — the
+  listing *encoder*'s DTX stream (`-dtx`, 273 markers/401 packets)
+  through OUR decoder — decodes with exact counts, bit-exact voice
+  before the first DTX run, and converges to **51 dB / max 60**
+  against the listing decoder's own decode within 0.3 s of resume.
+  Gated in `tests/dtx_encode.rs` (placement, hangover, exact
+  20-marker cadence, wire shape `0x48`/`0x4C`, savings, round-trip
+  statuses and counts, FEC-hangover recovery, elected/CBR
+  pass-through).
+
 - **DTX frames hold through the §4.4 concealment** (round 448): a
   §3.2.1 zero-length frame (DTX or a frame dropped in transit) no
   longer snaps to digital silence — RFC 7845 §4.1 pins the intent
