@@ -331,6 +331,44 @@ frame), `decode_packet_fec` recovers the 0–8 kHz LP band, and the FEC
 streams agree with the reference-listing decoder at **112–113 dB**
 (max 1 LSB).
 
+Round 448 lands the last untouched §2.1 subsystem: **§2.1.9
+discontinuous transmission**, on both sides of the wire. Decoder
+side, a §3.2.1 zero-length frame no longer snaps to digital silence:
+RFC 7845 §4.1 pins the intent ("explicitly request the use of Packet
+Loss Concealment"), so `decode_packet` routes every zero-length frame
+through the §4.4 hold — per-mode extrapolation with the concealment
+energy decay — with the §4.4 bookkeeping moved per-frame so
+zero-length frames combined into code-2/3 packets hold their exact
+place in the concealment timeline. Encoder side, `set_dtx` lands on
+**every arm** (`SilkEncoderMono/Stereo`, `HybridEncoderMono/Stereo`,
+`CeltVbrEncoder`, and the four SILK/Hybrid VBR arms): a fully
+inactive packet (the §4.2.3 activity floor; digital silence on the
+CELT arm) is — after a 2-packet transmitted hangover that carries the
+last active packet's §4.2.5 LBRR — replaced by the **1-byte TOC-only
+marker** (one §3.2.1 zero-length frame), with one real packet coded
+per 400 ms of suppression ("only one frame is encoded every
+400 milliseconds", §2.1.9). While suppressing, the encoder freezes
+every decoder-authoritative mirror (the decoder decodes nothing for a
+zero-length frame, so both sides freeze identically), and the first
+coded packet after a run carries no LTP (SILK) and intra energies
+(CELT/Hybrid), so its reconstruction never depends on what a
+decoder's own non-normative concealment left behind. Measured: 141 of
+150 silent-run packets suppressed (silent-run bytes at 16% of the
+DTX-off run); the §A reference-listing decoder accepts every DTX
+stream with exact packet/sample counts — SILK bit-exact until the
+first suppression, Hybrid at 118 dB pre-run and 50 dB from resume,
+CELT at 105 dB pre-run and **102 dB (max 1 LSB) from the intra
+resume** — and the listing encoder's own DTX stream (273 markers/401
+packets, now a shipped fixture) decodes through our decoder bit-exact
+before the first suppression and to 51 dB / max 60 one refresh period
+after resume (`tests/dtx_reference_stream.rs`). RFC 7845 §4.1 **gap
+repair** completes the packet-layer story: `compose_plc_gap_packets`
+synthesizes the zero-length-frame packets that fill a capture gap
+(§4.1's exact recommendations: configuration held, size changes
+delayed, CELT switch only at the end, MB→WB, cheapest packings; the
+RFC's 95 ms worked example is pinned byte-for-byte in
+`tests/gap_repair.rs`).
+
 Differential encoder/decoder testing and a restored cargo-fuzz suite
 (6 coverage-guided targets, incl. an encoder↔decoder range-coder
 roundtrip and the CELT / VBR encode→decode harnesses) have also
@@ -361,7 +399,8 @@ The crate ships a large, individually unit-tested set of SILK and
 CELT building blocks plus a complete RFC 7845 multistream /
 multichannel decode subsystem (1440+ lib tests + SILK-fixture,
 multistream (incl. the 5.1 reference-listing gate), FEC, CELT
-synthesis-backend, CELT-encode, Hybrid-encode, VBR, and
+synthesis-backend, CELT-encode, Hybrid-encode, VBR, DTX (encoder,
+decoder-hold, and reference-stream suites), §4.1 gap-repair, and
 registry-resolution integration suites). Per-stage progress lives in
 `CHANGELOG.md`.
 
@@ -493,6 +532,23 @@ side onto the `p0` / mid predictor pair, f64 normal equations) and
 `StereoWeightSymbols::quantize` (exhaustive deterministic argmin
 over the 5625-quintuple §4.2.7.1 codebook; representable targets
 roundtrip value-exactly).
+
+**§2.1.9 discontinuous transmission (`set_dtx`, every encoder arm):**
+inactive packets suppress to the 1-byte TOC-only §3.2.1 marker after
+a 2-packet hangover, one coded refresh per 400 ms of suppression,
+decoder-authoritative mirrors frozen across the run, LTP-free (SILK)
+/ intra-energy (CELT, Hybrid) resume; markers pass through the
+elected / VBR paths without an election and are never CBR-padded
+(`EncodedSilkPacket::is_dtx`; `tests/dtx_encode.rs`,
+`tests/dtx_reference_stream.rs`). Decoder side, every §3.2.1
+zero-length frame runs the §4.4 hold per RFC 7845 §4.1 (see
+`FrameDecodeStatus::DtxOrLost`).
+
+**RFC 7845 §4.1 gap repair:** `compose_plc_gap_packets` — the
+synthesized zero-length-frame packet sequence that requests PLC
+across a capture gap (configuration held, frame-size changes
+delayed, CELT switch only at the end of the gap, MB→WB, cheapest
+§3.2 packings under the R5 bound; `tests/gap_repair.rs`).
 
 **Packet-framing / RFC 7845 write side:** `compose_packet` /
 `compose_packet_code3` / `compose_self_delimited` / `encode_length` —
