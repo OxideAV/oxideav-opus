@@ -4,6 +4,18 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **§2.1.9 DTX reference-stream gate** (round 448): the crate now
+  ships a 6.8 KB packet capture produced by the §A reference
+  listing's demo program with DTX enabled (401 packets, 273 1-byte
+  §3.2.1 markers over voice | silence | voice | background noise)
+  plus two windows of that program's own 48 kHz decode.
+  `tests/dtx_reference_stream.rs` pins: exact per-packet sample
+  counts and statuses, **bit-exact** agreement with the reference
+  decode up to the first suppression, silence-floor agreement
+  across the DTX run, and ≥45 dB steady re-convergence one refresh
+  period after resume (measured 51 dB / max 60) — permanent CI
+  coverage of the decoder's DTX hold against reference material.
+
 - **RFC 7845 §4.1 gap repair** (round 448):
   `compose_plc_gap_packets(prev_toc_byte, gap_tenths_ms)` —
   synthesize the packet sequence that requests PLC across a gap in

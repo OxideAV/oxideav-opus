@@ -70,3 +70,25 @@ RFC 7845 §5.1.1.2 **Vorbis channel order** (FL, FC, FR, BL, BR, LFE)
 WAV channel order). It drives the whole-corpus multistream gate in
 `tests/multistream_decode.rs` (whole-stream ≥ 90 dB, per-channel
 ≥ 80 dB; measured ~100 dB).
+
+## §2.1.9 DTX reference capture
+
+`dtx-refenc-voice-silence.bits` is a packet capture produced by the
+RFC 6716 §A reference listing's demo program (opaque invocation with
+DTX enabled; voip mode, 16 kHz mono, 16 kb/s) over a synthetic
+1 s voice | 3 s digital silence | 1 s voice | 3 s low-level noise
+input. Framing: per packet, a big-endian u32 payload length, a
+big-endian u32 range-coder word, then the payload (the demo program's
+own capture format). It carries 401 packets, 273 of them 1-byte
+§3.2.1 DTX markers, with the §2.1.9 one-refresh-per-400 ms cadence
+inside the runs.
+
+`dtx-refenc.pre.expected48.pcm` and `dtx-refenc.tail.expected48.pcm`
+are two windows of the same program's decoder output (48 kHz s16le
+mono): packets 0..56 (start through the last packet before the first
+suppression) and packets 215..250 (one refresh period into the second
+voice segment). They drive `tests/dtx_reference_stream.rs`: bit-exact
+agreement before the first suppression, silence-floor agreement across
+the DTX run, and a ≥45 dB steady re-convergence gate after resume
+(the residual is the reference decoder's own non-normative
+post-concealment smoothing).
