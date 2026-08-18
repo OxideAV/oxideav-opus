@@ -4,6 +4,25 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **§2.1.9 DTX on the Hybrid arms + every VBR arm** (round 448):
+  `HybridEncoderMono/Stereo::set_dtx` runs the same driver on the
+  decimated WB band (stereo: the mid/side pair) — suppressed
+  packets freeze the SILK mirrors AND the CELT energy/synthesis
+  carries (the decoder advances neither for a zero-length frame)
+  and emit the 1-byte Hybrid TOC marker; the §2.1.9 refresh and
+  any resume code their CELT energies INTRA and their SILK frame
+  without LTP, so reconstruction never leans on a decoder's own
+  §4.4 concealment. `set_dtx` rides through
+  `SilkVbrEncoderMono/Stereo` and `HybridVbrEncoderMono/Stereo`
+  (markers commit their 1 byte to the drift; the silence-banking
+  cap already bounds the post-DTX spree). Measured (voice | 3 s
+  silence | voice, FB 20 ms elected 80 B): 140/150 silent-run
+  packets suppressed; the §A reference-listing decoder decodes the
+  stream at **118 dB (max 1 LSB)** before the run, **identical
+  zeros** across it, and **50 dB** immediately from resume. Gated
+  in `tests/dtx_encode.rs` (hybrid marker TOCs `0x78`/`0x7C`,
+  cadence, round-trip statuses, VBR silent-run collapse).
+
 - **§2.1.9 DTX on the SILK encoder arms** (round 448):
   `SilkEncoderMono/Stereo::set_dtx` — a packet whose every §4.2.2
   interval sits below the §4.2.3 activity floor is, after a

@@ -432,6 +432,14 @@ impl HybridVbrEncoderMono {
         self.enc.set_fec(enabled);
     }
 
+    /// Enable / disable §2.1.9 discontinuous transmission (see
+    /// [`HybridEncoderMono::set_dtx`]): a suppressed packet is the
+    /// 1-byte marker and its size is committed to the drift, so the
+    /// banked budget follows the constrained-VBR rules unchanged.
+    pub fn set_dtx(&mut self, enabled: bool) {
+        self.enc.set_dtx(enabled);
+    }
+
     /// §2.1.7 loss-optimised LBRR (see
     /// [`HybridEncoderMono::set_packet_loss_perc`]).
     pub fn set_packet_loss_perc(&mut self, loss_perc: u8) {
@@ -518,6 +526,12 @@ impl HybridVbrEncoderStereo {
         self.enc.set_packet_loss_perc(loss_perc);
     }
 
+    /// Enable / disable §2.1.9 discontinuous transmission (see
+    /// [`HybridEncoderStereo::set_dtx`]).
+    pub fn set_dtx(&mut self, enabled: bool) {
+        self.enc.set_dtx(enabled);
+    }
+
     /// Reset all carried state (§4.5.2).
     pub fn reset(&mut self) {
         self.enc.reset();
@@ -578,6 +592,14 @@ impl SilkVbrEncoderMono {
     /// elected sizes).
     pub fn set_fec(&mut self, enabled: bool) {
         self.enc.set_fec(enabled);
+    }
+
+    /// Enable / disable §2.1.9 discontinuous transmission (see
+    /// [`SilkEncoderMono::set_dtx`]): a suppressed packet is the
+    /// 1-byte marker, committed to the drift like any packet — the
+    /// silence-banking cap already bounds the post-DTX spree.
+    pub fn set_dtx(&mut self, enabled: bool) {
+        self.enc.set_dtx(enabled);
     }
 
     /// Arm the §5.2.3.8 delayed-decision noise shaping quantiser
@@ -654,6 +676,12 @@ impl SilkVbrEncoderStereo {
     /// [`SilkVbrEncoderMono::set_fec`]).
     pub fn set_fec(&mut self, enabled: bool) {
         self.enc.set_fec(enabled);
+    }
+
+    /// Enable / disable §2.1.9 discontinuous transmission (see
+    /// [`SilkEncoderStereo::set_dtx`]).
+    pub fn set_dtx(&mut self, enabled: bool) {
+        self.enc.set_dtx(enabled);
     }
 
     /// Arm the §5.2.3.8 delayed-decision noise shaping quantiser on

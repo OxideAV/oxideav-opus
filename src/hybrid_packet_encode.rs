@@ -30,7 +30,7 @@ use crate::range_encoder::RangeEncoder;
 use crate::silk_decode::{encode_silk_frame, SilkFrameConfig, StereoHeaderContext};
 use crate::silk_encoder::{
     interval_rms, lbrr_interval_is_onset, lbrr_ratio_for_loss, AnalyzedFrame, ChannelAnalyzer,
-    LBRR_ONSET_ONLY_MAX_LOSS_PERC, MID_ONLY_SIDE_RMS,
+    DtxState, ACTIVITY_RMS, LBRR_ONSET_ONLY_MAX_LOSS_PERC, MID_ONLY_SIDE_RMS,
 };
 use crate::silk_excitation::SilkFrameSize;
 use crate::silk_frame::{StereoPredictionWeights, StereoWeightSymbols};
@@ -137,6 +137,8 @@ pub struct HybridEncoderMono {
     loss_perc: u8,
     /// Previous LBRR-processed interval's RMS (§2.1.7 onset baseline).
     lbrr_prev_rms: f64,
+    /// §2.1.9 DTX driver.
+    dtx: DtxState,
 }
 
 /// The previous Hybrid packet's material a FEC-enabled encoder keeps
@@ -185,6 +187,7 @@ impl HybridEncoderMono {
             pending_fec: None,
             loss_perc: 0,
             lbrr_prev_rms: 0.0,
+            dtx: DtxState::default(),
         })
     }
 
@@ -192,6 +195,19 @@ impl HybridEncoderMono {
     #[must_use]
     pub fn frame_samples(&self) -> usize {
         self.n
+    }
+
+    /// Enable / disable §2.1.9 discontinuous transmission (see
+    /// [`crate::silk_encoder::SilkEncoderMono::set_dtx`]): an
+    /// inactive packet is (after the transmitted hangover) replaced
+    /// by the 1-byte Hybrid TOC marker, with one coded refresh per
+    /// 400 ms of suppression. The refresh (and any resume) codes its
+    /// CELT energies INTRA and its SILK frame without LTP, so its
+    /// reconstruction never depends on what a decoder's own
+    /// non-normative concealment left behind.
+    pub fn set_dtx(&mut self, enabled: bool) {
+        self.dtx.enabled = enabled;
+        self.dtx.reset();
     }
 
     /// Enable / disable §4.2.5 LBRR (in-band FEC) emission on the WB
@@ -242,6 +258,7 @@ impl HybridEncoderMono {
         self.decim.reset();
         self.pending_fec = None;
         self.lbrr_prev_rms = 0.0;
+        self.dtx.reset();
     }
 
     /// Encode one packet: `pcm` holds `frame_samples()` mono 48 kHz
@@ -253,7 +270,11 @@ impl HybridEncoderMono {
         if !(2..=MAX_FRAME_BYTES).contains(&payload_bytes) {
             return Err(Error::MalformedPacket);
         }
-        let (toc, re) = self.encode_silk_layer(pcm)?;
+        let pcm16 = self.decimate(pcm);
+        if let Some(marker) = self.dtx_gate(&pcm16)? {
+            return Ok(marker);
+        }
+        let (toc, re) = self.encode_silk_layer(&pcm16)?;
         // The SILK layer has no rate control (its quantizer targets a
         // fixed quality); when it alone exceeds the payload budget the
         // packet cannot be emitted. The analysis state has already
@@ -284,7 +305,11 @@ impl HybridEncoderMono {
         if pcm.len() != self.n {
             return Err(Error::MalformedPacket);
         }
-        let (toc, re) = self.encode_silk_layer(pcm)?;
+        let pcm16 = self.decimate(pcm);
+        if let Some(marker) = self.dtx_gate(&pcm16)? {
+            return Ok(marker);
+        }
+        let (toc, re) = self.encode_silk_layer(&pcm16)?;
         let silk_bytes = (re.tell() as usize).div_ceil(8);
         let floor = silk_bytes + HYBRID_MIN_CELT_TAIL_BYTES;
         if floor > MAX_FRAME_BYTES {
@@ -294,10 +319,55 @@ impl HybridEncoderMono {
         self.finish_with_celt(pcm, toc, re, payload_bytes)
     }
 
+    /// 48 kHz → WB internal rate (advances the decimator history —
+    /// input-side state, rolled for suppressed packets too).
+    fn decimate(&mut self, pcm: &[i16]) -> Vec<f32> {
+        let pcm48: Vec<f64> = pcm.iter().map(|&v| f64::from(v)).collect();
+        self.decim.process(&pcm48)
+    }
+
+    /// §2.1.9 DTX gate: run the driver on this packet's activity;
+    /// when it suppresses, roll the analysis lookback, freeze every
+    /// decoder-authoritative mirror (SILK synthesis state and the
+    /// CELT energy/synthesis carries alike — the decoder decodes
+    /// nothing for a zero-length frame), drop the (inactive) pending
+    /// redundancy, and return the 1-byte TOC-only marker. When the
+    /// packet is the first CODED one after a run, arm the resume
+    /// treatment: CELT energies intra + SILK frame without LTP.
+    fn dtx_gate(&mut self, pcm16: &[f32]) -> Result<Option<Vec<u8>>, Error> {
+        let all_inactive = interval_rms(pcm16) < ACTIVITY_RMS;
+        let lbrr_pending_active = self
+            .pending_fec
+            .as_ref()
+            .is_some_and(|p| interval_rms(&p.pcm16) >= ACTIVITY_RMS);
+        if self.dtx.step(
+            all_inactive,
+            lbrr_pending_active,
+            u32::from(self.frame_tenths_ms) / 10,
+        ) {
+            self.analyzer.skip_frame_untransmitted(pcm16);
+            self.lbrr_prev_rms = interval_rms(pcm16);
+            self.pending_fec = None;
+            let toc = OpusTocByte::compose_byte(
+                Mode::Hybrid,
+                self.bandwidth,
+                self.frame_tenths_ms,
+                false,
+                FrameCountCode::One,
+            )?;
+            return Ok(Some(vec![toc]));
+        }
+        if self.dtx.take_resume() {
+            self.celt.force_intra = true;
+            self.analyzer.set_force_unvoiced(true);
+        }
+        Ok(None)
+    }
+
     /// Phase 1: the §4.2 SILK layer (decimate to the WB internal rate
     /// and encode one SILK frame — a Hybrid frame carries exactly one)
     /// on a fresh range coder. Independent of the final payload size.
-    fn encode_silk_layer(&mut self, pcm: &[i16]) -> Result<(u8, RangeEncoder), Error> {
+    fn encode_silk_layer(&mut self, pcm16: &[f32]) -> Result<(u8, RangeEncoder), Error> {
         let toc = OpusTocByte::compose_byte(
             Mode::Hybrid,
             self.bandwidth,
@@ -306,8 +376,6 @@ impl HybridEncoderMono {
             FrameCountCode::One,
         )?;
         let mut re = RangeEncoder::new();
-        let pcm48: Vec<f64> = pcm.iter().map(|&v| f64::from(v)).collect();
-        let pcm16 = self.decim.process(&pcm48);
 
         // §4.2.5 / §2.1.7: this packet's LBRR frame is a reduced-rate
         // re-encode of the PREVIOUS packet's SILK band, from the
@@ -329,14 +397,16 @@ impl HybridEncoderMono {
         };
         if self.fec {
             self.pending_fec = Some(PendingFecHybridMono {
-                pcm16: pcm16.clone(),
+                pcm16: pcm16.to_vec(),
                 analyzer: self.analyzer.clone(),
             });
         }
 
         let analyzed = self
             .analyzer
-            .analyze_frame_sized(&pcm16, true, self.silk_frame_size)?;
+            .analyze_frame_sized(pcm16, true, self.silk_frame_size)?;
+        // Clear a one-shot §2.1.9 resume treatment (see `dtx_gate`).
+        self.analyzer.set_force_unvoiced(false);
         let vad = analyzed.header.frame_type >= 2;
         let header = SilkHeaderBits {
             num_silk_frames: 1,
@@ -458,6 +528,8 @@ pub struct HybridEncoderStereo {
     /// Previous LBRR-processed interval's MID RMS (§2.1.7 onset
     /// baseline).
     lbrr_prev_rms: f64,
+    /// §2.1.9 DTX driver.
+    dtx: DtxState,
 }
 
 /// The previous stereo Hybrid packet's material a FEC-enabled encoder
@@ -515,7 +587,17 @@ impl HybridEncoderStereo {
             pending_fec: None,
             loss_perc: 0,
             lbrr_prev_rms: 0.0,
+            dtx: DtxState::default(),
         })
+    }
+
+    /// Enable / disable §2.1.9 discontinuous transmission (see
+    /// [`HybridEncoderMono::set_dtx`]): the activity gate runs on the
+    /// decimated mid/side pair; the marker carries the stereo Hybrid
+    /// TOC.
+    pub fn set_dtx(&mut self, enabled: bool) {
+        self.dtx.enabled = enabled;
+        self.dtx.reset();
     }
 
     /// Enable / disable §4.2.5 LBRR (in-band FEC) emission on the WB
@@ -530,7 +612,7 @@ impl HybridEncoderStereo {
     /// §2.1.7 loss-optimised LBRR (see
     /// [`HybridEncoderMono::set_packet_loss_perc`]): the onset gate
     /// is decided on the mid channel, the rate ratio applies to both
-    /// channels'"'"' re-encoders.
+    /// channels' re-encoders.
     pub fn set_packet_loss_perc(&mut self, loss_perc: u8) {
         self.loss_perc = loss_perc.min(100);
         let ratio = lbrr_ratio_for_loss(self.loss_perc);
@@ -570,6 +652,7 @@ impl HybridEncoderStereo {
         self.decim_r.reset();
         self.pending_fec = None;
         self.lbrr_prev_rms = 0.0;
+        self.dtx.reset();
     }
 
     /// Encode one packet: `pcm` holds `2 * frame_samples()` interleaved
@@ -584,7 +667,11 @@ impl HybridEncoderStereo {
         if !(2..=MAX_FRAME_BYTES).contains(&payload_bytes) {
             return Err(Error::MalformedPacket);
         }
-        let (toc, re) = self.encode_silk_layer(pcm)?;
+        let (l16, r16) = self.decimate(pcm);
+        if let Some(marker) = self.dtx_gate(&l16, &r16)? {
+            return Ok(marker);
+        }
+        let (toc, re) = self.encode_silk_layer(&l16, &r16)?;
         if re.tell() > payload_bytes as u32 * 8 {
             return Err(Error::MalformedPacket);
         }
@@ -601,7 +688,11 @@ impl HybridEncoderStereo {
         if pcm.len() != 2 * self.n {
             return Err(Error::MalformedPacket);
         }
-        let (toc, re) = self.encode_silk_layer(pcm)?;
+        let (l16, r16) = self.decimate(pcm);
+        if let Some(marker) = self.dtx_gate(&l16, &r16)? {
+            return Ok(marker);
+        }
+        let (toc, re) = self.encode_silk_layer(&l16, &r16)?;
         let silk_bytes = (re.tell() as usize).div_ceil(8);
         let floor = silk_bytes + HYBRID_MIN_CELT_TAIL_BYTES;
         if floor > MAX_FRAME_BYTES {
@@ -611,13 +702,70 @@ impl HybridEncoderStereo {
         self.finish_with_celt(pcm, toc, re, payload_bytes)
     }
 
+    /// 48 kHz interleaved L/R → WB internal-rate pair (advances the
+    /// decimator histories — input-side state, rolled for suppressed
+    /// packets too).
+    fn decimate(&mut self, pcm: &[i16]) -> (Vec<f32>, Vec<f32>) {
+        let mut l48 = Vec::with_capacity(self.n);
+        let mut r48 = Vec::with_capacity(self.n);
+        for pair in pcm.chunks_exact(2) {
+            l48.push(f64::from(pair[0]));
+            r48.push(f64::from(pair[1]));
+        }
+        (self.decim_l.process(&l48), self.decim_r.process(&r48))
+    }
+
+    /// §2.1.9 DTX gate on the decimated pair (see the mono
+    /// [`HybridEncoderMono::encode_packet`] path): suppression rolls
+    /// both analysis lookbacks with the raw mid/side signals, freezes
+    /// every decoder-authoritative mirror (both SILK channels, the
+    /// §4.2.7.1 unmix-interp history, the CELT carries), and returns
+    /// the stereo Hybrid marker; a resume arms intra CELT energies +
+    /// LTP-free SILK frames.
+    fn dtx_gate(&mut self, l16: &[f32], r16: &[f32]) -> Result<Option<Vec<u8>>, Error> {
+        let flen = l16.len();
+        let mid_raw: Vec<f32> = l16.iter().zip(r16).map(|(&a, &b)| (a + b) / 2.0).collect();
+        let side_raw: Vec<f32> = l16.iter().zip(r16).map(|(&a, &b)| (a - b) / 2.0).collect();
+        let all_inactive =
+            interval_rms(&mid_raw) < ACTIVITY_RMS && interval_rms(&side_raw) < ACTIVITY_RMS;
+        let lbrr_pending_active = self
+            .pending_fec
+            .as_ref()
+            .is_some_and(|p| p.side_active || interval_rms(&p.mid_pcm) >= ACTIVITY_RMS);
+        if self.dtx.step(
+            all_inactive,
+            lbrr_pending_active,
+            u32::from(self.frame_tenths_ms) / 10,
+        ) {
+            self.mid.skip_frame_untransmitted(&mid_raw);
+            self.side.skip_frame_untransmitted(&side_raw);
+            self.prev_mid = mid_raw[flen - 1];
+            self.lbrr_prev_rms = interval_rms(&mid_raw);
+            self.pending_fec = None;
+            let toc = OpusTocByte::compose_byte(
+                Mode::Hybrid,
+                self.bandwidth,
+                self.frame_tenths_ms,
+                true,
+                FrameCountCode::One,
+            )?;
+            return Ok(Some(vec![toc]));
+        }
+        if self.dtx.take_resume() {
+            self.celt.force_intra = true;
+            self.mid.set_force_unvoiced(true);
+            self.side.set_force_unvoiced(true);
+        }
+        Ok(None)
+    }
+
     /// Phase 1: the §4.2.2 stereo SILK layer on a fresh range coder —
-    /// decimate L/R to the WB internal rate, run the §5.2.2 stereo
-    /// mixing front end (weight estimate → quantize → exact §4.2.8
-    /// downmix with the QUANTIZED pair), analyse mid and side, and
-    /// write header bits + mid frame (+ side frame unless mid-only),
-    /// mirroring the decoder's single-interval stereo walk.
-    fn encode_silk_layer(&mut self, pcm: &[i16]) -> Result<(u8, RangeEncoder), Error> {
+    /// run the §5.2.2 stereo mixing front end on the decimated pair
+    /// (weight estimate → quantize → exact §4.2.8 downmix with the
+    /// QUANTIZED pair), analyse mid and side, and write header bits +
+    /// mid frame (+ side frame unless mid-only), mirroring the
+    /// decoder's single-interval stereo walk.
+    fn encode_silk_layer(&mut self, l16: &[f32], r16: &[f32]) -> Result<(u8, RangeEncoder), Error> {
         let toc = OpusTocByte::compose_byte(
             Mode::Hybrid,
             self.bandwidth,
@@ -626,19 +774,11 @@ impl HybridEncoderStereo {
             FrameCountCode::One,
         )?;
         let mut re = RangeEncoder::new();
-        let mut l48 = Vec::with_capacity(self.n);
-        let mut r48 = Vec::with_capacity(self.n);
-        for pair in pcm.chunks_exact(2) {
-            l48.push(f64::from(pair[0]));
-            r48.push(f64::from(pair[1]));
-        }
-        let l16 = self.decim_l.process(&l48);
-        let r16 = self.decim_r.process(&r48);
         let flen = l16.len();
 
         // §5.2.2 stereo mixing (one §4.2.2 interval per Hybrid frame).
-        let mid_raw: Vec<f32> = l16.iter().zip(&r16).map(|(&a, &b)| (a + b) / 2.0).collect();
-        let side_raw: Vec<f32> = l16.iter().zip(&r16).map(|(&a, &b)| (a - b) / 2.0).collect();
+        let mid_raw: Vec<f32> = l16.iter().zip(r16).map(|(&a, &b)| (a + b) / 2.0).collect();
+        let side_raw: Vec<f32> = l16.iter().zip(r16).map(|(&a, &b)| (a - b) / 2.0).collect();
         let mid_next = mid_raw[flen - 1];
         let target = estimate_stereo_weights(&mid_raw, &side_raw, self.prev_mid, mid_next)?;
         let weight_symbols = StereoWeightSymbols::quantize(StereoPredictionWeights {
@@ -648,8 +788,8 @@ impl HybridEncoderStereo {
         let decoded_w = weight_symbols.weights();
         let ms = stereo_lr_to_ms(
             Bandwidth::Wb,
-            &l16,
-            &r16,
+            l16,
+            r16,
             StereoWeightsQ13 {
                 w0_q13: decoded_w.w0_q13,
                 w1_q13: decoded_w.w1_q13,
@@ -727,6 +867,9 @@ impl HybridEncoderStereo {
             self.side.reset();
             None
         };
+        // Clear a one-shot §2.1.9 resume treatment (see `dtx_gate`).
+        self.mid.set_force_unvoiced(false);
+        self.side.set_force_unvoiced(false);
         let side_active = side_frame
             .as_ref()
             .is_some_and(|f| f.header.frame_type >= 2);

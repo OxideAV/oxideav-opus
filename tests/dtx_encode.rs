@@ -293,3 +293,136 @@ fn elected_and_cbr_paths_pass_markers_through() {
     let out = enc2.encode_packet_cbr(&v, 1200).unwrap();
     assert_eq!(out.packet.len(), 1200);
 }
+
+// ---------------------------------------------------------------
+// Hybrid arms (§2.1.9 on configs 12–15) + the VBR pass-throughs.
+// ---------------------------------------------------------------
+
+use oxideav_opus::hybrid_packet_encode::{HybridEncoderMono, HybridEncoderStereo};
+use oxideav_opus::vbr::SilkVbrEncoderMono;
+
+/// 48 kHz i16 voice | silence | voice (20 ms hybrid packets).
+fn voice_silence_voice_48k(
+    voice_ms: usize,
+    silence_ms: usize,
+) -> (Vec<i16>, std::ops::Range<usize>) {
+    let v = voice_ms * 48;
+    let s = silence_ms * 48;
+    let f: Vec<f32> = voice(48_000, v);
+    let mut sig: Vec<i16> = f.iter().map(|&x| (x * 6000.0) as i16).collect();
+    sig.extend(std::iter::repeat(0i16).take(s));
+    sig.extend(f.iter().map(|&x| (x * 6000.0) as i16));
+    (sig, v.div_ceil(960)..(v + s) / 960)
+}
+
+/// Hybrid mono: markers carry the Hybrid TOC, the §2.1.9 cadence
+/// holds, and the stream round-trips with per-packet statuses.
+#[test]
+fn hybrid_mono_dtx_markers_cadence_and_roundtrip() {
+    let (sig, silent) = voice_silence_voice_48k(500, 3_000);
+    let mut enc = HybridEncoderMono::new(Bandwidth::Fb, 200).unwrap();
+    enc.set_dtx(true);
+    let packets: Vec<Vec<u8>> = sig
+        .chunks_exact(960)
+        .map(|c| enc.encode_packet_elected(c, 80).unwrap())
+        .collect();
+
+    let markers: Vec<usize> = (0..packets.len())
+        .filter(|&k| packets[k].len() == 1)
+        .collect();
+    assert!(
+        markers.len() > 100,
+        "hybrid DTX barely fired: {}",
+        markers.len()
+    );
+    for &k in &markers {
+        // Config 15 (Hybrid FB 20 ms), mono, code 0.
+        assert_eq!(packets[k], vec![0x78u8], "hybrid marker TOC at {k}");
+        assert!(silent.contains(&k), "marker outside the silent run");
+    }
+    // §2.1.9 cadence between coded packets deep in the run.
+    let coded_in_run: Vec<usize> = (markers[0]..silent.end)
+        .filter(|&k| packets[k].len() > 1)
+        .collect();
+    for w in coded_in_run.windows(2) {
+        assert_eq!(w[1] - w[0], 21, "hybrid refresh cadence at {w:?}");
+    }
+
+    let mut dec = OpusDecoder::new();
+    for (k, p) in packets.iter().enumerate() {
+        let out = dec.decode_packet(p).expect("decode");
+        assert_eq!(out.samples_per_channel(), 960, "packet {k}");
+        let want = if p.len() == 1 {
+            FrameDecodeStatus::DtxOrLost
+        } else {
+            FrameDecodeStatus::HybridDecoded
+        };
+        assert_eq!(out.frame_outcomes[0].status, want, "packet {k}");
+    }
+}
+
+/// Hybrid stereo: the stereo Hybrid marker + a clean two-channel
+/// round trip across the run.
+#[test]
+fn hybrid_stereo_dtx_markers_and_roundtrip() {
+    let (mono, silent) = voice_silence_voice_48k(400, 2_000);
+    let inter: Vec<i16> = mono
+        .iter()
+        .flat_map(|&s| [(f64::from(s) * 0.9) as i16, (f64::from(s) * 0.5) as i16])
+        .collect();
+    let mut enc = HybridEncoderStereo::new(Bandwidth::Fb, 200).unwrap();
+    enc.set_dtx(true);
+    let packets: Vec<Vec<u8>> = inter
+        .chunks_exact(1920)
+        .map(|c| enc.encode_packet_elected(c, 120).unwrap())
+        .collect();
+    let markers: Vec<usize> = (0..packets.len())
+        .filter(|&k| packets[k].len() == 1)
+        .collect();
+    assert!(markers.len() > 60, "stereo hybrid DTX barely fired");
+    for &k in &markers {
+        // Config 15, stereo flag SET, code 0.
+        assert_eq!(packets[k], vec![0x7Cu8], "stereo hybrid marker at {k}");
+        assert!(silent.contains(&k));
+    }
+    let mut dec = OpusDecoder::new();
+    for (k, p) in packets.iter().enumerate() {
+        let out = dec.decode_packet(p).expect("decode");
+        assert_eq!(out.channels, 2, "packet {k}");
+        assert_eq!(out.samples_per_channel(), 960, "packet {k}");
+    }
+}
+
+/// SILK VBR arm: markers commit 1 byte to the drift, the realized
+/// silent-run rate collapses far below target, and the stream still
+/// decodes packet for packet.
+#[test]
+fn silk_vbr_dtx_collapses_the_silent_run() {
+    let (sig, silent) = voice_silence_voice(500, 3_000);
+    let mut on = SilkVbrEncoderMono::new(Bandwidth::Wb, 200, 24_000, false).unwrap();
+    on.set_dtx(true);
+    let mut off = SilkVbrEncoderMono::new(Bandwidth::Wb, 200, 24_000, false).unwrap();
+    let pk_on: Vec<Vec<u8>> = sig
+        .chunks_exact(WB_20MS)
+        .map(|c| on.encode_frame(c).unwrap())
+        .collect();
+    let pk_off: Vec<Vec<u8>> = sig
+        .chunks_exact(WB_20MS)
+        .map(|c| off.encode_frame(c).unwrap())
+        .collect();
+
+    let markers = pk_on.iter().filter(|p| p.len() == 1).count();
+    assert!(markers > 100, "VBR DTX barely fired: {markers}");
+    let run_on: usize = silent.clone().map(|k| pk_on[k].len()).sum();
+    let run_off: usize = silent.clone().map(|k| pk_off[k].len()).sum();
+    assert!(
+        (run_on as f64) < run_off as f64 * 0.5,
+        "VBR silent-run savings too small: {run_on} vs {run_off}"
+    );
+
+    let mut dec = OpusDecoder::new();
+    for p in &pk_on {
+        let out = dec.decode_packet(p).expect("decode");
+        assert_eq!(out.samples_per_channel(), 960);
+    }
+}

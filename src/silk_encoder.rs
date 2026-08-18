@@ -188,7 +188,7 @@ pub(crate) const MID_ONLY_SIDE_RMS: f64 = 1.0e-4;
 
 /// Frame RMS below which a frame is coded INACTIVE (§4.2.7.3 frame
 /// type 0, VAD flag clear) — the signal-derived §4.2.3 VAD decision.
-const ACTIVITY_RMS: f64 = 1.0e-3;
+pub(crate) const ACTIVITY_RMS: f64 = 1.0e-3;
 
 /// §2.1.9: "When DTX is enabled, only one frame is encoded every
 /// 400 milliseconds." — the refresh cadence of a DTX run: once this
@@ -216,8 +216,8 @@ const DTX_HANGOVER_PACKETS: u32 = 2;
 /// transmitted first, and less than [`DTX_REFRESH_MS`] of suppressed
 /// time has accumulated since the last coded packet.
 #[derive(Debug, Clone, Default)]
-struct DtxState {
-    enabled: bool,
+pub(crate) struct DtxState {
+    pub(crate) enabled: bool,
     /// Consecutive fully-inactive packets seen (coded or suppressed).
     inactive_run: u32,
     /// Suppressed time since the last coded packet, in ms.
@@ -232,7 +232,12 @@ impl DtxState {
     /// Advance the driver by one packet and return whether that
     /// packet is suppressed. Must be called exactly once per
     /// `encode_packet`, before any state-carrying analysis.
-    fn step(&mut self, all_inactive: bool, lbrr_pending_active: bool, packet_ms: u32) -> bool {
+    pub(crate) fn step(
+        &mut self,
+        all_inactive: bool,
+        lbrr_pending_active: bool,
+        packet_ms: u32,
+    ) -> bool {
         if !self.enabled {
             return false;
         }
@@ -267,12 +272,12 @@ impl DtxState {
     /// content), and every later frame's 18 ms LTP window lies inside
     /// coded output again — the §4.2.7.6.3 error-containment intent,
     /// applied at the encoder.
-    fn take_resume(&mut self) -> bool {
+    pub(crate) fn take_resume(&mut self) -> bool {
         std::mem::take(&mut self.resumed)
     }
 
     /// Drop the run counters (encoder reset / DTX toggled).
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.inactive_run = 0;
         self.suppressed_ms = 0;
         self.resumed = false;
@@ -434,6 +439,13 @@ impl ChannelAnalyzer {
         self.hist.extend(pcm.iter().map(|&v| f64::from(v)));
         let cut = self.hist.len() - keep;
         self.hist.drain(..cut);
+    }
+
+    /// Force the next analysed frame(s) to code UNVOICED (no LTP) —
+    /// the §2.1.9 DTX resume treatment (see the LBRR re-encoder's
+    /// standing `force_unvoiced` for the other user of the flag).
+    pub(crate) fn set_force_unvoiced(&mut self, on: bool) {
+        self.force_unvoiced = on;
     }
 
     /// Re-arm a CLONE of a channel analyzer as the §4.2.5 LBRR
