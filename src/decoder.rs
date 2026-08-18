@@ -111,8 +111,11 @@ pub fn output_samples_per_channel(frame_size_tenths_ms: u16) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameDecodeStatus {
     /// A §3.2.1 zero-length frame: DTX or a lost/packet-loss marker.
-    /// Per §4.6 the floor behaviour is to emit silence; a real PLC model
-    /// is a separate milestone.
+    /// Per RFC 7845 §4.1 such a frame explicitly requests packet-loss
+    /// concealment, so the emitted PCM is the §4.4 hold — the last
+    /// decoded audio extrapolated with the concealment energy decay
+    /// (silence when there is no history, e.g. inside a DTX run that
+    /// followed a silent tail).
     DtxOrLost,
     /// The frame's operating mode does not yet have a composed
     /// sample-producing decode path in this crate, so silence of the
@@ -516,11 +519,11 @@ impl OpusDecoder {
             frame_outcomes.push(outcome);
         }
 
-        // §4.4: cross-lap a pending concealment tail into the head of
-        // this (first real post-loss) output, then record the output
-        // as concealment history and re-arm the loss counter.
-        self.plc.apply_tail(&mut pcm, channels as usize);
-        self.plc.feed_decoded(&pcm, channels as usize);
+        // (The §4.4 concealment bookkeeping — tail cross-lap, history
+        // feed, loss counter — is per-frame inside `decode_one_frame`,
+        // so a §3.2.1 zero-length DTX frame between two coded frames
+        // of the same packet holds its place in the concealment
+        // timeline.)
         self.last_frame_tenths_ms = Some(routing.frame_size_tenths_ms);
 
         Ok(DecodedAudio {
@@ -591,20 +594,39 @@ impl OpusDecoder {
         // (the paths below overwrite it when they find one).
         self.last_redundancy = crate::celt_redundancy::RedundancyDecision::NotPresent;
 
-        // §3.2.1 zero-length frame: DTX / lost. §4.6 floor = silence.
+        // §3.2.1 zero-length frame: DTX or a frame dropped in transit.
+        // RFC 7845 §4.1 pins the intent: such a frame "explicitly
+        // request[s] the use of Packet Loss Concealment", so the §4.4
+        // hold runs — the last decoded audio is extrapolated (LPC after
+        // a SILK-bearing predecessor, pitch-periodic repetition after
+        // CELT-only) with the energy decay of a concealment run, which
+        // after a silent tail simply holds the silence floor.
         if frame.is_empty() {
-            push_silence(pcm, per_channel, channels);
+            let flavor = match routing.operating_mode {
+                OperatingMode::CeltOnly => crate::plc::PlcFlavor::Celt,
+                _ => crate::plc::PlcFlavor::Silk,
+            };
+            let chunk = self.plc.conceal(per_channel, channels as usize, flavor);
+            pcm.extend_from_slice(&chunk);
             return FrameOutcome {
                 samples_per_channel: per_channel,
                 status: FrameDecodeStatus::DtxOrLost,
             };
         }
 
-        match routing.operating_mode {
+        let start = pcm.len();
+        let outcome = match routing.operating_mode {
             OperatingMode::SilkOnly => self.decode_silk_only_frame(frame, routing, pcm),
             OperatingMode::CeltOnly => self.decode_celt_only_frame(frame, routing, pcm),
             OperatingMode::Hybrid => self.decode_hybrid_frame(frame, routing, pcm),
-        }
+        };
+        // §4.4 bookkeeping for a coded frame: cross-lap a pending
+        // concealment tail into this (first post-concealment) frame's
+        // head, then record the output as concealment history and
+        // re-arm the loss counter.
+        self.plc.apply_tail(&mut pcm[start..], channels as usize);
+        self.plc.feed_decoded(&pcm[start..], channels as usize);
+        outcome
     }
 
     /// Decode one SILK-only Opus frame (§4.2).

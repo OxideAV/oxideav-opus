@@ -273,3 +273,157 @@ fn silk_concealment_preserves_the_tone() {
         "concealment lost the 440 Hz dominance: tone {tone:.1} off {off:.1}"
     );
 }
+
+/// TOC byte of an audio packet with the frame-count code replaced by
+/// code 0 — the 1-byte TOC-only packet is the minimal §3.2.1 DTX
+/// marker (a single zero-length frame).
+fn dtx_marker_for(packet: &[u8]) -> Vec<u8> {
+    vec![packet[0] & 0xFC]
+}
+
+/// A §3.2.1 zero-length (DTX) frame mid-stream: RFC 7845 §4.1 says
+/// such a frame explicitly requests PLC, so the decoder holds the
+/// waveform through the §4.4 extrapolation instead of snapping to
+/// digital silence, and both joins stay continuous.
+#[test]
+fn dtx_marker_packet_holds_the_waveform() {
+    let packets = ogg_audio_packets(FIXTURE_SILK_NB);
+    assert!(packets.len() > 20);
+    let at = packets.len() / 2;
+
+    let mut dec = OpusDecoder::new();
+    let mut pcm: Vec<i16> = Vec::new();
+    let mut j0 = 0usize;
+    let mut j1 = 0usize;
+    for (i, pk) in packets.iter().enumerate() {
+        let out = if i == at {
+            j0 = pcm.len();
+            let out = dec.decode_packet(&dtx_marker_for(pk)).expect("dtx decode");
+            assert_eq!(out.frame_outcomes.len(), 1);
+            assert_eq!(out.frame_outcomes[0].status, FrameDecodeStatus::DtxOrLost);
+            out
+        } else {
+            dec.decode_packet(pk).expect("decode")
+        };
+        pcm.extend_from_slice(&out.pcm);
+        if i == at {
+            j1 = pcm.len();
+        }
+    }
+
+    // The held frame is real (non-silent) extrapolated audio.
+    let frame = j1 - j0;
+    let held = energy(&pcm[j0..j1]);
+    let before = energy(&pcm[j0 - frame..j0]);
+    assert!(
+        held > before * 0.05,
+        "DTX hold near-silent: {held} vs {before}"
+    );
+    assert!(
+        held < before * 4.0,
+        "DTX hold overshoots: {held} vs {before}"
+    );
+
+    // Continuity at both joins.
+    let natural = max_step(&pcm, 1, j0 - 480, j0 - 1).max(1);
+    let at_enter = max_step(&pcm, 1, j0 - 2, j0 + 2);
+    let at_resume = max_step(&pcm, 1, j1 - 2, j1 + 2);
+    assert!(
+        at_enter <= natural * 4 + 64,
+        "DTX-entry join step {at_enter} vs natural {natural}"
+    );
+    assert!(
+        at_resume <= natural * 4 + 64,
+        "DTX-resume join step {at_resume} vs natural {natural}"
+    );
+}
+
+/// A long DTX run decays to the silence floor (the §4.4 energy decay
+/// drives the hold, exactly as for a loss burst), and the stream
+/// decodes cleanly when coded packets resume.
+#[test]
+fn dtx_run_decays_to_the_silence_floor() {
+    let packets = ogg_audio_packets(FIXTURE_SILK_NB);
+    let warmup = 12.min(packets.len() - 1);
+    let mut dec = OpusDecoder::new();
+    for pk in &packets[..warmup] {
+        let _ = dec.decode_packet(pk).expect("decode");
+    }
+    let marker = dtx_marker_for(&packets[warmup]);
+    let mut energies: Vec<f64> = Vec::new();
+    for _ in 0..30 {
+        let out = dec.decode_packet(&marker).expect("dtx decode");
+        assert_eq!(out.frame_outcomes[0].status, FrameDecodeStatus::DtxOrLost);
+        energies.push(energy(&out.pcm));
+    }
+    assert!(energies[0] > 0.0, "first held frame silent");
+    // Decayed to (near) the silence floor by the end of the run.
+    assert!(
+        energies[energies.len() - 1] <= energies[0] * 1e-4,
+        "DTX run failed to decay: first {} last {}",
+        energies[0],
+        energies[energies.len() - 1]
+    );
+    // Monotone non-increasing at the frame scale (tiny jitter allowed).
+    for w in energies.windows(2) {
+        assert!(
+            w[1] <= w[0] * 1.05 + 1.0,
+            "energy rose inside the DTX run: {w:?}"
+        );
+    }
+    // Coded packets resume cleanly after the run.
+    let out = dec.decode_packet(&packets[warmup]).expect("resume decode");
+    assert_eq!(
+        out.frame_outcomes[0].status,
+        FrameDecodeStatus::SilkParamsDecoded
+    );
+}
+
+/// A zero-length frame BETWEEN two coded frames of one code-3 VBR
+/// packet (the RFC 7845 §4.1 "combine the empty frames with previous
+/// or subsequent nonzero-length frames" packing): the coded frames
+/// decode, the middle frame holds, and the concealment timeline stays
+/// per-frame (the hold extrapolates the first frame, not stale
+/// history).
+#[test]
+fn dtx_frame_between_coded_frames_of_one_packet() {
+    let packets = ogg_audio_packets(FIXTURE_SILK_NB);
+    let warmup = 10.min(packets.len() - 2);
+    let mut dec = OpusDecoder::new();
+    for pk in &packets[..warmup] {
+        let _ = dec.decode_packet(pk).expect("decode");
+    }
+    let a = &packets[warmup];
+    let b = &packets[warmup + 1];
+    assert_eq!(a[0] & 0xFC, b[0] & 0xFC, "fixture TOC drifted");
+    let toc3 = a[0] | 0b11;
+    let combined = oxideav_opus::compose_packet_code3(toc3, &[&a[1..], &[], &b[1..]], true, 0)
+        .expect("compose");
+    let out = dec.decode_packet(&combined).expect("decode combined");
+    assert_eq!(out.frame_outcomes.len(), 3);
+    assert_eq!(
+        out.frame_outcomes[0].status,
+        FrameDecodeStatus::SilkParamsDecoded
+    );
+    assert_eq!(out.frame_outcomes[1].status, FrameDecodeStatus::DtxOrLost);
+    assert_eq!(
+        out.frame_outcomes[2].status,
+        FrameDecodeStatus::SilkParamsDecoded
+    );
+    let per = out.samples_per_channel() / 3;
+    assert_eq!(per, 960);
+    // The held middle frame carries energy from the first frame's tail
+    // (per-frame history feed), and the join into it is continuous.
+    let held = energy(&out.pcm[per..2 * per]);
+    let first = energy(&out.pcm[..per]);
+    assert!(
+        held > first * 0.02,
+        "mid-packet hold near-silent: {held} vs {first}"
+    );
+    let natural = max_step(&out.pcm, 1, per / 2, per - 1).max(1);
+    let at_join = max_step(&out.pcm, 1, per - 2, per + 2);
+    assert!(
+        at_join <= natural * 4 + 64,
+        "mid-packet DTX join step {at_join} vs natural {natural}"
+    );
+}

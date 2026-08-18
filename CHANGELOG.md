@@ -4,6 +4,25 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **DTX frames hold through the §4.4 concealment** (round 448): a
+  §3.2.1 zero-length frame (DTX or a frame dropped in transit) no
+  longer snaps to digital silence — RFC 7845 §4.1 pins the intent
+  ("emit packets that explicitly request the use of Packet Loss
+  Concealment"), so `decode_packet` now routes every zero-length
+  frame through the §4.4 hold: LPC extrapolation after a
+  SILK-bearing predecessor, pitch-periodic repetition after a
+  CELT-only one, with the concealment energy decay across a DTX run
+  down to the silence floor and the extrapolation tail cross-lapped
+  into the next coded frame. The §4.4 bookkeeping (tail / history /
+  loss counter) moved from per-packet to per-frame, so a zero-length
+  frame *between* two coded frames of one code-2/3 packet (the
+  RFC 7845 §4.1 combined packing) holds its exact place in the
+  concealment timeline; coded-frame output is unchanged
+  (whole-suite regression green, the SILK bit-exactness gates
+  included). `FrameDecodeStatus::DtxOrLost` keeps its name; three
+  new gates in `tests/plc_decode.rs` pin waveform hold + join
+  continuity, run decay + clean resume, and the mid-packet case.
+
 - **Hybrid in-band FEC** (round 445): the last SILK-bearing mode
   without LBRR emission now has it —
   `HybridEncoderMono/Stereo::set_fec` (+ the Hybrid VBR arms) ride
