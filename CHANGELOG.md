@@ -4,6 +4,22 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **RFC 7845 §4.1 gap repair** (round 448):
+  `compose_plc_gap_packets(prev_toc_byte, gap_tenths_ms)` —
+  synthesize the packet sequence that requests PLC across a gap in
+  a captured real-time stream: every frame a §3.2.1 zero-length
+  frame, the previous packet's configuration held for as long as
+  possible, frame-size changes delayed to the end, the CELT switch
+  only at the end of the gap, MB→WB on that switch, the cheapest
+  §3.2 packing per run (code 0 / code 1 / 2-byte CBR code 3, R5
+  120 ms bound respected), and gaps validated as positive
+  multiples of 2.5 ms. The §4.1 worked example (95 ms after a
+  20 ms SILK frame → 2 + 1 + 1 bytes) is pinned literally in
+  `tests/gap_repair.rs`, along with an end-to-end decode where the
+  repaired gap reports the §4.4 hold frame-for-frame and the §A
+  reference-listing decoder consumes a repaired stream with exact
+  sample counts.
+
 - **§2.1.9 DTX on the CELT-only VBR arm** (round 448):
   `CeltVbrEncoder::set_dtx` — a digitally silent frame (the same
   gate the 3-byte silence collapse uses) is, after the hangover,

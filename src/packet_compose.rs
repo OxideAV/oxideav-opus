@@ -733,3 +733,131 @@ mod tests {
         assert!(pad_packet_to(&code3, code3.len() + 10).is_err());
     }
 }
+
+/// RFC 7845 §4.1 gap repair: synthesize the packet sequence that
+/// requests Packet Loss Concealment across a gap in a captured
+/// real-time stream — every Opus frame inside the returned packets is
+/// a §3.2.1 **zero-length** frame ("The actual length of each missing
+/// Opus frame inside the packet is zero bytes").
+///
+/// `prev_toc_byte` is the §3.1 TOC byte of the last packet before the
+/// gap (its mode / bandwidth / channel count / frame size seed the
+/// synthesized configuration, per §4.1: "Synthesized TOC sequences
+/// SHOULD maintain the same mode, audio bandwidth, channel count, and
+/// frame size as the previous packet"). `gap_tenths_ms` is the gap
+/// duration in tenths of a millisecond and MUST be a positive
+/// multiple of 25 — "Only gaps that are a multiple of 2.5 ms are
+/// repairable, as these are the only durations that can be created by
+/// packet loss or discontinuous transmission."
+///
+/// The §4.1 recommendations are followed exactly:
+///
+/// * the previous frame size fills the gap for as long as possible,
+///   and frame-size changes are "delayed as long as possible" — the
+///   remainder uses progressively smaller frames of the same mode;
+/// * SILK / Hybrid frames cannot fill a sub-10 ms remainder, so a
+///   switch to CELT mode happens only "at the end of the gap";
+/// * a medium-band SILK predecessor switches to **wideband** CELT
+///   frames ("Since medium-band audio is an option only in the SILK
+///   mode, wideband frames SHOULD be generated if switching from that
+///   configuration to CELT mode");
+/// * zero-length frames of one configuration pack with the cheapest
+///   §3.2 code (code 0 for one, code 1 for two, code-3 CBR
+///   otherwise — 2 bytes for up to 48 frames), never exceeding the
+///   R5 120 ms packet-duration bound.
+///
+/// The concatenated frame durations of the returned packets equal
+/// `gap_tenths_ms` exactly.
+pub fn compose_plc_gap_packets(
+    prev_toc_byte: u8,
+    gap_tenths_ms: u32,
+) -> Result<Vec<Vec<u8>>, Error> {
+    use crate::toc::{Bandwidth, ChannelMapping, Mode};
+
+    let prev = OpusTocByte::parse(&[prev_toc_byte])?;
+    if gap_tenths_ms == 0 || gap_tenths_ms % 25 != 0 {
+        return Err(Error::MalformedPacket);
+    }
+    let stereo = prev.channels == ChannelMapping::Stereo;
+
+    /// Frame durations (tenths of ms) available per mode, descending.
+    fn mode_sizes(mode: Mode) -> &'static [u16] {
+        match mode {
+            Mode::SilkOnly => &[600, 400, 200, 100],
+            Mode::Hybrid => &[200, 100],
+            Mode::CeltOnly => &[200, 100, 50, 25],
+        }
+    }
+
+    // Phase 1: the previous frame size, for as long as it divides.
+    let mut plan: Vec<(Mode, Bandwidth, u16, u32)> = Vec::new();
+    let d = u32::from(prev.frame_size_tenths_ms);
+    let mut rem = gap_tenths_ms;
+    if rem >= d {
+        plan.push((
+            prev.mode,
+            prev.bandwidth,
+            prev.frame_size_tenths_ms,
+            rem / d,
+        ));
+        rem %= d;
+    }
+
+    // Phase 2: smaller frames of the same mode (changes delayed as
+    // long as possible — larger sizes first, none above the previous
+    // frame size).
+    for &sz in mode_sizes(prev.mode) {
+        if u32::from(sz) >= d {
+            continue;
+        }
+        let n = rem / u32::from(sz);
+        if n > 0 {
+            plan.push((prev.mode, prev.bandwidth, sz, n));
+            rem %= u32::from(sz);
+        }
+    }
+
+    // Phase 3: a CELT tail at the very end for what SILK / Hybrid
+    // cannot express (sub-10 ms remainders). MB exists only in SILK:
+    // switch to WB per §4.1.
+    if rem > 0 {
+        let celt_bw = match prev.bandwidth {
+            Bandwidth::Mb => Bandwidth::Wb,
+            other => other,
+        };
+        for &sz in mode_sizes(Mode::CeltOnly) {
+            let n = rem / u32::from(sz);
+            if n > 0 {
+                plan.push((Mode::CeltOnly, celt_bw, sz, n));
+                rem %= u32::from(sz);
+            }
+        }
+    }
+    debug_assert_eq!(rem, 0, "2.5 ms granularity always closes the plan");
+
+    // Pack each plan entry into packets of zero-length frames.
+    let mut packets: Vec<Vec<u8>> = Vec::new();
+    for (mode, bandwidth, sz, mut count) in plan {
+        // R5: at most 120 ms per packet; §3.2.5: at most 48 frames.
+        let max_frames = (1200 / usize::from(sz))
+            .min(usize::from(MAX_FRAMES_PER_PACKET))
+            .max(1);
+        while count > 0 {
+            let m = (count as usize).min(max_frames);
+            count -= m as u32;
+            let code = match m {
+                1 => FrameCountCode::One,
+                2 => FrameCountCode::TwoEqual,
+                _ => FrameCountCode::Arbitrary,
+            };
+            let toc = OpusTocByte::compose_byte(mode, bandwidth, sz, stereo, code)?;
+            let empties: Vec<&[u8]> = vec![&[]; m];
+            packets.push(match code {
+                // 1-byte and 2-byte shapes (§4.1's overhead argument).
+                FrameCountCode::One | FrameCountCode::TwoEqual => compose_packet(toc, &empties)?,
+                _ => compose_packet_code3(toc, &empties, false, 0)?,
+            });
+        }
+    }
+    Ok(packets)
+}

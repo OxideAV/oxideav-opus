@@ -1021,7 +1021,8 @@ pub use opus_head::{
     OPUS_HEAD_MAX_VERSION, OPUS_HEAD_MIN_LEN,
 };
 pub use packet_compose::{
-    compose_packet, compose_packet_code3, compose_self_delimited, encode_length,
+    compose_packet, compose_packet_code3, compose_plc_gap_packets, compose_self_delimited,
+    encode_length,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use plc::{
