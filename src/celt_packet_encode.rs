@@ -148,6 +148,31 @@ impl CeltEncoder {
         self.tapset_election = enabled.then(|| Self::fresh_election(self.channels()));
     }
 
+    /// The 1-byte TOC-only §2.1.9 DTX marker for this stream
+    /// configuration (one §3.2.1 zero-length frame, code 0).
+    pub(crate) fn dtx_marker(&self) -> Result<Vec<u8>, Error> {
+        Ok(vec![OpusTocByte::compose_byte(
+            Mode::CeltOnly,
+            self.bandwidth,
+            self.frame_tenths_ms,
+            self.stereo,
+            FrameCountCode::One,
+        )?])
+    }
+
+    /// Force the next coded frame's §5.3.2 energies INTRA (the §2.1.9
+    /// DTX resume treatment: after suppressed frames, a decoder's
+    /// carried energy state is whatever its own concealment left, so
+    /// the resume frame must not predict from it).
+    pub(crate) fn force_intra_next(&mut self) {
+        self.state.force_intra = true;
+    }
+
+    /// Frame duration in tenths of a millisecond.
+    pub(crate) fn frame_tenths_ms(&self) -> u16 {
+        self.frame_tenths_ms
+    }
+
     fn fresh_election(channels: usize) -> TapsetElection {
         TapsetElection {
             mirror: OpusDecoder::new(),

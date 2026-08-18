@@ -343,7 +343,7 @@ impl HybridEncoderMono {
         if self.dtx.step(
             all_inactive,
             lbrr_pending_active,
-            u32::from(self.frame_tenths_ms) / 10,
+            u32::from(self.frame_tenths_ms),
         ) {
             self.analyzer.skip_frame_untransmitted(pcm16);
             self.lbrr_prev_rms = interval_rms(pcm16);
@@ -735,7 +735,7 @@ impl HybridEncoderStereo {
         if self.dtx.step(
             all_inactive,
             lbrr_pending_active,
-            u32::from(self.frame_tenths_ms) / 10,
+            u32::from(self.frame_tenths_ms),
         ) {
             self.mid.skip_frame_untransmitted(&mid_raw);
             self.side.skip_frame_untransmitted(&side_raw);

@@ -4,6 +4,23 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **§2.1.9 DTX on the CELT-only VBR arm** (round 448):
+  `CeltVbrEncoder::set_dtx` — a digitally silent frame (the same
+  gate the 3-byte silence collapse uses) is, after the hangover,
+  replaced by the 1-byte TOC-only marker with one coded packet per
+  400 ms of suppression; the refresh / resume frame codes its
+  §5.3.2 energies INTRA (`CeltEncoderState::force_intra`), so its
+  reconstruction is fully independent of whatever a decoder's own
+  concealment left in the carried energy state. The DTX driver's
+  clock moved to tenths of a millisecond so the 2.5 ms frame
+  divides the §2.1.9 cadence evenly (160 markers per refresh,
+  gated). Measured (tone | 3 s digital silence | tone, FB 20 ms
+  64 kb/s): 141/150 silent packets suppressed; the §A
+  reference-listing decoder decodes the stream at **105 dB** before
+  the run, **identical zeros** across it, and **102 dB (max
+  1 LSB)** from the resume packet — the intra resume leaves no
+  state dependence at all. Gated in `tests/dtx_encode.rs`.
+
 - **§2.1.9 DTX on the Hybrid arms + every VBR arm** (round 448):
   `HybridEncoderMono/Stereo::set_dtx` runs the same driver on the
   decimated WB band (stereo: the mid/side pair) — suppressed

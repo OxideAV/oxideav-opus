@@ -426,3 +426,103 @@ fn silk_vbr_dtx_collapses_the_silent_run() {
         assert_eq!(out.samples_per_channel(), 960);
     }
 }
+
+// ---------------------------------------------------------------
+// CELT-only VBR arm (§2.1.9 on digital silence).
+// ---------------------------------------------------------------
+
+use oxideav_opus::vbr::CeltVbrEncoder;
+
+/// CELT VBR DTX: markers on digital silence with the CELT TOC, the
+/// §2.1.9 cadence, savings over the 3-byte silence collapse, and a
+/// clean round trip with an intra resume.
+#[test]
+fn celt_vbr_dtx_suppresses_digital_silence() {
+    let tone = |n: usize| -> Vec<i16> {
+        (0..n)
+            .map(|i| {
+                (8000.0 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48_000.0).sin()) as i16
+            })
+            .collect()
+    };
+    let v = 24_000; // 0.5 s
+    let s = 96_000; // 2 s digital silence
+    let mut sig = tone(v);
+    sig.extend(std::iter::repeat(0i16).take(s));
+    sig.extend(tone(v));
+    let silent = v / 960..(v + s) / 960;
+
+    let run = |dtx: bool| -> Vec<Vec<u8>> {
+        let mut enc = CeltVbrEncoder::new(Bandwidth::Fb, 200, false, 64_000, false).unwrap();
+        enc.set_dtx(dtx);
+        sig.chunks_exact(960)
+            .map(|c| enc.encode_frame(c).unwrap().0)
+            .collect()
+    };
+    let on = run(true);
+    let off = run(false);
+
+    let markers: Vec<usize> = (0..on.len()).filter(|&k| on[k].len() == 1).collect();
+    assert!(
+        markers.len() > 60,
+        "CELT DTX barely fired: {}",
+        markers.len()
+    );
+    for &k in &markers {
+        // Config 31 (CELT FB 20 ms), mono, code 0.
+        assert_eq!(on[k], vec![0xF8u8], "CELT marker TOC at {k}");
+        assert!(silent.contains(&k), "marker outside the silent run");
+    }
+    // §2.1.9 cadence: 20 markers between coded packets in the run.
+    let coded_in_run: Vec<usize> = (markers[0]..silent.end)
+        .filter(|&k| on[k].len() > 1)
+        .collect();
+    for w in coded_in_run.windows(2) {
+        assert_eq!(w[1] - w[0], 21, "CELT refresh cadence at {w:?}");
+    }
+    // Savings over the 3-byte silence collapse.
+    let run_on: usize = silent.clone().map(|k| on[k].len()).sum();
+    let run_off: usize = silent.clone().map(|k| off[k].len()).sum();
+    assert!(
+        run_on < run_off,
+        "CELT DTX run not cheaper than collapse: {run_on} vs {run_off}"
+    );
+
+    // Round trip: markers hold, coded frames decode, the stream ends
+    // clean after re-entry.
+    let mut dec = OpusDecoder::new();
+    for (k, p) in on.iter().enumerate() {
+        let out = dec.decode_packet(p).expect("decode");
+        assert_eq!(out.samples_per_channel(), 960, "packet {k}");
+        if p.len() == 1 {
+            assert_eq!(out.frame_outcomes[0].status, FrameDecodeStatus::DtxOrLost);
+        } else {
+            assert!(
+                matches!(
+                    out.frame_outcomes[0].status,
+                    FrameDecodeStatus::CeltDecoded | FrameDecodeStatus::CeltSilence
+                ),
+                "packet {k}: {:?}",
+                out.frame_outcomes[0].status
+            );
+        }
+    }
+}
+
+/// The 2.5 ms CELT frame divides the §2.1.9 cadence evenly in tenths:
+/// 160 markers (400 ms) between coded packets.
+#[test]
+fn celt_dtx_cadence_at_2_5ms_frames() {
+    let mut enc = CeltVbrEncoder::new(Bandwidth::Fb, 25, false, 64_000, false).unwrap();
+    enc.set_dtx(true);
+    let silence = vec![0i16; 120];
+    let mut sizes = Vec::new();
+    for _ in 0..600 {
+        sizes.push(enc.encode_frame(&silence).unwrap().0.len());
+    }
+    let coded: Vec<usize> = (0..sizes.len()).filter(|&k| sizes[k] > 1).collect();
+    // Hangover first, then exactly 160 markers between coded packets.
+    for w in coded.windows(2).skip(1) {
+        assert_eq!(w[1] - w[0], 161, "2.5 ms cadence at {w:?}");
+    }
+}

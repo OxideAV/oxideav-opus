@@ -291,6 +291,8 @@ pub struct CeltVbrEncoder {
     enc: CeltEncoder,
     rc: VbrRateControl,
     predetect: TransientPredetect,
+    /// §2.1.9 DTX driver (digital-silence gated on the CELT arm).
+    dtx: crate::silk_encoder::DtxState,
 }
 
 impl CeltVbrEncoder {
@@ -311,6 +313,7 @@ impl CeltVbrEncoder {
             enc,
             rc,
             predetect: TransientPredetect::new(channels),
+            dtx: crate::silk_encoder::DtxState::default(),
         })
     }
 
@@ -337,6 +340,22 @@ impl CeltVbrEncoder {
         self.enc.reset();
         self.rc.reset();
         self.predetect.reset();
+        self.dtx.reset();
+    }
+
+    /// Enable / disable §2.1.9 discontinuous transmission on the
+    /// CELT-only VBR arm: a DIGITALLY SILENT frame (the same gate the
+    /// 3-byte silence collapse uses) is — after the transmitted
+    /// hangover — replaced by the 1-byte TOC-only marker (one §3.2.1
+    /// zero-length frame), with one coded packet per 400 ms of
+    /// suppression as the §2.1.9 refresh; the refresh / resume frame
+    /// codes its §5.3.2 energies INTRA so it never predicts from the
+    /// energy state a decoder's own concealment left behind. Marker
+    /// bytes are committed to the drift. Off (the default) is
+    /// bit-identical to before.
+    pub fn set_dtx(&mut self, enabled: bool) {
+        self.dtx.enabled = enabled;
+        self.dtx.reset();
     }
 
     /// Enable / disable the §5.3.1 tapset election inside the elected
@@ -359,7 +378,36 @@ impl CeltVbrEncoder {
         if pcm.len() != self.channels() * self.frame_samples() {
             return Err(Error::MalformedPacket);
         }
-        let packet_bytes = if pcm.iter().all(|&v| v == 0) {
+        let digital_silence = pcm.iter().all(|&v| v == 0);
+        // §2.1.9 DTX gate (see the SILK arms): suppression freezes
+        // the CELT carries — the decoder decodes nothing for a
+        // zero-length frame — and emits the marker; the packet after
+        // a run codes intra energies.
+        if self.dtx.step(
+            digital_silence,
+            false,
+            u32::from(self.enc.frame_tenths_ms()),
+        ) {
+            let marker = self.enc.dtx_marker()?;
+            self.rc.commit(marker.len());
+            return Ok((
+                marker,
+                CeltFrameEncodeInfo {
+                    silence: true,
+                    transient: false,
+                    intra: false,
+                    coded_bands: 0,
+                    postfilter_on: false,
+                    postfilter_period: 0,
+                    postfilter_gain: 0.0,
+                    postfilter_tapset: 0,
+                },
+            ));
+        }
+        if self.dtx.take_resume() {
+            self.enc.force_intra_next();
+        }
+        let packet_bytes = if digital_silence {
             // Digital silence: collapse to the minimum packet. The
             // CELT layer codes its §4.3 silence flag inside it.
             MIN_PACKET_BYTES

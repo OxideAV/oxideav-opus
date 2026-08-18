@@ -191,10 +191,11 @@ pub(crate) const MID_ONLY_SIDE_RMS: f64 = 1.0e-4;
 pub(crate) const ACTIVITY_RMS: f64 = 1.0e-3;
 
 /// §2.1.9: "When DTX is enabled, only one frame is encoded every
-/// 400 milliseconds." — the refresh cadence of a DTX run: once this
-/// much suppressed time has accumulated, one packet is coded so the
-/// decoder's comfort-noise floor stays current.
-const DTX_REFRESH_MS: u32 = 400;
+/// 400 milliseconds." — the refresh cadence of a DTX run in tenths
+/// of a millisecond: once this much suppressed time has accumulated,
+/// one packet is coded so the decoder's comfort-noise floor stays
+/// current. (Tenths so the 2.5 ms CELT frame divides evenly.)
+pub(crate) const DTX_REFRESH_TENTHS_MS: u32 = 4_000;
 
 /// Consecutive fully-inactive packets the encoder still TRANSMITS
 /// before the first §2.1.9 suppression (a documented crate choice —
@@ -220,8 +221,8 @@ pub(crate) struct DtxState {
     pub(crate) enabled: bool,
     /// Consecutive fully-inactive packets seen (coded or suppressed).
     inactive_run: u32,
-    /// Suppressed time since the last coded packet, in ms.
-    suppressed_ms: u32,
+    /// Suppressed time since the last coded packet, in tenths of ms.
+    suppressed_tenths: u32,
     /// At least one packet was suppressed since the last coded one:
     /// the next coded packet is a DTX *resume* (see
     /// [`Self::take_resume`]).
@@ -236,27 +237,27 @@ impl DtxState {
         &mut self,
         all_inactive: bool,
         lbrr_pending_active: bool,
-        packet_ms: u32,
+        packet_tenths_ms: u32,
     ) -> bool {
         if !self.enabled {
             return false;
         }
         if !all_inactive {
             self.inactive_run = 0;
-            self.suppressed_ms = 0;
+            self.suppressed_tenths = 0;
             return false;
         }
         self.inactive_run = self.inactive_run.saturating_add(1);
         if lbrr_pending_active || self.inactive_run <= DTX_HANGOVER_PACKETS {
-            self.suppressed_ms = 0;
+            self.suppressed_tenths = 0;
             return false;
         }
-        if self.suppressed_ms >= DTX_REFRESH_MS {
+        if self.suppressed_tenths >= DTX_REFRESH_TENTHS_MS {
             // §2.1.9 refresh: code this packet.
-            self.suppressed_ms = 0;
+            self.suppressed_tenths = 0;
             return false;
         }
-        self.suppressed_ms += packet_ms;
+        self.suppressed_tenths += packet_tenths_ms;
         self.resumed = true;
         true
     }
@@ -279,7 +280,7 @@ impl DtxState {
     /// Drop the run counters (encoder reset / DTX toggled).
     pub(crate) fn reset(&mut self) {
         self.inactive_run = 0;
-        self.suppressed_ms = 0;
+        self.suppressed_tenths = 0;
         self.resumed = false;
     }
 }
@@ -1140,7 +1141,7 @@ impl SilkEncoderMono {
         if self.dtx.step(
             all_inactive,
             lbrr_pending_active,
-            u32::from(self.packet_tenths_ms) / 10,
+            u32::from(self.packet_tenths_ms),
         ) {
             // Suppressed: roll the analysis lookback past the silent
             // input, freeze every decoder-authoritative mirror, drop
@@ -1483,7 +1484,7 @@ impl SilkEncoderStereo {
         if self.dtx.step(
             all_inactive,
             lbrr_pending_active,
-            u32::from(self.packet_tenths_ms) / 10,
+            u32::from(self.packet_tenths_ms),
         ) {
             // Suppressed: roll both analysis lookbacks past the
             // silent mid/side signals, freeze the decoder-visible
