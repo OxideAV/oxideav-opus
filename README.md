@@ -369,6 +369,37 @@ delayed, CELT switch only at the end, MB→WB, cheapest packings; the
 RFC's 95 ms worked example is pinned byte-for-byte in
 `tests/gap_repair.rs`).
 
+Round 450 closes the decode tail and the framework-registry gap.
+**Decoding at any §4.2.9 supported output rate** is real
+(`OpusDecoder::with_output_rate`, 8 / 12 / 16 / 24 / 48 kHz): the
+SILK layer resamples internal → output directly through the full
+decoder-side reference-resampler matrix — pass-through, pure 2×,
+allpass + fractional FIR, and the AR2 + decimating-FIR chains (3:4,
+2:3, 1:2), every one of the 15 rate pairs pinned **bit-exact**
+against the §A reference listing's resampler — while the CELT layer
+keeps its 48 kHz MDCT grid, zeroes the spectrum above the output
+Nyquist before the inverse MDCT, and decimates the de-emphasized
+signal at phase 0 (the listing's reduced-rate construction), with
+the §4.4 Hybrid sum, §4.5.1.4 cross-laps, FEC, DTX holds, PLC
+(duration-rescaled), and the multistream assembly all on the
+output-rate timeline. Whole-stream gates against the reference
+decoder's own reduced-rate decodes: SILK fixtures **bit-exact** at
+8 and 24 kHz, CELT at 88.6–104.0 dB, Hybrid at 70.7–72.9 dB,
+mode-switching at 102.6–102.8 dB; a 270-decode corpus sweep
+(NB/MB/WB/hybrid/CELT × 10–60 ms × mono/stereo × tone/click/noise ×
+all 5 rates) measured **150/150 SILK decodes bit-exact** and
+everything else at the float floor (max 1 LSB), zero failures. The
+**§4.5 switch seams without redundancy** landed too: Hybrid→SILK now
+performs the normative overlap-buffer flush (2.5 ms CELT silence
+frame, Figure 18 `c`/`+`) — seam 31.9 dB → **bit-exact** — SILK
+bandwidth switches carry the §4.2.8 delay sample (NB↔WB captures now
+**bit-exact** whole-stream), and non-normative CELT↔SILK/Hybrid
+switches apply the RECOMMENDED 5 ms PLC fill with the
+power-complementary crossfade (whole-stream 34–40 dB vs ≈27 dB for a
+hard switch, off-seam ≥ 97 dB). Loss re-convergence is gated against
+reference decodes of planted-loss captures at 48 kHz AND 16 kHz, and
+the decode fuzz target cycles output rates.
+
 Differential encoder/decoder testing and a restored cargo-fuzz suite
 (6 coverage-guided targets, incl. an encoder↔decoder range-coder
 roundtrip and the CELT / VBR encode→decode harnesses) have also
@@ -431,6 +462,20 @@ registry-resolution integration suites). Per-stage progress lives in
   `silk_stereo::stereo_ms_to_lr` mid/side → left/right unmix run per SILK
   interval into interleaved L/R PCM.
 
+- `OpusDecoder::with_output_rate` — decode at any §4.2.9 supported
+  output rate (8/12/16/24/48 kHz): SILK internal → output through the
+  full decoder-side reference resampler matrix (bit-exact), CELT via
+  the output-Nyquist spectrum bound + phase-0 decimation of the
+  de-emphasized 48 kHz signal, Hybrid summing and every cross-lap /
+  concealment path on the output-rate timeline
+  (`tests/downsampled_decode.rs`).
+- §4.5 seams without redundancy: the normative Hybrid→SILK CELT
+  overlap flush (2.5 ms silence frame, direct mix), SILK
+  bandwidth-change state policy (delay sample carried; bit-exact
+  NB↔WB switch captures), and the RECOMMENDED 5 ms PLC fill with
+  power-complementary crossfade on CELT↔SILK/Hybrid switches
+  (`tests/mode_switch_seams.rs`, `tests/plc_reconvergence.rs`).
+
 **Packet & framing (RFC 6716 §3 / §4.2):**
 
 - `OpusTocByte` — the §3.1 TOC parser (config × stereo flag × frame-count
@@ -492,7 +537,17 @@ registry-resolution integration suites). Per-stage progress lives in
   from its first payload bytes
   (`CodecRegistry::resolve_payload_magic_ref`); `OpusTags` and every
   truncation of the magic are refused by construction (pinned in
-  `tests/registry_resolution.rs`).
+  `tests/registry_resolution.rs`). Since round 450 the registration
+  also wires working **decoder/encoder factories** (`make_decoder` /
+  `make_encoder`, the dual-API convention): registry resolution
+  constructs an `OpusStreamDecoder` honouring `CodecParameters`
+  (extradata `OpusHead` → channels / §5.1.1 multistream mapping /
+  pre-skip / output gain, `sample_rate` → any §4.2.9 output rate) or
+  an `OpusStreamEncoder` on the CELT-only VBR arm (channels,
+  `bit_rate`, and the typed `OpusEncoderOptions` schema: bandwidth,
+  frame-ms, constrained-vbr, dtx, tapset-election, complexity).
+  Registry-resolved decodes of the SILK fixtures are bit-exact
+  against their reference decodes.
 
 **Range coder (RFC 6716 §4.1 / §5.1):** `RangeDecoder` — the shared
 entropy primitive consumed by both layers, including the §4.1.2
