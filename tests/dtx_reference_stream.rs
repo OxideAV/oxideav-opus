@@ -114,3 +114,36 @@ fn reference_dtx_stream_decodes_with_pinned_agreement() {
     assert!(snr >= 45.0, "post-resume SNR {snr:.1} dB below the gate");
     assert!(maxdiff <= 256, "post-resume max |diff| {maxdiff}");
 }
+
+#[test]
+fn reference_dtx_stream_at_16k_is_bit_exact_before_suppression() {
+    // The same capture decoded at a 16 kHz output rate: WB SILK is the
+    // §4.2.9 pass-through path, so the decode must be BIT-EXACT
+    // against the reference listing decoder's own 16 kHz decode up to
+    // the first suppression, with every packet (markers included)
+    // holding its exact place on the reduced timeline (320 samples per
+    // 20 ms), and the DTX run still at the silence floor.
+    let packets = capture_packets();
+    let mut dec = OpusDecoder::with_output_rate(16_000).expect("supported rate");
+    let mut pcm: Vec<i16> = Vec::new();
+    for (k, p) in packets.iter().enumerate() {
+        let out = dec.decode_packet(p).expect("decode");
+        assert_eq!(out.sample_rate_hz, 16_000, "packet {k}");
+        assert_eq!(out.samples_per_channel(), 320, "packet {k}");
+        pcm.extend_from_slice(&out.pcm);
+    }
+    let pre = pcm_i16(include_bytes!("fixtures/dtx-refenc.pre.expected16.pcm"));
+    assert_eq!(pre.len(), 56 * 320, "pre-window shape");
+    assert_eq!(
+        &pcm[..pre.len()],
+        &pre[..],
+        "16 kHz pre-DTX region not bit-exact"
+    );
+
+    let deep = 80 * 320..120 * 320;
+    let peak = pcm[deep].iter().map(|&s| i32::from(s).abs()).max().unwrap();
+    assert!(
+        peak <= 64,
+        "16 kHz DTX region not at the silence floor: {peak}"
+    );
+}

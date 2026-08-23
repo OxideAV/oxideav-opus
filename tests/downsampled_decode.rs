@@ -365,3 +365,37 @@ fn multistream_n1_at_12k_matches_the_plain_decoder() {
         assert_eq!(a.pcm, b.pcm);
     }
 }
+
+// ───────────────────────── FEC at reduced rates ─────────────────────────
+
+#[test]
+fn fec_recovery_runs_on_the_reduced_timeline() {
+    use oxideav_opus::decoder::FecDecodeStatus;
+
+    // Walk the FEC fixture at 12 kHz, simulating a loss before every
+    // packet: at least one packet must recover real LBRR audio, every
+    // recovery must land the exact reduced-rate sample count, and the
+    // stream must keep decoding cleanly afterwards.
+    let stream = include_bytes!("fixtures/fec-on.opus");
+    let packets = ogg_packets(stream);
+    let mut dec = OpusDecoder::with_output_rate(12_000).expect("rate");
+    let mut recovered = 0usize;
+    let mut recovered_energy = 0f64;
+    for pk in &packets[2..] {
+        let fec = dec.decode_packet_fec(pk).expect("fec parse");
+        assert_eq!(fec.sample_rate_hz, 12_000);
+        if fec.status == FecDecodeStatus::Recovered {
+            recovered += 1;
+            let routing_samples = fec.pcm.len() / fec.channels.max(1) as usize;
+            // 20 ms at 12 kHz = 240 per channel (fixture is 20 ms).
+            assert_eq!(routing_samples, 240);
+            for &s in &fec.pcm {
+                recovered_energy += f64::from(s) * f64::from(s);
+            }
+        }
+        let out = dec.decode_packet(pk).expect("regular decode");
+        assert_eq!(out.sample_rate_hz, 12_000);
+    }
+    assert!(recovered > 0, "FEC fixture must recover at least one frame");
+    assert!(recovered_energy > 0.0, "recovered audio must carry signal");
+}

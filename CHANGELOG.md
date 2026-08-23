@@ -4,6 +4,22 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **§4.4 concealment, DTX holds, and FEC at reduced rates** (round
+  450): `PlcState::with_rate` puts the concealment history on the
+  output-rate timeline with every duration-defined constant rescaled
+  (100 ms history, 2.5 ms cross-lap, the §4.3.7.1-derived pitch lag
+  range, the 20 ms correlation and 30 ms Burg windows; `find_pitch_at`
+  / `conceal_celt_at` / `conceal_silk_at` are the rate-aware forms,
+  the 48 kHz functions unchanged), wired through
+  `OpusDecoder::with_output_rate` and kept across `reset`. Gates: the
+  reference encoder's DTX capture decodes at 16 kHz **bit-exactly**
+  against the reference listing decoder's own 16 kHz decode up to the
+  first suppression with the run at the silence floor
+  (`tests/dtx_reference_stream.rs`), the FEC fixture recovers LBRR
+  audio at 12 kHz with exact reduced-rate sample counts, and a
+  reduced-rate concealment continues a planted period on its own
+  timeline.
+
 - **Multistream + registry at reduced rates** (round 450):
   `MultistreamDecoder::with_output_rate` /
   `from_head_with_output_rate` run every §5.1.1 sub-stream decoder on

@@ -85,6 +85,13 @@ const LOSS_DECAY_PER_FRAME: f32 = 0.8;
 /// Gain below which concealment output is treated as the silence floor.
 const SILENCE_FLOOR_GAIN: f32 = 1e-3;
 
+/// Scale a 48 kHz sample count onto a reduced output-rate timeline
+/// (the concealment is non-normative; every constant in this module
+/// is defined at 48 kHz and rescaled by duration).
+fn scale(samples_48k: usize, rate_hz: u32) -> usize {
+    (samples_48k * rate_hz as usize) / 48_000
+}
+
 /// The §4.4 energy-decay gain applied to the `k`-th *consecutive*
 /// concealed frame (`k` counts from 1). The first concealed frame
 /// plays at full gain; each further loss multiplies by
@@ -107,13 +114,23 @@ pub fn loss_gain(k: u32) -> f32 {
 /// is too short to correlate even the minimum lag or is (near-)silent.
 #[must_use]
 pub fn find_pitch(hist: &[f32]) -> Option<(usize, f32)> {
-    let max_lag = PITCH_MAX_LAG.min(hist.len().saturating_sub(8));
-    if max_lag < PITCH_MIN_LAG {
+    find_pitch_at(hist, 48_000)
+}
+
+/// [`find_pitch`] with the lag range and correlation window rescaled
+/// onto a reduced output-rate timeline (same durations, fewer
+/// samples).
+#[must_use]
+pub fn find_pitch_at(hist: &[f32], rate_hz: u32) -> Option<(usize, f32)> {
+    let min_lag = scale(PITCH_MIN_LAG, rate_hz).max(2);
+    let max_lag = scale(PITCH_MAX_LAG, rate_hz).min(hist.len().saturating_sub(8));
+    if max_lag < min_lag {
         return None;
     }
+    let corr_window = scale(PITCH_CORR_WINDOW, rate_hz).max(2 * min_lag);
     let mut best: Option<(usize, f32)> = None;
-    for lag in PITCH_MIN_LAG..=max_lag {
-        let w = PITCH_CORR_WINDOW.min(hist.len() - lag);
+    for lag in min_lag..=max_lag {
+        let w = corr_window.min(hist.len() - lag);
         let cur = &hist[hist.len() - w..];
         let prev = &hist[hist.len() - w - lag..hist.len() - lag];
         let mut xy = 0.0f64;
@@ -150,11 +167,23 @@ pub fn find_pitch(hist: &[f32]) -> Option<(usize, f32)> {
 /// search maximized). An empty / silent history conceals to silence.
 #[must_use]
 pub fn conceal_celt(hist: &[f32], n_out: usize, gain_start: f32, gain_end: f32) -> Vec<f32> {
+    conceal_celt_at(hist, n_out, gain_start, gain_end, 48_000)
+}
+
+/// [`conceal_celt`] on a reduced output-rate history.
+#[must_use]
+pub fn conceal_celt_at(
+    hist: &[f32],
+    n_out: usize,
+    gain_start: f32,
+    gain_end: f32,
+    rate_hz: u32,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; n_out];
     if gain_start <= SILENCE_FLOOR_GAIN && gain_end <= SILENCE_FLOOR_GAIN {
         return out;
     }
-    let Some((lag, corr)) = find_pitch(hist) else {
+    let Some((lag, corr)) = find_pitch_at(hist, rate_hz) else {
         return out;
     };
     // A weakly periodic (noise-like) history still repeats its final
@@ -187,23 +216,39 @@ pub fn conceal_celt(hist: &[f32], n_out: usize, gain_start: f32, gain_end: f32) 
 /// LPC fit is unavailable (short or degenerate history).
 #[must_use]
 pub fn conceal_silk(hist: &[f32], n_out: usize, gain_start: f32, gain_end: f32) -> Vec<f32> {
+    conceal_silk_at(hist, n_out, gain_start, gain_end, 48_000)
+}
+
+/// [`conceal_silk`] on a reduced output-rate history (Burg window and
+/// lag range rescaled by duration; the LPC order is kept — a 16-order
+/// envelope is denser, not coarser, at a lower rate).
+#[must_use]
+pub fn conceal_silk_at(
+    hist: &[f32],
+    n_out: usize,
+    gain_start: f32,
+    gain_end: f32,
+    rate_hz: u32,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; n_out];
     if gain_start <= SILENCE_FLOOR_GAIN && gain_end <= SILENCE_FLOOR_GAIN {
         return out;
     }
-    let Some((lag, _corr)) = find_pitch(hist) else {
+    let Some((lag, _corr)) = find_pitch_at(hist, rate_hz) else {
         return out;
     };
-    let fit_len = LPC_FIT_WINDOW.min(hist.len());
+    let fit_len = scale(LPC_FIT_WINDOW, rate_hz)
+        .max(LPC_ORDER * 4)
+        .min(hist.len());
     if fit_len < LPC_ORDER * 4 || hist.len() < lag + LPC_ORDER {
-        return conceal_celt(hist, n_out, gain_start, gain_end);
+        return conceal_celt_at(hist, n_out, gain_start, gain_end, rate_hz);
     }
     let fit: Vec<f64> = hist[hist.len() - fit_len..]
         .iter()
         .map(|&v| f64::from(v))
         .collect();
     let Ok(mut a) = burg_lpc(&fit, LPC_ORDER) else {
-        return conceal_celt(hist, n_out, gain_start, gain_end);
+        return conceal_celt_at(hist, n_out, gain_start, gain_end, rate_hz);
     };
     bandwidth_expand(&mut a, LPC_PLC_CHIRP);
 
@@ -286,18 +331,46 @@ pub struct PlcState {
     /// Per-channel extrapolation tail to cross-lap into the head of
     /// the next decoded frame.
     tail: Option<Vec<Vec<f32>>>,
+    /// Output rate the history lives at (0 — the derived-`Default`
+    /// placeholder — reads as 48 kHz).
+    rate_hz: u32,
 }
 
 impl PlcState {
-    /// Fresh state (no history, no pending tail).
+    /// Fresh state (no history, no pending tail) at 48 kHz.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Drop all state (decoder reset).
+    /// Fresh state whose history/constants live on a reduced
+    /// output-rate timeline (every duration-defined constant —
+    /// history depth, pitch range, correlation and Burg windows,
+    /// cross-lap length — is rescaled by duration).
+    #[must_use]
+    pub fn with_rate(rate_hz: u32) -> Self {
+        Self {
+            rate_hz,
+            ..Self::default()
+        }
+    }
+
+    /// The output rate this state's history lives at.
+    #[must_use]
+    pub fn rate_hz(&self) -> u32 {
+        if self.rate_hz == 0 {
+            48_000
+        } else {
+            self.rate_hz
+        }
+    }
+
+    /// Drop all state (decoder reset); the configured rate is kept.
     pub fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            rate_hz: self.rate_hz,
+            ..Self::default()
+        };
     }
 
     /// Number of consecutive concealed frames since the last real
@@ -319,6 +392,7 @@ impl PlcState {
     /// A channel-count change drops the old history.
     pub fn feed_decoded(&mut self, pcm: &[i16], channels: usize) {
         self.ensure_channels(channels);
+        let cap = scale(PLC_HISTORY_SAMPLES, self.rate_hz());
         for (c, hist) in self.hist.iter_mut().enumerate() {
             hist.extend(
                 pcm.iter()
@@ -326,8 +400,8 @@ impl PlcState {
                     .step_by(channels)
                     .map(|&s| f32::from(s) / 32768.0),
             );
-            if hist.len() > PLC_HISTORY_SAMPLES {
-                hist.drain(..hist.len() - PLC_HISTORY_SAMPLES);
+            if hist.len() > cap {
+                hist.drain(..hist.len() - cap);
             }
         }
         self.consecutive_losses = 0;
@@ -372,14 +446,15 @@ impl PlcState {
         let gain_start = loss_gain(k);
         let gain_end = loss_gain(k + 1);
 
-        let total = per_channel + PLC_CROSS_LAP_SAMPLES;
+        let rate = self.rate_hz();
+        let total = per_channel + scale(PLC_CROSS_LAP_SAMPLES, rate).max(1);
         let mut pcm = vec![0i16; per_channel * channels];
         let mut tails: Vec<Vec<f32>> = Vec::with_capacity(channels);
         for c in 0..channels {
             let hist = &self.hist[c];
             let ext = match flavor {
-                PlcFlavor::Silk => conceal_silk(hist, total, gain_start, gain_end),
-                PlcFlavor::Celt => conceal_celt(hist, total, gain_start, gain_end),
+                PlcFlavor::Silk => conceal_silk_at(hist, total, gain_start, gain_end, rate),
+                PlcFlavor::Celt => conceal_celt_at(hist, total, gain_start, gain_end, rate),
             };
             for (i, &v) in ext[..per_channel].iter().enumerate() {
                 pcm[i * channels + c] = (v.clamp(-1.0, 1.0) * 32767.0).round() as i16;
@@ -387,8 +462,9 @@ impl PlcState {
             tails.push(ext[per_channel..].to_vec());
             let hist = &mut self.hist[c];
             hist.extend_from_slice(&ext[..per_channel]);
-            if hist.len() > PLC_HISTORY_SAMPLES {
-                hist.drain(..hist.len() - PLC_HISTORY_SAMPLES);
+            let cap = scale(PLC_HISTORY_SAMPLES, rate);
+            if hist.len() > cap {
+                hist.drain(..hist.len() - cap);
             }
         }
         self.tail = Some(tails);
@@ -411,6 +487,49 @@ mod tests {
         (0..n)
             .map(|i| amp * (core::f32::consts::TAU * i as f32 / period).sin())
             .collect()
+    }
+
+    #[test]
+    fn reduced_rate_state_continues_a_period_on_its_own_timeline() {
+        // A 160-sample period at 48 kHz is ~26.7 samples at 8 kHz —
+        // outside an unscaled 15..=1022 lag floor's useful range for
+        // short histories, but comfortably inside the rescaled one.
+        // Plant a 27-sample period directly on the 8 kHz timeline and
+        // require the concealment to continue it.
+        let hist = sine(800, 27.0, 0.5);
+        let mut st = PlcState::with_rate(8_000);
+        assert_eq!(st.rate_hz(), 8_000);
+        let interleaved: Vec<i16> = hist
+            .iter()
+            .map(|&v| (v * 32768.0).clamp(-32768.0, 32767.0) as i16)
+            .collect();
+        st.feed_decoded(&interleaved, 1);
+        let out = st.conceal(160, 1, PlcFlavor::Celt);
+        let expected: Vec<f32> = (0..160)
+            .map(|i| 0.5 * (core::f32::consts::TAU * (800 + i) as f32 / 27.0).sin())
+            .collect();
+        let mut err = 0.0f64;
+        let mut sig = 0.0f64;
+        for (o, e) in out.iter().zip(&expected) {
+            let ov = f64::from(*o) / 32768.0;
+            sig += f64::from(*e) * f64::from(*e);
+            err += (ov - f64::from(*e)) * (ov - f64::from(*e));
+        }
+        let snr = 10.0 * (sig / err.max(1e-12)).log10();
+        assert!(snr > 10.0, "8 kHz concealment SNR {snr:.1} dB");
+    }
+
+    #[test]
+    fn reduced_rate_reset_keeps_the_rate_and_scaled_history_cap() {
+        let mut st = PlcState::with_rate(12_000);
+        st.reset();
+        assert_eq!(st.rate_hz(), 12_000);
+        // Feed 400 ms of audio at 12 kHz: the kept history must cap at
+        // the 100 ms duration (1200 samples), not the 48 kHz count.
+        let pcm = vec![100i16; 4800];
+        st.feed_decoded(&pcm, 1);
+        let out = st.conceal(120, 1, PlcFlavor::Celt);
+        assert_eq!(out.len(), 120);
     }
 
     #[test]

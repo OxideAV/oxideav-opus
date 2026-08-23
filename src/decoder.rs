@@ -400,6 +400,7 @@ impl OpusDecoder {
         }
         Some(Self {
             output_rate_hz,
+            plc: crate::plc::PlcState::with_rate(output_rate_hz),
             ..Self::default()
         })
     }
@@ -433,6 +434,7 @@ impl OpusDecoder {
     pub fn reset(&mut self) {
         *self = Self {
             output_rate_hz: self.output_rate_hz,
+            plc: crate::plc::PlcState::with_rate(self.output_rate_hz()),
             ..Self::default()
         };
     }
