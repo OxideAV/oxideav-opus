@@ -808,6 +808,7 @@ pub mod range_decoder;
 pub mod range_encoder;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod redundancy_decode_params;
+pub mod registry;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_decode;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
@@ -1038,6 +1039,7 @@ pub use redundancy_decode_params::{
     apply_mb_to_wb_override, redundant_frame_params, CrossLapPlacement, RedundantFrameParams,
     REDUNDANT_CROSS_LAP_TENTHS_MS, REDUNDANT_FRAME_TENTHS_MS,
 };
+pub use registry::{make_decoder, make_encoder, OpusStreamDecoder, OpusStreamEncoder};
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_decode::{
     decode_silk_frame, encode_silk_frame, SilkFrameConfig, SilkFrameDecoded, SilkFrameSymbols,
@@ -1130,12 +1132,14 @@ pub use toc::{Bandwidth, ChannelMapping, FrameCountCode, Mode, OpusTocByte};
 /// so truncations (`"Opus"`, `"OpusHea"`) and the sibling comment
 /// header signature (`"OpusTags"`, RFC 7845 §5.2) do not resolve.
 ///
-/// Registry-level decoder/encoder factories are not wired yet — the
-/// crate's working entry points are the direct APIs
-/// ([`decoder::OpusDecoder`], [`multistream::MultistreamDecoder`], and
-/// the packet encoders) — so this registration carries capability
-/// metadata and the magic claim only (a tag-only registration in
-/// registry terms).
+/// The registration also wires the working decoder/encoder factories
+/// ([`registry::make_decoder`] / [`registry::make_encoder`]), so
+/// registry resolution (`CodecRegistry::first_decoder` and friends)
+/// constructs a real [`registry::OpusStreamDecoder`] /
+/// [`registry::OpusStreamEncoder`] honouring the stream's
+/// [`oxideav_core::CodecParameters`] (extradata `OpusHead`, channel
+/// count, bit rate). The same factory functions remain directly
+/// callable without a registry — the crate's dual-API convention.
 pub fn register(ctx: &mut RuntimeContext) {
     let mut caps = oxideav_core::CodecCapabilities::audio("opus_sw");
     caps.lossy = true;
@@ -1145,6 +1149,8 @@ pub fn register(ctx: &mut RuntimeContext) {
     ctx.codecs.register(
         oxideav_core::CodecInfo::new(oxideav_core::CodecId::new("opus"))
             .capabilities(caps)
+            .decoder(registry::make_decoder)
+            .encoder(registry::make_encoder)
             .payload_magic(opus_head::OPUS_HEAD_MAGIC.as_slice()),
     );
 }

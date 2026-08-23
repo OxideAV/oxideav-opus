@@ -4,6 +4,29 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Registry decoder/encoder factories** (round 450): `register(ctx)`
+  is no longer a tag-only registration — it wires working
+  `oxideav_core::DecoderFactory` / `EncoderFactory` functions
+  (`registry::make_decoder` / `registry::make_encoder`, also exported
+  at the crate root per the dual-API convention) so registry
+  resolution constructs a real decoder/encoder honouring the stream's
+  `CodecParameters`. The decode adapter (`OpusStreamDecoder`) reads
+  the RFC 7845 §5.1 `OpusHead` from `extradata` when present
+  (channel count, §5.1.1 mapping → multistream assembly, pre-skip,
+  output gain — all applied inside the adapter), falls back to the
+  parameter channel count for raw streams, remixes each packet's
+  coded channel count onto the fixed output layout (mono↔stereo),
+  and conceals zero-length payloads per §4.4. The encode adapter
+  (`OpusStreamEncoder`) re-blocks 48 kHz S16 input into 20 ms Opus
+  frames on the CELT-only fullband VBR arm at the requested
+  `bit_rate` and publishes a composed `OpusHead` in
+  `output_params().extradata`. `tests/registry_resolution.rs` now
+  resolves the codec through a `RuntimeContext` registry and gates:
+  the NB-mono and WB-stereo SILK fixtures at the ≥100 dB reference
+  floor (bit-exact), the FB-stereo CELT fixture and the 5.1
+  multistream fixture at their established gates, and an
+  encode→decode roundtrip where both engines are registry-resolved.
+
 - **§2.1.9 DTX reference-stream gate** (round 448): the crate now
   ships a 6.8 KB packet capture produced by the §A reference
   listing's demo program with DTX enabled (401 packets, 273 1-byte
