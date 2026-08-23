@@ -1,8 +1,9 @@
 //! Top-level Opus packet → PCM orchestration — RFC 6716 §3 / §4.
 //!
 //! This module is the keystone that turns a raw Opus packet (a TOC byte
-//! plus one or more §3.2-packed Opus frames) into interleaved 48 kHz PCM
-//! samples. It sits above every per-stage SILK / CELT decoder in the
+//! plus one or more §3.2-packed Opus frames) into interleaved PCM
+//! samples at the decoder's configured output rate (48 kHz by default;
+//! any §4.2.9 supported rate via [`OpusDecoder::with_output_rate`]). It sits above every per-stage SILK / CELT decoder in the
 //! crate and wires the §3.1 TOC parse, the §3.2 frame packing
 //! ([`crate::frames::OpusPacket`]), and the §4.2 / §4.3 per-frame mode
 //! dispatch ([`crate::framing::OpusFrameRouting`]) into one
@@ -16,12 +17,13 @@
 //!   output, so a 60 ms code-3 packet of three 20 ms frames yields one
 //!   contiguous PCM buffer.
 //! * The §3.2.1 DTX / lost-frame marker handling: a zero-length frame
-//!   slice contributes one Opus-frame worth of silence (the §4.6 PLC
-//!   "fill with silence" floor — a real concealment model is a separate
-//!   milestone).
-//! * The 48 kHz output sample-count accounting (RFC 7845 §5.1: the Opus
-//!   decoder always emits 48 kHz regardless of the internal SILK / CELT
-//!   sample rate).
+//!   slice runs the §4.4 concealment hold (RFC 7845 §4.1).
+//! * The output sample-count accounting: 48 kHz per RFC 7845 §5.1 by
+//!   default, or the §4.2.9 "sample rate desired by the application"
+//!   when constructed with [`OpusDecoder::with_output_rate`] (the SILK
+//!   layer resamples internal → output directly; the CELT layer bounds
+//!   its spectrum at the output Nyquist and decimates the de-emphasized
+//!   48 kHz-grid signal).
 //! * The per-frame routing seam: each Opus frame is dispatched to
 //!   [`Self::decode_silk_only_frame`], [`Self::decode_celt_only_frame`],
 //!   or [`Self::decode_hybrid_frame`] based on its [`OpusFrameRouting`].
@@ -81,9 +83,10 @@ use crate::framing::{OperatingMode, OpusFrameRouting};
 use crate::toc::ChannelMapping;
 use crate::Error;
 
-/// Output sample rate of the Opus decoder, in Hz. Per RFC 7845 §5.1 the
-/// decoder always emits 48 kHz regardless of the internal SILK / CELT
-/// sample rate; the per-layer resamplers upsample to this rate.
+/// Default output sample rate of the Opus decoder, in Hz (RFC 7845
+/// §5.1's canonical rate; also the CELT layer's MDCT grid). A decoder
+/// built with [`OpusDecoder::with_output_rate`] emits any §4.2.9
+/// supported rate instead.
 pub const OUTPUT_SAMPLE_RATE_HZ: u32 = 48_000;
 
 /// Output samples per millisecond per channel at [`OUTPUT_SAMPLE_RATE_HZ`].
@@ -203,8 +206,8 @@ pub struct DecodedAudio {
 }
 
 impl DecodedAudio {
-    /// Total per-channel 48 kHz sample count across every Opus frame in
-    /// the packet.
+    /// Total per-channel sample count (at [`Self::sample_rate_hz`])
+    /// across every Opus frame in the packet.
     pub fn samples_per_channel(&self) -> usize {
         self.pcm.len() / self.channels.max(1) as usize
     }
