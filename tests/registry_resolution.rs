@@ -343,3 +343,47 @@ fn registry_resolved_encoder_roundtrips_through_resolved_decoder() {
     assert_eq!(decoded, samples - 120);
     assert!(energy > 0.0);
 }
+
+#[test]
+fn registry_resolved_decoder_honours_a_reduced_sample_rate() {
+    // `CodecParameters::sample_rate = 8000` must route the resolved
+    // decoder through the reduced-rate decode surface. The NB SILK
+    // fixture decodes BIT-EXACTLY against the reference listing
+    // decoder's own 8 kHz decode (shipped fixture), so the adapter's
+    // output must equal that reference minus the rescaled RFC 7845
+    // §5.1 pre-skip (48 kHz pre-skip × 8/48, exactly divisible here).
+    let stream = include_bytes!("fixtures/silk-nb-mono-16kbps.opus");
+    let expected_full = {
+        let raw = include_bytes!("fixtures/silk-nb-mono-16kbps.expected8000.pcm");
+        raw.chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect::<Vec<i16>>()
+    };
+    let ctx = registered_context();
+    let packets = ogg_packets(stream);
+    let head = &packets[0];
+    let pre_skip_48k = u16::from_le_bytes([head[10], head[11]]) as usize;
+    let pre_skip_8k = pre_skip_48k * 8_000 / 48_000;
+    assert_eq!(pre_skip_8k * 48_000, pre_skip_48k * 8_000, "exact rescale");
+
+    let mut params = CodecParameters::audio(CodecId::new("opus"));
+    params.extradata = head.clone();
+    params.sample_rate = Some(8_000);
+    let mut dec = ctx.codecs.first_decoder(&params).expect("resolve decoder");
+    let mut pcm: Vec<i16> = Vec::new();
+    for pk in &packets[2..] {
+        dec.send_packet(&core_packet(pk)).expect("decode");
+        while let Ok(Frame::Audio(f)) = dec.receive_frame() {
+            pcm.extend(
+                f.data[0]
+                    .chunks_exact(2)
+                    .map(|b| i16::from_le_bytes([b[0], b[1]])),
+            );
+        }
+    }
+    assert_eq!(
+        pcm,
+        expected_full[pre_skip_8k..],
+        "bit-exact 8 kHz registry decode"
+    );
+}

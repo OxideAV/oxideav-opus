@@ -302,3 +302,66 @@ fn conceal_loss_runs_at_the_configured_rate() {
     assert_eq!(concealed.sample_rate_hz, 12_000);
     assert_eq!(concealed.pcm.len(), per_frame * first.channels as usize);
 }
+
+// ───────────────────────── multistream ─────────────────────────
+
+#[test]
+fn multistream_51_at_24k_assembles_on_the_reduced_timeline() {
+    use oxideav_opus::multistream::MultistreamDecoder;
+    use oxideav_opus::opus_head::OpusHead;
+
+    let stream = include_bytes!("fixtures/multistream-5.1.opus");
+    let packets = ogg_packets(stream);
+    let head = OpusHead::parse(&packets[0]).expect("OpusHead");
+    let mut dec =
+        MultistreamDecoder::from_head_with_output_rate(&head, 24_000).expect("supported rate");
+    assert_eq!(dec.output_rate_hz(), 24_000);
+
+    // Reference timeline: the 48 kHz decode of the same stream.
+    let mut dec48 = MultistreamDecoder::from_head(&head);
+    let mut samples_24k = 0usize;
+    let mut samples_48k = 0usize;
+    let mut energy = 0f64;
+    for pk in &packets[2..] {
+        let out = dec.decode_packet(pk).expect("24 kHz decode");
+        assert_eq!(out.sample_rate_hz, 24_000);
+        assert_eq!(out.channels, 6);
+        samples_24k += out.samples_per_channel;
+        for &s in &out.pcm {
+            energy += f64::from(s) * f64::from(s);
+        }
+        samples_48k += dec48
+            .decode_packet(pk)
+            .expect("48 kHz decode")
+            .samples_per_channel;
+    }
+    // Exact ÷2 sample accounting against the 48 kHz decode, and real
+    // audio on the reduced timeline.
+    assert_eq!(samples_24k * 2, samples_48k);
+    assert!(energy > 0.0);
+}
+
+#[test]
+fn multistream_n1_at_12k_matches_the_plain_decoder() {
+    use oxideav_opus::multistream::MultistreamDecoder;
+    use oxideav_opus::opus_head::ChannelMappingTable;
+
+    // A family-0 style single-stream mono table: the N=1 multistream
+    // decode at a reduced rate must be byte-identical to a plain
+    // reduced-rate decoder on the same packets.
+    let stream = include_bytes!("fixtures/silk-nb-mono-16kbps.opus");
+    let packets = ogg_packets(stream);
+    let mapping = ChannelMappingTable {
+        stream_count: 1,
+        coupled_count: 0,
+        mapping: vec![0],
+    };
+    let mut ms = MultistreamDecoder::with_output_rate(mapping, 12_000).expect("rate");
+    let mut plain = OpusDecoder::with_output_rate(12_000).expect("rate");
+    for pk in &packets[2..] {
+        let a = ms.decode_packet(pk).expect("multistream");
+        let b = plain.decode_packet(pk).expect("plain");
+        assert_eq!(a.sample_rate_hz, 12_000);
+        assert_eq!(a.pcm, b.pcm);
+    }
+}

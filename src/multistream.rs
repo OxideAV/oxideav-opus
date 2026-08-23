@@ -201,17 +201,44 @@ pub struct MultistreamDecoder {
 }
 
 impl MultistreamDecoder {
-    /// Build a decoder for the given §5.1.1 channel-mapping table.
+    /// Build a decoder for the given §5.1.1 channel-mapping table,
+    /// producing 48 kHz output.
     pub fn new(mapping: ChannelMappingTable) -> Self {
+        Self::with_output_rate(mapping, crate::decoder::OUTPUT_SAMPLE_RATE_HZ)
+            .expect("48 kHz is always supported")
+    }
+
+    /// Build a decoder for the given mapping table at any §4.2.9
+    /// supported output rate (8 / 12 / 16 / 24 / 48 kHz): every
+    /// sub-stream decoder runs at the reduced rate (RFC 6716 §4.2.9 /
+    /// the reduced-rate CELT construction), so the assembled
+    /// `C`-channel output shares one output-rate timeline. Returns
+    /// `None` for an unsupported rate.
+    pub fn with_output_rate(mapping: ChannelMappingTable, output_rate_hz: u32) -> Option<Self> {
         let n = mapping.stream_count as usize;
-        let decoders = (0..n).map(|_| crate::decoder::OpusDecoder::new()).collect();
-        MultistreamDecoder { mapping, decoders }
+        let decoders = (0..n)
+            .map(|_| crate::decoder::OpusDecoder::with_output_rate(output_rate_hz))
+            .collect::<Option<Vec<_>>>()?;
+        Some(MultistreamDecoder { mapping, decoders })
     }
 
     /// Build a multistream decoder straight from a parsed
     /// [`OpusHead`] identification header.
     pub fn from_head(head: &OpusHead) -> Self {
         Self::new(head.mapping.clone())
+    }
+
+    /// [`Self::from_head`] at a reduced output rate.
+    pub fn from_head_with_output_rate(head: &OpusHead, output_rate_hz: u32) -> Option<Self> {
+        Self::with_output_rate(head.mapping.clone(), output_rate_hz)
+    }
+
+    /// The output sample rate in Hz this decoder produces.
+    pub fn output_rate_hz(&self) -> u32 {
+        self.decoders
+            .first()
+            .map(|d| d.output_rate_hz())
+            .unwrap_or(crate::decoder::OUTPUT_SAMPLE_RATE_HZ)
     }
 
     /// The §5.1.1 channel-mapping table this decoder was built with.
@@ -314,7 +341,7 @@ impl MultistreamDecoder {
         Ok(MultistreamAudio {
             pcm: out,
             channels: self.mapping.output_channels(),
-            sample_rate_hz: crate::decoder::OUTPUT_SAMPLE_RATE_HZ,
+            sample_rate_hz: self.output_rate_hz(),
             samples_per_channel,
         })
     }
@@ -329,7 +356,8 @@ pub struct MultistreamAudio {
     pub pcm: Vec<i16>,
     /// Output channel count `C`.
     pub channels: u8,
-    /// Output sample rate (always 48 kHz).
+    /// Output sample rate in Hz (48 kHz unless the decoder was built
+    /// with [`MultistreamDecoder::with_output_rate`]).
     pub sample_rate_hz: u32,
     /// Per-channel 48 kHz sample count.
     pub samples_per_channel: usize,

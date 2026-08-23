@@ -14,9 +14,12 @@
 //!   streams decode through [`crate::multistream::MultistreamDecoder`]),
 //!   the pre-skip, and the §5.1 output gain; without extradata the
 //!   parameter channel count (default: stereo) selects a plain 1-/2-
-//!   channel [`crate::decoder::OpusDecoder`]. A zero-length packet
-//!   payload is treated as a lost packet and concealed per RFC 6716
-//!   §4.4 ([`crate::decoder::OpusDecoder::conceal_loss`]).
+//!   channel [`crate::decoder::OpusDecoder`]. `sample_rate` selects
+//!   any §4.2.9 supported output rate (8 / 12 / 16 / 24 / 48 kHz —
+//!   the reduced-rate decode surface, pre-skip rescaled to the
+//!   output-rate timeline). A zero-length packet payload is treated
+//!   as a lost packet and concealed per RFC 6716 §4.4
+//!   ([`crate::decoder::OpusDecoder::conceal_loss`]).
 //! * **Encode** ([`OpusStreamEncoder`]): 48 kHz interleaved S16 input
 //!   frames are re-blocked into 20 ms Opus frames and encoded through
 //!   the CELT-only fullband VBR arm ([`crate::vbr::CeltVbrEncoder`])
@@ -86,12 +89,11 @@ pub struct OpusStreamDecoder {
 
 impl OpusStreamDecoder {
     fn from_params(params: &CodecParameters) -> oxideav_core::Result<Self> {
-        if let Some(rate) = params.sample_rate {
-            if rate != OUTPUT_SAMPLE_RATE_HZ {
-                return Err(oxideav_core::Error::unsupported(format!(
-                    "opus: unsupported output sample rate {rate} Hz (48000 required)"
-                )));
-            }
+        let rate = params.sample_rate.unwrap_or(OUTPUT_SAMPLE_RATE_HZ);
+        if !crate::silk_resampler::is_supported_output_rate(rate) {
+            return Err(oxideav_core::Error::unsupported(format!(
+                "opus: unsupported output sample rate {rate} Hz                  (8000 / 12000 / 16000 / 24000 / 48000)"
+            )));
         }
         match params.sample_format {
             None | Some(SampleFormat::S16) => {}
@@ -118,16 +120,26 @@ impl OpusStreamDecoder {
                 }
             }
             channels = head.channel_count;
-            pre_skip = PreSkip::from_head(&head);
+            // RFC 7845 §5.1 pre-skip counts 48 kHz samples; at a
+            // reduced output rate the discarded interval is the same
+            // duration, rounded up to whole output samples.
+            let pre_skip_scaled = (u64::from(head.pre_skip) * u64::from(rate))
+                .div_ceil(u64::from(OUTPUT_SAMPLE_RATE_HZ));
+            pre_skip = PreSkip::new(pre_skip_scaled as u16);
             gain_q7_8 = head.output_gain_q7_8;
             // A single family-0/1 stream with ≤ 2 channels decodes
             // through the plain packet decoder (identical output, no
             // §3 self-delimited split); anything mapped goes through
             // the multistream assembly.
             engine = if head.mapping.stream_count == 1 && head.channel_count <= 2 {
-                DecodeEngine::Single(Box::new(OpusDecoder::new()))
+                DecodeEngine::Single(Box::new(
+                    OpusDecoder::with_output_rate(rate).expect("rate validated above"),
+                ))
             } else {
-                DecodeEngine::Multi(MultistreamDecoder::from_head(&head))
+                DecodeEngine::Multi(
+                    MultistreamDecoder::from_head_with_output_rate(&head, rate)
+                        .expect("rate validated above"),
+                )
             };
         } else {
             let c = params.channels.unwrap_or(2);
@@ -139,7 +151,9 @@ impl OpusStreamDecoder {
             channels = c as u8;
             pre_skip = PreSkip::new(0);
             gain_q7_8 = 0;
-            engine = DecodeEngine::Single(Box::new(OpusDecoder::new()));
+            engine = DecodeEngine::Single(Box::new(
+                OpusDecoder::with_output_rate(rate).expect("rate validated above"),
+            ));
         }
 
         Ok(Self {

@@ -4,6 +4,18 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Multistream + registry at reduced rates** (round 450):
+  `MultistreamDecoder::with_output_rate` /
+  `from_head_with_output_rate` run every §5.1.1 sub-stream decoder on
+  one reduced-rate timeline (the N=1 decode stays byte-identical to a
+  plain reduced-rate decoder; the 5.1 fixture assembles with exact ÷2
+  sample accounting at 24 kHz), and the registry decode adapter now
+  honours `CodecParameters::sample_rate` for all five §4.2.9 rates,
+  rescaling the RFC 7845 §5.1 pre-skip onto the output-rate timeline
+  — a registry-resolved 8 kHz decode of the NB SILK fixture is
+  **bit-exact** against the reference listing decoder's own 8 kHz
+  decode.
+
 - **Reduced-output-rate decode** (round 450):
   `OpusDecoder::with_output_rate(rate)` decodes any stream at any
   §4.2.9 supported output rate (8 / 12 / 16 / 24 / 48 kHz) — "the
