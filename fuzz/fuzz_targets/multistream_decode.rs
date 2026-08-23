@@ -26,7 +26,12 @@ fuzz_target!(|data: &[u8]| {
     let Ok(head) = OpusHead::parse(head_bytes) else {
         return;
     };
-    let mut dec = MultistreamDecoder::new(head.mapping);
+    // The first byte also selects the assembly's output rate, so the
+    // reduced-rate multistream timeline is fuzzed too.
+    const RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
+    let rate = RATES[(data[0] % 5) as usize];
+    let mut dec =
+        MultistreamDecoder::with_output_rate(head.mapping, rate).expect("supported rate");
     if body.is_empty() {
         let _ = dec.decode_packet(body);
         return;

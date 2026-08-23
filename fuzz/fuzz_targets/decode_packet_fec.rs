@@ -17,11 +17,17 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_opus::decoder::OpusDecoder;
 
+/// §4.2.9 supported output rates the harness cycles through, so the
+/// reduced-rate FEC recovery path (fresh direct-to-rate resamplers)
+/// is fuzzed alongside the 48 kHz one.
+const RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
+
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
     }
-    let mut dec = OpusDecoder::new();
+    let rate = RATES[(data[0] % 5) as usize];
+    let mut dec = OpusDecoder::with_output_rate(rate).expect("supported rate");
     // Split: first half warms the decoder as a "previous packet", the
     // whole input then plays the "next received packet" the FEC
     // recovery is invoked on, followed by its regular decode (the real
