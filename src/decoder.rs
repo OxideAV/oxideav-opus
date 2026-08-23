@@ -188,13 +188,14 @@ pub struct FrameOutcome {
 /// per-frame outcomes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedAudio {
-    /// Interleaved signed 16-bit PCM at 48 kHz. For stereo the layout is
-    /// `[L0, R0, L1, R1, …]`; for mono it is `[S0, S1, …]`. Length is
-    /// `total_samples_per_channel * channels`.
+    /// Interleaved signed 16-bit PCM at [`Self::sample_rate_hz`]. For
+    /// stereo the layout is `[L0, R0, L1, R1, …]`; for mono it is
+    /// `[S0, S1, …]`. Length is `total_samples_per_channel * channels`.
     pub pcm: Vec<i16>,
     /// Number of audio channels (1 for mono, 2 for stereo).
     pub channels: u8,
-    /// Output sample rate in Hz (always [`OUTPUT_SAMPLE_RATE_HZ`]).
+    /// Output sample rate in Hz ([`OUTPUT_SAMPLE_RATE_HZ`] unless the
+    /// decoder was built with [`OpusDecoder::with_output_rate`]).
     pub sample_rate_hz: u32,
     /// Per-Opus-frame outcomes, in packet order. `outcomes.len()` equals
     /// the packet's §3.2 frame count.
@@ -243,12 +244,14 @@ pub enum FecDecodeStatus {
 /// ([`OpusDecoder::decode_packet_fec`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FecRecovered {
-    /// Interleaved signed 16-bit PCM at 48 kHz, same layout as
-    /// [`DecodedAudio::pcm`]. Length is `samples_per_channel * channels`.
+    /// Interleaved signed 16-bit PCM at [`Self::sample_rate_hz`], same
+    /// layout as [`DecodedAudio::pcm`]. Length is
+    /// `samples_per_channel * channels`.
     pub pcm: Vec<i16>,
     /// Number of audio channels (1 for mono, 2 for stereo).
     pub channels: u8,
-    /// Output sample rate in Hz (always [`OUTPUT_SAMPLE_RATE_HZ`]).
+    /// Output sample rate in Hz ([`OUTPUT_SAMPLE_RATE_HZ`] unless the
+    /// decoder was built with [`OpusDecoder::with_output_rate`]).
     pub sample_rate_hz: u32,
     /// Why the samples were produced (real recovery vs silence and why).
     pub status: FecDecodeStatus,
@@ -364,20 +367,74 @@ pub struct OpusDecoder {
     /// recently decoded packet — the duration [`Self::conceal_loss`]
     /// conceals when the lost packet's own duration is unknown.
     last_frame_tenths_ms: Option<u16>,
+    /// Output sample rate in Hz (one of [`crate::silk_resampler::SUPPORTED_OUTPUT_RATES_HZ`]).
+    /// `0` is the derived-`Default` placeholder and reads as 48 kHz —
+    /// use [`Self::output_rate_hz`], never the field.
+    output_rate_hz: u32,
 }
 
 impl OpusDecoder {
     /// Construct a fresh decoder with no carried state (equivalent to the
-    /// post-`reset` state of §4.5.2).
+    /// post-`reset` state of §4.5.2), producing 48 kHz output.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Construct a decoder that outputs at `output_rate_hz` — any of
+    /// the §4.2.9 supported rates (8 / 12 / 16 / 24 / 48 kHz), the
+    /// "sample rate desired by the application". Returns `None` for an
+    /// unsupported rate.
+    ///
+    /// At a reduced rate the SILK layer resamples internal → output
+    /// directly through the full §4.2.9 decoder-side filter matrix
+    /// (bit-exact against the reference resampler), and the CELT layer
+    /// zeroes the spectrum above the output Nyquist
+    /// (`bound = N/downsample` bins) before the inverse MDCT, then
+    /// decimates the de-emphasized 48 kHz-grid signal — the exact
+    /// reduced-rate structure of the §A reference listing's decoder,
+    /// so reduced-rate decodes track the reference decode at the same
+    /// agreement floors as 48 kHz ones.
+    pub fn with_output_rate(output_rate_hz: u32) -> Option<Self> {
+        if !crate::silk_resampler::is_supported_output_rate(output_rate_hz) {
+            return None;
+        }
+        Some(Self {
+            output_rate_hz,
+            ..Self::default()
+        })
+    }
+
+    /// The output sample rate in Hz this decoder produces.
+    pub fn output_rate_hz(&self) -> u32 {
+        if self.output_rate_hz == 0 {
+            OUTPUT_SAMPLE_RATE_HZ
+        } else {
+            self.output_rate_hz
+        }
+    }
+
+    /// The 48 kHz-grid decimation factor of the CELT path
+    /// (48000 / output rate ∈ {1, 2, 3, 4, 6}).
+    fn downsample(&self) -> usize {
+        (OUTPUT_SAMPLE_RATE_HZ / self.output_rate_hz()) as usize
+    }
+
+    /// Output samples per channel an Opus frame of `tenths` (§3.1
+    /// Table 2 tenths of a millisecond) produces at this decoder's
+    /// output rate. Exact for every duration × supported rate.
+    fn out_samples(&self, tenths: u16) -> usize {
+        output_samples_per_channel(tenths) / self.downsample()
+    }
+
     /// Discard all inter-frame state, as after a container seek (the
     /// §4.5.2 decoder reset). Leaves the decoder ready to decode a new
-    /// bitstream position as if it were the first packet.
+    /// bitstream position as if it were the first packet; the
+    /// configured output rate is kept.
     pub fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            output_rate_hz: self.output_rate_hz,
+            ..Self::default()
+        };
     }
 
     /// Decode one complete Opus packet into interleaved 48 kHz PCM.
@@ -409,7 +466,7 @@ impl OpusDecoder {
     fn decode_parsed_packet(&mut self, parsed: OpusPacket<'_>) -> Result<DecodedAudio, Error> {
         let routing = OpusFrameRouting::from_toc(parsed.toc);
         let channels = routing.channel_count();
-        let per_frame_samples = output_samples_per_channel(routing.frame_size_tenths_ms);
+        let per_frame_samples = self.out_samples(routing.frame_size_tenths_ms);
 
         // §4.5.2 state resets at the Opus-packet boundary, using the
         // recorded previous operating mode and the §4.5.1 redundancy
@@ -529,7 +586,7 @@ impl OpusDecoder {
         Ok(DecodedAudio {
             pcm,
             channels,
-            sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
+            sample_rate_hz: self.output_rate_hz(),
             frame_outcomes,
         })
     }
@@ -560,7 +617,7 @@ impl OpusDecoder {
     /// treatment or carry §4.5.1 redundancy).
     pub fn conceal_loss(&mut self) -> DecodedAudio {
         let tenths = self.last_frame_tenths_ms.unwrap_or(200);
-        let per_channel = output_samples_per_channel(tenths);
+        let per_channel = self.out_samples(tenths);
         let channels = self.last_channels.unwrap_or(1);
         let flavor = match self.prev_mode {
             Some(OperatingMode::CeltOnly) => crate::plc::PlcFlavor::Celt,
@@ -570,7 +627,7 @@ impl OpusDecoder {
         DecodedAudio {
             pcm,
             channels,
-            sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
+            sample_rate_hz: self.output_rate_hz(),
             frame_outcomes: vec![FrameOutcome {
                 samples_per_channel: per_channel,
                 status: FrameDecodeStatus::Concealed,
@@ -586,7 +643,7 @@ impl OpusDecoder {
         routing: &OpusFrameRouting,
         pcm: &mut Vec<i16>,
     ) -> FrameOutcome {
-        let per_channel = output_samples_per_channel(routing.frame_size_tenths_ms);
+        let per_channel = self.out_samples(routing.frame_size_tenths_ms);
         let channels = routing.channel_count();
 
         // §4.5.1 bookkeeping: only SILK-only / Hybrid frames can carry
@@ -662,7 +719,7 @@ impl OpusDecoder {
         routing: &OpusFrameRouting,
         pcm: &mut Vec<i16>,
     ) -> FrameOutcome {
-        let per_channel = output_samples_per_channel(routing.frame_size_tenths_ms);
+        let per_channel = self.out_samples(routing.frame_size_tenths_ms);
         let channels = routing.channel_count();
         let pcm_start = pcm.len();
         push_silence(pcm, per_channel, channels);
@@ -734,6 +791,7 @@ impl OpusDecoder {
                         &red_pcm,
                         channels as usize,
                         params.position,
+                        self.downsample(),
                     );
                 }
             }
@@ -902,11 +960,15 @@ impl OpusDecoder {
         out: &mut [i16],
     ) {
         use crate::silk_resampler::SilkUpsampler;
+        let rate = self.output_rate_hz();
         let stale = !matches!(&self.silk_resamp_mono,
-            Some(up) if up.bandwidth() == bandwidth);
+            Some(up) if up.bandwidth() == bandwidth && up.output_rate_hz() == rate);
         if stale {
-            self.silk_resamp_mono =
-                SilkUpsampler::new(bandwidth, crate::silk_resampler::SilkChannelPath::Mono);
+            self.silk_resamp_mono = SilkUpsampler::new_to_rate(
+                bandwidth,
+                crate::silk_resampler::SilkChannelPath::Mono,
+                rate,
+            );
         }
         match self.silk_resamp_mono.as_mut() {
             Some(up) => resample_through_upsampler_i16(up, internal, out),
@@ -932,12 +994,13 @@ impl OpusDecoder {
         if per_channel == 0 {
             return;
         }
+        let rate = self.output_rate_hz();
         let stale = !matches!(&self.silk_resamp_stereo,
-            Some((l, _)) if l.bandwidth() == bandwidth);
+            Some((l, _)) if l.bandwidth() == bandwidth && l.output_rate_hz() == rate);
         if stale {
             let path = crate::silk_resampler::SilkChannelPath::Stereo;
-            self.silk_resamp_stereo =
-                SilkUpsampler::new(bandwidth, path).zip(SilkUpsampler::new(bandwidth, path));
+            self.silk_resamp_stereo = SilkUpsampler::new_to_rate(bandwidth, path, rate)
+                .zip(SilkUpsampler::new_to_rate(bandwidth, path, rate));
         }
         let mut l = vec![0i16; per_channel];
         let mut r = vec![0i16; per_channel];
@@ -1207,7 +1270,7 @@ impl OpusDecoder {
     ) -> FrameOutcome {
         use crate::celt_band_layout::CeltFrameSize;
 
-        let per_channel = output_samples_per_channel(routing.frame_size_tenths_ms);
+        let per_channel = self.out_samples(routing.frame_size_tenths_ms);
         let channels = routing.channel_count() as usize;
         let pcm_start = pcm.len();
         push_silence(pcm, per_channel, channels as u8);
@@ -1222,9 +1285,11 @@ impl OpusDecoder {
             return err;
         };
         let lm = celt_size.column_index() as i32;
-        let n = per_channel; // CELT-only runs at the 48 kHz output rate.
-                             // §4.4 / Table 55: the coded band range ends at the signalled
-                             // audio bandwidth (NB→13, WB→17, SWB→19, FB→21).
+        // The CELT layer always runs on the 48 kHz MDCT grid; a
+        // reduced output rate decimates AFTER de-emphasis.
+        let n = output_samples_per_channel(routing.frame_size_tenths_ms);
+        // §4.4 / Table 55: the coded band range ends at the signalled
+        // audio bandwidth (NB→13, WB→17, SWB→19, FB→21).
         let end = match routing.toc_bandwidth {
             crate::toc::Bandwidth::Nb => 13,
             crate::toc::Bandwidth::Mb | crate::toc::Bandwidth::Wb => 17,
@@ -1263,27 +1328,33 @@ impl OpusDecoder {
         }
 
         // §4.3.6 denormalisation into the frame spectrum (bins outside
-        // the coded range stay zero).
+        // the coded range stay zero). At a reduced output rate the
+        // spectrum above the output Nyquist is zeroed before the
+        // inverse MDCT: `bound = min(coded end, N/downsample)` bins.
         let m = 1usize << lm;
+        let bound = n / self.downsample();
         let mut freq = vec![0.0f64; channels * n];
         for c in 0..channels {
             for band in 0..end {
                 let gain = out.band_gain[c][band];
                 let off = m * crate::celt_rate_alloc::band_edge(band) as usize;
-                let len = m * crate::celt_rate_alloc::band_width(band) as usize;
+                let len = (m * crate::celt_rate_alloc::band_width(band) as usize)
+                    .min(bound.saturating_sub(off));
                 for j in 0..len {
                     freq[c * n + off + j] = gain * out.x[c * out.plane + off + j];
                 }
             }
         }
 
-        // §4.3.7 synthesis (signal half).
+        // §4.3.7 synthesis (signal half), then decimation onto the
+        // output-rate timeline (every `downsample`-th de-emphasized
+        // sample, phase 0 — the reference reduced-rate structure).
         let blocks = if out.transient { m } else { 1 };
         let synth = self.celt_synth.as_mut().expect("state built above");
         let mut frame_pcm = vec![0i16; channels * n];
         synth.synthesize_frame(&freq, blocks, out.post_filter, &mut frame_pcm);
         let region = &mut pcm[pcm_start..pcm_start + per_channel * channels];
-        region.copy_from_slice(&frame_pcm);
+        decimate_interleaved(&frame_pcm, region, channels, self.downsample());
 
         FrameOutcome {
             samples_per_channel: per_channel,
@@ -1332,7 +1403,7 @@ impl OpusDecoder {
         // channel count as the carrier packet's regular frames, and covers
         // the equivalent prior interval(s); the recovered duration matches
         // the carrier's per-frame duration.
-        let per_channel = output_samples_per_channel(routing.frame_size_tenths_ms);
+        let per_channel = self.out_samples(routing.frame_size_tenths_ms);
         let mut pcm = vec![0i16; per_channel * channels as usize];
 
         // FEC only exists for SILK-bearing modes (§2.1.7 re-encodes the
@@ -1344,7 +1415,7 @@ impl OpusDecoder {
             return Ok(FecRecovered {
                 pcm,
                 channels,
-                sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
+                sample_rate_hz: self.output_rate_hz(),
                 status: FecDecodeStatus::NotSilk,
             });
         }
@@ -1359,7 +1430,7 @@ impl OpusDecoder {
             return Ok(FecRecovered {
                 pcm,
                 channels,
-                sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
+                sample_rate_hz: self.output_rate_hz(),
                 status: FecDecodeStatus::DecodeError,
             });
         };
@@ -1367,7 +1438,7 @@ impl OpusDecoder {
             return Ok(FecRecovered {
                 pcm,
                 channels,
-                sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
+                sample_rate_hz: self.output_rate_hz(),
                 status: FecDecodeStatus::NoLbrr,
             });
         }
@@ -1375,7 +1446,13 @@ impl OpusDecoder {
         let status = if channels == 2 {
             match self.decode_silk_fec_stereo(frame, &routing) {
                 Ok(Some((left, right, bandwidth))) => {
-                    resample_stereo_to_output_i16(&left, &right, bandwidth, &mut pcm);
+                    resample_stereo_to_output_i16(
+                        &left,
+                        &right,
+                        bandwidth,
+                        self.output_rate_hz(),
+                        &mut pcm,
+                    );
                     FecDecodeStatus::Recovered
                 }
                 Ok(None) => FecDecodeStatus::NoLbrr,
@@ -1384,7 +1461,12 @@ impl OpusDecoder {
         } else {
             match self.decode_silk_fec_mono(frame, &routing) {
                 Ok(Some((internal, bandwidth))) => {
-                    resample_internal_to_output_i16(&internal, bandwidth, &mut pcm);
+                    resample_internal_to_output_i16(
+                        &internal,
+                        bandwidth,
+                        self.output_rate_hz(),
+                        &mut pcm,
+                    );
                     FecDecodeStatus::Recovered
                 }
                 Ok(None) => FecDecodeStatus::NoLbrr,
@@ -1403,7 +1485,7 @@ impl OpusDecoder {
         Ok(FecRecovered {
             pcm,
             channels,
-            sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
+            sample_rate_hz: self.output_rate_hz(),
             status,
         })
     }
@@ -1710,7 +1792,7 @@ impl OpusDecoder {
     ) -> FrameOutcome {
         use crate::celt_band_layout::CeltFrameSize;
 
-        let per_channel = output_samples_per_channel(routing.frame_size_tenths_ms);
+        let per_channel = self.out_samples(routing.frame_size_tenths_ms);
         let channels = routing.channel_count() as usize;
         let pcm_start = pcm.len();
         push_silence(pcm, per_channel, channels as u8);
@@ -1823,7 +1905,9 @@ impl OpusDecoder {
             };
         };
         let lm = celt_size.column_index() as i32;
-        let n = per_channel;
+        // The CELT layer runs on the 48 kHz MDCT grid; the layer sum
+        // below happens on the output-rate timeline.
+        let n = output_samples_per_channel(routing.frame_size_tenths_ms);
         let end = match routing.toc_bandwidth {
             crate::toc::Bandwidth::Swb => 19,
             _ => 21,
@@ -1866,12 +1950,14 @@ impl OpusDecoder {
         }
 
         let m = 1usize << lm;
+        let bound = n / self.downsample();
         let mut freq = vec![0.0f64; channels * n];
         for c in 0..channels {
             for band in crate::celt_band_layout::HYBRID_FIRST_CODED_BAND..end {
                 let gain = out.band_gain[c][band];
                 let off = m * crate::celt_rate_alloc::band_edge(band) as usize;
-                let len = m * crate::celt_rate_alloc::band_width(band) as usize;
+                let len = (m * crate::celt_rate_alloc::band_width(band) as usize)
+                    .min(bound.saturating_sub(off));
                 for j in 0..len {
                     freq[c * n + off + j] = gain * out.x[c * out.plane + off + j];
                 }
@@ -1882,11 +1968,17 @@ impl OpusDecoder {
         let mut celt_pcm = vec![0i16; channels * n];
         synth.synthesize_frame(&freq, blocks, out.post_filter, &mut celt_pcm);
 
-        // §4.4: the layer outputs sum (saturating at the i16 rails).
+        // §4.4: the layer outputs sum on the output-rate timeline
+        // (saturating at the i16 rails); at a reduced rate the CELT
+        // layer contributes its decimated samples.
         {
+            let ds = self.downsample();
             let region = &mut pcm[pcm_start..pcm_start + per_channel * channels];
-            for (dst, &c) in region.iter_mut().zip(celt_pcm.iter()) {
-                *dst = dst.saturating_add(c);
+            for i in 0..per_channel {
+                for c in 0..channels {
+                    let dst = &mut region[i * channels + c];
+                    *dst = dst.saturating_add(celt_pcm[i * ds * channels + c]);
+                }
             }
         }
 
@@ -1905,7 +1997,13 @@ impl OpusDecoder {
             }
         }
         if let (Some(params), Some(red)) = (&red_params, &red_pcm) {
-            apply_redundancy_cross_lap(&mut pcm[pcm_start..], red, channels, params.position);
+            apply_redundancy_cross_lap(
+                &mut pcm[pcm_start..],
+                red,
+                channels,
+                params.position,
+                self.downsample(),
+            );
         }
 
         FrameOutcome {
@@ -1980,12 +2078,14 @@ impl OpusDecoder {
         }
 
         let m = 1usize << lm;
+        let bound = n / self.downsample();
         let mut freq = vec![0.0f64; channels * n];
         for c in 0..channels {
             for band in 0..end {
                 let gain = out.band_gain[c][band];
                 let off = m * crate::celt_rate_alloc::band_edge(band) as usize;
-                let len = m * crate::celt_rate_alloc::band_width(band) as usize;
+                let len = (m * crate::celt_rate_alloc::band_width(band) as usize)
+                    .min(bound.saturating_sub(off));
                 for j in 0..len {
                     freq[c * n + off + j] = gain * out.x[c * out.plane + off + j];
                 }
@@ -1995,6 +2095,11 @@ impl OpusDecoder {
         let synth = self.celt_synth.as_mut().expect("built above");
         let mut red_pcm = vec![0i16; channels * n];
         synth.synthesize_frame(&freq, blocks, out.post_filter, &mut red_pcm);
+        if self.downsample() > 1 {
+            let mut red_out = vec![0i16; red_pcm.len() / self.downsample()];
+            decimate_interleaved(&red_pcm, &mut red_out, channels, self.downsample());
+            return Some(red_out);
+        }
         Some(red_pcm)
     }
 }
@@ -2019,10 +2124,14 @@ fn apply_redundancy_cross_lap(
     red: &[i16],
     channels: usize,
     position: crate::celt_redundancy::RedundancyPosition,
+    downsample: usize,
 ) {
     use crate::celt_mdct_window::{celt_overlap_window, CELT_OVERLAP_48K};
 
-    let lap = CELT_OVERLAP_48K; // 120 samples = 2.5 ms at 48 kHz
+    // 2.5 ms at the output rate; the power-complementary window is
+    // sampled on the 48 kHz grid at stride `downsample` (the
+    // reduced-rate cross-fade structure).
+    let lap = CELT_OVERLAP_48K / downsample.max(1);
     let half = lap * channels;
     if red.len() < 2 * half || region.len() < 2 * half || channels == 0 {
         return;
@@ -2039,7 +2148,8 @@ fn apply_redundancy_cross_lap(
             // First 2.5 ms: redundant output as-is.
             region[..half].copy_from_slice(&red[..half]);
             // Next 2.5 ms: main fades in, redundant fades out.
-            for (i, &w) in window.iter().enumerate().take(lap) {
+            for i in 0..lap {
+                let w = window[i * downsample];
                 let f = w * w;
                 for c in 0..channels {
                     let idx = half + i * channels + c;
@@ -2051,13 +2161,31 @@ fn apply_redundancy_cross_lap(
             // Last 2.5 ms: the redundant frame's second half fades in,
             // the main signal fades out.
             let base = region.len() - half;
-            for (i, &w) in window.iter().enumerate().take(lap) {
+            for i in 0..lap {
+                let w = window[i * downsample];
                 let f = w * w;
                 for c in 0..channels {
                     let idx = base + i * channels + c;
                     region[idx] = mix(red[half + i * channels + c], region[idx], f);
                 }
             }
+        }
+    }
+}
+
+/// Take every `downsample`-th per-channel sample (phase 0) of
+/// interleaved `src` into interleaved `dst` — the reduced-rate
+/// decimation of the de-emphasized 48 kHz CELT signal. `downsample`
+/// of 1 is a plain copy.
+fn decimate_interleaved(src: &[i16], dst: &mut [i16], channels: usize, downsample: usize) {
+    if downsample <= 1 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let out_per_channel = dst.len() / channels.max(1);
+    for i in 0..out_per_channel {
+        for c in 0..channels {
+            dst[i * channels + c] = src[i * downsample * channels + c];
         }
     }
 }
@@ -2224,7 +2352,7 @@ fn resample_through_upsampler_i16(
     if out.is_empty() {
         return;
     }
-    if internal.is_empty() || internal.len() * up.factor() != out.len() {
+    if internal.is_empty() || up.output_len(internal.len()) != out.len() {
         resample_linear_i16(internal, out);
         return;
     }
@@ -2266,10 +2394,11 @@ fn resample_linear_i16(internal: &[i16], out: &mut [i16]) {
 fn resample_internal_to_output_i16(
     internal: &[i16],
     bandwidth: crate::toc::Bandwidth,
+    output_rate_hz: u32,
     out: &mut [i16],
 ) {
     let path = crate::silk_resampler::SilkChannelPath::Mono;
-    match crate::silk_resampler::SilkUpsampler::new(bandwidth, path) {
+    match crate::silk_resampler::SilkUpsampler::new_to_rate(bandwidth, path, output_rate_hz) {
         Some(mut up) => resample_through_upsampler_i16(&mut up, internal, out),
         None => resample_linear_i16(internal, out),
     }
@@ -2282,6 +2411,7 @@ fn resample_stereo_to_output_i16(
     left: &[i16],
     right: &[i16],
     bandwidth: crate::toc::Bandwidth,
+    output_rate_hz: u32,
     out: &mut [i16],
 ) {
     let per_channel = out.len() / 2;
@@ -2292,9 +2422,9 @@ fn resample_stereo_to_output_i16(
     // Resample each channel into a scratch buffer, then interleave.
     let mut l = vec![0i16; per_channel];
     let mut r = vec![0i16; per_channel];
-    match crate::silk_resampler::SilkUpsampler::new(bandwidth, path)
-        .zip(crate::silk_resampler::SilkUpsampler::new(bandwidth, path))
-    {
+    match crate::silk_resampler::SilkUpsampler::new_to_rate(bandwidth, path, output_rate_hz).zip(
+        crate::silk_resampler::SilkUpsampler::new_to_rate(bandwidth, path, output_rate_hz),
+    ) {
         Some((mut ul, mut ur)) => {
             resample_through_upsampler_i16(&mut ul, left, &mut l);
             resample_through_upsampler_i16(&mut ur, right, &mut r);

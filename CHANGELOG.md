@@ -4,6 +4,29 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Reduced-output-rate decode** (round 450):
+  `OpusDecoder::with_output_rate(rate)` decodes any stream at any
+  §4.2.9 supported output rate (8 / 12 / 16 / 24 / 48 kHz) — "the
+  sample rate desired by the application". The SILK layer resamples
+  internal → output directly through the new decoder-side resampler
+  matrix; the CELT layer keeps its 48 kHz MDCT grid but zeroes the
+  spectrum above the output Nyquist (`bound = N/downsample` bins)
+  before the inverse MDCT and emits every `downsample`-th
+  de-emphasized sample (phase 0) — the §A reference listing's
+  reduced-rate construction — so the §4.4 Hybrid layer sum, the
+  §4.5.1.4 redundant-frame cross-laps (window sampled at the 48 kHz
+  grid stride), FEC recovery, DTX holds, and `conceal_loss` all live
+  on the output-rate timeline. `reset()` keeps the configured rate.
+  New `tests/downsampled_decode.rs` gates whole streams against the
+  reference listing decoder's own reduced-rate decodes (shipped as
+  `*.expected<rate>.pcm` fixtures): the SILK fixtures decode
+  **bit-exactly** at 8 kHz (pass-through NB, 2:3 MB, 1:2 WB stereo)
+  and 24 kHz (fractional upsampling); CELT-only at 88.6 dB (÷4,
+  2.5 ms stereo) and 104.0 dB (÷2, 20 ms FB stereo); Hybrid at
+  70.7 / 72.9 dB (16 / 24 kHz — the crate's established hybrid float
+  floor); and the mode-switching stream at 102.8 dB (÷2) / 102.6 dB
+  (÷6) across its §4.5 transitions.
+
 - **§4.2.9 resampler: full decoder-side rate matrix** (round 450):
   `SilkUpsampler::new_to_rate(bandwidth, path, output_rate_hz)`
   extends the reference resampler transcription from the fixed
