@@ -124,3 +124,16 @@ the §4.5 text handles without it: the Hybrid → SILK overlap flush
 PLC fill on the non-normative CELT ↔ SILK/Hybrid switches (Figure 19
 `P`). `switch-*.expected48.pcm` are the reference listing decoder's
 48 kHz decodes; they drive `tests/mode_switch_seams.rs`.
+
+## §4.4 loss-pattern captures (round 450)
+
+`loss-silkwb.bits` / `loss-celt.bits` / `loss-hybrid.bits` are
+reference-encoder streams (WB SILK 20 kb/s, FB CELT 64 kb/s, FB
+Hybrid 32 kb/s; 20 ms mono, 51 packets over a tone-mix source) with
+packets 20–21 (SILK) or packet 20 (CELT/Hybrid) replaced by
+zero-length entries — the demo capture format's lost-packet
+convention. `loss-*.expected<rate>.pcm` are the reference listing
+decoder's decodes of those captures (its own PLC across the holes).
+They drive `tests/plc_reconvergence.rs`: bit-exact/float-floor
+agreement before the loss and pinned re-convergence floors after it,
+identical at 48 kHz and 16 kHz.

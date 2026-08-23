@@ -4,6 +4,17 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Loss re-convergence gates + rate-aware fuzzing** (round 450):
+  `tests/plc_reconvergence.rs` decodes reference-encoder streams with
+  planted losses next to the reference listing decoder's own decodes:
+  concealment legitimately diverges across the hole (non-normative on
+  both sides), but the coded stream pulls the decoder back — pinned at
+  ≥15 dB (SILK) / ≥40 dB (CELT) / ≥25 dB (Hybrid) one loss-recovery
+  window out and 52 / 102 / 53 dB in the tail, byte-identical
+  behaviour at 48 kHz and 16 kHz (the concealment timeline scales
+  with the output rate). The `decode_packet` fuzz target now cycles
+  the §4.2.9 output rates from its control byte (77 k runs clean).
+
 - **§4.5 configuration-switch seams without redundancy** (round 450):
   three seam behaviours land, gated on new synthetic switch captures
   (two independent reference-encoder runs concatenated, so no packet

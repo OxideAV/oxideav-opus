@@ -18,14 +18,22 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_opus::decoder::OpusDecoder;
 
+/// §4.2.9 supported output rates the harness cycles through, so the
+/// reduced-rate surface (SILK direct-to-rate resampling, CELT
+/// Nyquist bound + decimation, seam fills on the reduced timeline) is
+/// fuzzed alongside the 48 kHz path.
+const RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
+
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
     }
-    // First byte: number of packets (1..=8) the rest is split into.
+    // First byte: low 3 bits = number of packets (1..=8) the rest is
+    // split into; next bits select the decoder output rate.
     let n = 1 + (data[0] & 7) as usize;
+    let rate = RATES[((data[0] >> 3) % 5) as usize];
     let body = &data[1..];
-    let mut dec = OpusDecoder::new();
+    let mut dec = OpusDecoder::with_output_rate(rate).expect("supported rate");
     if body.is_empty() {
         let _ = dec.decode_packet(body);
         return;
