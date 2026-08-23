@@ -37,7 +37,8 @@
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Frame, Packet, Rational, SampleFormat, TimeBase,
+    AudioFrame, CodecId, CodecParameters, Frame, OptionField, OptionKind, OptionValue, Packet,
+    Rational, SampleFormat, TimeBase,
 };
 
 use crate::decoder::{DecodedAudio, OpusDecoder, OUTPUT_SAMPLE_RATE_HZ};
@@ -309,8 +310,94 @@ pub fn make_decoder(
 
 // ─────────────────────────── encoder ───────────────────────────
 
-/// Samples per channel in one 20 ms Opus frame at 48 kHz.
-const ENCODE_FRAME_SAMPLES: usize = 960;
+/// Typed encoder options (RFC 6716 encoder-side knobs), parsed from
+/// [`CodecParameters::options`] and declared to the registry via
+/// [`oxideav_core::registry::CodecInfo::encoder_options`].
+#[derive(Debug, Clone)]
+pub struct OpusEncoderOptions {
+    /// §2.1 audio bandwidth of the CELT-only arm: `"nb"`, `"wb"`,
+    /// `"swb"`, or `"fb"` (default).
+    pub bandwidth: String,
+    /// Frame duration in milliseconds: 2.5, 5, 10, or 20 (default).
+    pub frame_ms: f32,
+    /// §2.1.8 constrained VBR (bit-reservoir discipline) instead of
+    /// unconstrained drift correction.
+    pub constrained_vbr: bool,
+    /// §2.1.9 discontinuous transmission.
+    pub dtx: bool,
+    /// §5.3.1 post-filter tapset election.
+    pub tapset_election: bool,
+    /// Complexity rung 0..=10 (`None` keeps the crate default, which
+    /// is bit-identical to rung 4).
+    pub complexity: Option<u32>,
+}
+
+impl Default for OpusEncoderOptions {
+    fn default() -> Self {
+        Self {
+            bandwidth: "fb".into(),
+            frame_ms: 20.0,
+            constrained_vbr: false,
+            dtx: false,
+            tapset_election: false,
+            complexity: None,
+        }
+    }
+}
+
+impl oxideav_core::CodecOptionsStruct for OpusEncoderOptions {
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "bandwidth",
+            kind: OptionKind::Enum(&["nb", "wb", "swb", "fb"]),
+            default: OptionValue::String(String::new()),
+            help: "audio bandwidth: nb, wb, swb, or fb (default fb)",
+        },
+        OptionField {
+            name: "frame-ms",
+            kind: OptionKind::F32,
+            default: OptionValue::F32(20.0),
+            help: "frame duration in ms: 2.5, 5, 10, or 20",
+        },
+        OptionField {
+            name: "constrained-vbr",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "constrained VBR (bit-reservoir bound) instead of unconstrained",
+        },
+        OptionField {
+            name: "dtx",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "discontinuous transmission (1-byte markers over silence)",
+        },
+        OptionField {
+            name: "tapset-election",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "elect the post-filter tapset per frame by measured SNR",
+        },
+        OptionField {
+            name: "complexity",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(4),
+            help: "complexity rung 0..=10 (default rung is bit-identical to 4)",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, value: &OptionValue) -> oxideav_core::Result<()> {
+        match key {
+            "bandwidth" => self.bandwidth = value.as_str()?.to_ascii_lowercase(),
+            "frame-ms" => self.frame_ms = value.as_f32()?,
+            "constrained-vbr" => self.constrained_vbr = value.as_bool()?,
+            "dtx" => self.dtx = value.as_bool()?,
+            "tapset-election" => self.tapset_election = value.as_bool()?,
+            "complexity" => self.complexity = Some(value.as_u32()?),
+            _ => unreachable!("guarded by SCHEMA"),
+        }
+        Ok(())
+    }
+}
 
 /// Decoder-side start-up samples the encoder's processing chain
 /// introduces (the CELT MDCT overlap latency), declared as the RFC
@@ -326,6 +413,9 @@ pub struct OpusStreamEncoder {
     enc: crate::vbr::CeltVbrEncoder,
     out_params: CodecParameters,
     channels: usize,
+    /// Samples per channel in one Opus frame (options-selected
+    /// duration at 48 kHz).
+    frame_samples: usize,
     /// Interleaved samples awaiting a full 20 ms frame.
     pending: Vec<i16>,
     /// Encoded packets not yet pulled by `receive_packet`.
@@ -359,20 +449,45 @@ impl OpusStreamEncoder {
             )));
         }
         let stereo = channels == 2;
+        let opts: OpusEncoderOptions = oxideav_core::parse_options(&params.options)?;
+        let bandwidth = match opts.bandwidth.as_str() {
+            "nb" => crate::toc::Bandwidth::Nb,
+            "wb" => crate::toc::Bandwidth::Wb,
+            "swb" => crate::toc::Bandwidth::Swb,
+            "fb" => crate::toc::Bandwidth::Fb,
+            other => {
+                return Err(oxideav_core::Error::invalid(format!(
+                    "opus encode: bandwidth '{other}' (nb / wb / swb / fb)"
+                )))
+            }
+        };
+        let frame_tenths = (opts.frame_ms * 10.0).round() as u16;
+        if !matches!(frame_tenths, 25 | 50 | 100 | 200) {
+            return Err(oxideav_core::Error::invalid(format!(
+                "opus encode: frame-ms {} (2.5 / 5 / 10 / 20)",
+                opts.frame_ms
+            )));
+        }
         // Default rate: 64 kb/s per channel, a comfortable fullband
         // music operating point for the §2.1.8 VBR controller.
         let bit_rate = params
             .bit_rate
             .unwrap_or(64_000 * channels as u64)
             .clamp(6_000, 512_000) as u32;
-        let enc = crate::vbr::CeltVbrEncoder::new(
-            crate::toc::Bandwidth::Fb,
-            200, // 20 ms frames
+        let mut enc = crate::vbr::CeltVbrEncoder::new(
+            bandwidth,
+            frame_tenths,
             stereo,
             bit_rate,
-            false,
+            opts.constrained_vbr,
         )
         .map_err(map_err)?;
+        enc.set_dtx(opts.dtx);
+        enc.set_tapset_election(opts.tapset_election);
+        if let Some(c) = opts.complexity {
+            enc.set_complexity(c.min(10) as u8);
+        }
+        let frame_samples = enc.frame_samples();
 
         let head = OpusHead {
             version: 1,
@@ -404,6 +519,7 @@ impl OpusStreamEncoder {
             enc,
             out_params,
             channels: channels as usize,
+            frame_samples,
             pending: Vec::new(),
             queue: VecDeque::new(),
             next_pts: 0,
@@ -412,7 +528,7 @@ impl OpusStreamEncoder {
     }
 
     fn encode_ready_frames(&mut self) -> oxideav_core::Result<()> {
-        let frame_len = ENCODE_FRAME_SAMPLES * self.channels;
+        let frame_len = self.frame_samples * self.channels;
         while self.pending.len() >= frame_len {
             let frame: Vec<i16> = self.pending.drain(..frame_len).collect();
             let (bytes, _info) = self.enc.encode_frame(&frame).map_err(map_err)?;
@@ -423,8 +539,8 @@ impl OpusStreamEncoder {
             );
             packet.pts = Some(self.next_pts);
             packet.dts = Some(self.next_pts);
-            packet.duration = Some(ENCODE_FRAME_SAMPLES as i64);
-            self.next_pts += ENCODE_FRAME_SAMPLES as i64;
+            packet.duration = Some(self.frame_samples as i64);
+            self.next_pts += self.frame_samples as i64;
             self.queue.push_back(packet);
         }
         Ok(())
@@ -496,7 +612,7 @@ impl oxideav_core::Encoder for OpusStreamEncoder {
                 // Zero-pad the final partial frame to a whole 20 ms
                 // packet; the container's end-trimming (RFC 7845 §4.4
                 // granule arithmetic) drops the padding on playback.
-                let frame_len = ENCODE_FRAME_SAMPLES * self.channels;
+                let frame_len = self.frame_samples * self.channels;
                 self.pending.resize(frame_len, 0);
                 self.encode_ready_frames()?;
             }

@@ -1039,7 +1039,9 @@ pub use redundancy_decode_params::{
     apply_mb_to_wb_override, redundant_frame_params, CrossLapPlacement, RedundantFrameParams,
     REDUNDANT_CROSS_LAP_TENTHS_MS, REDUNDANT_FRAME_TENTHS_MS,
 };
-pub use registry::{make_decoder, make_encoder, OpusStreamDecoder, OpusStreamEncoder};
+pub use registry::{
+    make_decoder, make_encoder, OpusEncoderOptions, OpusStreamDecoder, OpusStreamEncoder,
+};
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_decode::{
     decode_silk_frame, encode_silk_frame, SilkFrameConfig, SilkFrameDecoded, SilkFrameSymbols,
@@ -1151,6 +1153,7 @@ pub fn register(ctx: &mut RuntimeContext) {
             .capabilities(caps)
             .decoder(registry::make_decoder)
             .encoder(registry::make_encoder)
+            .encoder_options::<registry::OpusEncoderOptions>()
             .payload_magic(opus_head::OPUS_HEAD_MAGIC.as_slice()),
     );
 }

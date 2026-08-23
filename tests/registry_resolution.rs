@@ -387,3 +387,80 @@ fn registry_resolved_decoder_honours_a_reduced_sample_rate() {
         "bit-exact 8 kHz registry decode"
     );
 }
+
+#[test]
+fn registry_encoder_options_schema_and_knobs() {
+    use oxideav_core::CodecOptions;
+
+    let ctx = registered_context();
+    // The schema is introspectable through the registry.
+    let schema = ctx
+        .codecs
+        .encoder_options_schema(&CodecId::new("opus"))
+        .expect("schema registered");
+    let names: Vec<&str> = schema.iter().map(|f| f.name).collect();
+    for key in [
+        "bandwidth",
+        "frame-ms",
+        "constrained-vbr",
+        "dtx",
+        "tapset-election",
+        "complexity",
+    ] {
+        assert!(names.contains(&key), "schema missing '{key}'");
+    }
+
+    // frame-ms selects the packet duration: 10 ms frames carry 480
+    // samples each.
+    let mut params = CodecParameters::audio(CodecId::new("opus"));
+    params.channels = Some(1);
+    params.options = CodecOptions::new()
+        .set("frame-ms", "10")
+        .set("bandwidth", "wb")
+        .set("complexity", "2");
+    let mut enc = ctx.codecs.first_encoder(&params).expect("encoder");
+    let pcm: Vec<i16> = (0..960)
+        .map(|i| (6_000.0 * (std::f64::consts::TAU * 440.0 * i as f64 / 48_000.0).sin()) as i16)
+        .collect();
+    let mut bytes = Vec::new();
+    for s in &pcm {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+        samples: 960,
+        pts: Some(0),
+        data: vec![bytes],
+    }))
+    .expect("send");
+    let p1 = enc.receive_packet().expect("packet 1");
+    let p2 = enc.receive_packet().expect("packet 2");
+    assert_eq!(p1.duration, Some(480));
+    assert_eq!(p2.pts, Some(480));
+
+    // DTX: a long silent input collapses to 1-byte markers after the
+    // hangover.
+    let mut params = CodecParameters::audio(CodecId::new("opus"));
+    params.channels = Some(1);
+    params.options = CodecOptions::new().set("dtx", "true");
+    let mut enc = ctx.codecs.first_encoder(&params).expect("encoder");
+    enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+        samples: 48_000,
+        pts: Some(0),
+        data: vec![vec![0u8; 48_000 * 2]],
+    }))
+    .expect("send");
+    enc.flush().expect("flush");
+    let mut markers = 0usize;
+    while let Ok(p) = enc.receive_packet() {
+        if p.data.len() == 1 {
+            markers += 1;
+        }
+    }
+    assert!(markers >= 30, "DTX markers on silence: {markers}");
+
+    // Unknown keys are rejected up front.
+    let mut params = CodecParameters::audio(CodecId::new("opus"));
+    params.channels = Some(1);
+    params.options = CodecOptions::new().set("no-such-knob", "1");
+    assert!(ctx.codecs.first_encoder(&params).is_err());
+}

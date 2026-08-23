@@ -4,6 +4,18 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Typed registry encoder options** (round 450):
+  `OpusEncoderOptions` (schema declared to the registry via
+  `CodecInfo::encoder_options`, introspectable through
+  `encoder_options_schema`) parses `CodecParameters::options` into
+  the encode adapter's knobs — `bandwidth` (nb/wb/swb/fb),
+  `frame-ms` (2.5/5/10/20), `constrained-vbr`, `dtx`,
+  `tapset-election`, `complexity` (0..=10) — mapped onto the
+  CELT-only VBR arm's setters; unknown keys and malformed values are
+  rejected at construction. Gated: 10 ms frames carry 480-sample
+  packets, DTX collapses a silent second to ≥30 one-byte markers,
+  unknown keys error.
+
 - **Loss re-convergence gates + rate-aware fuzzing** (round 450):
   `tests/plc_reconvergence.rs` decodes reference-encoder streams with
   planted losses next to the reference listing decoder's own decodes:
