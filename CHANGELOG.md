@@ -4,6 +4,25 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **§4.2.9 resampler: full decoder-side rate matrix** (round 450):
+  `SilkUpsampler::new_to_rate(bandwidth, path, output_rate_hz)`
+  extends the reference resampler transcription from the fixed
+  internal→48 kHz upsampling paths to **every** decoder-side rate
+  pair ({8, 12, 16} kHz internal → {8, 12, 16, 24, 48} kHz output):
+  the pass-through path (equal rates), the pure 2× allpass path
+  (8→16, 12→24), the allpass + fractional-FIR path (all remaining
+  upsampling pairs), and the AR2 + decimating-FIR downsampling
+  chain (16→12 at 3:4 with 3 interpolation fractions, 12→8 at 2:3
+  with 2, 16→8 at 1:2 through the 24-tap symmetric FIR), with the
+  full decoder delay-compensation matrix replacing the 48 kHz-only
+  column. All 15 pairs are pinned **bit-exact** against the §A
+  reference listing's resampler (50 × 20 ms LCG-noise frames per
+  pair, output digests pinned in
+  `silk_resampler::tests::decoder_rate_matrix_is_bit_exact_against_the_reference_resampler`).
+  This is the SILK half of decoding at the §4.2.9 "sample rate
+  desired by the application"; `output_len` / `output_rate_hz`
+  expose the exact per-frame accounting.
+
 - **Registry decoder/encoder factories** (round 450): `register(ctx)`
   is no longer a tag-only registration — it wires working
   `oxideav_core::DecoderFactory` / `EncoderFactory` functions

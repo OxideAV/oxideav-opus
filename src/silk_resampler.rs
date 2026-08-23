@@ -218,17 +218,6 @@ pub enum SilkChannelPath {
     Stereo,
 }
 
-/// The §A reference listing's decoder-side delay compensation, in input
-/// samples, for resampling {8, 12, 16} kHz → 48 kHz (the `delay_matrix`
-/// row/column for each SILK internal rate at a 48 kHz output).
-fn decoder_input_delay(fs_in_khz: usize) -> usize {
-    match fs_in_khz {
-        8 => 0,
-        12 => 4,
-        _ => 7, // 16 kHz
-    }
-}
-
 /// Interpolation FIR half-tables for the fractional-phase stage of the
 /// §4.2.9 upsampler (12 phases × 4 taps; the second half of each 8-tap
 /// filter mirrors the table at `11 − index`). Transcribed from the
@@ -258,6 +247,72 @@ const ORDER_FIR_12: usize = 8;
 /// Batch size in milliseconds (the reference processes 10 ms at a time,
 /// restarting the fractional-index accumulator per batch).
 const MAX_BATCH_MS: usize = 10;
+
+/// Decoder-side delay-compensation table (input samples) equalizing
+/// total delay across the resampling modes — the §A reference
+/// listing's decoder delay matrix, rows = input rate (8/12/16 kHz),
+/// columns = output rate (8/12/16/24/48 kHz).
+const DELAY_MATRIX_DEC: [[usize; 5]; 3] = [[4, 0, 2, 0, 0], [0, 9, 4, 7, 4], [0, 3, 12, 7, 7]];
+
+/// Column index into [`DELAY_MATRIX_DEC`] for a supported output rate.
+fn rate_column(rate_hz: u32) -> Option<usize> {
+    match rate_hz {
+        8_000 => Some(0),
+        12_000 => Some(1),
+        16_000 => Some(2),
+        24_000 => Some(3),
+        48_000 => Some(4),
+        _ => None,
+    }
+}
+
+/// 3:4 downsampling coefficient set (16 kHz → 12 kHz): AR2 pair
+/// (Q14) then 3 interpolation fractions × 9 half-taps of the 18-tap
+/// FIR (Q16 against the Q8 AR2 output). Transcribed from the RFC 6716
+/// §A reference listing's resampler coefficient tables.
+const DOWN_3_4_COEFS: [i16; 2 + 3 * 9] = [
+    -20694, -13867, //
+    -49, 64, 17, -157, 353, -496, 163, 11047, 22205, //
+    -39, 6, 91, -170, 186, 23, -896, 6336, 19928, //
+    -19, -36, 102, -89, -24, 328, -951, 2568, 15909,
+];
+
+/// 2:3 downsampling coefficient set (12 kHz → 8 kHz): AR2 pair then
+/// 2 fractions × 9 half-taps.
+const DOWN_2_3_COEFS: [i16; 2 + 2 * 9] = [
+    -14457, -14019, //
+    64, 128, -122, 36, 310, -768, 584, 9267, 17733, //
+    12, 128, 18, -142, 288, -117, -865, 4123, 14459,
+];
+
+/// 1:2 downsampling coefficient set (16 kHz → 8 kHz): AR2 pair then
+/// the symmetric half (12 taps) of the 24-tap FIR.
+const DOWN_1_2_COEFS: [i16; 2 + 12] = [
+    616, -14323, //
+    -10, 39, 58, -46, -84, 120, 184, -315, -541, 1284, 5380, 9024,
+];
+
+/// 18-tap asymmetric down-FIR order (fraction-interpolated).
+const DOWN_ORDER_FIR0: usize = 18;
+/// 24-tap symmetric down-FIR order.
+const DOWN_ORDER_FIR1: usize = 24;
+/// Largest carried down-FIR history.
+const DOWN_MAX_FIR_ORDER: usize = DOWN_ORDER_FIR1;
+
+/// Which §4.2.9 filter structure a rate pair selects (the §A
+/// listing's method matrix: C / U / UF / AF over the decoder-side
+/// rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResamplerKind {
+    /// Equal rates: pass-through (through the delay buffer).
+    Copy,
+    /// Exact 2× upsampling: the allpass pair alone.
+    Up2Hq,
+    /// General upsampling: 2× allpass then fractional 8-tap FIR.
+    IirFir,
+    /// Downsampling: 2nd-order AR filter then decimating FIR.
+    DownFir,
+}
 
 /// A stateful streaming resampler from one SILK internal rate
 /// (8/12/16 kHz) to the 48 kHz decoder output rate — the §4.2.9
@@ -289,32 +344,87 @@ pub struct SilkUpsampler {
     input_delay: usize,
     batch_size: usize,
     inv_ratio_q16: i32,
-    /// 2× allpass chain state (Q10), 3 sections × 2 phases.
+    /// Filter structure this rate pair selects.
+    kind: ResamplerKind,
+    /// Down-FIR configuration (meaningful for [`ResamplerKind::DownFir`]):
+    /// interpolation fraction count, FIR order, and the AR2+FIR
+    /// coefficient set.
+    fir_fracs: usize,
+    fir_order: usize,
+    coefs: &'static [i16],
+    /// 2× allpass chain state (Q10), 3 sections × 2 phases — doubles
+    /// as the AR2 state (2 words) on the down path.
     s_iir: [i32; 6],
     /// Carried tail of the 2×-upsampled signal for the FIR stage.
     s_fir: [i16; ORDER_FIR_12],
+    /// Carried Q8 filtered history for the down-FIR stage.
+    s_fir32: [i32; DOWN_MAX_FIR_ORDER],
     /// 1 ms delay-compensation buffer (`fs_in_khz` samples used).
     delay_buf: [i16; 48],
 }
 
 impl SilkUpsampler {
-    /// Construct a resampler for one SILK audio bandwidth on one
-    /// reconstruction path, or `None` for SWB / FB (which never reach
-    /// the §4.2.9 SILK resampler).
+    /// Construct a 48 kHz-output resampler for one SILK audio
+    /// bandwidth on one reconstruction path, or `None` for SWB / FB
+    /// (which never reach the §4.2.9 SILK resampler).
     pub fn new(bandwidth: Bandwidth, path: SilkChannelPath) -> Option<Self> {
+        Self::new_to_rate(bandwidth, path, REFERENCE_RATE_HZ)
+    }
+
+    /// Construct a resampler from one SILK internal rate to **any**
+    /// supported decoder output rate ([`SUPPORTED_OUTPUT_RATES_HZ`]),
+    /// selecting the §A reference listing's filter structure for the
+    /// rate pair: pass-through for equal rates, the 2× allpass pair
+    /// for exact doubling, allpass + fractional FIR for general
+    /// upsampling, and the AR2 + decimating-FIR chain for the three
+    /// decoder-side downsampling ratios (16→12, 12→8, 16→8 kHz).
+    /// Returns `None` for SWB / FB or an unsupported output rate.
+    pub fn new_to_rate(
+        bandwidth: Bandwidth,
+        path: SilkChannelPath,
+        output_rate_hz: u32,
+    ) -> Option<Self> {
         let fs_in_khz = match bandwidth {
             Bandwidth::Nb => 8,
             Bandwidth::Mb => 12,
             Bandwidth::Wb => 16,
             Bandwidth::Swb | Bandwidth::Fb => return None,
         };
-        let fs_out_khz = 48;
-        // invRatio_Q16 = ((fs_in << (14 + 1)) / fs_out) << 2, rounded up
-        // until invRatio × fs_out ≥ fs_in << 1 (the 2× upsampled rate).
+        let col = rate_column(output_rate_hz)?;
+        let fs_out_khz = (output_rate_hz / 1000) as usize;
+        let row = match fs_in_khz {
+            8 => 0,
+            12 => 1,
+            _ => 2,
+        };
+        let input_delay = DELAY_MATRIX_DEC[row][col];
+
+        // Filter-structure selection (the listing's ratio ladder).
+        let (kind, fir_fracs, fir_order, coefs): (ResamplerKind, usize, usize, &'static [i16]) =
+            if fs_out_khz == fs_in_khz {
+                (ResamplerKind::Copy, 0, 0, &[])
+            } else if fs_out_khz == 2 * fs_in_khz {
+                (ResamplerKind::Up2Hq, 0, 0, &[])
+            } else if fs_out_khz > fs_in_khz {
+                (ResamplerKind::IirFir, 0, 0, &[])
+            } else if 4 * fs_out_khz == 3 * fs_in_khz {
+                (ResamplerKind::DownFir, 3, DOWN_ORDER_FIR0, &DOWN_3_4_COEFS)
+            } else if 3 * fs_out_khz == 2 * fs_in_khz {
+                (ResamplerKind::DownFir, 2, DOWN_ORDER_FIR0, &DOWN_2_3_COEFS)
+            } else if 2 * fs_out_khz == fs_in_khz {
+                (ResamplerKind::DownFir, 1, DOWN_ORDER_FIR1, &DOWN_1_2_COEFS)
+            } else {
+                return None;
+            };
+
+        // invRatio_Q16 = ((fs_in << (14 + up2x)) / fs_out) << 2, rounded
+        // up until invRatio × fs_out ≥ fs_in << up2x (up2x = 1 on the
+        // allpass+FIR upsampling path, whose FIR runs on the 2× signal).
+        let up2x = if kind == ResamplerKind::IirFir { 1 } else { 0 };
         let fs_in_hz = (fs_in_khz as i32) * 1000;
         let fs_out_hz = (fs_out_khz as i32) * 1000;
-        let mut inv_ratio_q16 = ((fs_in_hz << 15) / fs_out_hz) << 2;
-        while crate::silk_decode_core::smulww(inv_ratio_q16, fs_out_hz) < (fs_in_hz << 1) {
+        let mut inv_ratio_q16 = ((fs_in_hz << (14 + up2x)) / fs_out_hz) << 2;
+        while crate::silk_decode_core::smulww(inv_ratio_q16, fs_out_hz) < (fs_in_hz << up2x) {
             inv_ratio_q16 += 1;
         }
         Some(Self {
@@ -322,11 +432,16 @@ impl SilkUpsampler {
             path,
             fs_in_khz,
             fs_out_khz,
-            input_delay: decoder_input_delay(fs_in_khz),
+            input_delay,
             batch_size: fs_in_khz * MAX_BATCH_MS,
             inv_ratio_q16,
+            kind,
+            fir_fracs,
+            fir_order,
+            coefs,
             s_iir: [0; 6],
             s_fir: [0; ORDER_FIR_12],
+            s_fir32: [0; DOWN_MAX_FIR_ORDER],
             delay_buf: [0; 48],
         })
     }
@@ -341,15 +456,31 @@ impl SilkUpsampler {
         self.path
     }
 
-    /// The upsampling factor to 48 kHz (6 / 4 / 3 for NB / MB / WB).
+    /// The integer upsampling factor (6 / 4 / 3 for NB / MB / WB at a
+    /// 48 kHz output). Only meaningful for integer-ratio upsampling;
+    /// fractional and downsampling pairs report the floor (use
+    /// [`Self::output_len`] for exact accounting).
     pub fn factor(&self) -> usize {
         self.fs_out_khz / self.fs_in_khz
+    }
+
+    /// The output rate in Hz this resampler produces.
+    pub fn output_rate_hz(&self) -> u32 {
+        (self.fs_out_khz as u32) * 1000
+    }
+
+    /// Exact per-frame output sample count for `input_len` internal-rate
+    /// samples (every SILK frame is a whole number of milliseconds, so
+    /// the division is exact).
+    pub fn output_len(&self, input_len: usize) -> usize {
+        input_len * self.fs_out_khz / self.fs_in_khz
     }
 
     /// Clear the carried filter state (a §4.5.2 SILK state reset).
     pub fn reset(&mut self) {
         self.s_iir = [0; 6];
         self.s_fir = [0; ORDER_FIR_12];
+        self.s_fir32 = [0; DOWN_MAX_FIR_ORDER];
         self.delay_buf = [0; 48];
     }
 
@@ -361,8 +492,8 @@ impl SilkUpsampler {
     pub fn process_i16(&mut self, input: &[i16], out: &mut [i16]) {
         assert_eq!(
             out.len(),
-            input.len() * self.factor(),
-            "output must be factor × input"
+            self.output_len(input.len()),
+            "output must be the rate-scaled input length"
         );
         assert!(input.len() >= self.fs_in_khz, "need at least 1 ms");
         let n_first = self.fs_in_khz - self.input_delay;
@@ -372,14 +503,104 @@ impl SilkUpsampler {
         head[..self.fs_in_khz].copy_from_slice(&self.delay_buf[..self.fs_in_khz]);
         head[self.input_delay..self.fs_in_khz].copy_from_slice(&input[..n_first]);
         let (out_head, out_rest) = out.split_at_mut(self.fs_out_khz);
-        self.iir_fir(&head[..self.fs_in_khz], out_head);
-        // …then the rest of the frame directly.
+        self.run(&head[..self.fs_in_khz], out_head);
         // …then the rest of the frame, holding back the final
         // `input_delay` samples for the next frame's delay buffer.
-        self.iir_fir(&input[n_first..input.len() - self.input_delay], out_rest);
+        self.run(&input[n_first..input.len() - self.input_delay], out_rest);
         // Refill the delay buffer with the frame's tail.
         self.delay_buf[..self.input_delay]
             .copy_from_slice(&input[input.len() - self.input_delay..]);
+    }
+
+    /// Run the rate pair's filter structure over one contiguous input
+    /// segment (`out.len()` must be the rate-scaled input length).
+    fn run(&mut self, input: &[i16], out: &mut [i16]) {
+        match self.kind {
+            ResamplerKind::Copy => out.copy_from_slice(input),
+            ResamplerKind::Up2Hq => self.up2_hq(input, out),
+            ResamplerKind::IirFir => self.iir_fir(input, out),
+            ResamplerKind::DownFir => self.down_fir(input, out),
+        }
+    }
+
+    /// One `down_FIR` pass: the 2nd-order AR filter (Q8 output) into a
+    /// scratch buffer behind the carried `fir_order`-sample history,
+    /// then the decimating FIR interpolation — the 18-tap
+    /// fraction-interpolated form for the 3:4 / 2:3 ratios, the 24-tap
+    /// symmetric form for 1:2 — in batches of at most 10 ms.
+    fn down_fir(&mut self, input: &[i16], out: &mut [i16]) {
+        use crate::silk_decode_core::{rshift_round, sat16, smlawb, smulwb};
+        let order = self.fir_order;
+        let fracs = self.fir_fracs as i32;
+        let a_q14 = &self.coefs[..2];
+        let fir_coefs = &self.coefs[2..];
+        let mut buf = vec![0i32; self.batch_size + DOWN_MAX_FIR_ORDER];
+        buf[..order].copy_from_slice(&self.s_fir32[..order]);
+        let index_increment_q16 = self.inv_ratio_q16;
+        let mut in_pos = 0usize;
+        let mut out_pos = 0usize;
+        let mut n;
+        loop {
+            n = (input.len() - in_pos).min(self.batch_size);
+
+            // Second-order AR filter (Q8 output) with single delay
+            // elements on the first two carried state words.
+            for (k, &x) in input[in_pos..in_pos + n].iter().enumerate() {
+                let out32 = self.s_iir[0].wrapping_add(i32::from(x) << 8);
+                buf[order + k] = out32;
+                let out32 = out32.wrapping_shl(2);
+                self.s_iir[0] = smlawb(self.s_iir[1], out32, i32::from(a_q14[0]));
+                self.s_iir[1] = smulwb(out32, i32::from(a_q14[1]));
+            }
+
+            let max_index_q16 = (n as i32) << 16;
+            let mut index_q16 = 0i32;
+            while index_q16 < max_index_q16 {
+                let base = (index_q16 >> 16) as usize;
+                let res_q6 = if order == DOWN_ORDER_FIR0 {
+                    // Fractional part selects the interpolation row;
+                    // the mirrored row covers the trailing 9 taps.
+                    let ind = smulwb(index_q16 & 0xffff, fracs) as usize;
+                    let fwd = &fir_coefs[9 * ind..9 * ind + 9];
+                    let rev_row = 9 * (self.fir_fracs - 1 - ind);
+                    let rev = &fir_coefs[rev_row..rev_row + 9];
+                    let mut res = smulwb(buf[base], i32::from(fwd[0]));
+                    for t in 1..9 {
+                        res = smlawb(res, buf[base + t], i32::from(fwd[t]));
+                    }
+                    for t in 0..9 {
+                        res = smlawb(res, buf[base + 17 - t], i32::from(rev[t]));
+                    }
+                    res
+                } else {
+                    // 24-tap symmetric: taps pair as
+                    // (buf[t] + buf[23 − t]) × coef[t].
+                    let mut res = 0i32;
+                    for t in 0..12 {
+                        let pair = buf[base + t].wrapping_add(buf[base + 23 - t]);
+                        res = if t == 0 {
+                            smulwb(pair, i32::from(fir_coefs[t]))
+                        } else {
+                            smlawb(res, pair, i32::from(fir_coefs[t]))
+                        };
+                    }
+                    res
+                };
+                out[out_pos] = sat16(rshift_round(res_q6, 6));
+                out_pos += 1;
+                index_q16 += index_increment_q16;
+            }
+            in_pos += n;
+            if input.len() - in_pos > 1 {
+                // More batches: roll the filtered tail to the front.
+                buf.copy_within(n..n + order, 0);
+            } else {
+                break;
+            }
+        }
+        // Carry the filtered tail into the next call.
+        self.s_fir32[..order].copy_from_slice(&buf[n..n + order]);
+        debug_assert_eq!(out_pos, out.len(), "§4.2.9 output count");
     }
 
     /// [`Self::process_i16`] with the crate's `f32` sample convention
@@ -499,6 +720,92 @@ impl SilkUpsampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----------------------------------------------------------------
+    // Full decoder-side rate matrix vs the reference resampler.
+    // ----------------------------------------------------------------
+
+    /// FNV-1a 64 over a byte stream (test-only digest primitive).
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    #[test]
+    fn decoder_rate_matrix_is_bit_exact_against_the_reference_resampler() {
+        // 50 × 20 ms frames of a deterministic LCG signal through each
+        // (internal rate → output rate) pair of the decoder-side
+        // matrix. The pinned digests are FNV-1a 64 over the
+        // little-endian output bytes of the §A reference listing's
+        // resampler (hash-verified extraction, RFC 8251 §5 buffer
+        // corrections applied) driven with the identical input, so any
+        // arithmetic drift in the copy / 2× / allpass+FIR / AR2+FIR
+        // structures shows up as a digest mismatch.
+        const PINS: [(u32, u32, u64); 15] = [
+            (8_000, 8_000, 0x33b306f3b83b2e16),
+            (8_000, 12_000, 0x586988059dee45b2),
+            (8_000, 16_000, 0x6205a3ea46433220),
+            (8_000, 24_000, 0xa5edb0bcdfa4c5db),
+            (8_000, 48_000, 0xac48cb12fd5d0c23),
+            (12_000, 8_000, 0x7e351ac051f9df04),
+            (12_000, 12_000, 0x6850abf48c73b08c),
+            (12_000, 16_000, 0x725f1fed007b00ff),
+            (12_000, 24_000, 0x290d4f2a5e5c481e),
+            (12_000, 48_000, 0x96010d1257cecafa),
+            (16_000, 8_000, 0x2ed22c4291ec0d8a),
+            (16_000, 12_000, 0xd13b7b6e81e71dbe),
+            (16_000, 16_000, 0xb3939a87a4398aff),
+            (16_000, 24_000, 0xc68f59fdc155d312),
+            (16_000, 48_000, 0xee1ba45d5ad18ebe),
+        ];
+        for (fin, fout, want) in PINS {
+            let bw = match fin {
+                8_000 => Bandwidth::Nb,
+                12_000 => Bandwidth::Mb,
+                _ => Bandwidth::Wb,
+            };
+            let mut rs = SilkUpsampler::new_to_rate(bw, SilkChannelPath::Mono, fout)
+                .expect("decoder-side pair must construct");
+            let frame_in = (fin / 50) as usize;
+            let mut seed = 42u32;
+            let mut bytes: Vec<u8> = Vec::new();
+            for _ in 0..50 {
+                let mut input = vec![0i16; frame_in];
+                for slot in input.iter_mut() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *slot = (seed >> 16) as i16;
+                }
+                let mut out = vec![0i16; rs.output_len(frame_in)];
+                rs.process_i16(&input, &mut out);
+                for v in &out {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            assert_eq!(
+                fnv1a64(&bytes),
+                want,
+                "{fin} Hz -> {fout} Hz diverged from the reference resampler"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_rates_and_bandwidths_return_none() {
+        assert!(SilkUpsampler::new_to_rate(Bandwidth::Nb, SilkChannelPath::Mono, 44_100).is_none());
+        assert!(
+            SilkUpsampler::new_to_rate(Bandwidth::Swb, SilkChannelPath::Mono, 48_000).is_none()
+        );
+        assert!(SilkUpsampler::new_to_rate(Bandwidth::Fb, SilkChannelPath::Mono, 8_000).is_none());
+        for &r in SUPPORTED_OUTPUT_RATES_HZ {
+            for bw in [Bandwidth::Nb, Bandwidth::Mb, Bandwidth::Wb] {
+                assert!(SilkUpsampler::new_to_rate(bw, SilkChannelPath::Mono, r).is_some());
+            }
+        }
+    }
 
     // ----------------------------------------------------------------
     // Table 54 transcription self-checks.
