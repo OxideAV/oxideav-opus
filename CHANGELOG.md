@@ -4,6 +4,31 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **§4.5 configuration-switch seams without redundancy** (round 450):
+  three seam behaviours land, gated on new synthetic switch captures
+  (two independent reference-encoder runs concatenated, so no packet
+  carries §4.5.1 redundancy; `tests/mode_switch_seams.rs`).
+  (1) **Hybrid → SILK-only** now performs the normative Figure 18
+  `c`/`+` operation — "adding in the final contents of the CELT
+  overlap buffer to the first SILK-only packet … by decoding a 2.5 ms
+  silence frame with the CELT decoder" — placed per the listing
+  between a beginning-position redundant frame and an end-position
+  one's reset, and skipped when redundant frames already bridge the
+  seam. Measured: the Hybrid→WB-SILK capture goes from 31.9 dB at the
+  seam to **bit-exact** (whole-stream 112.6 dB, tail identical).
+  (2) **SILK bandwidth changes** keep the §4.2.8 output-buffering
+  delay sample across the internal-rate change (only a §4.5.2 reset
+  zeroes it), making the NB↔WB switch captures **bit-exact**
+  whole-stream (previously 22–45 dB at the seam).
+  (3) **CELT ↔ SILK/Hybrid without redundancy** applies the §4.5
+  RECOMMENDED concealment fill: 5 ms extrapolated from the previous
+  mode's output (`PlcState::extrapolate`, bookkeeping-free), first
+  2.5 ms as-is + power-complementary crossfade (Figure 19 `P`),
+  cancelled when the frame turns out to carry redundancy and on DTX
+  holds. Measured vs the reference decoder: whole-stream 34–40 dB
+  (hard switch: ≈ 27 dB), seams 15–19 dB (both sides' fills are
+  non-normative PLC), everything away from the seam ≥ 97 dB.
+
 - **§4.4 concealment, DTX holds, and FEC at reduced rates** (round
   450): `PlcState::with_rate` puts the concealment history on the
   output-rate timeline with every duration-defined constant rescaled

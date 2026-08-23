@@ -471,6 +471,40 @@ impl PlcState {
         pcm
     }
 
+    /// Extrapolate `per_channel` samples past the current history
+    /// WITHOUT touching the concealment bookkeeping (no loss counted,
+    /// no tail armed, history unchanged) — the §4.5 "fill in the gap"
+    /// material for a non-normative mode transition without
+    /// redundancy (RFC 6716 §4.5: "it is RECOMMENDED that the decoder
+    /// use a concealment technique (e.g., make use of a PLC
+    /// algorithm) to fill in the gap or discontinuity caused by the
+    /// mode transition"). Full gain throughout (a transition is not a
+    /// loss run). Returns `None` when the history's channel count does
+    /// not match `channels` (nothing coherent to extrapolate).
+    #[must_use]
+    pub fn extrapolate(
+        &self,
+        per_channel: usize,
+        channels: usize,
+        flavor: PlcFlavor,
+    ) -> Option<Vec<i16>> {
+        if self.hist.len() != channels || channels == 0 {
+            return None;
+        }
+        let rate = self.rate_hz();
+        let mut pcm = vec![0i16; per_channel * channels];
+        for (c, hist) in self.hist.iter().enumerate() {
+            let ext = match flavor {
+                PlcFlavor::Silk => conceal_silk_at(hist, per_channel, 1.0, 1.0, rate),
+                PlcFlavor::Celt => conceal_celt_at(hist, per_channel, 1.0, 1.0, rate),
+            };
+            for (i, &v) in ext.iter().enumerate() {
+                pcm[i * channels + c] = (v.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+            }
+        }
+        Some(pcm)
+    }
+
     fn ensure_channels(&mut self, channels: usize) {
         if self.hist.len() != channels {
             self.hist = vec![Vec::new(); channels];

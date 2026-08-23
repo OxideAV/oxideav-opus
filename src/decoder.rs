@@ -371,6 +371,24 @@ pub struct OpusDecoder {
     /// `0` is the derived-`Default` placeholder and reads as 48 kHz —
     /// use [`Self::output_rate_hz`], never the field.
     output_rate_hz: u32,
+    /// §4.5 Hybrid → SILK-only seam: the first SILK-only frame after a
+    /// Hybrid frame must add "the final contents of the CELT overlap
+    /// buffer" (the Figure 18 `c`, extracted by decoding a 2.5 ms
+    /// silence CELT frame). Armed at the packet boundary with the
+    /// previous frame's §4.5.1 end-position-redundancy fact (the
+    /// flush is skipped when that frame carried end-position
+    /// redundancy AND this one carries beginning-position redundancy —
+    /// the redundant frames already bridge the seam); consumed by the
+    /// packet's first frame.
+    hybrid_to_silk_flush: Option<bool>,
+    /// §4.5 non-normative mode transition (CELT-only ↔ SILK-only /
+    /// Hybrid) without redundancy: the recommended PLC "fill in the
+    /// gap" — 5 ms extrapolated from the previous mode's output,
+    /// crossfaded into the head of the new-mode frame unless that
+    /// frame turns out to carry §4.5.1 redundancy. Holds the previous
+    /// mode's concealment flavor; consumed by the packet's first
+    /// frame.
+    transition_fill: Option<crate::plc::PlcFlavor>,
 }
 
 impl OpusDecoder {
@@ -565,6 +583,34 @@ impl OpusDecoder {
             self.silk_carry_side = SilkChannelCarry::default();
         }
 
+        // §4.5 seam bookkeeping for the packet's first frame (all frames
+        // of a packet share a mode, so only the first can transition).
+        self.hybrid_to_silk_flush = None;
+        self.transition_fill = None;
+        if let Some(prev) = self.prev_mode {
+            let prev_end_redundancy = matches!(
+                self.last_redundancy,
+                crate::celt_redundancy::RedundancyDecision::Present {
+                    position: crate::celt_redundancy::RedundancyPosition::End,
+                    ..
+                }
+            );
+            if prev == OperatingMode::Hybrid && routing.operating_mode == OperatingMode::SilkOnly {
+                self.hybrid_to_silk_flush = Some(prev_end_redundancy);
+            }
+            let to_celt = routing.operating_mode == OperatingMode::CeltOnly
+                && prev != OperatingMode::CeltOnly
+                && !prev_end_redundancy;
+            let from_celt = routing.operating_mode != OperatingMode::CeltOnly
+                && prev == OperatingMode::CeltOnly;
+            if to_celt || from_celt {
+                self.transition_fill = Some(match prev {
+                    OperatingMode::CeltOnly => crate::plc::PlcFlavor::Celt,
+                    _ => crate::plc::PlcFlavor::Silk,
+                });
+            }
+        }
+
         self.last_channels = Some(channels);
         self.prev_mode = Some(routing.operating_mode);
 
@@ -661,6 +707,11 @@ impl OpusDecoder {
         // CELT-only) with the energy decay of a concealment run, which
         // after a silent tail simply holds the silence floor.
         if frame.is_empty() {
+            // A hold at the packet's head consumes the §4.5 seam
+            // bookkeeping: the concealment already bridges the
+            // boundary.
+            self.hybrid_to_silk_flush = None;
+            self.transition_fill = None;
             let flavor = match routing.operating_mode {
                 OperatingMode::CeltOnly => crate::plc::PlcFlavor::Celt,
                 _ => crate::plc::PlcFlavor::Silk,
@@ -673,12 +724,37 @@ impl OpusDecoder {
             };
         }
 
+        // §4.5 recommended PLC fill for a non-normative transition: 5 ms
+        // extrapolated from the previous mode's output, BEFORE this
+        // frame's output joins the history.
+        let fill = self.transition_fill.take().and_then(|flavor| {
+            let f5 = self.out_samples(50);
+            self.plc.extrapolate(f5, channels as usize, flavor)
+        });
+
         let start = pcm.len();
         let outcome = match routing.operating_mode {
             OperatingMode::SilkOnly => self.decode_silk_only_frame(frame, routing, pcm),
             OperatingMode::CeltOnly => self.decode_celt_only_frame(frame, routing, pcm),
             OperatingMode::Hybrid => self.decode_hybrid_frame(frame, routing, pcm),
         };
+        // The fill only applies when the frame carries no §4.5.1
+        // redundancy (a redundant frame makes the transition normative
+        // and bridges the seam itself).
+        if let Some(fill) = fill {
+            let redundant = matches!(
+                self.last_redundancy,
+                crate::celt_redundancy::RedundancyDecision::Present { .. }
+            );
+            if !redundant {
+                apply_transition_fill(
+                    &mut pcm[start..],
+                    &fill,
+                    channels as usize,
+                    self.downsample(),
+                );
+            }
+        }
         // §4.4 bookkeeping for a coded frame: cross-lap a pending
         // concealment tail into this (first post-concealment) frame's
         // head, then record the output as concealment history and
@@ -686,6 +762,29 @@ impl OpusDecoder {
         self.plc.apply_tail(&mut pcm[start..], channels as usize);
         self.plc.feed_decoded(&pcm[start..], channels as usize);
         outcome
+    }
+
+    /// §4.5 Hybrid → SILK-only seam: extract "the final contents of the
+    /// CELT overlap buffer" by decoding a 2.5 ms silence CELT frame
+    /// through the carried CELT state with the SILK packet's channel
+    /// count (the RFC's own recipe — "which will correctly handle the
+    /// cases when the channel count changes as well"), returning it
+    /// on the output-rate timeline. `None` when no CELT state is
+    /// carried (nothing to flush).
+    fn celt_overlap_flush(&mut self, channels: usize) -> Option<Vec<i16>> {
+        let downsample = self.downsample();
+        let synth = self.celt_synth.as_mut()?;
+        let n = output_samples_per_channel(25);
+        synth.set_geometry(channels, n);
+        let freq = vec![0.0f64; channels * n];
+        let mut out48 = vec![0i16; channels * n];
+        synth.synthesize_frame(&freq, 1, None, &mut out48);
+        if downsample > 1 {
+            let mut out = vec![0i16; out48.len() / downsample];
+            decimate_interleaved(&out48, &mut out, channels, downsample);
+            return Some(out);
+        }
+        Some(out48)
     }
 
     /// Decode one SILK-only Opus frame (§4.2).
@@ -781,13 +880,33 @@ impl OpusDecoder {
                 // §4.5.2: an end-position redundant frame opens a new
                 // CELT chain (reset before its decode; Figure 18's
                 // `!R`); a beginning-position one continues the
-                // previous chain (rule 4).
-                let reset_before = matches!(
+                // previous chain (rule 4). The Hybrid→SILK overlap
+                // flush sits between them: after a beginning-position
+                // frame (which continues the Hybrid CELT chain first)
+                // and before an end-position one (whose reset would
+                // discard the overlap), and is skipped when the
+                // previous Hybrid frame's end-position redundancy and
+                // this beginning-position frame already bridge the
+                // seam.
+                let beginning = matches!(
                     params.position,
-                    crate::celt_redundancy::RedundancyPosition::End
+                    crate::celt_redundancy::RedundancyPosition::Beginning
                 );
-                if let Some(red_pcm) = self.decode_redundant_celt(red_bytes, &params, reset_before)
-                {
+                let mut red_pcm = None;
+                if beginning {
+                    red_pcm = self.decode_redundant_celt(red_bytes, &params, false);
+                }
+                if let Some(prev_end_redundancy) = self.hybrid_to_silk_flush.take() {
+                    if !(beginning && prev_end_redundancy) {
+                        if let Some(flush) = self.celt_overlap_flush(channels as usize) {
+                            add_into_head(&mut pcm[pcm_start..], &flush);
+                        }
+                    }
+                }
+                if !beginning {
+                    red_pcm = self.decode_redundant_celt(red_bytes, &params, true);
+                }
+                if let Some(red_pcm) = red_pcm {
                     apply_redundancy_cross_lap(
                         &mut pcm[pcm_start..],
                         &red_pcm,
@@ -796,6 +915,13 @@ impl OpusDecoder {
                         self.downsample(),
                     );
                 }
+            }
+        }
+        // No redundant frame in this SILK frame: the Hybrid→SILK seam
+        // still flushes the CELT overlap (Figure 18 `H -> c + S`).
+        if self.hybrid_to_silk_flush.take().is_some() {
+            if let Some(flush) = self.celt_overlap_flush(channels as usize) {
+                add_into_head(&mut pcm[pcm_start..], &flush);
             }
         }
         self.last_redundancy = redundancy;
@@ -921,9 +1047,13 @@ impl OpusDecoder {
         };
         if need_fresh {
             self.silk_synth_mono = Some(SilkSynthState::new(bandwidth)?);
-            // A bandwidth change re-times the internal-rate signal; the
-            // carried §4.2.8 delay sample belongs to the old rate.
-            self.silk_mono_delay = 0;
+            // The carried §4.2.8 delay sample is NOT cleared here: it
+            // is part of the stereo/mono output buffering (the reference
+            // decoder's two-sample `sMid` history), which only a §4.5.2
+            // SILK reset zeroes — a bandwidth change re-creates the
+            // synthesis and resampler states but emits the previous
+            // frame's final sample first, exactly as at any other frame
+            // boundary.
         }
         let state = self
             .silk_synth_mono
@@ -2170,6 +2300,60 @@ fn apply_redundancy_cross_lap(
                     let idx = base + i * channels + c;
                     region[idx] = mix(red[half + i * channels + c], region[idx], f);
                 }
+            }
+        }
+    }
+}
+
+/// Direct-mix `add` (interleaved) into the head of `region` — the
+/// Figure 18 `+` operation (saturating at the i16 rails).
+fn add_into_head(region: &mut [i16], add: &[i16]) {
+    for (dst, &a) in region.iter_mut().zip(add.iter()) {
+        *dst = dst.saturating_add(a);
+    }
+}
+
+/// Apply the §4.5 recommended PLC fill to the head of a new-mode
+/// frame: `fill` is 5 ms of previous-mode extrapolation (interleaved,
+/// output rate). For a frame of at least 5 ms the first 2.5 ms are
+/// replaced by the fill outright and the next 2.5 ms crossfade from
+/// the fill into the decoded audio under the power-complementary
+/// window (the Figure 19 `P & …` join); a 2.5 ms frame crossfades
+/// over its whole length instead.
+fn apply_transition_fill(region: &mut [i16], fill: &[i16], channels: usize, downsample: usize) {
+    use crate::celt_mdct_window::{celt_overlap_window, CELT_OVERLAP_48K};
+    if channels == 0 {
+        return;
+    }
+    let lap = CELT_OVERLAP_48K / downsample.max(1);
+    let half = lap * channels;
+    let per_channel = region.len() / channels;
+    if fill.len() < 2 * half || per_channel < lap {
+        return;
+    }
+    let window = celt_overlap_window();
+    let mix = |fade_in: i16, fade_out: i16, f: f64| -> i16 {
+        (f64::from(fade_in) * f + f64::from(fade_out) * (1.0 - f))
+            .round()
+            .clamp(-32768.0, 32767.0) as i16
+    };
+    if per_channel >= 2 * lap {
+        region[..half].copy_from_slice(&fill[..half]);
+        for i in 0..lap {
+            let w = window[i * downsample];
+            let f = w * w;
+            for c in 0..channels {
+                let idx = half + i * channels + c;
+                region[idx] = mix(region[idx], fill[idx], f);
+            }
+        }
+    } else {
+        for i in 0..lap {
+            let w = window[i * downsample];
+            let f = w * w;
+            for c in 0..channels {
+                let idx = i * channels + c;
+                region[idx] = mix(region[idx], fill[idx], f);
             }
         }
     }

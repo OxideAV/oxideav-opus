@@ -92,3 +92,35 @@ agreement before the first suppression, silence-floor agreement across
 the DTX run, and a ≥45 dB steady re-convergence gate after resume
 (the residual is the reference decoder's own non-normative
 post-concealment smoothing).
+
+## Reduced-output-rate reference decodes (round 450)
+
+`<name>.expected<rate>.pcm` files (e.g.
+`silk-nb-mono-16kbps.expected8000.pcm`,
+`celt-fb-stereo-128kbps.expected24000.pcm`,
+`mode-switching.expected8000.pcm`) are the raw s16le interleaved
+output of the §A reference listing's demo program (RFC 8251 patches
+applied) decoding the SAME `.opus` stream at that output sample rate
+(`-d <rate> <channels>`, Ogg packets re-framed as the demo capture
+format; no pre-skip trim — comparison starts at sample zero). They
+drive `tests/downsampled_decode.rs`: bit-exact SILK decodes at 8 and
+24 kHz, float-floor CELT / Hybrid / mode-switching decodes at 12, 16,
+24 and 8 kHz. `dtx-refenc.pre.expected16.pcm` is the DTX capture's
+16 kHz reference decode up to the first suppression
+(`tests/dtx_reference_stream.rs`).
+
+## §4.5 configuration-switch captures (round 450)
+
+`switch-<a>-to-<b>.bits` are synthetic mode-switch streams in the
+demo capture format: 15 × 20 ms mono packets from one reference-
+encoder run (opaque invocation) followed by 15 from another —
+`hybrid` (voip 48 kHz 32 kb/s FB → config 15), `silkwb` (voip 16 kHz
+16 kb/s → config 9), `silknb` (voip 8 kHz 10 kb/s → config 1), `celt`
+(restricted-lowdelay 48 kHz 64 kb/s → config 31) — over the same
+tone-mix source. Because the halves come from separate encodes no
+packet carries §4.5.1 redundancy, which exercises exactly the seams
+the §4.5 text handles without it: the Hybrid → SILK overlap flush
+(Figure 18 `c` / `+`), SILK bandwidth changes, and the recommended
+PLC fill on the non-normative CELT ↔ SILK/Hybrid switches (Figure 19
+`P`). `switch-*.expected48.pcm` are the reference listing decoder's
+48 kHz decodes; they drive `tests/mode_switch_seams.rs`.
