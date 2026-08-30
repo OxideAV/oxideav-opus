@@ -643,8 +643,12 @@
 //!   [`celt_pvq_decode`] shape decode. The closed-form path for the
 //!   eight sentinel `(band, LM)` tuples runs at the consumer site.
 //!
-//! The rest of the CELT layer is not yet wired up; the [`Decoder`]
-//! / [`Encoder`] entry points still return [`Error::NotImplemented`].
+//! The complete decode and encode paths sit above these blocks:
+//! [`OpusDecoder`] (packet → PCM at any §4.2.9 output rate, with
+//! FEC, PLC, DTX holds and the §4.5 transition machinery),
+//! [`OpusEncoder`] (the unified §2.1 encoder over the SILK-only /
+//! Hybrid / CELT-only arms with §4.5.3 Figure 18 transitions), and
+//! the framework-facing [`make_decoder`] / [`make_encoder`] factories.
 
 #![warn(missing_debug_implementations)]
 
@@ -663,9 +667,8 @@ pub enum Error {
     /// `M = 0` or whose CBR per-frame size is not an integer divisor
     /// of the remaining payload.
     MalformedPacket,
-    /// The clean-room rebuild has not yet wired up a working
-    /// SILK / CELT pipeline; the higher-level decode / encode paths
-    /// return this until that work lands.
+    /// A feature outside the implemented surface was requested
+    /// (retained for the few remaining unimplemented entry points).
     NotImplemented,
 }
 

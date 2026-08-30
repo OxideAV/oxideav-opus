@@ -323,9 +323,10 @@ fn dump_ladder_captures_for_blackbox() {
         (P, 10_000),
     ];
     let total: usize = schedule.iter().map(|(c, _)| c * N).sum();
+    let redundancy = std::env::var_os("OPUS_DUMP_NO_REDUNDANCY").is_none();
     for (name, channels) in [("ladder-mono", 1usize), ("ladder-stereo", 2)] {
         let input = multitone(total + N, channels, 9000.0);
-        let packets = run_ladder(channels, Application::Audio, true, &input, schedule);
+        let packets = run_ladder(channels, Application::Audio, redundancy, &input, schedule);
         let mut bits = Vec::new();
         for p in &packets {
             bits.extend_from_slice(&(p.len() as u32).to_be_bytes());

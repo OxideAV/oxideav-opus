@@ -4,6 +4,23 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **Registry encoder on the unified encoder** (round 453):
+  `OpusStreamEncoder` wraps `OpusEncoder`; the option schema grows
+  `application`, `mode`, `bandwidth` `auto` + `nb`/`mb`, `frame-ms`
+  40/60, `cbr`, `fec`, `packet-loss`, `redundancy`.
+
+- **Black-box validation of the transition ladders** (round 453):
+  the §A reference listing's demo decoder and `opusdec` both decode
+  the unified encoder's 10-leg mono and stereo ladders without
+  error, agreeing with our decoder at 60.3 / 86.6 dB whole-stream
+  (listing) and 62 dB (`opusdec`); the sweep caught — and the
+  SILK-only writers now fix — the §5.1.5 terminator's omitted
+  trailing zero bytes shifting the decoder's §4.5.1.3 whole-bytes
+  count by one on about a third of redundancy-carrying packets. The
+  residual is the decoders' own post-switch conditioning on the
+  CELT→Hybrid legs (37 → 70 dB over four packets, measured with and
+  without redundancy).
+
 - **§4.5 configuration switching on the ENCODE side + unified
   `OpusEncoder`** (round 453): a top-level streaming encoder
   (`OpusEncoder`, 48 kHz S16 in / one packet per frame out) that

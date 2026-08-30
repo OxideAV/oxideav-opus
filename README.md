@@ -105,232 +105,6 @@ extrapolation tail cross-lapped into the first packet decoded after
 the loss run; in-band FEC (`decode_packet_fec`) remains the preferred
 recovery when the next packet is available.
 
-The crate now also carries the start of the **encode side**: the
-bit-exact §5.1 range *encoder* (`RangeEncoder` — the §5.1.1 symbol
-update, §5.1.1.2 carry propagation, the §5.1.2 division-free variants
-sharing the decoder's `icdf[]` tables, §5.1.3 raw bits, §5.1.4
-uniform integers, §5.1.5 finalization, §5.1.6 `tell`/`tell_frac`
-matching the decoder bit-for-bit), write-side mirrors of **every**
-SILK §4.2.7 decode stage (header / gains with a deterministic
-quantizer / LSF stage-1 + stage-2 / interpolation index / LTP / seed
-/ excitation, each returning the value the decoder will
-reconstruct), the whole-frame Table-5 composition
-(`encode_silk_frame`), and SILK-only **packet encoders for both mono
-and stereo** (`encode_silk_only_packet_mono` /
-`encode_silk_only_packet_stereo`: TOC byte + §4.2.3/§4.2.4 header
-bits + 1–3 SILK frames at 10/20/40/60 ms — the stereo entry writing
-the §4.2.2 mid/side interleave with the §4.2.7.1 weight quintuple and
-gated §4.2.7.2 mid-only flag on each mid frame, and two independent
-per-channel carried states) whose packets decode end-to-end through a
-fresh `OpusDecoder::decode_packet` to real SILK PCM, with every
-per-frame parameter verified equal to the encoder's prediction. LBRR
-(in-band FEC, §4.2.5) emission is included for both channel layouts
-and closes the FEC loop: `decode_packet_fec` recovers real (mono or
-two-channel) audio from the encoder's own redundancy. On top of the
-packet writers sit the **stereo analysis front half** — the exact
-§4.2.8 algebraic-inverse downmix `stereo_lr_to_ms` (L/R → mid/side
-with the decoder's weight-interpolation ramp; roundtrips to the
-input at the §4.2.8 one-sample delay), the least-squares §4.2.7.1
-weight estimator `estimate_stereo_weights`, and the exhaustive
-codebook quantizer `StereoWeightSymbols::quantize` — plus the **§3.2
-/ Appendix-B framing writers** (`compose_packet`,
-`compose_packet_code3`, `compose_self_delimited`; all four codes,
-CBR/VBR, §3.2.5 padding chains, parser-validated R2/R3/R5/R6) and
-the **RFC 7845 write side** (`OpusHead::compose`, byte-identical on
-reparse, and `assemble_multistream_packet`, roundtripped against the
-splitter and decoded sample-identically through
-`MultistreamDecoder`). On top of it all now sits the **§5.2.3 SILK
-signal analysis** — `encode(pcm)` is real: `SilkEncoderMono` /
-`SilkEncoderStereo` derive every Table-5 symbol from internal-rate
-PCM across the full SILK packet matrix — 10 / 20 / 40 / 60 ms
-packets (one 2-subframe frame, or one to three 20 ms frames with the
-intra-packet delta-gain / §4.2.7.6.1 relative-lag / §4.2.7.6.3
-scaling-presence threading of the decoder's regular walk), per-frame
-§4.2.3 VAD flags derived from the signal (silent intervals code
-frame type 0 and skip the pitch search), §4.2.5 **LBRR in-band FEC**
-from PCM (`set_fec(true)`: each packet re-encodes the previous
-packet's active intervals at a reduced rate from a pre-packet
-analyzer snapshot with a fresh closed-loop state, recovered
-end-to-end through `decode_packet_fec`), and §3.2.5 **CBR transport
-shaping** (`encode_packet_cbr` / `pad_packet_to`: exact-byte-size
-code-3 re-framing, every target size reachable, decode-identical).
-The chain is Burg's-method LPC
-(§5.2.3.4.2.1) → analysis-direction LPC→NLSF conversion (deflated
-line-spectral root search, verified as the exact inverse of the
-§4.2.7.5.6 fixed-point reconstruction) → exhaustive stage-1
-analysis-by-synthesis NLSF quantisation scored on the real decode
-chain → whitened-domain §5.2.3.2 pitch analysis with joint
-(primary-lag × Table 33-36 contour) quantisation → §5.2.3.6
-exact-distortion LTP codebook search → per-subframe residual-energy
-gain selection through the §4.2.7.4 quantizer (cross-packet
-clamp-safe) → a closed-loop excitation quantiser (the §5.2.3.8 role)
-that rounds each pulse against the prediction the decoder will
-actually form, LCG sign inversion included, and updates the carried
-state through the real §4.2.7.9 synthesis chain. Sine, pulse-train
-(voiced), and amplitude-panned stereo inputs all decode back through
-the real streaming `OpusDecoder` at >10 dB tone-projection SNR on
-the 48 kHz output, with stereo panning preserved.
-
-Round 418 completed the encoder arc beyond SILK: **CELT-mode packet
-encode is real, end to end** (`CeltEncoder`). The full §5.3 stage
-sequence mirrors the §4.3 decoder symbol for symbol — silence flag,
-post-filter (off), transient analysis + short blocks, two-pass
-intra/inter §5.3.2 coarse energy with the decoder-lockstep quantized
-`oldBandE` carry, budget-gated tf flags, the §5.3.4 spreading
-decision, the dynalloc boost loop, trim analysis, the §4.3.3
-allocation with coded skip / intensity / dual-stereo decisions
-(encode→decode roundtrips to identical allocations), fine energy,
-the recursive §4.3.4 band encode (split angles measured from the
-band energies on the step/uniform/triangular PDFs, intensity
-collapse, Haar/Hadamard time reorganisation, PVQ pyramid search +
-exact §4.3.4.2 index construction at the leaves, the decode side's
-exact 1/8-bit budget bookkeeping), the anti-collapse bit, the final
-fine backfill, and the fixed-size §5.1.5 finalization where range
-bytes and raw bits share exactly the frame's bytes. The whole
-configuration matrix encodes — NB/WB/SWB/FB × 2.5/5/10/20 ms × mono
-+ stereo at any constant payload 2..=1275 bytes — and every stream
-was validated through BOTH decoders: the crate's own `OpusDecoder`
-(13–46 dB multitone SNR by rate with a monotone rate ladder) and the
-RFC 6716 §A reference-listing decoder (RFC 8251-patched,
-hash-verified extraction), which reconstructs our streams
-identically to ours at 88–108 dB (float-noise floor, max 1 LSB).
-At matched CBR rates on the same content our encoder lands within
-2.7–3.3 dB of the reference listing's own encoder (32→128 kb/s
-sweep). **Hybrid encode works too** (`HybridEncoderMono`, configs
-12–15: SWB/FB × 10/20 ms): the WB SILK layer and the CELT bands
-17.. share one range coder with the §4.5.1.1 redundancy flag coded
-off under the decoder's 37-bit gate, and the two layers sit on one
-timeline (a 165-tap linear-phase 48→16 kHz decimator's 82-sample
-delay + the §4.2.9 resampler's 35 + the §4.2.8 mono delay's 3
-exactly equal the CELT path's 120-sample MDCT-overlap delay; an
-empirical best-lag search returns 120). Hybrid streams decode
-through both decoders as well (the listing decoder agrees with ours
-at 105–108 dB). The SILK layer has no rate control yet, so a payload
-it alone would overflow is rejected cleanly.
-
-Round 431 adds **Opus-level VBR** (RFC 6716 §2.1.8 / §3.2.1):
-`vbr::VbrRateControl` elects every code-0 packet's size against a
-target bitrate — unconstrained mode corrects by the accumulated drift
-(clamped to ±one frame's target, so silence cannot bank an unbounded
-spree), constrained mode adds the §2.1.8 bit-reservoir simulation
-(spend above target only what below-target packets banked; bank
-capped at a documented 100 ms default, giving the provable
-`n·target + cap` bound on every n-packet window). `CeltVbrEncoder`
-covers the full CELT matrix with 3-byte digital-silence collapse and
-a transient pre-detect boost the drift repays; `HybridVbrEncoderMono`
-rides `encode_packet_elected` (SILK floor raises feed the drift).
-Realized averages land within 2–5% of target on every arm and frame
-size; at matched average rate VBR ≥ CBR on steady content and beats
-CBR by ~3.3 dB on mixed tone/silence content at equal total bytes. A
-15-stream VBR corpus (CELT NB/WB/SWB/FB × 2.5–20 ms × mono/stereo ×
-constrained/unconstrained + all four Hybrid configs) decodes through
-the §A reference-listing decoder with exact packet and sample counts,
-agreeing with our decoder at 90–107 dB (max 1 LSB).
-
-Round 437 closes the remaining encoder-arc frontiers. **SILK-layer
-rate control** (the §5.2.3.9 "iterative loop around the noise shaping
-quantizer and entropy coding"):
-`SilkEncoderMono/Stereo::encode_packet_elected` searches the
-excitation-pulse-RMS knob with a warm-started secant over cloned
-full-packet trial encodes, adopting the largest packet not exceeding
-the election (floor-raising when even the coarsest quantization
-overshoots — the drift accounting repays it). Below the default
-quality the **§5.2.3.8 noise shaping quantizer** engages: the
-§5.2.3.7 `Wana` prefilter on the target (quantized predictor chirped
-by `g_ana = 0.95 − 0.01·C`), the `a_syn`-filtered quantized-history
-feedback in every pulse decision (`g_syn = 0.95 + 0.01·C`, the
-stable `1/Wsyn` noise loop), and a linear `(r − q)² + λ·|q|` rate
-penalty — the pure closed-loop tracker's noise-chasing equilibrium
-(≈ 1 pulse/sample) made voiced rate irreducible by gain coarsening
-alone, and the default path stays bit-identical to before. Measured:
-the knob spans ~16–200 bytes/packet (WB 20 ms); elections land at
-96–98% of target across NB/WB mono and stereo (+FEC); all elected
-oracle streams decode **bit-exactly** through the §A
-reference-listing decoder. On top sit the **SILK-only VBR arms**
-(`vbr::SilkVbrEncoderMono` / `SilkVbrEncoderStereo`: realized
-averages within 0.1% of target at NB 12 k / WB 20–32 k / 40–60 ms /
-stereo 28 k constrained + FEC; silence collapses to the header floor
-with the post-silence spree bounded at 2× target; a 5-stream oracle
-set decodes bit-exactly), **stereo Hybrid encode**
-(`HybridEncoderStereo`, configs 12–15 stereo: the §5.2.2 mixing
-front end + two-channel §4.2.3 header + mid/side frames and the
-stereo CELT bands 17.. on one range coder at the mono arm's
-120-sample timeline; L 16.4 / R 12.4 dB at FB 20 ms 144 kb/s,
-oracle agreement 104–107 dB) with its **VBR arm**
-(`vbr::HybridVbrEncoderStereo`, exact-on-target averages, 103–106 dB
-oracle), and the **§4.3.4.5 CELT tf analysis** (the listing's
-per-band Haar-level L1 metric + budget-λ Viterbi smoothing;
-`encode_celt_frame` now codes real per-band `tf_change` flags —
-313/420 band decisions fire on half-bin tone + click content — with
-tf-flagged oracle streams agreeing at 93–99 dB). A new
-`silk_elected_roundtrip` fuzz target hardened the election against
-adversarial content (a §3.2.1 writer overflow at a generous starting
-quality now steps the knob down instead of erroring). Finally, the
-**§5.3.1 pitch pre-filter** is real: the listing's pitch estimator
-(`pitch_downsample` / `pitch_search` / `remove_doubling` with the
-sub-multiple confirmation walk) drives the §4.3.7.1 comb applied as
-the decoder post-filter's inverse, with the full decision ladder and
-octave/period/gain/tapset parameter coding — on voice-like periodic
-content it fires on every frame at the exact true period, buys
-+1.0–1.3 dB at equal rate over the pf-off encoder, stays off on
-noise, and the coded streams agree with the reference-listing
-decoder at 81 dB (max 1 LSB). No encoder-arc item remains open.
-
-Round 442 works the encoder-quality tail with two new elections.
-The **§5.2.3.8 delayed-decision NSQ**
-(`silk_nsq_del_dec::quantize_excitation_frame_del_dec`, armed via
-`set_nsq_delayed_decision`) runs the reference listing's multi-state
-trellis — up to 4 states on distinct §4.2.7.7 dither seeds, two
-quantization-level candidates per state per sample, K-best pruning,
-the winner electing the frame's coded seed (two uniform bits either
-way, so the election is rate-free) — with each state carrying its own
-§4.2.7.9 synthesis mirrors, so the decision horizon spans the whole
-frame. Every frame elects between the single-state quantiser and the
-trellis on the measured `(recon − want)² + λ·|q|` frame cost, so only
-measured wins are adopted and the 1-state default stays bit-identical.
-Measured: **+0.8–1.2 dB** at equal elected rate on speech-like content
-(WB 25/40/60 B, NB 30 B; 2 states already take most of it), rate −2.4%
-at equal SNR on the default-quality path, and five delayed-decision
-oracle streams (elected mono / FEC / default / 60 ms multiframe /
-stereo) decode **bit-exactly** through the §A reference-listing
-decoder. The **§5.3.1 tapset election**
-(`CeltEncoder::set_tapset_election`) replaces the hardwired
-post-filter tapset 0: each pre-filter-firing frame is trial-encoded
-per tapset at the same payload, decoded through a clone of a lockstep
-mirror decoder, and the measured-SNR winner is committed — **+0.2–1.7
-dB** at equal rate over the fixed-0 encoder on periodic content
-(within ±0.1 dB of the best fixed tapset per content), the elected
-streams agreeing with the reference-listing decoder at 103 dB (max
-1 LSB).
-
-Round 445 closes the r442 followups and lands three new encoder
-surfaces. The **delayed-decision × LBRR / Hybrid composition** is
-measured and gated: the trellis election runs inside the §4.2.5 LBRR
-re-encode itself (elected seeds ride on 7/10 LBRR frames), FEC
-recoveries track the clean decode **+1.0 dB** better at equal elected
-rate, and Hybrid framing composes at parity with byte-identical
-elected sizes. The **tapset-election × VBR silence-collapse
-interaction** (flagged untested in r442) is pinned: the lockstep
-mirror survives 3-byte silence packets, winning **+1.7 dB
-whole-stream / +1.9 dB post-silence** over tapset-0 at 16 kb/s across
-a silence gap (oracle: 102.9 dB / max 1 LSB on the silence-gapped
-elected VBR stream). The **§2.1.7 loss-optimised LBRR mode**
-(`set_packet_loss_perc`, SILK + Hybrid + VBR arms) shapes redundancy
-from the declared loss: onsets-only at ≤10% (carriers 143 → 10,
-**+2.0 dB** clean at equal elected rate), a 0.5 → 0.9 rate-ratio ramp
-above (recoveries **+1.6 dB** at the 50% point; three loss-optimised
-oracle streams decode **bit-exactly**). The **complexity ladder**
-(`set_complexity(0..=10)` on every encoder arm) maps the election
-machinery onto one knob — measured monotone: CELT 14.6 / 19.1 /
-20.3 dB at rungs 0/4/10, SILK 9.0 / 9.8 / 10.2 dB — with untouched
-encoders bit-identical to the documented default rung. And **Hybrid
-in-band FEC** closes the LBRR story across every SILK-bearing mode:
-mono and stereo Hybrid packets carry the §4.2.5 redundancy on the
-shared range coder (stereo with the §4.2.7.1 weights on the LBRR mid
-frame), `decode_packet_fec` recovers the 0–8 kHz LP band, and the FEC
-streams agree with the reference-listing decoder at **112–113 dB**
-(max 1 LSB).
-
 Round 448 lands the last untouched §2.1 subsystem: **§2.1.9
 discontinuous transmission**, on both sides of the wire. Decoder
 side, a §3.2.1 zero-length frame no longer snaps to digital silence:
@@ -399,6 +173,97 @@ power-complementary crossfade (whole-stream 34–40 dB vs ≈27 dB for a
 hard switch, off-seam ≥ 97 dB). Loss re-convergence is gated against
 reference decodes of planted-loss captures at 48 kHz AND 16 kHz, and
 the decode fuzz target cycles output rates.
+
+### Encoder
+
+The **encode side is complete across every RFC 6716 mode** and
+fronted by one streaming encoder. `OpusEncoder` (`opus_encoder`)
+takes 48 kHz interleaved S16 and emits one packet per frame, with
+every §2.1 control parameter live: bitrate (6–510 kb/s), operating
+mode (auto / SILK / Hybrid / CELT), audio bandwidth (auto / NB / MB /
+WB / SWB / FB), frame duration (2.5–60 ms), VBR / constrained VBR /
+hard CBR (§3.2.5 exact-size padding), DTX, in-band FEC with the
+§2.1.7 packet-loss knob, the 0–10 complexity ladder, tapset election,
+and the §4.5.1 transition redundancy switch. In `auto`, the mode and
+bandwidth follow the bitrate per application profile (`Voip` /
+`Audio` / `RestrictedLowDelay`; §2.1.1's sweet spots), and a
+configuration change is carried out as a **§4.5.3 Figure 18
+normative transition**: a 5 ms redundant CELT frame in the last
+old-configuration packet (SILK→CELT, Hybrid→CELT, NB/MB SILK→Hybrid),
+in the first new-configuration packet (CELT→SILK / Hybrid), in both
+(SILK bandwidth change, Hybrid→NB/MB SILK), or in neither (the WB
+SILK↔Hybrid pairs, normative bare). One CELT state threads the whole
+stream across the arms with the §4.5.2 reset placement mirrored from
+the decoder's own rule table (an end-position frame reset-then-warms
+the state the following CELT / Hybrid frames continue; a
+beginning-position frame rides the carried chain ahead of the
+deferred `|H` main-layer reset), the SILK analyzer carries across WB
+SILK↔Hybrid where the decoder carries its SILK state, and every arm
+sits on the same 120-sample stream timeline (measured end-to-end lag
+120 ± 2 for NB/MB/WB × mono/stereo SILK-only, Hybrid, and CELT).
+Changes land one packet after the knob moves — the packet coded when
+a change is first seen is the transition carrier — and the redundant
+bytes (~5 ms of the richer seam side's rate) ride on top of the
+election, outside the VBR drift ledger.
+
+Underneath sit the per-mode arms, each usable directly:
+
+* **SILK-only** (`SilkEncoderMono` / `SilkEncoderStereo`): the full
+  §5.2.3 signal analysis — Burg LPC → analysis-direction NLSF
+  conversion → analysis-by-synthesis stage-1/2 NLSF quantisation on
+  the real decode chain → whitened-domain pitch analysis with joint
+  lag/contour quantisation → exact-distortion LTP codebook search →
+  residual-energy gain selection through the §4.2.7.4 quantizer → a
+  closed-loop excitation quantizer (LCG sign inversion included),
+  the §5.2.3.8 noise-shaping quantizer with a 2–4-state
+  delayed-decision trellis on the higher complexity rungs, the
+  §5.2.2 stereo mixing front end with the §4.2.7.1 weight codebook
+  and §4.2.7.2 mid-only escape per interval, §4.2.5 LBRR (FEC) and
+  §2.1.9 DTX emission, and the §5.2.3.9 rate loop
+  (`encode_packet_elected`: a warm-started secant on the pulse-RMS
+  knob over cloned trial encodes). NB/MB/WB × 10/20/40/60 ms; every
+  elected oracle stream decodes **bit-exactly** through the §A
+  reference-listing decoder.
+* **CELT-only** (`CeltEncoder`): the whole §5.3 mirror of the §4.3
+  decoder — silence, the §5.3.1 pitch pre-filter with the full
+  decision ladder and tapset election, transient / short blocks,
+  two-pass coarse energy with the decoder-lockstep energy carry,
+  §4.3.4.5 tf analysis (Haar-level L1 metric + Viterbi smoothing),
+  spreading, dynalloc, trim, the §4.3.3 allocation with coded
+  skip / intensity / dual-stereo decisions, fine energy, the
+  recursive §4.3.4 band coder with PVQ search and exact §4.3.4.2
+  index construction, anti-collapse, and the fixed-size §5.1.5
+  finalization. NB/WB/SWB/FB × 2.5/5/10/20 ms × mono/stereo at any
+  payload 2..=1275; streams decode through the reference listing at
+  88–108 dB agreement with our decoder and land within 2.7–3.3 dB of
+  the listing's own encoder at matched CBR rates.
+* **Hybrid** (`HybridEncoderMono` / `HybridEncoderStereo`): the WB
+  SILK layer and CELT bands 17.. on one range coder with the two
+  layers delay-matched (a 165-tap 48→16 kHz decimator + the §4.2.9
+  resampler + the §4.2.8 delay equal the 120-sample MDCT overlap),
+  SWB/FB × 10/20 ms, with FEC / DTX and now the explicit §4.5.1.1
+  redundancy flag, §4.5.1.2 position and §4.5.1.3 size when a
+  transition rides (the main CELT layer is coded against the
+  reduced budget). Listing agreement 104–108 dB.
+* **Rate control** (`vbr`): `VbrRateControl` — unconstrained drift
+  correction or the §2.1.8 constrained bit-reservoir bound
+  (provable `n·target + cap` window) — behind `CeltVbrEncoder`,
+  `HybridVbrEncoderMono/Stereo` and `SilkVbrEncoderMono/Stereo`
+  (realized averages within 0.1–5 % of target on every arm).
+
+Validation of the unified encoder's transition ladders (10 legs
+walking every Figure 18 class, mono and stereo) through the crate's
+own decoder pins the redundancy decision, its §4.5.1.2 position and
+its §4.5.1.3 size packet by packet; through the two black-box
+decoders (the §A reference listing's demo decoder and `opusdec`) the
+streams decode without error and agree with our decoder at 86.6 dB
+(stereo) / 60.3 dB (mono) whole-stream against the listing and
+62 dB against `opusdec`, the residual being the decoders' own
+non-normative post-switch conditioning on the CELT→Hybrid legs
+(37 → 70 dB over four packets, present with and without redundancy).
+Seam quality over the §4.5.3 Figure 19 concealment fallback:
+SILK→CELT 6.9 → 32.3 dB, CELT→Hybrid 17.9 → 24.0 dB, CELT→SILK at
+parity with the (already strong) §4.4 fill on steady content.
 
 Differential encoder/decoder testing and a restored cargo-fuzz suite
 (6 coverage-guided targets, incl. an encoder↔decoder range-coder
@@ -543,7 +408,7 @@ registry-resolution integration suites). Per-stage progress lives in
   constructs an `OpusStreamDecoder` honouring `CodecParameters`
   (extradata `OpusHead` → channels / §5.1.1 multistream mapping /
   pre-skip / output gain, `sample_rate` → any §4.2.9 output rate) or
-  an `OpusStreamEncoder` on the CELT-only VBR arm (channels,
+  an `OpusStreamEncoder` on the unified `OpusEncoder` (mode / bandwidth / application / cbr / fec / packet-loss / redundancy options included) (channels,
   `bit_rate`, and the typed `OpusEncoderOptions` schema: bandwidth,
   frame-ms, constrained-vbr, dtx, tapset-election, complexity).
   Registry-resolved decodes of the SILK fixtures are bit-exact
@@ -556,6 +421,18 @@ helpers — and `RangeEncoder`, its bit-exact §5.1 write-side mirror
 (validated by per-primitive roundtrips, `tell`/`tell_frac` lockstep,
 a 5000-seed mixed-symbol fuzz roundtrip, and a coverage-guided
 libfuzzer differential target).
+
+**Unified encoder (RFC 6716 §2.1 / §4.5):** `OpusEncoder`
+(`opus_encoder`) — one streaming front end over the three arms with
+every §2.1 knob, bitrate-driven mode/bandwidth selection per
+`Application`, and the §4.5.3 Figure 18 transitions written with
+their §4.5.1 redundant CELT frames (`encode_redundant_celt_frame`;
+the §4.5.1.2 position symbol via
+`encode_silk_only_packet_{mono,stereo}_red`; the Hybrid arms'
+`RedundancyPlan` through `encode_packet_elected_with`), the §4.5.2
+reset placement mirrored from `decide_state_resets`, and 48 kHz →
+8/12/16 kHz input decimation on the CELT 120-sample timeline
+(`tests/unified_encoder_transitions.rs`).
 
 **SILK encode side (RFC 6716 §5.2 bitstream back end):** write-side
 mirrors of every §4.2.7 stage sharing the decode tables
