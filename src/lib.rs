@@ -798,6 +798,7 @@ pub mod hybrid_packet_encode;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod mode_transition_reset;
 pub mod multistream;
+pub mod opus_encoder;
 pub mod opus_head;
 pub mod packet_compose;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
@@ -1017,6 +1018,7 @@ pub use multistream::{
     assemble_multistream_packet, split_multistream_packet, MultistreamAudio, MultistreamDecoder,
     StreamPacket,
 };
+pub use opus_encoder::{Application, OpusEncoder};
 pub use opus_head::{
     apply_output_gain, ChannelMappingTable, OpusHead, OpusHeadError, PreSkip, OPUS_HEAD_MAGIC,
     OPUS_HEAD_MAX_VERSION, OPUS_HEAD_MIN_LEN,

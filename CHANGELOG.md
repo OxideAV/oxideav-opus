@@ -4,6 +4,48 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+- **§4.5 configuration switching on the ENCODE side + unified
+  `OpusEncoder`** (round 453): a top-level streaming encoder
+  (`OpusEncoder`, 48 kHz S16 in / one packet per frame out) that
+  resolves the operating mode and audio bandwidth from the bitrate
+  knob per application profile (§2.1.1 / §2.1.3; `Voip` / `Audio` /
+  `RestrictedLowDelay`), drives the existing SILK-only / Hybrid /
+  CELT-only arms, and writes the §4.5.1 **transition side
+  information** — the 5 ms redundant CELT frame — at every §4.5.3
+  Figure 18 position: end-of-last-old-frame for SILK→CELT,
+  Hybrid→CELT and NB/MB-SILK→Hybrid, beginning-of-first-new-frame
+  for CELT→SILK/Hybrid, both for SILK bandwidth changes and
+  Hybrid→NB/MB SILK, and none for the WB-SILK↔Hybrid pairs (already
+  normative). One CELT state threads the whole stream (arms hand it
+  over at each switch; `CeltEncoderState::set_geometry` carries it
+  across the 5 ms/frame-size changes) with the §4.5.2 reset placement
+  mirrored encoder-side via the decoder's own `decide_state_resets`
+  (end-position frames reset-then-warm the state the following
+  CELT/Hybrid frames continue — Figure 18 `!R`; beginning-position
+  frames ride the carried chain before a deferred `|H` main-layer
+  reset). The SILK analyzer state carries across WB-SILK↔Hybrid
+  exactly where the decoder carries its SILK state. New write-side
+  plumbing: `encode_redundant_celt_frame` (5 ms, TOC-less, own
+  §4.5.1.3 byte-aligned coder), the §4.5.1.2 position symbol in the
+  SILK-only packet writers (`encode_silk_only_packet_{mono,stereo}_red`),
+  an explicit-size redundancy plan in the Hybrid arms'
+  `encode_packet_elected_with` (flag/position/`2 + uint(256)` size,
+  main CELT layer coded against the §4.5.1.3-reduced budget), and
+  48 kHz→8/12/16 kHz input decimators whose group delays put every
+  SILK-only chain on the CELT 120-sample stream timeline (measured
+  end-to-end lag 120 ± 2 on all NB/MB/WB × mono/stereo arms).
+  Configuration changes land one packet after the knob moves so the
+  last old-configuration packet can carry the end redundancy;
+  redundant bytes ride on top of the election (sized from the richer
+  seam side, ~5 ms of bitrate) and stay out of the VBR drift ledger.
+  Gated in `tests/unified_encoder_transitions.rs`: a 10-leg mono
+  ladder walks every transition class with the redundancy decision
+  and §4.5.1.2 position verified packet-by-packet through the
+  decoder's `last_redundancy`, plus stereo, knob-validation, and
+  seam-SNR suites — measured S→C seam 6.9 → 32.3 dB and C→H
+  17.9 → 24.0 dB over the Figure 19 concealment fallback, C→S at
+  parity with the (already strong) §4.4 fill on steady content.
+
 - **Typed registry encoder options** (round 450):
   `OpusEncoderOptions` (schema declared to the registry via
   `CodecInfo::encoder_options`, introspectable through
