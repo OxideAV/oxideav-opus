@@ -269,7 +269,21 @@ pub fn encode_silk_only_packet_mono_red(
 
     // §5.1.5 finalize; §3.2 code-0 framing = TOC byte + the single
     // compressed frame. R2: a frame may not exceed 1275 bytes.
-    let body = re.finish();
+    let tell = re.tell() as usize;
+    let mut body = re.finish();
+    if redundancy_position.is_some() {
+        // §4.5.1.3: the redundant frame is "the number of whole bytes
+        // remaining" = frame length − ceil(tell / 8) as the DECODER
+        // counts it. The §5.1.5 finalization omits trailing zero
+        // bytes of the terminator (the decoder zero-extends), so the
+        // SILK portion can end short of ceil(tell / 8); restore those
+        // zero bytes explicitly so the appended redundant frame
+        // starts exactly where the decoder's count puts it.
+        let full = tell.div_ceil(8);
+        if body.len() < full {
+            body.resize(full, 0);
+        }
+    }
     if body.len() > 1275 {
         return Err(Error::MalformedPacket);
     }
@@ -587,8 +601,17 @@ pub fn encode_silk_only_packet_stereo_red(
     }
 
     // §5.1.5 finalize; §3.2 code-0 framing. R2: a frame may not exceed
-    // 1275 bytes.
-    let body = re.finish();
+    // 1275 bytes. With redundancy following, restore the terminator's
+    // omitted trailing zero bytes up to ceil(tell / 8) (see the mono
+    // writer — the decoder's §4.5.1.3 whole-bytes count starts there).
+    let tell = re.tell() as usize;
+    let mut body = re.finish();
+    if redundancy_position.is_some() {
+        let full = tell.div_ceil(8);
+        if body.len() < full {
+            body.resize(full, 0);
+        }
+    }
     if body.len() > 1275 {
         return Err(Error::MalformedPacket);
     }

@@ -191,6 +191,21 @@ fn mono_ladder_places_figure18_redundancy() {
         };
         assert_eq!(got_end, end, "leg {leg} carrier packet side info");
         assert_eq!(got_begin, begin, "leg {leg} first-new packet side info");
+        // §4.5.1.3 size as the decoder counts it must equal what the
+        // encoder appended: ~5 ms of the richer seam side's bitrate
+        // (the SILK portion is padded to ceil(tell / 8) so the
+        // terminator's omitted zero bytes cannot shift the count).
+        let expected_size = (schedule[leg - 1].1.max(schedule[leg].1) / 1600) as usize;
+        for (pkt, want) in [(carrier, end), (first_new, begin)] {
+            if want.is_some() {
+                assert!(
+                    matches!(reds[pkt], RedundancyDecision::Present { size_bytes, .. }
+                        if size_bytes == expected_size),
+                    "leg {leg} packet {pkt}: {:?}, expected {expected_size} bytes",
+                    reds[pkt]
+                );
+            }
+        }
     }
 
     // Whole-stream decode on the 120-sample timeline.
@@ -254,8 +269,12 @@ fn stereo_ladder_places_redundancy() {
         reds[2 * P + 1],
         RedundancyDecision::Present {
             position: RedundancyPosition::Beginning,
-            ..
+            size_bytes: 37, // max(60k, 14k) / 1600
         }
+    ));
+    assert!(matches!(
+        reds[P],
+        RedundancyDecision::Present { size_bytes: 37, .. }
     ));
     let snr = snr_window(&input, &pcm, 2, 120, 4_800..total - 200);
     assert!(snr > 3.0, "stereo whole-stream SNR {snr:.1} dB");
