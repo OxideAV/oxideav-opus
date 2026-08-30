@@ -150,6 +150,35 @@ impl CeltAnalysis {
         self.prefilter_mem.fill(0.0);
     }
 
+    /// Change the frame geometry WITHOUT dropping the carried state
+    /// (§4.5.2: a CELT state persists across a frame-size change —
+    /// the 5 ms §4.5.1 redundant frame shares the stream's one CELT
+    /// state with the 10/20 ms frames around it). The §4.3.7 overlap
+    /// history is the same 120 samples at every size ≥ 2.5 ms, so
+    /// only the frame length changes; a channel-count change (never a
+    /// state-preserving transition) re-creates the buffers zeroed.
+    pub fn set_geometry(&mut self, channels: usize, n: usize) {
+        if channels != self.channels {
+            *self = Self::new(channels, n);
+            return;
+        }
+        let old_overlap = CELT_OVERLAP_48K.min(self.n);
+        let overlap = CELT_OVERLAP_48K.min(n);
+        if overlap != old_overlap {
+            // Only reachable via a 2.5 ms frame (overlap 120 either
+            // way for n >= 120); keep the most recent samples.
+            let mut mem = vec![0.0f64; channels * overlap];
+            for c in 0..channels {
+                let src = &self.in_mem[c * old_overlap..(c + 1) * old_overlap];
+                let keep = overlap.min(old_overlap);
+                mem[c * overlap + overlap - keep..(c + 1) * overlap]
+                    .copy_from_slice(&src[old_overlap - keep..]);
+            }
+            self.in_mem = mem;
+        }
+        self.n = n;
+    }
+
     /// Pre-emphasize one interleaved i16 frame (`channels * n`
     /// samples) into the per-channel `[COMBFILTER_MAXPERIOD | N]`
     /// pre-filter layout, advancing only the §5.3 emphasis memory

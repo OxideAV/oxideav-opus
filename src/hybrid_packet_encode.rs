@@ -23,8 +23,14 @@
 //! per §A.1). No external library source was consulted.
 
 use crate::celt_frame_encode::{encode_celt_frame, CeltEncoderState};
+use crate::celt_packet_encode::{
+    encode_redundant_celt_frame, REDUNDANT_FRAME_MAX_BYTES, REDUNDANT_FRAME_MIN_BYTES,
+    REDUNDANT_FRAME_SAMPLES,
+};
 use crate::celt_redundancy::{
-    HYBRID_REDUNDANCY_MIN_REMAINING_BITS, REDUNDANCY_FLAG_ICDF, REDUNDANCY_FLAG_ICDF_FTB,
+    HYBRID_REDUNDANCY_MIN_REMAINING_BITS, HYBRID_REDUNDANCY_SIZE_BASELINE_BYTES,
+    REDUNDANCY_FLAG_ICDF, REDUNDANCY_FLAG_ICDF_FTB, REDUNDANCY_POSITION_ICDF,
+    REDUNDANCY_POSITION_ICDF_FTB,
 };
 use crate::range_encoder::RangeEncoder;
 use crate::silk_decode::{encode_silk_frame, SilkFrameConfig, StereoHeaderContext};
@@ -49,24 +55,40 @@ const MAX_FRAME_BYTES: usize = 1275;
 /// §4.3 layer always has a working budget for its gated symbols.
 pub const HYBRID_MIN_CELT_TAIL_BYTES: usize = 12;
 
-/// Decimator FIR half-width at 48 kHz: 165 taps → 82-sample group
-/// delay (see the module docs' alignment budget).
+/// Decimator FIR length at 48 kHz for the WB (48 → 16 kHz) path:
+/// 165 taps → 82-sample group delay (see the module docs' alignment
+/// budget).
 const DECIM_TAPS: usize = 165;
 
-/// Linear-phase windowed-sinc 48 kHz → 16 kHz decimator with carried
-/// history (streaming; group delay (165-1)/2 = 82 input samples).
+/// Linear-phase windowed-sinc 48 kHz → SILK-internal-rate decimator
+/// with carried history (streaming; group delay `(taps - 1) / 2`
+/// input samples). `ratio` is 6 / 4 / 3 for the NB / MB / WB internal
+/// rates; the tap count is chosen by the caller so the decimator's
+/// delay plus the decoder-side §4.2.9 resampler and §4.2.8 delays
+/// land on the CELT chain's 120-sample timeline.
 #[derive(Debug, Clone)]
-struct Decimator48To16 {
+pub(crate) struct Decimator48 {
+    ratio: usize,
     taps: Vec<f64>,
     hist: Vec<f64>,
 }
 
-impl Decimator48To16 {
-    fn new() -> Self {
-        // Kaiser-ish Hann-windowed sinc, cutoff 0.9 * 8 kHz.
-        let fc = 0.9 * 8000.0 / 48000.0; // cycles per input sample
-        let m = (DECIM_TAPS - 1) as f64;
-        let mut taps = vec![0.0f64; DECIM_TAPS];
+/// The WB-path decimator the Hybrid arms use.
+pub(crate) type Decimator48To16 = Decimator48;
+
+impl Decimator48 {
+    /// The Hybrid arms' 48 → 16 kHz decimator (165 taps).
+    pub(crate) fn new() -> Self {
+        Self::with_taps(3, DECIM_TAPS)
+    }
+
+    /// A decimator by `ratio` (6 / 4 / 3) with an odd `taps` count
+    /// (Hann-windowed sinc, cutoff at 90% of the output Nyquist).
+    pub(crate) fn with_taps(ratio: usize, taps_len: usize) -> Self {
+        debug_assert!(taps_len % 2 == 1, "linear phase needs an odd tap count");
+        let fc = 0.9 * 0.5 / ratio as f64; // cycles per input sample
+        let m = (taps_len - 1) as f64;
+        let mut taps = vec![0.0f64; taps_len];
         let mut sum = 0.0f64;
         for (i, t) in taps.iter_mut().enumerate() {
             let x = i as f64 - m / 2.0;
@@ -83,27 +105,59 @@ impl Decimator48To16 {
             *t /= sum;
         }
         Self {
+            ratio,
             taps,
-            hist: vec![0.0; DECIM_TAPS - 1],
+            hist: vec![0.0; taps_len - 1],
         }
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.hist.fill(0.0);
     }
 
-    /// Consume `3 * n` 48 kHz samples, produce `n` 16 kHz samples
-    /// (f32 in [-1, 1] for the SILK analyzer).
-    fn process(&mut self, input48: &[f64]) -> Vec<f32> {
-        let n_out = input48.len() / 3;
+    /// Re-prime the carried history from the most recent 48 kHz input
+    /// samples (`recent` oldest-first; shorter histories are
+    /// zero-extended at the old end). Lets a decimator built at a
+    /// configuration switch continue the input timeline seamlessly.
+    pub(crate) fn prime(&mut self, recent: &[f64]) {
+        let keep = self.hist.len();
+        self.hist.fill(0.0);
+        let take = recent.len().min(keep);
+        self.hist[keep - take..].copy_from_slice(&recent[recent.len() - take..]);
+    }
+
+    /// The internal-rate output sample the decimator produced LAST
+    /// (i.e. for the final output slot of the most recent packet),
+    /// recomputed from raw recent 48 kHz history (oldest first; must
+    /// hold at least `taps + ratio - 1` samples for an exact value —
+    /// shorter histories zero-extend). Used to seed the stereo
+    /// SILK-only arm's one-sample §4.2.8 lookahead hold at a
+    /// configuration switch.
+    pub(crate) fn sample_before(&self, recent48: &[f64]) -> f32 {
+        let taps_len = self.taps.len();
+        let need = taps_len + self.ratio - 1;
+        let mut ext = vec![0.0f64; need.saturating_sub(recent48.len())];
+        ext.extend_from_slice(recent48);
+        let start = ext.len() - need;
+        let mut acc = 0.0f64;
+        for (j, &t) in self.taps.iter().enumerate() {
+            acc += t * ext[start + j];
+        }
+        (acc / 32768.0) as f32
+    }
+
+    /// Consume `ratio * n` 48 kHz samples, produce `n` internal-rate
+    /// samples (f32 in [-1, 1] for the SILK analyzer).
+    pub(crate) fn process(&mut self, input48: &[f64]) -> Vec<f32> {
+        let n_out = input48.len() / self.ratio;
         let mut ext = Vec::with_capacity(self.hist.len() + input48.len());
         ext.extend_from_slice(&self.hist);
         ext.extend_from_slice(input48);
         let mut out = Vec::with_capacity(n_out);
         for k in 0..n_out {
-            // Output sample k corresponds to input index 3k (plus the
-            // FIR delay carried by the history offset).
-            let base = 3 * k;
+            // Output sample k corresponds to input index ratio*k (plus
+            // the FIR delay carried by the history offset).
+            let base = self.ratio * k;
             let mut acc = 0.0f64;
             for (j, &t) in self.taps.iter().enumerate() {
                 acc += t * ext[base + j];
@@ -114,6 +168,118 @@ impl Decimator48To16 {
         self.hist.copy_from_slice(&ext[ext.len() - keep..]);
         out
     }
+}
+
+/// Where a §4.5.1 redundant CELT frame sits in a Hybrid Opus frame
+/// being written (see [`HybridEncoderMono::encode_packet_elected_with`]).
+#[derive(Debug, Clone)]
+pub enum RedundancyPlan {
+    /// No redundant frame: the §4.5.1.1 flag is coded off (when the
+    /// 37-bit window is open).
+    None,
+    /// A **beginning-position** redundant frame (Figure 18 `R & |H`,
+    /// CELT → Hybrid): the frame bytes were already coded by the
+    /// caller on the carried CELT state (§4.5.2: no reset for the
+    /// redundant frame; the main CELT layer then starts from a
+    /// reset state, which the caller applies before this call).
+    Beginning(Vec<u8>),
+    /// An **end-position** redundant frame of `bytes` bytes (Figure 18
+    /// `!R`, Hybrid → CELT / NB-MB SILK): coded here after the main
+    /// CELT layer, on the CELT state RESET (§4.5.2: "the CELT state is
+    /// reset before decoding the redundant CELT frame embedded in the
+    /// SILK-only or Hybrid frame, but it is not reset before decoding
+    /// the following CELT-only frame"), from the carrier's last 5 ms
+    /// of input; the warmed state is what this encoder carries out.
+    End { bytes: usize },
+}
+
+impl RedundancyPlan {
+    /// Bytes the plan appends to the Opus frame.
+    pub(crate) fn bytes(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Beginning(f) => f.len(),
+            Self::End { bytes } => *bytes,
+        }
+    }
+}
+
+/// Phase 2 of a Hybrid frame, shared by the mono and stereo arms:
+/// the §4.5.1.1 redundancy flag (on with the §4.5.1.2 position and
+/// §4.5.1.3 size when `plan` carries a frame, else off — either way
+/// only when the decoder's 37-bit window is open), then the §4.3
+/// CELT layer (bands 17..) on the same coder against the payload
+/// REDUCED by the redundant frame's bytes (§4.5.1.3: "the decoder
+/// reduces the size of the buffer currently in use by the range coder
+/// by that amount … all calculations of the number of bits remaining
+/// in the buffer must be done using this new, reduced size"), then
+/// the redundant frame's bytes appended.
+#[allow(clippy::too_many_arguments)]
+fn finish_hybrid_celt(
+    celt: &mut CeltEncoderState,
+    pcm: &[i16],
+    toc: u8,
+    mut re: RangeEncoder,
+    payload_bytes: usize,
+    end_band: usize,
+    lm: i32,
+    carrier_bandwidth: Bandwidth,
+    plan: RedundancyPlan,
+) -> Result<Vec<u8>, Error> {
+    let total_bits = payload_bytes as u32 * 8;
+    debug_assert!(re.tell() <= total_bits, "SILK layer over budget");
+    let window_open = total_bits.saturating_sub(re.tell()) >= HYBRID_REDUNDANCY_MIN_REMAINING_BITS;
+    let red_bytes = plan.bytes();
+    let plan = if window_open && red_bytes > 0 {
+        if !(REDUNDANT_FRAME_MIN_BYTES..=REDUNDANT_FRAME_MAX_BYTES).contains(&red_bytes)
+            || red_bytes + HYBRID_MIN_CELT_TAIL_BYTES > payload_bytes
+        {
+            return Err(Error::MalformedPacket);
+        }
+        re.enc_icdf(1, &REDUNDANCY_FLAG_ICDF, REDUNDANCY_FLAG_ICDF_FTB);
+        let pos = match &plan {
+            RedundancyPlan::Beginning(_) => 1,
+            _ => 0,
+        };
+        re.enc_icdf(pos, &REDUNDANCY_POSITION_ICDF, REDUNDANCY_POSITION_ICDF_FTB);
+        re.enc_uint(
+            (red_bytes - HYBRID_REDUNDANCY_SIZE_BASELINE_BYTES) as u32,
+            256,
+        );
+        plan
+    } else {
+        if window_open {
+            re.enc_icdf(0, &REDUNDANCY_FLAG_ICDF, REDUNDANCY_FLAG_ICDF_FTB);
+        }
+        RedundancyPlan::None
+    };
+    let main_bytes = payload_bytes - plan.bytes();
+    let _info = encode_celt_frame(
+        celt,
+        &mut re,
+        pcm,
+        main_bytes,
+        crate::celt_band_layout::HYBRID_FIRST_CODED_BAND,
+        end_band,
+        lm,
+    );
+    debug_assert!(re.tell() <= main_bytes as u32 * 8, "hybrid CELT layer bust");
+    let body = re.finish_fixed(main_bytes).ok_or(Error::MalformedPacket)?;
+    let mut packet = Vec::with_capacity(1 + payload_bytes);
+    packet.push(toc);
+    packet.extend_from_slice(&body);
+    match plan {
+        RedundancyPlan::None => {}
+        RedundancyPlan::Beginning(frame) => packet.extend_from_slice(&frame),
+        RedundancyPlan::End { bytes } => {
+            let channels = celt.channels();
+            let tail = &pcm[pcm.len() - channels * REDUNDANT_FRAME_SAMPLES..];
+            celt.reset();
+            let frame = encode_redundant_celt_frame(celt, tail, carrier_bandwidth, bytes)?;
+            packet.extend_from_slice(&frame);
+        }
+    }
+    Ok(packet)
 }
 
 /// A mono Hybrid packet encoder (configs 12–15: SWB/FB × 10/20 ms).
@@ -283,7 +449,7 @@ impl HybridEncoderMono {
         if re.tell() > payload_bytes as u32 * 8 {
             return Err(Error::MalformedPacket);
         }
-        self.finish_with_celt(pcm, toc, re, payload_bytes)
+        self.finish_with_celt(pcm, toc, re, payload_bytes, RedundancyPlan::None)
     }
 
     /// Encode one packet with a VBR-elected payload size, raising the
@@ -302,6 +468,20 @@ impl HybridEncoderMono {
         pcm: &[i16],
         elected_payload_bytes: usize,
     ) -> Result<Vec<u8>, Error> {
+        self.encode_packet_elected_with(pcm, elected_payload_bytes, RedundancyPlan::None)
+    }
+
+    /// [`Self::encode_packet_elected`] carrying §4.5.1 transition side
+    /// information per `plan` (the redundant frame's bytes are part
+    /// of the elected payload; the SILK floor is raised to fit them).
+    /// A §2.1.9 DTX-suppressed packet carries no redundancy (the
+    /// 1-byte marker is returned as is).
+    pub fn encode_packet_elected_with(
+        &mut self,
+        pcm: &[i16],
+        elected_payload_bytes: usize,
+        plan: RedundancyPlan,
+    ) -> Result<Vec<u8>, Error> {
         if pcm.len() != self.n {
             return Err(Error::MalformedPacket);
         }
@@ -311,12 +491,43 @@ impl HybridEncoderMono {
         }
         let (toc, re) = self.encode_silk_layer(&pcm16)?;
         let silk_bytes = (re.tell() as usize).div_ceil(8);
-        let floor = silk_bytes + HYBRID_MIN_CELT_TAIL_BYTES;
+        let floor = silk_bytes + HYBRID_MIN_CELT_TAIL_BYTES + plan.bytes();
         if floor > MAX_FRAME_BYTES {
             return Err(Error::MalformedPacket);
         }
         let payload_bytes = elected_payload_bytes.clamp(floor, MAX_FRAME_BYTES);
-        self.finish_with_celt(pcm, toc, re, payload_bytes)
+        self.finish_with_celt(pcm, toc, re, payload_bytes, plan)
+    }
+
+    /// The carried CELT state (see
+    /// [`crate::celt_packet_encode::CeltEncoder::celt_state_mut`]).
+    pub(crate) fn celt_state_mut(&mut self) -> &mut CeltEncoderState {
+        &mut self.celt
+    }
+
+    /// Replace the carried CELT state (geometry re-applied).
+    pub(crate) fn adopt_celt_state(&mut self, mut state: CeltEncoderState) {
+        state.set_geometry(1, self.n);
+        self.celt = state;
+    }
+
+    /// The WB SILK analyzer (the §4.5.2 "SILK decoder state" mirror —
+    /// carried across the normative WB SILK ↔ Hybrid transitions,
+    /// which reset neither side's SILK state).
+    pub(crate) fn silk_analyzer_mut(&mut self) -> &mut ChannelAnalyzer {
+        &mut self.analyzer
+    }
+
+    /// Re-prime the 48 → 16 kHz decimator from recent 48 kHz input
+    /// (mono samples, oldest first).
+    pub(crate) fn prime_decimator(&mut self, recent48: &[f64]) {
+        self.decim.prime(recent48);
+    }
+
+    /// Drop any pending §4.2.5 LBRR material (a configuration switch
+    /// changes the rate the previous packet was analysed at).
+    pub(crate) fn drop_pending_fec(&mut self) {
+        self.pending_fec = None;
     }
 
     /// 48 kHz → WB internal rate (advances the decimator history —
@@ -458,39 +669,28 @@ impl HybridEncoderMono {
         Ok((toc, re))
     }
 
-    /// Phase 2: the §4.5.1.1 redundancy flag (signalled off — only
-    /// coded when the 37-bit window is open, mirroring the decoder's
-    /// gate) and the §4.3 CELT layer (bands 17..) on the same coder,
-    /// finalized to exactly `payload_bytes` bytes.
+    /// Phase 2: the §4.5.1.1 redundancy side information and the §4.3
+    /// CELT layer (bands 17..) on the same coder, finalized to exactly
+    /// `payload_bytes` bytes (see [`finish_hybrid_celt`]).
     fn finish_with_celt(
         &mut self,
         pcm: &[i16],
         toc: u8,
-        mut re: RangeEncoder,
+        re: RangeEncoder,
         payload_bytes: usize,
+        plan: RedundancyPlan,
     ) -> Result<Vec<u8>, Error> {
-        let total_bits = payload_bytes as u32 * 8;
-        debug_assert!(re.tell() <= total_bits, "SILK layer over budget");
-        if total_bits.saturating_sub(re.tell()) >= HYBRID_REDUNDANCY_MIN_REMAINING_BITS {
-            re.enc_icdf(0, &REDUNDANCY_FLAG_ICDF, REDUNDANCY_FLAG_ICDF_FTB);
-        }
-        let _info = encode_celt_frame(
+        finish_hybrid_celt(
             &mut self.celt,
-            &mut re,
             pcm,
+            toc,
+            re,
             payload_bytes,
-            crate::celt_band_layout::HYBRID_FIRST_CODED_BAND,
             self.end_band,
             self.lm,
-        );
-        debug_assert!(re.tell() <= total_bits, "hybrid CELT layer bust");
-        let body = re
-            .finish_fixed(payload_bytes)
-            .ok_or(Error::MalformedPacket)?;
-        let mut packet = Vec::with_capacity(1 + payload_bytes);
-        packet.push(toc);
-        packet.extend_from_slice(&body);
-        Ok(packet)
+            self.bandwidth,
+            plan,
+        )
     }
 }
 
@@ -675,7 +875,7 @@ impl HybridEncoderStereo {
         if re.tell() > payload_bytes as u32 * 8 {
             return Err(Error::MalformedPacket);
         }
-        self.finish_with_celt(pcm, toc, re, payload_bytes)
+        self.finish_with_celt(pcm, toc, re, payload_bytes, RedundancyPlan::None)
     }
 
     /// Encode one packet with a VBR-elected payload size (see
@@ -684,6 +884,17 @@ impl HybridEncoderStereo {
         &mut self,
         pcm: &[i16],
         elected_payload_bytes: usize,
+    ) -> Result<Vec<u8>, Error> {
+        self.encode_packet_elected_with(pcm, elected_payload_bytes, RedundancyPlan::None)
+    }
+
+    /// [`Self::encode_packet_elected`] carrying §4.5.1 transition side
+    /// information (see [`HybridEncoderMono::encode_packet_elected_with`]).
+    pub fn encode_packet_elected_with(
+        &mut self,
+        pcm: &[i16],
+        elected_payload_bytes: usize,
+        plan: RedundancyPlan,
     ) -> Result<Vec<u8>, Error> {
         if pcm.len() != 2 * self.n {
             return Err(Error::MalformedPacket);
@@ -694,12 +905,54 @@ impl HybridEncoderStereo {
         }
         let (toc, re) = self.encode_silk_layer(&l16, &r16)?;
         let silk_bytes = (re.tell() as usize).div_ceil(8);
-        let floor = silk_bytes + HYBRID_MIN_CELT_TAIL_BYTES;
+        let floor = silk_bytes + HYBRID_MIN_CELT_TAIL_BYTES + plan.bytes();
         if floor > MAX_FRAME_BYTES {
             return Err(Error::MalformedPacket);
         }
         let payload_bytes = elected_payload_bytes.clamp(floor, MAX_FRAME_BYTES);
-        self.finish_with_celt(pcm, toc, re, payload_bytes)
+        self.finish_with_celt(pcm, toc, re, payload_bytes, plan)
+    }
+
+    /// The carried CELT state (see [`HybridEncoderMono::celt_state_mut`]).
+    pub(crate) fn celt_state_mut(&mut self) -> &mut CeltEncoderState {
+        &mut self.celt
+    }
+
+    /// Replace the carried CELT state (geometry re-applied).
+    pub(crate) fn adopt_celt_state(&mut self, mut state: CeltEncoderState) {
+        state.set_geometry(2, self.n);
+        self.celt = state;
+    }
+
+    /// The carried stereo SILK front end: mid / side analyzers, the
+    /// §4.2.8 downmix state and the boundary mid sample (see
+    /// [`HybridEncoderMono::silk_analyzer_mut`]).
+    pub(crate) fn silk_stereo_parts_mut(
+        &mut self,
+    ) -> (
+        &mut ChannelAnalyzer,
+        &mut ChannelAnalyzer,
+        &mut StereoDownmixState,
+        &mut f32,
+    ) {
+        (
+            &mut self.mid,
+            &mut self.side,
+            &mut self.downmix,
+            &mut self.prev_mid,
+        )
+    }
+
+    /// Re-prime both decimators from recent 48 kHz input (per
+    /// channel, oldest first).
+    pub(crate) fn prime_decimators(&mut self, recent_l: &[f64], recent_r: &[f64]) {
+        self.decim_l.prime(recent_l);
+        self.decim_r.prime(recent_r);
+    }
+
+    /// Drop any pending §4.2.5 LBRR material.
+    pub(crate) fn drop_pending_fec(&mut self) {
+        self.pending_fec = None;
     }
 
     /// 48 kHz interleaved L/R → WB internal-rate pair (advances the
@@ -987,37 +1240,27 @@ impl HybridEncoderStereo {
         Ok((toc, re))
     }
 
-    /// Phase 2: identical to the mono encoder's (§4.5.1.1 redundancy
-    /// flag off + stereo §4.3 CELT layer on the same coder).
+    /// Phase 2: identical to the mono encoder's (see
+    /// [`finish_hybrid_celt`]).
     fn finish_with_celt(
         &mut self,
         pcm: &[i16],
         toc: u8,
-        mut re: RangeEncoder,
+        re: RangeEncoder,
         payload_bytes: usize,
+        plan: RedundancyPlan,
     ) -> Result<Vec<u8>, Error> {
-        let total_bits = payload_bytes as u32 * 8;
-        debug_assert!(re.tell() <= total_bits, "SILK layer over budget");
-        if total_bits.saturating_sub(re.tell()) >= HYBRID_REDUNDANCY_MIN_REMAINING_BITS {
-            re.enc_icdf(0, &REDUNDANCY_FLAG_ICDF, REDUNDANCY_FLAG_ICDF_FTB);
-        }
-        let _info = encode_celt_frame(
+        finish_hybrid_celt(
             &mut self.celt,
-            &mut re,
             pcm,
+            toc,
+            re,
             payload_bytes,
-            crate::celt_band_layout::HYBRID_FIRST_CODED_BAND,
             self.end_band,
             self.lm,
-        );
-        debug_assert!(re.tell() <= total_bits, "hybrid CELT layer bust");
-        let body = re
-            .finish_fixed(payload_bytes)
-            .ok_or(Error::MalformedPacket)?;
-        let mut packet = Vec::with_capacity(1 + payload_bytes);
-        packet.push(toc);
-        packet.extend_from_slice(&body);
-        Ok(packet)
+            self.bandwidth,
+            plan,
+        )
     }
 }
 

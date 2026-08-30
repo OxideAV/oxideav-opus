@@ -1900,6 +1900,16 @@ impl OpusDecoder {
         Ok(Some((left, right, bandwidth)))
     }
 
+    /// The §4.5.1 redundancy decision decoded from the most recent
+    /// SILK-only / Hybrid Opus frame (test/diagnostic surface: lets
+    /// the encoder-side §4.5 transition suites verify the written
+    /// side information without re-parsing the bitstream).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn last_redundancy(&self) -> crate::celt_redundancy::RedundancyDecision {
+        self.last_redundancy
+    }
+
     /// Decode one Hybrid Opus frame (§4.4): the §4.2 SILK layer (WB
     /// internal rate) and the §4.3 CELT layer (bands 17–21) share one
     /// range coder; their 48 kHz outputs are summed.

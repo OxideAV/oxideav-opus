@@ -28,6 +28,9 @@
 //! with two independent per-channel carried states threaded exactly
 //! the way [`crate::decoder::OpusDecoder`]'s stereo walk threads them.
 
+use crate::celt_redundancy::{
+    RedundancyPosition, REDUNDANCY_POSITION_ICDF, REDUNDANCY_POSITION_ICDF_FTB,
+};
 use crate::decoder::ChannelDecodeState;
 use crate::range_encoder::RangeEncoder;
 use crate::silk_decode::{
@@ -84,6 +87,33 @@ pub fn encode_silk_only_packet_mono_with_lbrr(
     frame_size_tenths_ms: u16,
     frames: &[SilkFrameSymbols<'_>],
     lbrr: &[Option<SilkFrameSymbols<'_>>],
+) -> Result<
+    (
+        Vec<u8>,
+        Vec<SilkFrameDecoded>,
+        Vec<Option<SilkFrameDecoded>>,
+    ),
+    Error,
+> {
+    encode_silk_only_packet_mono_red(bandwidth, frame_size_tenths_ms, frames, lbrr, None)
+}
+
+/// [`encode_silk_only_packet_mono_with_lbrr`] optionally arming the
+/// §4.5.1 transition side information: when `redundancy_position` is
+/// set, the §4.5.1.2 Table 65 position symbol is coded after the SILK
+/// frames (the §4.5.1.1 SILK-only redundancy signal is *implicit* —
+/// it fires when the caller appends at least 3 whole bytes of
+/// redundant CELT frame after this packet, leaving the decoder ≥ 17
+/// unused bits; the appended bytes themselves are produced by
+/// [`crate::celt_packet_encode::encode_redundant_celt_frame`] and are
+/// NOT part of this range coder per §4.5.1.3).
+#[allow(clippy::type_complexity)]
+pub fn encode_silk_only_packet_mono_red(
+    bandwidth: Bandwidth,
+    frame_size_tenths_ms: u16,
+    frames: &[SilkFrameSymbols<'_>],
+    lbrr: &[Option<SilkFrameSymbols<'_>>],
+    redundancy_position: Option<RedundancyPosition>,
 ) -> Result<
     (
         Vec<u8>,
@@ -226,6 +256,17 @@ pub fn encode_silk_only_packet_mono_with_lbrr(
         predictions.push(decoded);
     }
 
+    // §4.5.1.2: the redundancy position symbol, coded after the SILK
+    // frames on the same coder (the decoder reads it right after its
+    // implicit §4.5.1.1 remaining-bits check).
+    if let Some(pos) = redundancy_position {
+        let sym = match pos {
+            RedundancyPosition::End => 0,
+            RedundancyPosition::Beginning => 1,
+        };
+        re.enc_icdf(sym, &REDUNDANCY_POSITION_ICDF, REDUNDANCY_POSITION_ICDF_FTB);
+    }
+
     // §5.1.5 finalize; §3.2 code-0 framing = TOC byte + the single
     // compressed frame. R2: a frame may not exceed 1275 bytes.
     let body = re.finish();
@@ -343,6 +384,19 @@ pub fn encode_silk_only_packet_stereo_with_lbrr(
     frame_size_tenths_ms: u16,
     intervals: &[StereoIntervalScripts<'_>],
     lbrr: &[StereoIntervalLbrr<'_>],
+) -> Result<(Vec<u8>, StereoPacketPredictions, StereoLbrrPredictions), Error> {
+    encode_silk_only_packet_stereo_red(bandwidth, frame_size_tenths_ms, intervals, lbrr, None)
+}
+
+/// [`encode_silk_only_packet_stereo_with_lbrr`] optionally arming the
+/// §4.5.1 transition side information (see
+/// [`encode_silk_only_packet_mono_red`]).
+pub fn encode_silk_only_packet_stereo_red(
+    bandwidth: Bandwidth,
+    frame_size_tenths_ms: u16,
+    intervals: &[StereoIntervalScripts<'_>],
+    lbrr: &[StereoIntervalLbrr<'_>],
+    redundancy_position: Option<RedundancyPosition>,
 ) -> Result<(Vec<u8>, StereoPacketPredictions, StereoLbrrPredictions), Error> {
     let num_silk_frames = silk_frame_count(frame_size_tenths_ms).ok_or(Error::MalformedPacket)?;
     if intervals.len() != num_silk_frames as usize || lbrr.len() != num_silk_frames as usize {
@@ -521,6 +575,15 @@ pub fn encode_silk_only_packet_stereo_with_lbrr(
             side_state.mark_interval_uncoded(false);
             side_pred.push(None);
         }
+    }
+
+    // §4.5.1.2: the redundancy position symbol (see the mono writer).
+    if let Some(pos) = redundancy_position {
+        let sym = match pos {
+            RedundancyPosition::End => 0,
+            RedundancyPosition::Beginning => 1,
+        };
+        re.enc_icdf(sym, &REDUNDANCY_POSITION_ICDF, REDUNDANCY_POSITION_ICDF_FTB);
     }
 
     // §5.1.5 finalize; §3.2 code-0 framing. R2: a frame may not exceed

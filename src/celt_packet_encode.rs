@@ -97,6 +97,26 @@ impl CeltEncoder {
         self.state.frame_len()
     }
 
+    /// The carried cross-frame CELT state (the §4.5.2 "CELT decoder
+    /// state" mirror) — the unified encoder moves it across mode
+    /// transitions so the state a §4.5.1 redundant frame warmed
+    /// continues into the following CELT-only frames.
+    pub(crate) fn celt_state_mut(&mut self) -> &mut CeltEncoderState {
+        &mut self.state
+    }
+
+    /// Replace the carried CELT state (geometry re-applied to this
+    /// encoder's frame size; the tapset-election mirror, when armed,
+    /// re-arms from a fresh decoder — non-normative trial machinery).
+    pub(crate) fn adopt_celt_state(&mut self, mut state: CeltEncoderState) {
+        let channels = self.channels();
+        state.set_geometry(channels, 120usize << self.lm);
+        self.state = state;
+        if self.tapset_election.is_some() {
+            self.tapset_election = Some(Self::fresh_election(channels));
+        }
+    }
+
     /// Channel count.
     #[must_use]
     pub fn channels(&self) -> usize {
@@ -331,6 +351,75 @@ impl CeltEncoder {
         }
         Ok(10.0 * (sig / err).log10())
     }
+}
+
+/// Coded band count for a CELT layer at `bandwidth` (§4.3, Table 55
+/// end band: NB 13 / WB 17 / SWB 19 / FB 21). MB is not a CELT
+/// bandwidth; §4.5.1.4 maps an MB SILK carrier's redundant frame to
+/// WB.
+#[must_use]
+pub fn celt_end_band(bandwidth: Bandwidth) -> usize {
+    match bandwidth {
+        Bandwidth::Nb => 13,
+        Bandwidth::Mb | Bandwidth::Wb => 17,
+        Bandwidth::Swb => 19,
+        Bandwidth::Fb => 21,
+    }
+}
+
+/// Samples per channel of the §4.5.1 redundant CELT frame (5 ms at
+/// 48 kHz).
+pub const REDUNDANT_FRAME_SAMPLES: usize = 240;
+
+/// Smallest §4.5.1.3 redundant frame this crate emits. The §4.5.1.1
+/// SILK-only signal needs at least 17 unused bits after the SILK
+/// portion; the SILK range coder finalizes into exactly
+/// `ceil(tell / 8)` bytes, so two appended bytes can leave exactly
+/// 16 — three always clear the gate (and Hybrid's explicit size is
+/// `2 + uint(256)`).
+pub const REDUNDANT_FRAME_MIN_BYTES: usize = 3;
+
+/// Largest redundant frame the Hybrid §4.5.1.3 size field can code
+/// (`2 + 255`).
+pub const REDUNDANT_FRAME_MAX_BYTES: usize = 257;
+
+/// Encode one §4.5.1 **redundant CELT frame**: "decoded like any other
+/// CELT-only frame, with the exception that it does not contain a
+/// TOC byte. The frame size is fixed at 5 ms, the channel count is set
+/// to that of the current frame, and the audio bandwidth is also set
+/// to that of the current frame, with the exception that for MB SILK
+/// frames, it is set to WB" (§4.5.1.4). It "does not use the same
+/// entropy coder state as the rest of the Opus frame" (§4.5.1.3), so
+/// it is finalized on its own coder into exactly `bytes` bytes.
+///
+/// `state` is the stream's carried CELT state: the caller places the
+/// §4.5.2 reset (before an end-position frame — Figure 18's `!R`; not
+/// before a beginning-position one) and the geometry is switched to
+/// 5 ms for the frame and restored by the caller. `pcm` holds
+/// `channels * 240` interleaved 48 kHz samples — the LAST 5 ms of the
+/// carrier Opus frame's input for an end-position frame (only its
+/// second half is used by the decoder: the first half of a
+/// just-reset MDCT chain has no overlap partner), the FIRST 5 ms for
+/// a beginning-position one.
+pub fn encode_redundant_celt_frame(
+    state: &mut CeltEncoderState,
+    pcm: &[i16],
+    carrier_bandwidth: Bandwidth,
+    bytes: usize,
+) -> Result<Vec<u8>, Error> {
+    let channels = state.channels();
+    if pcm.len() != channels * REDUNDANT_FRAME_SAMPLES
+        || !(REDUNDANT_FRAME_MIN_BYTES..=MAX_FRAME_BYTES).contains(&bytes)
+    {
+        return Err(Error::MalformedPacket);
+    }
+    let end_band = celt_end_band(carrier_bandwidth);
+    let n_before = state.frame_len();
+    state.set_geometry(channels, REDUNDANT_FRAME_SAMPLES);
+    let mut enc = RangeEncoder::new();
+    let _info = encode_celt_frame(state, &mut enc, pcm, bytes, 0, end_band, 1);
+    state.set_geometry(channels, n_before);
+    enc.finish_fixed(bytes).ok_or(Error::MalformedPacket)
 }
 
 #[cfg(test)]

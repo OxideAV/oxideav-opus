@@ -56,6 +56,7 @@
 //! All truth is taken from RFC 6716 §4.2.7 / §4.2.8 / §5.2. No
 //! external library source is consulted.
 
+use crate::celt_redundancy::RedundancyPosition;
 use crate::silk_decode::SilkFrameSymbols;
 use crate::silk_excitation::{ExcitationSymbols, SilkFrameSize};
 use crate::silk_excitation_quantize::{
@@ -78,8 +79,8 @@ use crate::silk_ltp_synth::LtpSynthState;
 use crate::silk_nlsf_quantize::quantize_nlsf;
 use crate::silk_nsq_del_dec::{quantize_excitation_frame_del_dec, MAX_DEL_DEC_STATES};
 use crate::silk_packet_encode::{
-    encode_silk_only_packet_mono_with_lbrr, encode_silk_only_packet_stereo_with_lbrr,
-    StereoIntervalLbrr, StereoIntervalScripts,
+    encode_silk_only_packet_mono_red, encode_silk_only_packet_stereo_red, StereoIntervalLbrr,
+    StereoIntervalScripts,
 };
 use crate::silk_pitch::{pitch_analysis, quantize_lag};
 use crate::silk_stereo::{stereo_lr_to_ms, StereoDownmixState, StereoWeightsQ13};
@@ -998,6 +999,9 @@ pub struct SilkEncoderMono {
     lbrr_prev_rms: f64,
     /// §2.1.9 DTX driver.
     dtx: DtxState,
+    /// §4.5.1.2 transition side-information arming for the NEXT
+    /// packet (see [`Self::set_redundancy_position`]).
+    pending_red_pos: Option<RedundancyPosition>,
 }
 
 impl SilkEncoderMono {
@@ -1026,7 +1030,32 @@ impl SilkEncoderMono {
             loss_perc: 0,
             lbrr_prev_rms: 0.0,
             dtx: DtxState::default(),
+            pending_red_pos: None,
         })
+    }
+
+    /// Arm the §4.5.1 transition side information for the next coded
+    /// packet: the §4.5.1.2 Table 65 position symbol is coded after
+    /// the SILK frames, and the caller appends the redundant CELT
+    /// frame's whole bytes to the returned packet (the §4.5.1.1
+    /// SILK-only signal is implicit in those trailing bytes).
+    /// Consumed by the next [`Self::encode_packet`]; a §2.1.9
+    /// DTX-suppressed packet drops it (a zero-length frame carries
+    /// nothing).
+    pub(crate) fn set_redundancy_position(&mut self, pos: Option<RedundancyPosition>) {
+        self.pending_red_pos = pos;
+    }
+
+    /// The carried channel analyzer (the SILK "decoder state" mirror
+    /// the §4.5 unified encoder moves across WB SILK ↔ Hybrid
+    /// transitions, which reset neither side's SILK state).
+    pub(crate) fn analyzer_mut(&mut self) -> &mut ChannelAnalyzer {
+        &mut self.channel
+    }
+
+    /// Drop any pending §4.2.5 LBRR material (configuration switch).
+    pub(crate) fn drop_pending_fec(&mut self) {
+        self.pending_fec = None;
     }
 
     /// Enable / disable §2.1.9 discontinuous transmission: when on,
@@ -1121,6 +1150,7 @@ impl SilkEncoderMono {
     /// nominally in `[-1.0, 1.0]`.
     pub fn encode_packet(&mut self, pcm: &[f32]) -> Result<EncodedSilkPacket, Error> {
         let bandwidth = self.channel.bandwidth;
+        let red_pos = self.pending_red_pos.take();
         if pcm.len() != self.frame_samples() {
             return Err(Error::MalformedPacket);
         }
@@ -1228,11 +1258,12 @@ impl SilkEncoderMono {
             .iter()
             .map(|o| o.as_ref().map(AnalyzedFrame::symbols))
             .collect();
-        let (packet, _, _) = encode_silk_only_packet_mono_with_lbrr(
+        let (packet, _, _) = encode_silk_only_packet_mono_red(
             bandwidth,
             self.packet_tenths_ms,
             &symbols,
             &lbrr_symbols,
+            red_pos,
         )?;
         let mut reconstructed = Vec::with_capacity(pcm.len());
         let mut voiced = false;
@@ -1344,6 +1375,9 @@ pub struct SilkEncoderStereo {
     lbrr_prev_rms: f64,
     /// §2.1.9 DTX driver.
     dtx: DtxState,
+    /// §4.5.1.2 transition side-information arming (see
+    /// [`SilkEncoderMono::set_redundancy_position`]).
+    pending_red_pos: Option<RedundancyPosition>,
 }
 
 impl SilkEncoderStereo {
@@ -1377,7 +1411,37 @@ impl SilkEncoderStereo {
             loss_perc: 0,
             lbrr_prev_rms: 0.0,
             dtx: DtxState::default(),
+            pending_red_pos: None,
         })
+    }
+
+    /// Arm the §4.5.1 transition side information for the next coded
+    /// packet (see [`SilkEncoderMono::set_redundancy_position`]).
+    pub(crate) fn set_redundancy_position(&mut self, pos: Option<RedundancyPosition>) {
+        self.pending_red_pos = pos;
+    }
+
+    /// The carried stereo SILK front end: mid / side analyzers, the
+    /// §4.2.8 downmix state and the boundary mid sample.
+    pub(crate) fn stereo_parts_mut(
+        &mut self,
+    ) -> (
+        &mut ChannelAnalyzer,
+        &mut ChannelAnalyzer,
+        &mut StereoDownmixState,
+        &mut f32,
+    ) {
+        (
+            &mut self.mid,
+            &mut self.side,
+            &mut self.downmix,
+            &mut self.prev_mid,
+        )
+    }
+
+    /// Drop any pending §4.2.5 LBRR material (configuration switch).
+    pub(crate) fn drop_pending_fec(&mut self) {
+        self.pending_fec = None;
     }
 
     /// Enable / disable §2.1.9 discontinuous transmission (see
@@ -1454,6 +1518,7 @@ impl SilkEncoderStereo {
         right: &[f32],
         next_lr: Option<(f32, f32)>,
     ) -> Result<EncodedSilkPacket, Error> {
+        let red_pos = self.pending_red_pos.take();
         let total_len = self.frame_samples();
         if left.len() != total_len || right.len() != total_len {
             return Err(Error::MalformedPacket);
@@ -1728,11 +1793,12 @@ impl SilkEncoderStereo {
                 side: s.as_ref().map(AnalyzedFrame::symbols),
             })
             .collect();
-        let (packet, _, _) = encode_silk_only_packet_stereo_with_lbrr(
+        let (packet, _, _) = encode_silk_only_packet_stereo_red(
             self.bandwidth,
             self.packet_tenths_ms,
             &intervals,
             &lbrr,
+            red_pos,
         )?;
 
         let mut reconstructed = Vec::with_capacity(total_len);

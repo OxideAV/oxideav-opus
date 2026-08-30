@@ -142,6 +142,21 @@ impl CeltEncoderState {
         self.channels
     }
 
+    /// Change the frame geometry while keeping the carried state
+    /// (§4.5.2 — see [`CeltAnalysis::set_geometry`]): the §4.5.1
+    /// redundant 5 ms frame is coded on the same state as the frames
+    /// around it, and the energy / tonality / pre-filter carries are
+    /// geometry-independent.
+    pub fn set_geometry(&mut self, channels: usize, n: usize) {
+        if channels != self.channels {
+            // Channel-count changes are never state-preserving.
+            *self = Self::new(channels, n);
+            return;
+        }
+        self.analysis.set_geometry(channels, n);
+        self.n = n;
+    }
+
     /// Reset to stream-start state (§4.5.2).
     pub fn reset(&mut self) {
         self.analysis.reset();
