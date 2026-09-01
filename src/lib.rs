@@ -760,6 +760,7 @@ pub mod celt_overlap_add;
 pub mod celt_packet_encode;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_post_filter;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_prefilter;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_pulse_cache;
@@ -783,6 +784,7 @@ pub mod celt_static_alloc;
 pub mod celt_synthesis;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_tf_adjust;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_tf_analysis;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_tf_decode;
