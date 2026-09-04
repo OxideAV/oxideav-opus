@@ -526,3 +526,56 @@ fn celt_dtx_cadence_at_2_5ms_frames() {
         assert_eq!(w[1] - w[0], 161, "2.5 ms cadence at {w:?}");
     }
 }
+
+/// §2.1.9 "silence or background noise": with the signal analyser on,
+/// the unified encoder's CELT-only arm suppresses packets over
+/// low-level background noise (not only digital silence) — the gate is
+/// the analyser's tracked noise floor plus margin — and codes the
+/// voice again on re-entry; without the analyser only digital silence
+/// suppresses.
+#[test]
+fn celt_dtx_gates_on_the_analyser_activity_floor() {
+    use oxideav_opus::{Application, Mode, OpusEncoder};
+    let v = voice(48_000, 48_000);
+    let mut lcg = 0x2468u32;
+    let mut noise = || {
+        lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((lcg >> 16) as f64 / 65_536.0 - 0.5) * 6.0 // ≈ −75 dBFS
+    };
+    let mut pcm: Vec<i16> = v.iter().map(|&s| (s * 9000.0) as i16).collect();
+    pcm.extend((0..48_000 * 3).map(|_| noise() as i16));
+    pcm.extend(v.iter().map(|&s| (s * 9000.0) as i16));
+
+    let run = |adaptive: bool| -> (usize, Vec<u8>) {
+        let mut enc = OpusEncoder::new(1, Application::Audio, 48_000).unwrap();
+        enc.set_mode(Some(Mode::CeltOnly)).unwrap();
+        enc.set_dtx(true);
+        enc.set_signal_adaptive(adaptive);
+        let mut dec = OpusDecoder::new();
+        let mut markers = 0usize;
+        let mut sizes = Vec::new();
+        for frame in pcm.chunks_exact(960) {
+            let p = enc.encode_frame(frame).unwrap();
+            let out = dec.decode_packet(&p).unwrap();
+            assert_eq!(out.samples_per_channel(), 960);
+            markers += usize::from(p.len() == 1);
+            sizes.push(p.len().min(255) as u8);
+        }
+        (markers, sizes)
+    };
+    let (with, sizes) = run(true);
+    let (without, _) = run(false);
+    assert_eq!(without, 0, "digital-silence gate must not fire on noise");
+    // 3 s of noise = 150 packets; hangover + one refresh per 400 ms
+    // leaves ≥ 120 markers.
+    assert!(with >= 120, "{with} markers over the noise run");
+    // The voice segments are never suppressed.
+    assert!(
+        sizes[..50].iter().all(|&s| s > 1),
+        "leading voice suppressed"
+    );
+    assert!(
+        sizes[200..].iter().all(|&s| s > 1),
+        "trailing voice suppressed"
+    );
+}

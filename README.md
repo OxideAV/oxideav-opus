@@ -507,7 +507,10 @@ over the 5625-quintuple §4.2.7.1 codebook; representable targets
 roundtrip value-exactly).
 
 **§2.1.9 discontinuous transmission (`set_dtx`, every encoder arm):**
-inactive packets suppress to the 1-byte TOC-only §3.2.1 marker after
+inactive packets (the SILK arms' §4.2.3 activity floor; the CELT-only
+arm's digital silence, or — with the signal-adaptive election on — the
+analyser's tracked noise floor plus margin, so background noise
+suppresses too) suppress to the 1-byte TOC-only §3.2.1 marker after
 a 2-packet hangover, one coded refresh per 400 ms of suppression,
 decoder-authoritative mirrors frozen across the run, LTP-free (SILK)
 / intra-energy (CELT, Hybrid) resume; markers pass through the

@@ -243,6 +243,10 @@ pub struct SignalAnalyser {
     /// Blocks since each upper band (4–6 / 6–8 / 8–12 / 12–20 kHz) was
     /// last present.
     band_age: [u32; 4],
+    /// Blocks of the most recent [`Self::analyse`] call that were
+    /// active / total (the encoder's DTX gate reads them).
+    last_call_active: u32,
+    last_call_blocks: u32,
     /// Hysteresis state.
     smoothed: f32,
     above: u32,
@@ -283,6 +287,8 @@ impl SignalAnalyser {
             width_ema: 0.0,
             noise_floor_db: -120.0,
             band_age: [u32::MAX; 4],
+            last_call_active: 0,
+            last_call_blocks: 0,
             smoothed: 0.5,
             above: 0,
             below: 0,
@@ -313,6 +319,8 @@ impl SignalAnalyser {
     /// verdict, which is returned.
     pub fn analyse(&mut self, pcm: &[i16]) -> SignalVerdict {
         let block_len = BLOCK_SAMPLES * self.channels;
+        self.last_call_active = 0;
+        self.last_call_blocks = 0;
         let mut input = pcm;
         if !self.pending.is_empty() {
             let need = block_len - self.pending.len();
@@ -333,6 +341,17 @@ impl SignalAnalyser {
         }
         self.pending.extend_from_slice(input);
         self.verdict
+    }
+
+    /// Whether every block completed by the most recent
+    /// [`Self::analyse`] call sat below the activity floor (`false`
+    /// when that call completed no block, so a caller feeding 2.5 /
+    /// 5 ms frames never suppresses on a partial block). This is the
+    /// §2.1.9 "silence or background noise" test: the tracked noise
+    /// floor plus a margin, not digital silence.
+    #[must_use]
+    pub fn last_frame_inactive(&self) -> bool {
+        self.last_call_blocks > 0 && self.last_call_active == 0
     }
 
     /// One 10 ms block of interleaved input.
@@ -369,6 +388,8 @@ impl SignalAnalyser {
         }
         let active =
             level_db > ACTIVITY_FLOOR_DB && level_db > self.noise_floor_db + ACTIVITY_MARGIN_DB;
+        self.last_call_blocks += 1;
+        self.last_call_active += u32::from(active);
 
         // ---- Histories (always rolled, so silence gaps stay in the
         // windows the features see).

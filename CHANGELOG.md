@@ -37,6 +37,9 @@ All notable changes to `oxideav-opus` are recorded here.
   CBR padding, all-zero-length DTX markers, §4.5.1 redundancy in the first
   / last frame of the packet); `frame-ms=40|60` no longer forces SILK
   (`tests/long_packets.rs`).
+- §2.1.9 DTX on the CELT-only arm gates on the analyser's activity floor
+  (tracked noise floor + margin — "silence or background noise") when the
+  signal-adaptive election is on; digital silence only otherwise.
 - Hybrid SILK-layer share knob (`set_silk_share` / `set_hybrid_silk_share`).
 - `signal_analysis`: per-frame speech-vs-music analyser for the §2.1 / §5
   election — tonality, spectral flux, harmonicity + pitch stability,

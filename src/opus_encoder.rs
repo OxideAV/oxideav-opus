@@ -263,6 +263,8 @@ pub struct OpusEncoder {
     signal_switches: u32,
     /// Hybrid SILK-layer share.
     hybrid_silk_share: f64,
+    /// The analyser found the current packet inactive (CELT DTX gate).
+    celt_inactive: bool,
 }
 
 impl OpusEncoder {
@@ -304,6 +306,7 @@ impl OpusEncoder {
             prev_knob_target: None,
             signal_switches: 0,
             hybrid_silk_share: crate::hybrid_packet_encode::HYBRID_SILK_SHARE,
+            celt_inactive: false,
         })
     }
 
@@ -718,6 +721,15 @@ impl OpusEncoder {
             return Err(Error::MalformedPacket);
         }
         let verdict = self.signal.as_mut().map(|a| a.analyse(pcm));
+        // §2.1.9 "silence or background noise": with the analyser on,
+        // the CELT-only arm's DTX gate is its activity floor (a
+        // tracked noise floor plus margin); without it, digital
+        // silence only — the SILK-bearing arms keep their own §4.2.3
+        // activity gate either way.
+        self.celt_inactive = self
+            .signal
+            .as_ref()
+            .is_some_and(SignalAnalyser::last_frame_inactive);
         let knob_target = self.decide(None);
         let mut target = self.decide(verdict);
         if self.cur.is_none() {
@@ -1043,11 +1055,11 @@ impl OpusEncoder {
                         "CELT frames carry no §4.5.1 side info"
                     );
                     let digital_silence = pcm.iter().all(|&v| v == 0);
-                    if self.celt_dtx.step(
-                        digital_silence,
-                        false,
-                        u32::from(self.arm_tenths(cur.mode)),
-                    ) {
+                    let inactive = digital_silence || self.celt_inactive;
+                    if self
+                        .celt_dtx
+                        .step(inactive, false, u32::from(self.arm_tenths(cur.mode)))
+                    {
                         return Ok((enc.dtx_marker()?, false, 0));
                     }
                     if self.celt_dtx.take_resume() {
