@@ -35,8 +35,8 @@ use crate::celt_redundancy::{
 use crate::range_encoder::RangeEncoder;
 use crate::silk_decode::{encode_silk_frame, SilkFrameConfig, StereoHeaderContext};
 use crate::silk_encoder::{
-    interval_rms, lbrr_interval_is_onset, lbrr_ratio_for_loss, AnalyzedFrame, ChannelAnalyzer,
-    DtxState, ACTIVITY_RMS, LBRR_ONSET_ONLY_MAX_LOSS_PERC, MID_ONLY_SIDE_RMS,
+    elect_by_size, interval_rms, lbrr_interval_is_onset, lbrr_ratio_for_loss, AnalyzedFrame,
+    ChannelAnalyzer, DtxState, ACTIVITY_RMS, LBRR_ONSET_ONLY_MAX_LOSS_PERC, MID_ONLY_SIDE_RMS,
 };
 use crate::silk_excitation::SilkFrameSize;
 use crate::silk_frame::{StereoPredictionWeights, StereoWeightSymbols};
@@ -49,6 +49,15 @@ use crate::Error;
 
 /// §3.2 maximum Opus frame payload.
 const MAX_FRAME_BYTES: usize = 1275;
+
+/// Share of the elected Hybrid payload (after any §4.5.1 redundant
+/// frame) the WB SILK layer targets; the CELT layer (bands 17.. —
+/// 8 kHz and up) gets the rest. Elected per packet on the SILK
+/// pulse-RMS knob exactly like the SILK-only arm's rate control.
+pub const HYBRID_SILK_SHARE: f64 = 0.7;
+
+/// Smallest SILK-layer target the share election asks for.
+const HYBRID_SILK_MIN_BYTES: usize = 8;
 
 /// Minimum CELT-layer tail (bytes past the coded SILK layer) that
 /// [`HybridEncoderMono::encode_packet_elected`] guarantees, so the
@@ -282,6 +291,13 @@ fn finish_hybrid_celt(
     Ok(packet)
 }
 
+/// The SILK-layer byte target for an elected payload carrying
+/// `red_bytes` of §4.5.1 redundancy.
+fn silk_share_target(elected_payload_bytes: usize, red_bytes: usize) -> usize {
+    let primary = elected_payload_bytes.saturating_sub(red_bytes) as f64;
+    ((primary * HYBRID_SILK_SHARE) as usize).max(HYBRID_SILK_MIN_BYTES)
+}
+
 /// A mono Hybrid packet encoder (configs 12–15: SWB/FB × 10/20 ms).
 #[derive(Debug, Clone)]
 pub struct HybridEncoderMono {
@@ -489,7 +505,8 @@ impl HybridEncoderMono {
         if let Some(marker) = self.dtx_gate(&pcm16)? {
             return Ok(marker);
         }
-        let (toc, re) = self.encode_silk_layer(&pcm16)?;
+        let silk_target = silk_share_target(elected_payload_bytes, plan.bytes());
+        let (toc, re) = self.elect_silk_layer(&pcm16, silk_target)?;
         let silk_bytes = (re.tell() as usize).div_ceil(8);
         let floor = silk_bytes + HYBRID_MIN_CELT_TAIL_BYTES + plan.bytes();
         if floor > MAX_FRAME_BYTES {
@@ -497,6 +514,26 @@ impl HybridEncoderMono {
         }
         let payload_bytes = elected_payload_bytes.clamp(floor, MAX_FRAME_BYTES);
         self.finish_with_celt(pcm, toc, re, payload_bytes, plan)
+    }
+
+    /// Code the SILK layer at the pulse-RMS knob that lands its bytes
+    /// on `target_bytes` (secant election over cloned state; the
+    /// adopted clone's analyzer carries the knob as the next packet's
+    /// warm start).
+    fn elect_silk_layer(
+        &mut self,
+        pcm16: &[f32],
+        target_bytes: usize,
+    ) -> Result<(u8, RangeEncoder), Error> {
+        let start = self.analyzer.pulse_target();
+        let (adopted, product) = elect_by_size(self, start, target_bytes, |enc, q| {
+            enc.analyzer.set_pulse_target(q);
+            let (toc, re) = enc.encode_silk_layer(pcm16)?;
+            let size = (re.tell() as usize).div_ceil(8);
+            Ok(((toc, re), size, false))
+        })?;
+        *self = adopted;
+        Ok(product)
     }
 
     /// The carried CELT state (see
@@ -903,7 +940,8 @@ impl HybridEncoderStereo {
         if let Some(marker) = self.dtx_gate(&l16, &r16)? {
             return Ok(marker);
         }
-        let (toc, re) = self.encode_silk_layer(&l16, &r16)?;
+        let silk_target = silk_share_target(elected_payload_bytes, plan.bytes());
+        let (toc, re) = self.elect_silk_layer(&l16, &r16, silk_target)?;
         let silk_bytes = (re.tell() as usize).div_ceil(8);
         let floor = silk_bytes + HYBRID_MIN_CELT_TAIL_BYTES + plan.bytes();
         if floor > MAX_FRAME_BYTES {
@@ -911,6 +949,26 @@ impl HybridEncoderStereo {
         }
         let payload_bytes = elected_payload_bytes.clamp(floor, MAX_FRAME_BYTES);
         self.finish_with_celt(pcm, toc, re, payload_bytes, plan)
+    }
+
+    /// See [`HybridEncoderMono::elect_silk_layer`] (one knob drives
+    /// both the mid and the side analyzer).
+    fn elect_silk_layer(
+        &mut self,
+        l16: &[f32],
+        r16: &[f32],
+        target_bytes: usize,
+    ) -> Result<(u8, RangeEncoder), Error> {
+        let start = self.mid.pulse_target();
+        let (adopted, product) = elect_by_size(self, start, target_bytes, |enc, q| {
+            enc.mid.set_pulse_target(q);
+            enc.side.set_pulse_target(q);
+            let (toc, re) = enc.encode_silk_layer(l16, r16)?;
+            let size = (re.tell() as usize).div_ceil(8);
+            Ok(((toc, re), size, false))
+        })?;
+        *self = adopted;
+        Ok(product)
     }
 
     /// The carried CELT state (see [`HybridEncoderMono::celt_state_mut`]).

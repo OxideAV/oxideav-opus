@@ -4,6 +4,19 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- SILK rate knob made continuous: a rate-controlled encode now runs the
+  §5.2.3.8 noise-shaping quantizer at every pulse target (λ only below the
+  default), closing the ~4× packet-size cliff at the default target that
+  left the election no operating point between ~10 and ~70 kb/s; the
+  election takes a decisive step on a flat byte response instead of
+  stopping.
+- Hybrid arms elect their WB SILK layer to a share of the payload
+  (`HYBRID_SILK_SHARE`) instead of coding it at a fixed quality, so a
+  Hybrid stream lands on its target rate (16–32 kb/s targets used to emit
+  ~70–80 kb/s).
+
 ### Added
 
 - `signal_analysis`: per-frame speech-vs-music analyser for the §2.1 / §5

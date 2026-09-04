@@ -706,7 +706,7 @@ impl ChannelAnalyzer {
             // Flooring keeps the quantization step proportional to
             // the signal, so the λ deadzone actually zeroes the
             // noise-level corrections.
-            if self.rate_control && self.pulse_rms < TARGET_PULSE_RMS {
+            if self.rate_control {
                 let sig_energy: f64 = pcm[s * n..(s + 1) * n]
                     .iter()
                     .map(|&v| (v as f64) * (v as f64))
@@ -749,19 +749,25 @@ impl ChannelAnalyzer {
         self.prev_log_gain = Some(gains.last_log_gain());
 
         // ---- 5. Closed-loop excitation (§5.2.3.8 role). ----
-        // Rate-control knobs (see [`PulseRateControl`]): pulse
-        // targets below the default engage the §5.2.3.8 noise
-        // shaping quantizer — the §5.2.3.7 Wana prefilter on the
-        // target, the a_syn feedback in the pulse decisions, and a
-        // linear λ penalty that grows as the target shrinks; at/above
-        // the default target the pure closed-loop tracker runs
-        // unchanged.
+        // Rate-control knobs (see [`PulseRateControl`]): a
+        // rate-controlled encode runs the §5.2.3.8 noise shaping
+        // quantizer at EVERY pulse target — the §5.2.3.7 Wana
+        // prefilter on the target, the a_syn feedback in the pulse
+        // decisions, and a linear λ penalty that grows as the target
+        // shrinks below the default (zero at and above it, where only
+        // the shaping remains). The knob's size response is thereby
+        // one continuous curve: switching quantizers at the default
+        // target used to open a ~4× size cliff there (the unshaped
+        // tracker codes the noise floor at full precision), leaving
+        // no operating point between ~10 and ~70 kb/s for the
+        // election to land on. Encoders that never set the knob keep
+        // the pure closed-loop tracker unchanged.
         let ratio = if self.rate_control {
-            (TARGET_PULSE_RMS / self.pulse_rms).max(1.0)
+            TARGET_PULSE_RMS / self.pulse_rms
         } else {
             1.0
         };
-        let (rate, quant_target) = if ratio <= 1.0 {
+        let (rate, quant_target) = if !self.rate_control {
             (PulseRateControl::default(), pcm.to_vec())
         } else {
             // §5.2.3.3: coding quality C in [0, 1]; the chirps
@@ -794,7 +800,7 @@ impl ChannelAnalyzer {
             }
             (
                 PulseRateControl {
-                    lambda_pulses: (RATE_LAMBDA_SLOPE * (ratio - 1.0)) as f32,
+                    lambda_pulses: (RATE_LAMBDA_SLOPE * (ratio - 1.0).max(0.0)) as f32,
                     a_syn: Some(a_syn),
                 },
                 xpre,
@@ -1859,21 +1865,9 @@ impl SilkEncoderStereo {
 /// full-packet trial encodes on cloned encoder state.
 ///
 /// `encode(state, pulse_target)` must set the knob on the clone and
-/// run the ordinary packet encode. The election adopts the attempt
-/// whose packet is the largest not exceeding the target (quantization
-/// precision is monotone in size, so that is the closest-from-below
-/// attempt); when even the coarsest quantization overshoots — the
-/// header-bits floor of the coded frames exceeds the target — the
-/// smallest achieved packet is adopted instead (floor-raise
-/// semantics: the caller's drift accounting repays the excess, as
-/// with the Hybrid arm's SILK floor). Returns the adopted state (its
-/// analyzers carry the adopted knob as the next packet's warm start)
-/// and the packet.
-///
-/// The size-vs-knob relation is close to affine over a packet
-/// (excitation pulses dominate the varying cost), so the search is a
-/// warm-started secant iteration in the knob, clamped to
-/// [`PULSE_TARGET_MIN`]..[`PULSE_TARGET_MAX`].
+/// run the ordinary packet encode. See [`elect_by_size`] for the
+/// adoption rule; a §2.1.9 DTX marker is knob-independent and adopted
+/// at once.
 fn elect_packet_encode<S, F>(
     state: &S,
     start_pulse_target: f64,
@@ -1884,14 +1878,51 @@ where
     S: Clone,
     F: Fn(&mut S, f64) -> Result<EncodedSilkPacket, Error>,
 {
+    elect_by_size(state, start_pulse_target, target_bytes, |s, q| {
+        let pkt = encode(s, q)?;
+        let size = pkt.packet.len();
+        let fixed = pkt.is_dtx();
+        Ok((pkt, size, fixed))
+    })
+}
+
+/// The generic size election behind [`elect_packet_encode`] (and the
+/// Hybrid arms' SILK-layer share): `encode(state, pulse_target)`
+/// sets the knob on a clone and returns `(product, size_bytes,
+/// knob_independent)`. The election adopts the attempt whose size is
+/// the largest not exceeding the target (quantization precision is
+/// monotone in size, so that is the closest-from-below attempt); when
+/// even the coarsest quantization overshoots — the header-bits floor
+/// of the coded frames exceeds the target — the smallest achieved
+/// product is adopted instead (floor-raise semantics: the caller's
+/// drift accounting repays the excess). A `knob_independent` product
+/// (a DTX marker) is adopted immediately. Returns the adopted state
+/// (its analyzers carry the adopted knob as the next packet's warm
+/// start) and the product.
+///
+/// The size-vs-knob relation is close to affine over a packet
+/// (excitation pulses dominate the varying cost), so the search is a
+/// warm-started secant iteration in the knob, clamped to
+/// [`PULSE_TARGET_MIN`]..[`PULSE_TARGET_MAX`].
+pub(crate) fn elect_by_size<S, T, F>(
+    state: &S,
+    start_pulse_target: f64,
+    target_bytes: usize,
+    encode: F,
+) -> Result<(S, T), Error>
+where
+    S: Clone,
+    T: Clone,
+    F: Fn(&mut S, f64) -> Result<(T, usize, bool), Error>,
+{
     let target = target_bytes.max(2) as f64;
     let mut q = start_pulse_target.clamp(PULSE_TARGET_MIN, PULSE_TARGET_MAX);
     // (knob, size) evaluations for the secant update.
     let mut evals: Vec<(f64, f64)> = Vec::with_capacity(ELECT_MAX_ATTEMPTS);
     // Best attempt not exceeding the target (largest size).
-    let mut best_under: Option<(S, EncodedSilkPacket)> = None;
+    let mut best_under: Option<(S, T, usize)> = None;
     // Smallest attempt overall (the floor-raise fallback).
-    let mut smallest: Option<(S, EncodedSilkPacket)> = None;
+    let mut smallest: Option<(S, T, usize)> = None;
     let mut last_err = Error::MalformedPacket;
     for _ in 0..ELECT_MAX_ATTEMPTS {
         let mut cand = state.clone();
@@ -1900,8 +1931,8 @@ where
         // that is a "too big" outcome, not a failure — drop the knob
         // hard and keep searching. Only a search that never produces
         // a packet at all errors out.
-        let pkt = match encode(&mut cand, q) {
-            Ok(pkt) => pkt,
+        let (product, size_bytes, fixed) = match encode(&mut cand, q) {
+            Ok(v) => v,
             Err(e) => {
                 last_err = e;
                 evals.clear();
@@ -1913,24 +1944,19 @@ where
                 continue;
             }
         };
-        // A §2.1.9 DTX marker is knob-independent: adopt it
-        // immediately (no election to run over a 1-byte packet).
-        if pkt.is_dtx() {
-            return Ok((cand, pkt));
+        if fixed {
+            return Ok((cand, product));
         }
-        let size = pkt.packet.len() as f64;
+        let size = size_bytes as f64;
         if size <= target
             && best_under
                 .as_ref()
-                .map_or(true, |(_, b)| pkt.packet.len() > b.packet.len())
+                .map_or(true, |(_, _, b)| size_bytes > *b)
         {
-            best_under = Some((cand.clone(), pkt.clone()));
+            best_under = Some((cand.clone(), product.clone(), size_bytes));
         }
-        if smallest
-            .as_ref()
-            .map_or(true, |(_, b)| pkt.packet.len() < b.packet.len())
-        {
-            smallest = Some((cand, pkt));
+        if smallest.as_ref().map_or(true, |(_, _, b)| size_bytes < *b) {
+            smallest = Some((cand, product, size_bytes));
         }
         if size <= target && size >= ELECT_ACCEPT_FRACTION * target {
             break;
@@ -1938,15 +1964,28 @@ where
         evals.push((q, size));
         // Next knob: secant through the two most recent distinct
         // evaluations, multiplicative bootstrap otherwise. A flat
-        // size response (inactive content at its header floor) stops
-        // the search.
+        // size response over a small knob step (the size is
+        // quantized to whole bytes) takes a decisive halving /
+        // doubling step in the needed direction instead; only a knob
+        // already pinned at its bound stops the search (inactive
+        // content at its header floor).
         let next = if evals.len() >= 2 {
             let (q1, s1) = evals[evals.len() - 2];
             let (q2, s2) = evals[evals.len() - 1];
             if (s2 - s1).abs() < 0.51 {
-                break;
+                let pinned = (size > target && q <= PULSE_TARGET_MIN)
+                    || (size < target && q >= PULSE_TARGET_MAX);
+                if pinned {
+                    break;
+                }
+                if size > target {
+                    q2 * 0.5
+                } else {
+                    q2 * 2.0
+                }
+            } else {
+                q2 + (target - s2) * (q2 - q1) / (s2 - s1)
             }
-            q2 + (target - s2) * (q2 - q1) / (s2 - s1)
         } else {
             q * (target / size).clamp(0.25, 4.0)
         };
@@ -1957,7 +1996,10 @@ where
         }
         q = next;
     }
-    best_under.or(smallest).ok_or(last_err)
+    best_under
+        .or(smallest)
+        .map(|(s, t, _)| (s, t))
+        .ok_or(last_err)
 }
 
 /// Map a desired linear Q16 gain to the §4.2.7.4 `log_gain` index
