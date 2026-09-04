@@ -50,11 +50,15 @@ use crate::Error;
 /// §3.2 maximum Opus frame payload.
 const MAX_FRAME_BYTES: usize = 1275;
 
-/// Share of the elected Hybrid payload (after any §4.5.1 redundant
-/// frame) the WB SILK layer targets; the CELT layer (bands 17.. —
-/// 8 kHz and up) gets the rest. Elected per packet on the SILK
-/// pulse-RMS knob exactly like the SILK-only arm's rate control.
-pub const HYBRID_SILK_SHARE: f64 = 0.7;
+/// Default share of the elected Hybrid payload (after any §4.5.1
+/// redundant frame) the WB SILK layer targets; the CELT layer (bands
+/// 17.. — 8 kHz and up) gets the rest. Elected per packet on the SILK
+/// pulse-RMS knob exactly like the SILK-only arm's rate control
+/// (`set_silk_share` adjusts it). Measured optimum over the corpus of
+/// `tests/signal_adaptive_election.rs` at 16–48 kb/s: 0.8 minimises
+/// the log-spectral distance on speech, real speech, music and mixed
+/// content alike (0.9 ties within 0.1 dB, 0.5–0.6 lose 0.3–3 dB).
+pub const HYBRID_SILK_SHARE: f64 = 0.8;
 
 /// Smallest SILK-layer target the share election asks for.
 const HYBRID_SILK_MIN_BYTES: usize = 8;
@@ -293,9 +297,9 @@ fn finish_hybrid_celt(
 
 /// The SILK-layer byte target for an elected payload carrying
 /// `red_bytes` of §4.5.1 redundancy.
-fn silk_share_target(elected_payload_bytes: usize, red_bytes: usize) -> usize {
+fn silk_share_target(elected_payload_bytes: usize, red_bytes: usize, share: f64) -> usize {
     let primary = elected_payload_bytes.saturating_sub(red_bytes) as f64;
-    ((primary * HYBRID_SILK_SHARE) as usize).max(HYBRID_SILK_MIN_BYTES)
+    ((primary * share) as usize).max(HYBRID_SILK_MIN_BYTES)
 }
 
 /// A mono Hybrid packet encoder (configs 12–15: SWB/FB × 10/20 ms).
@@ -321,6 +325,8 @@ pub struct HybridEncoderMono {
     lbrr_prev_rms: f64,
     /// §2.1.9 DTX driver.
     dtx: DtxState,
+    /// SILK-layer share of the elected payload.
+    silk_share: f64,
 }
 
 /// The previous Hybrid packet's material a FEC-enabled encoder keeps
@@ -370,6 +376,7 @@ impl HybridEncoderMono {
             loss_perc: 0,
             lbrr_prev_rms: 0.0,
             dtx: DtxState::default(),
+            silk_share: HYBRID_SILK_SHARE,
         })
     }
 
@@ -387,6 +394,13 @@ impl HybridEncoderMono {
     /// CELT energies INTRA and its SILK frame without LTP, so its
     /// reconstruction never depends on what a decoder's own
     /// non-normative concealment left behind.
+    /// Share of the elected payload (after redundancy) the WB SILK
+    /// layer targets (clamped to `0.3..=0.9`; default
+    /// [`HYBRID_SILK_SHARE`]).
+    pub fn set_silk_share(&mut self, share: f64) {
+        self.silk_share = share.clamp(0.3, 0.9);
+    }
+
     pub fn set_dtx(&mut self, enabled: bool) {
         self.dtx.enabled = enabled;
         self.dtx.reset();
@@ -505,7 +519,7 @@ impl HybridEncoderMono {
         if let Some(marker) = self.dtx_gate(&pcm16)? {
             return Ok(marker);
         }
-        let silk_target = silk_share_target(elected_payload_bytes, plan.bytes());
+        let silk_target = silk_share_target(elected_payload_bytes, plan.bytes(), self.silk_share);
         let (toc, re) = self.elect_silk_layer(&pcm16, silk_target)?;
         let silk_bytes = (re.tell() as usize).div_ceil(8);
         let floor = silk_bytes + HYBRID_MIN_CELT_TAIL_BYTES + plan.bytes();
@@ -767,6 +781,8 @@ pub struct HybridEncoderStereo {
     lbrr_prev_rms: f64,
     /// §2.1.9 DTX driver.
     dtx: DtxState,
+    /// SILK-layer share of the elected payload.
+    silk_share: f64,
 }
 
 /// The previous stereo Hybrid packet's material a FEC-enabled encoder
@@ -825,6 +841,7 @@ impl HybridEncoderStereo {
             loss_perc: 0,
             lbrr_prev_rms: 0.0,
             dtx: DtxState::default(),
+            silk_share: HYBRID_SILK_SHARE,
         })
     }
 
@@ -832,6 +849,13 @@ impl HybridEncoderStereo {
     /// [`HybridEncoderMono::set_dtx`]): the activity gate runs on the
     /// decimated mid/side pair; the marker carries the stereo Hybrid
     /// TOC.
+    /// Share of the elected payload (after redundancy) the WB SILK
+    /// layer targets (clamped to `0.3..=0.9`; default
+    /// [`HYBRID_SILK_SHARE`]).
+    pub fn set_silk_share(&mut self, share: f64) {
+        self.silk_share = share.clamp(0.3, 0.9);
+    }
+
     pub fn set_dtx(&mut self, enabled: bool) {
         self.dtx.enabled = enabled;
         self.dtx.reset();
@@ -940,7 +964,7 @@ impl HybridEncoderStereo {
         if let Some(marker) = self.dtx_gate(&l16, &r16)? {
             return Ok(marker);
         }
-        let silk_target = silk_share_target(elected_payload_bytes, plan.bytes());
+        let silk_target = silk_share_target(elected_payload_bytes, plan.bytes(), self.silk_share);
         let (toc, re) = self.elect_silk_layer(&l16, &r16, silk_target)?;
         let silk_bytes = (re.tell() as usize).div_ceil(8);
         let floor = silk_bytes + HYBRID_MIN_CELT_TAIL_BYTES + plan.bytes();

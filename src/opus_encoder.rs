@@ -31,6 +31,17 @@
 //! effect **one packet after** the knob moves: the packet coded when
 //! a change is first observed is the transition carrier.
 //!
+//! With [`OpusEncoder::set_signal_adaptive`] the decision also takes
+//! the §5 "type of signal (speech vs. music)" input from the crate's
+//! own [`SignalAnalyser`]: the per-frame class selects a speech or a
+//! music rate ladder under the application profile, and the analyser's
+//! content-bandwidth estimate caps the coded bandwidth (§2.1.3 "the
+//! best bandwidth decision possible given the current bitrate" — and
+//! the content). Signal-driven changes are rate-limited to one per
+//! [`SIGNAL_SWITCH_DWELL_MS`] on top of the analyser's own hysteresis
+//! and go through exactly the same §4.5 transition machinery as
+//! knob-driven ones, so every switch stays conformant.
+//!
 //! The SILK-only arms consume internal-rate PCM, so this module owns
 //! the 48 kHz → 8/12/16 kHz decimators; their tap counts put each
 //! SILK-only chain (decimator group delay + the decoder's §4.2.9
@@ -55,6 +66,7 @@ use crate::hybrid_packet_encode::{
 };
 use crate::mode_transition_reset::{decide_state_resets, CeltResetPlacement};
 use crate::packet_compose::pad_packet_to;
+use crate::signal_analysis::{SignalAnalyser, SignalClass, SignalVerdict};
 use crate::silk_encoder::{DtxState, SilkEncoderMono, SilkEncoderStereo};
 use crate::toc::{Bandwidth, Mode};
 use crate::vbr::VbrRateControl;
@@ -65,6 +77,12 @@ const MAX_FRAME_BYTES: usize = 1275;
 
 /// Smallest electable code-0 packet (TOC + 2-byte CELT minimum).
 const MIN_PACKET_BYTES: usize = 3;
+
+/// Minimum spacing of signal-driven configuration changes (the
+/// analyser's hysteresis already delays each decision by ~0.5 s; this
+/// bounds the switch rate on content that keeps hovering at a class
+/// boundary, e.g. speech over a music bed).
+pub const SIGNAL_SWITCH_DWELL_MS: u32 = 1_500;
 
 /// 48 kHz input history kept per channel for re-priming decimators at
 /// a configuration switch (longest FIR is 177 taps).
@@ -227,6 +245,17 @@ pub struct OpusEncoder {
     /// richer side of the seam (a downward switch would otherwise
     /// starve the redundancy below the concealment it replaces).
     prev_bitrate_bps: u32,
+    /// The §5 signal-type input (`None` = bitrate-only election).
+    signal: Option<SignalAnalyser>,
+    /// Packets coded since the last configuration change.
+    packets_since_switch: u32,
+    /// The previous packet's knob-only decision (signal-driven
+    /// changes are the ones made while this stands still).
+    prev_knob_target: Option<StreamConfig>,
+    /// Configuration changes the analyser (not a knob) caused.
+    signal_switches: u32,
+    /// Hybrid SILK-layer share.
+    hybrid_silk_share: f64,
 }
 
 impl OpusEncoder {
@@ -263,7 +292,56 @@ impl OpusEncoder {
             celt_dtx: DtxState::default(),
             hist48: vec![Vec::new(); channels],
             prev_bitrate_bps: bitrate_bps,
+            signal: None,
+            packets_since_switch: 0,
+            prev_knob_target: None,
+            signal_switches: 0,
+            hybrid_silk_share: crate::hybrid_packet_encode::HYBRID_SILK_SHARE,
         })
+    }
+
+    /// Share of a Hybrid packet's elected payload the WB SILK layer
+    /// targets (see [`crate::hybrid_packet_encode::HYBRID_SILK_SHARE`]).
+    pub fn set_hybrid_silk_share(&mut self, share: f64) {
+        self.hybrid_silk_share = share.clamp(0.3, 0.9);
+        match self.arm.as_mut() {
+            Some(Arm::HybridMono(h)) => h.set_silk_share(self.hybrid_silk_share),
+            Some(Arm::HybridStereo(h)) => h.set_silk_share(self.hybrid_silk_share),
+            _ => {}
+        }
+    }
+
+    /// Enable the signal-adaptive election (§5 "type of signal"):
+    /// the encoder's own analyser classifies the input as speech or
+    /// music and estimates its content bandwidth per frame, and the
+    /// automatic mode / bandwidth decision follows (forced mode and
+    /// bandwidth knobs still win; `RestrictedLowDelay` stays
+    /// CELT-only). Off by default.
+    pub fn set_signal_adaptive(&mut self, enabled: bool) {
+        match (enabled, self.signal.is_some()) {
+            (true, false) => self.signal = Some(SignalAnalyser::new(self.channels)),
+            (false, true) => self.signal = None,
+            _ => {}
+        }
+    }
+
+    /// Whether the signal-adaptive election is on.
+    #[must_use]
+    pub fn signal_adaptive(&self) -> bool {
+        self.signal.is_some()
+    }
+
+    /// The analyser's current verdict (class, probability, content
+    /// bandwidth, features) when the adaptive election is on.
+    #[must_use]
+    pub fn signal_verdict(&self) -> Option<SignalVerdict> {
+        self.signal.as_ref().map(SignalAnalyser::verdict)
+    }
+
+    /// Configuration changes the signal analyser caused so far.
+    #[must_use]
+    pub fn signal_switches(&self) -> u32 {
+        self.signal_switches
     }
 
     /// Samples **per channel** consumed by one [`Self::encode_frame`].
@@ -427,9 +505,10 @@ impl OpusEncoder {
     }
 
     /// Resolve the §2.1.1 / §2.1.3 configuration for the current
-    /// knobs (see [`Application`]). Pure in the knobs: the decision
-    /// only moves when a knob does.
-    fn decide(&self) -> StreamConfig {
+    /// knobs (see [`Application`]) and, when given, the analyser's
+    /// verdict. Pure in its inputs: the decision only moves when a
+    /// knob or the verdict does.
+    fn decide(&self, verdict: Option<SignalVerdict>) -> StreamConfig {
         // Stereo spends bits on the second channel; compare on an
         // effective per-stream rate so stereo switches up later.
         let eff = if self.channels == 2 {
@@ -437,18 +516,24 @@ impl OpusEncoder {
         } else {
             self.bitrate_bps
         };
+        let class = verdict.map_or(SignalClass::Unknown, |v| v.class);
+        // The content-bandwidth cap applies once the analyser has
+        // decided a class (its hold-down memory has then heard ≥ 0.8 s
+        // of active input); before that a stream opening on a
+        // narrowband onset would otherwise start capped and pay a §4.5
+        // bandwidth transition a few packets in.
+        let cap = verdict
+            .filter(|v| v.class != SignalClass::Unknown)
+            .map_or(Bandwidth::Fb, |v| v.bandwidth);
         let celt_only_duration = matches!(self.frame_tenths_ms, 25 | 50);
         let silk_only_duration = matches!(self.frame_tenths_ms, 400 | 600);
-        let mode = self.forced_mode.unwrap_or_else(|| {
+        let mut mode = self.forced_mode.unwrap_or_else(|| {
             if celt_only_duration || self.application == Application::RestrictedLowDelay {
                 Mode::CeltOnly
             } else if silk_only_duration {
                 Mode::SilkOnly
             } else {
-                let (hybrid_at, celt_at) = match self.application {
-                    Application::Voip => (24_000, 48_000),
-                    _ => (20_000, 32_000),
-                };
+                let (hybrid_at, celt_at) = Self::rate_ladder(self.application, class);
                 if eff < hybrid_at {
                     Mode::SilkOnly
                 } else if eff < celt_at {
@@ -458,18 +543,36 @@ impl OpusEncoder {
                 }
             }
         });
+        // Hybrid codes only what lies above 8 kHz in its CELT layer:
+        // content capped at WB or below has nothing for it, so the
+        // automatic decision falls back to the WB arm of the class.
+        if mode == Mode::Hybrid
+            && self.forced_mode.is_none()
+            && matches!(cap, Bandwidth::Nb | Bandwidth::Mb | Bandwidth::Wb)
+        {
+            mode = if class == SignalClass::Music {
+                Mode::CeltOnly
+            } else {
+                Mode::SilkOnly
+            };
+        }
         let bandwidth = match mode {
             Mode::SilkOnly => match self.forced_bandwidth {
                 Some(Bandwidth::Nb) => Bandwidth::Nb,
                 Some(Bandwidth::Mb) => Bandwidth::Mb,
                 Some(_) => Bandwidth::Wb,
                 None => {
-                    if eff < 12_000 {
+                    let ladder = if eff < 12_000 {
                         Bandwidth::Nb
                     } else if eff < 16_000 {
                         Bandwidth::Mb
                     } else {
                         Bandwidth::Wb
+                    };
+                    match cap {
+                        Bandwidth::Nb => Bandwidth::Nb,
+                        Bandwidth::Mb if ladder != Bandwidth::Nb => Bandwidth::Mb,
+                        _ => ladder,
                     }
                 }
             },
@@ -477,7 +580,7 @@ impl OpusEncoder {
                 Some(Bandwidth::Fb) => Bandwidth::Fb,
                 Some(_) => Bandwidth::Swb,
                 None => {
-                    if eff < 32_000 {
+                    if eff < 32_000 || cap == Bandwidth::Swb {
                         Bandwidth::Swb
                     } else {
                         Bandwidth::Fb
@@ -489,7 +592,7 @@ impl OpusEncoder {
                 Some(Bandwidth::Mb) | Some(Bandwidth::Wb) => Bandwidth::Wb,
                 Some(bw) => bw,
                 None => {
-                    if eff < 12_000 {
+                    let ladder = if eff < 12_000 {
                         Bandwidth::Nb
                     } else if eff < 24_000 {
                         Bandwidth::Wb
@@ -497,11 +600,56 @@ impl OpusEncoder {
                         Bandwidth::Swb
                     } else {
                         Bandwidth::Fb
+                    };
+                    // CELT has no MB row: MB content codes as WB.
+                    let cap = if cap == Bandwidth::Mb {
+                        Bandwidth::Wb
+                    } else {
+                        cap
+                    };
+                    if Self::bw_rank(cap) < Self::bw_rank(ladder) {
+                        cap
+                    } else {
+                        ladder
                     }
                 }
             },
         };
         StreamConfig { mode, bandwidth }
+    }
+
+    /// The (Hybrid-from, CELT-from) effective-rate thresholds per
+    /// application and signal class.
+    ///
+    /// Speech (and an undecided signal) follows §2.1.1's sweet spots —
+    /// the LP layer through the WB speech band, Hybrid across the
+    /// "28–40 kbit/s FB speech" band, CELT above — with the Voip
+    /// profile holding the LP layer longer. Music takes the MDCT layer
+    /// from 12 kb/s up (§2: "the MDCT layer should be used for music
+    /// signals"): measured on the corpus of
+    /// `tests/signal_adaptive_election.rs`, CELT-only beats both the
+    /// SILK-only and the Hybrid arm on music, tones and speech-over-
+    /// music at every rate from 12 kb/s (e.g. 24 kb/s music: LSD 7.9 dB
+    /// Hybrid → 4.8 dB CELT; tones: 16.6 → 5.5 dB), and Hybrid never
+    /// beats CELT-only on music, so the music ladder has no Hybrid
+    /// rung.
+    fn rate_ladder(application: Application, class: SignalClass) -> (u32, u32) {
+        match (application, class) {
+            (Application::RestrictedLowDelay, _) => (0, 0),
+            (_, SignalClass::Music) => (12_000, 12_000),
+            (Application::Voip, _) => (24_000, 48_000),
+            (Application::Audio, _) => (20_000, 32_000),
+        }
+    }
+
+    fn bw_rank(bw: Bandwidth) -> u8 {
+        match bw {
+            Bandwidth::Nb => 0,
+            Bandwidth::Mb => 1,
+            Bandwidth::Wb => 2,
+            Bandwidth::Swb => 3,
+            Bandwidth::Fb => 4,
+        }
     }
 
     /// §4.5.3: does the (old → new) transition carry an END-position
@@ -558,12 +706,31 @@ impl OpusEncoder {
         if pcm.len() != self.channels * self.frame_samples() {
             return Err(Error::MalformedPacket);
         }
-        let target = self.decide();
+        let verdict = self.signal.as_mut().map(|a| a.analyse(pcm));
+        let knob_target = self.decide(None);
+        let mut target = self.decide(verdict);
         if self.cur.is_none() {
             self.install_fresh(target)?;
             self.cur = Some(target);
         }
         let cur = self.cur.expect("installed above");
+        // A purely signal-driven change (the knob decision did not
+        // move since the previous packet) waits out the dwell in both
+        // directions; a knob move always goes through (to the
+        // adaptive target).
+        let signal_driven = target != cur && self.prev_knob_target == Some(knob_target);
+        self.prev_knob_target = Some(knob_target);
+        if signal_driven {
+            // A bandwidth RAISE in the same mode goes through at once
+            // (content above the coded band is lost until it does);
+            // everything else waits.
+            let raise = target.mode == cur.mode
+                && Self::bw_rank(target.bandwidth) > Self::bw_rank(cur.bandwidth);
+            let dwell = SIGNAL_SWITCH_DWELL_MS * 10 / u32::from(self.frame_tenths_ms);
+            if !raise && self.packets_since_switch < dwell {
+                target = cur;
+            }
+        }
 
         // §4.5.1: plan an end-position redundant frame when this is
         // the last packet before a transition that carries one (a
@@ -601,6 +768,12 @@ impl OpusEncoder {
         if switching {
             self.switch_to(cur, target, end_r_carried)?;
             self.cur = Some(target);
+            self.packets_since_switch = 0;
+            if signal_driven {
+                self.signal_switches += 1;
+            }
+        } else {
+            self.packets_since_switch = self.packets_since_switch.saturating_add(1);
         }
         self.prev_bitrate_bps = self.bitrate_bps;
 
@@ -644,6 +817,7 @@ impl OpusEncoder {
             Mode::Hybrid => {
                 if stereo {
                     let mut h = HybridEncoderStereo::new(config.bandwidth, self.frame_tenths_ms)?;
+                    h.set_silk_share(self.hybrid_silk_share);
                     h.set_dtx(self.dtx);
                     h.set_fec(self.fec);
                     h.set_packet_loss_perc(self.loss_perc);
@@ -664,6 +838,7 @@ impl OpusEncoder {
                     Arm::HybridStereo(Box::new(h))
                 } else {
                     let mut h = HybridEncoderMono::new(config.bandwidth, self.frame_tenths_ms)?;
+                    h.set_silk_share(self.hybrid_silk_share);
                     h.set_dtx(self.dtx);
                     h.set_fec(self.fec);
                     h.set_packet_loss_perc(self.loss_perc);

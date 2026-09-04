@@ -760,9 +760,12 @@ fn hybrid_stereo_vbr_tracks_target_and_decodes() {
 
 #[test]
 fn hybrid_stereo_vbr_floor_raise_survives_starving_targets() {
-    // A target under the stereo SILK layer's floor: every packet is
+    // A target under the stereo SILK layer's floor: the SILK layer is
+    // elected to its payload share, so a 24 kb/s target is honoured
+    // outright; at 8 kb/s (20 B/packet) even the coarsest stereo
+    // SILK layer plus the CELT tail cannot fit and every packet is
     // floor-raised, decodes cleanly, and the drift stays clamped.
-    let mut enc = HybridVbrEncoderStereo::new(Bandwidth::Fb, 200, 24_000, false).unwrap();
+    let mut enc = HybridVbrEncoderStereo::new(Bandwidth::Fb, 200, 8_000, false).unwrap();
     let spf = enc.frame_samples();
     let mut dec = OpusDecoder::new();
     for f in 0..12 {
@@ -773,7 +776,7 @@ fn hybrid_stereo_vbr_floor_raise_survives_starving_targets() {
             pcm.push((0.6 * v).round().clamp(-32768.0, 32767.0) as i16);
         }
         let packet = enc.encode_frame(&pcm).unwrap();
-        assert!(packet.len() > 60, "starving election must floor-raise");
+        assert!(packet.len() > 21, "starving election must floor-raise");
         assert!(packet.len() <= 1276);
         let out = dec.decode_packet(&packet).unwrap();
         assert_eq!(out.samples_per_channel(), spf);

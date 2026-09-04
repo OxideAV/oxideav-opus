@@ -669,3 +669,447 @@ fn analyser_tracks_alternating_content_with_hysteresis() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Equal-rate election batteries.
+
+use oxideav_opus::{Application, Bandwidth, Mode, OpusDecoder, OpusEncoder, OpusTocByte};
+
+/// End-to-end stream lag on the 120-sample timeline.
+const LAG: usize = 120;
+
+struct Run {
+    packets: Vec<Vec<u8>>,
+    /// (mode, bandwidth) per packet.
+    configs: Vec<(Mode, Bandwidth)>,
+    /// Configuration changes across the stream.
+    switches: usize,
+    /// Of which the analyser caused.
+    signal_switches: u32,
+    kbps: f64,
+    seg_snr: f64,
+    lsd: f64,
+    /// LSD over the second half of the stream (the steady state
+    /// after the class decision).
+    lsd_tail: f64,
+}
+
+fn config_of(packet: &[u8]) -> (Mode, Bandwidth) {
+    let toc = OpusTocByte::parse(packet).expect("toc");
+    (toc.mode, toc.bandwidth)
+}
+
+fn run(
+    pcm: &[i16],
+    channels: usize,
+    app: Application,
+    bitrate: u32,
+    forced: Option<Mode>,
+    adaptive: bool,
+) -> Run {
+    let mut enc = OpusEncoder::new(channels, app, bitrate).expect("encoder");
+    enc.set_mode(forced).expect("mode");
+    enc.set_signal_adaptive(adaptive);
+    let n = enc.frame_samples() * channels;
+    let frames = pcm.len() / n;
+    let mut packets = Vec::with_capacity(frames);
+    let mut dec = OpusDecoder::new();
+    let mut out = Vec::with_capacity(pcm.len() + 4800);
+    for f in 0..frames {
+        let p = enc.encode_frame(&pcm[f * n..(f + 1) * n]).expect("encode");
+        out.extend_from_slice(&dec.decode_packet(&p).expect("decode").pcm);
+        packets.push(p);
+    }
+    let configs: Vec<_> = packets.iter().map(|p| config_of(p)).collect();
+    let switches = configs.windows(2).filter(|w| w[0] != w[1]).count();
+    let bytes: usize = packets.iter().map(Vec::len).sum();
+    let seconds = frames as f64 * enc.frame_samples() as f64 / FS;
+    let input = &pcm[..frames * n];
+    let half = (frames / 2) * n;
+    Run {
+        seg_snr: seg_snr_db(input, &out, channels, LAG),
+        lsd: lsd_db(input, &out, channels, LAG),
+        lsd_tail: lsd_db(&input[half..], &out[half..], channels, LAG),
+        kbps: bytes as f64 * 8.0 / seconds / 1000.0,
+        packets,
+        configs,
+        switches,
+        signal_switches: enc.signal_switches(),
+    }
+}
+
+fn mode_tag(cfgs: &[(Mode, Bandwidth)]) -> String {
+    let mut counts = std::collections::BTreeMap::new();
+    for c in cfgs {
+        *counts
+            .entry(format!("{:?}/{:?}", c.0, c.1))
+            .or_insert(0usize) += 1;
+    }
+    counts
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// One class of the corpus with its ground-truth class.
+struct Clip {
+    name: &'static str,
+    channels: usize,
+    pcm: Vec<i16>,
+    class: SignalClass,
+}
+
+fn corpus(seconds: f64, seed: u64) -> Vec<Clip> {
+    let mut clips = vec![
+        Clip {
+            name: "speech",
+            channels: 1,
+            pcm: speech_like(seconds, seed, 1),
+            class: SignalClass::Speech,
+        },
+        Clip {
+            name: "music",
+            channels: 1,
+            pcm: music_like(seconds, seed, 1),
+            class: SignalClass::Music,
+        },
+        Clip {
+            name: "music-st",
+            channels: 2,
+            pcm: music_like(seconds, seed, 2),
+            class: SignalClass::Music,
+        },
+        Clip {
+            name: "mixed",
+            channels: 1,
+            pcm: mixed(seconds, seed, 1),
+            class: SignalClass::Unknown,
+        },
+        Clip {
+            name: "tones",
+            channels: 1,
+            pcm: tones(seconds, 1),
+            class: SignalClass::Music,
+        },
+    ];
+    if let Some(ext) = external_speech(1) {
+        clips.push(Clip {
+            name: "ext-speech",
+            channels: 1,
+            pcm: ext,
+            class: SignalClass::Speech,
+        });
+    }
+    clips
+}
+
+struct Row {
+    clip: &'static str,
+    rate: u32,
+    arm: &'static str,
+    run: Run,
+}
+
+fn battery(clips: &[Clip], rates: &[u32], arms: &[(&'static str, Option<Mode>, bool)]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for clip in clips {
+        for &rate in rates {
+            let rate = if clip.channels == 2 {
+                rate * 3 / 2
+            } else {
+                rate
+            };
+            for &(arm, forced, adaptive) in arms {
+                let run = run(
+                    &clip.pcm,
+                    clip.channels,
+                    Application::Audio,
+                    rate,
+                    forced,
+                    adaptive,
+                );
+                rows.push(Row {
+                    clip: clip.name,
+                    rate,
+                    arm,
+                    run,
+                });
+            }
+        }
+    }
+    rows
+}
+
+fn print_rows(rows: &[Row]) {
+    for r in rows {
+        println!(
+            "{:<10} {:>6} {:<8} kbps {:6.1} segsnr {:6.2} lsd {:5.2} tail {:5.2} sw {:2} (sig {}) {}",
+            r.clip,
+            r.rate,
+            r.arm,
+            r.run.kbps,
+            r.run.seg_snr,
+            r.run.lsd,
+            r.run.lsd_tail,
+            r.run.switches,
+            r.run.signal_switches,
+            mode_tag(&r.run.configs)
+        );
+    }
+}
+
+const ARMS: &[(&str, Option<Mode>, bool)] = &[
+    ("adaptive", None, true),
+    ("auto", None, false),
+    ("silk", Some(Mode::SilkOnly), false),
+    ("hybrid", Some(Mode::Hybrid), false),
+    ("celt", Some(Mode::CeltOnly), false),
+];
+
+/// Full matrix for tuning the ladders (`OPUS_ELECTION_REPORT=full`).
+#[test]
+fn election_report_full_matrix() {
+    if std::env::var("OPUS_ELECTION_REPORT").ok().as_deref() != Some("full") {
+        return;
+    }
+    let clips = corpus(6.0, 2);
+    let rows = battery(&clips, &[12_000, 16_000, 24_000, 32_000, 48_000], ARMS);
+    print_rows(&rows);
+}
+
+/// Hybrid SILK-share sweep (`OPUS_ELECTION_REPORT=share`).
+#[test]
+fn election_report_hybrid_share() {
+    if std::env::var("OPUS_ELECTION_REPORT").ok().as_deref() != Some("share") {
+        return;
+    }
+    let clips = corpus(6.0, 2);
+    for clip in &clips {
+        for rate in [16_000u32, 24_000, 32_000, 48_000] {
+            for share in [0.5f64, 0.6, 0.7, 0.8, 0.9] {
+                let mut enc = OpusEncoder::new(clip.channels, Application::Audio, rate).unwrap();
+                enc.set_mode(Some(Mode::Hybrid)).unwrap();
+                enc.set_hybrid_silk_share(share);
+                let n = enc.frame_samples() * clip.channels;
+                let frames = clip.pcm.len() / n;
+                let mut dec = OpusDecoder::new();
+                let mut out = Vec::new();
+                let mut bytes = 0usize;
+                for f in 0..frames {
+                    let p = enc.encode_frame(&clip.pcm[f * n..(f + 1) * n]).unwrap();
+                    bytes += p.len();
+                    out.extend_from_slice(&dec.decode_packet(&p).unwrap().pcm);
+                }
+                let input = &clip.pcm[..frames * n];
+                println!(
+                    "{:<10} {:>6} share {share:.1} kbps {:5.1} segsnr {:6.2} lsd {:5.2}",
+                    clip.name,
+                    rate,
+                    bytes as f64 * 8.0 / (frames as f64 * 0.02) / 1000.0,
+                    seg_snr_db(input, &out, clip.channels, LAG),
+                    lsd_db(input, &out, clip.channels, LAG)
+                );
+            }
+        }
+    }
+}
+
+fn find<'a>(rows: &'a [Row], clip: &str, rate: u32, arm: &str) -> &'a Row {
+    rows.iter()
+        .find(|r| r.clip == clip && r.rate == rate && r.arm == arm)
+        .expect("row")
+}
+
+/// Equal-rate election battery (CI): the adaptive election never
+/// loses to the bitrate-only ladder on speech, wins on music / tones
+/// where the analyser routes to the MDCT layer (measured against the
+/// CELT-only fixed encode too), does not regress mixed content, and
+/// switches only at the class decision. The tuning matrices above
+/// carry every arm; this one keeps CI to the decisive comparisons.
+#[test]
+fn adaptive_election_equal_rate_battery() {
+    let clips: Vec<Clip> = corpus(5.0, 5)
+        .into_iter()
+        .filter(|c| matches!(c.name, "speech" | "music" | "mixed" | "tones"))
+        .collect();
+    let rates = [16_000u32, 24_000];
+    let arms: &[(&str, Option<Mode>, bool)] = &[
+        ("adaptive", None, true),
+        ("auto", None, false),
+        ("celt", Some(Mode::CeltOnly), false),
+    ];
+    let rows = battery(&clips, &rates, arms);
+    if std::env::var_os("OPUS_ELECTION_REPORT").is_some() {
+        print_rows(&rows);
+    }
+    let mut music_wins = 0usize;
+    for clip in &clips {
+        for &rate in &rates {
+            let adaptive = &find(&rows, clip.name, rate, "adaptive").run;
+            let auto = &find(&rows, clip.name, rate, "auto").run;
+            let celt = &find(&rows, clip.name, rate, "celt").run;
+            // Rate discipline: the adaptive stream sits on target like
+            // the bitrate-only one.
+            assert!(
+                adaptive.kbps <= auto.kbps.max(rate as f64 / 1000.0) * 1.10 + 0.5,
+                "{} {rate}: adaptive rate {:.1} vs auto {:.1}",
+                clip.name,
+                adaptive.kbps,
+                auto.kbps
+            );
+            match clip.class {
+                SignalClass::Speech => {
+                    // Speech keeps the §2.1.1 ladder: identical stream.
+                    assert!(
+                        adaptive.lsd <= auto.lsd + 0.25,
+                        "{} {rate}: adaptive LSD {:.2} regressed vs auto {:.2}",
+                        clip.name,
+                        adaptive.lsd,
+                        auto.lsd
+                    );
+                    assert_eq!(adaptive.switches, 0, "{} {rate}: switched", clip.name);
+                }
+                SignalClass::Music => {
+                    assert!(
+                        adaptive.lsd <= auto.lsd + 0.25,
+                        "{} {rate}: adaptive LSD {:.2} regressed vs auto {:.2}",
+                        clip.name,
+                        adaptive.lsd,
+                        auto.lsd
+                    );
+                    // The steady state (second half of the clip) is
+                    // the CELT-only encode.
+                    assert!(
+                        adaptive.lsd_tail <= celt.lsd_tail + 0.5,
+                        "{} {rate}: adaptive tail LSD {:.2} too far from CELT {:.2}",
+                        clip.name,
+                        adaptive.lsd_tail,
+                        celt.lsd_tail
+                    );
+                    if adaptive.lsd + 0.5 < auto.lsd {
+                        music_wins += 1;
+                    }
+                    assert_eq!(
+                        adaptive.signal_switches, 1,
+                        "{} {rate}: one class decision",
+                        clip.name
+                    );
+                    assert!(
+                        adaptive.switches <= 2,
+                        "{} {rate}: {} switches",
+                        clip.name,
+                        adaptive.switches
+                    );
+                    assert_eq!(
+                        adaptive.configs.last().map(|c| c.0),
+                        Some(Mode::CeltOnly),
+                        "{} {rate}: steady state must be the MDCT layer",
+                        clip.name
+                    );
+                }
+                SignalClass::Unknown => {
+                    assert!(
+                        adaptive.lsd <= auto.lsd + 0.25,
+                        "{} {rate}: adaptive LSD {:.2} regressed vs auto {:.2}",
+                        clip.name,
+                        adaptive.lsd,
+                        auto.lsd
+                    );
+                    assert!(
+                        adaptive.switches <= 4,
+                        "{} {rate}: {} switches",
+                        clip.name,
+                        adaptive.switches
+                    );
+                }
+            }
+        }
+    }
+    // The MDCT routing pays off on the music-class rows (measured
+    // 0.5–5 dB LSD over the bitrate-only ladder).
+    assert!(music_wins >= 3, "only {music_wins} music-class wins");
+}
+
+/// Black-box capture dump: with `OPUS_DUMP_DIR` set, write every
+/// corpus class's adaptive encode (mono + stereo, alternating
+/// speech/music included) in the reference demo program's capture
+/// framing plus the 48 kHz s16le input and our own decode, for
+/// out-of-tree validation against black-box decoders. A no-op in CI.
+#[test]
+fn dump_adaptive_captures_for_blackbox() {
+    let Some(dir) = std::env::var_os("OPUS_DUMP_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let mut clips = corpus(6.0, 3);
+    clips.push(Clip {
+        name: "alternating",
+        channels: 1,
+        pcm: alternating(4, 31, 1),
+        class: SignalClass::Unknown,
+    });
+    clips.push(Clip {
+        name: "alternating-st",
+        channels: 2,
+        pcm: alternating(4, 37, 2),
+        class: SignalClass::Unknown,
+    });
+    clips.push(Clip {
+        name: "silence",
+        channels: 1,
+        pcm: silence(4.0, 1),
+        class: SignalClass::Unknown,
+    });
+    for clip in &clips {
+        for rate in [16_000u32, 32_000] {
+            let rate = if clip.channels == 2 {
+                rate * 3 / 2
+            } else {
+                rate
+            };
+            let r = run(
+                &clip.pcm,
+                clip.channels,
+                Application::Audio,
+                rate,
+                None,
+                true,
+            );
+            let name = format!(
+                "adaptive-{}-{}k-{}ch",
+                clip.name,
+                rate / 1000,
+                clip.channels
+            );
+            let mut bits = Vec::new();
+            for p in &r.packets {
+                bits.extend_from_slice(&(p.len() as u32).to_be_bytes());
+                bits.extend_from_slice(&0u32.to_be_bytes());
+                bits.extend_from_slice(p);
+            }
+            std::fs::write(dir.join(format!("{name}.bits")), bits).expect("write bits");
+            let n = r.packets.len() * 960 * clip.channels;
+            let mut raw = Vec::with_capacity(n * 2);
+            for s in &clip.pcm[..n] {
+                raw.extend_from_slice(&s.to_le_bytes());
+            }
+            std::fs::write(dir.join(format!("{name}.input.s16")), raw).expect("write input");
+            let mut dec = OpusDecoder::new();
+            let mut own = Vec::new();
+            for p in &r.packets {
+                for s in dec.decode_packet(p).expect("decode").pcm {
+                    own.extend_from_slice(&s.to_le_bytes());
+                }
+            }
+            std::fs::write(dir.join(format!("{name}.own.s16")), own).expect("write own");
+            println!(
+                "{name}: {} packets, {} switches ({} signal) {}",
+                r.packets.len(),
+                r.switches,
+                r.signal_switches,
+                mode_tag(&r.configs)
+            );
+        }
+    }
+}
