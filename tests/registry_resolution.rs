@@ -406,8 +406,18 @@ fn registry_encoder_options_schema_and_knobs() {
         "dtx",
         "tapset-election",
         "complexity",
+        "signal-adaptive",
     ] {
         assert!(names.contains(&key), "schema missing '{key}'");
+    }
+    // `signal-adaptive` parses on both settings and builds an encoder.
+    for v in ["true", "false"] {
+        let mut params = CodecParameters::audio(CodecId::new("opus"));
+        params.channels = Some(1);
+        params.options = CodecOptions::new().set("signal-adaptive", v);
+        ctx.codecs
+            .first_encoder(&params)
+            .unwrap_or_else(|e| panic!("signal-adaptive={v}: {e}"));
     }
 
     // frame-ms selects the packet duration: 10 ms frames carry 480

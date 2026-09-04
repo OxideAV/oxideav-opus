@@ -24,6 +24,15 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- Signal-adaptive election: `OpusEncoder::set_signal_adaptive` (registry
+  option `signal-adaptive`, default on under `mode=auto`) — the analyser's
+  speech/music class selects the rate ladder (music → MDCT layer from
+  12 kb/s), its content-bandwidth estimate caps the coded bandwidth, and
+  every signal-driven change rides the §4.5 transition machinery with a
+  1.5 s dwell; `signal_verdict` / `signal_switches` expose the decision.
+  Measured wins at equal rate on music, tones and mixed content; speech
+  streams unchanged (`tests/signal_adaptive_election.rs`).
+- Hybrid SILK-layer share knob (`set_silk_share` / `set_hybrid_silk_share`).
 - `signal_analysis`: per-frame speech-vs-music analyser for the §2.1 / §5
   election — tonality, spectral flux, harmonicity + pitch stability,
   voiced/unvoiced alternation, transient density, envelope modulation,

@@ -321,8 +321,8 @@ pub struct OpusEncoderOptions {
     /// `"lowdelay"` (CELT-only).
     pub application: String,
     /// §3.1 operating mode: `"auto"` (default — §2.1.1
-    /// bitrate-driven with §4.5 transitions), `"silk"`, `"hybrid"`,
-    /// or `"celt"`.
+    /// bitrate-driven, signal-adaptive unless `signal-adaptive=false`,
+    /// with §4.5 transitions), `"silk"`, `"hybrid"`, or `"celt"`.
     pub mode: String,
     /// §2.1.3 audio bandwidth: `"auto"` (default — bitrate-driven),
     /// `"nb"`, `"mb"`, `"wb"`, `"swb"`, or `"fb"`.
@@ -350,6 +350,12 @@ pub struct OpusEncoderOptions {
     /// Complexity rung 0..=10 (`None` keeps the crate default, which
     /// is bit-identical to rung 4).
     pub complexity: Option<u32>,
+    /// §5 signal-adaptive election under `mode=auto`: the encoder's
+    /// own speech/music analyser and content-bandwidth estimate steer
+    /// the mode / bandwidth decision (default on — measured to win on
+    /// music, tones and mixed content at equal rate and to leave
+    /// speech streams identical; see `tests/signal_adaptive_election.rs`).
+    pub signal_adaptive: bool,
 }
 
 impl Default for OpusEncoderOptions {
@@ -367,6 +373,7 @@ impl Default for OpusEncoderOptions {
             redundancy: true,
             tapset_election: false,
             complexity: None,
+            signal_adaptive: true,
         }
     }
 }
@@ -445,6 +452,12 @@ impl oxideav_core::CodecOptionsStruct for OpusEncoderOptions {
             default: OptionValue::U32(4),
             help: "complexity rung 0..=10 (default rung is bit-identical to 4)",
         },
+        OptionField {
+            name: "signal-adaptive",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(true),
+            help: "under mode=auto, let the speech/music analyser steer the mode and bandwidth (default on)",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> oxideav_core::Result<()> {
@@ -461,6 +474,7 @@ impl oxideav_core::CodecOptionsStruct for OpusEncoderOptions {
             "redundancy" => self.redundancy = value.as_bool()?,
             "tapset-election" => self.tapset_election = value.as_bool()?,
             "complexity" => self.complexity = Some(value.as_u32()?),
+            "signal-adaptive" => self.signal_adaptive = value.as_bool()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -595,6 +609,7 @@ impl OpusStreamEncoder {
         if let Some(c) = opts.complexity {
             enc.set_complexity(c.min(10) as u8);
         }
+        enc.set_signal_adaptive(opts.signal_adaptive);
         let frame_samples = enc.frame_samples();
 
         let head = OpusHead {

@@ -186,7 +186,20 @@ hard CBR (§3.2.5 exact-size padding), DTX, in-band FEC with the
 §2.1.7 packet-loss knob, the 0–10 complexity ladder, tapset election,
 and the §4.5.1 transition redundancy switch. In `auto`, the mode and
 bandwidth follow the bitrate per application profile (`Voip` /
-`Audio` / `RestrictedLowDelay`; §2.1.1's sweet spots), and a
+`Audio` / `RestrictedLowDelay`; §2.1.1's sweet spots) **and, with the
+signal-adaptive election (`set_signal_adaptive`, registry
+`signal-adaptive`, default on), the signal itself**: the crate's own
+`SignalAnalyser` (§5 "type of signal (speech vs. music)", designed
+from the RFC's mode semantics — tonality, spectral flux, harmonicity
+and pitch stability, voiced/unvoiced alternation, transient density,
+syllabic envelope modulation, stereo width and a held content-bandwidth
+estimate on a 10 ms block grid, a fixed logistic, smoothing and a
+two-threshold hysteresis with a 0.4 s dwell) classes each frame as
+speech or music; speech keeps the §2.1.1 ladder, music takes the MDCT
+layer from 12 kb/s up (no Hybrid rung: measured, Hybrid never beats
+CELT-only on music), the content bandwidth caps the coded bandwidth
+(raises immediate, everything else rate-limited to one signal-driven
+change per 1.5 s), and a
 configuration change is carried out as a **§4.5.3 Figure 18
 normative transition**: a 5 ms redundant CELT frame in the last
 old-configuration packet (SILK→CELT, Hybrid→CELT, NB/MB SILK→Hybrid),
@@ -205,6 +218,31 @@ Changes land one packet after the knob moves — the packet coded when
 a change is first seen is the transition carrier — and the redundant
 bytes (~5 ms of the richer seam side's rate) ride on top of the
 election, outside the VBR drift ledger.
+
+Measured on the crate's corpus (`tests/signal_adaptive_election.rs`:
+synthetic speech, four-voice music mono/stereo, speech over a music
+bed, tones, silence, an optional real speech sample; own decode; bark
+log-spectral distance, lower is better) at equal target rate, the
+adaptive election against the bitrate-only ladder: music 16 kb/s
+9.56 → 9.06 dB, 24 kb/s 7.86 → 5.80, stereo music 36 kb/s 8.64 → 5.90,
+tones 24 kb/s 16.6 → 9.7 (steady state 5.5), speech over music
+24 kb/s 5.94 → 5.43; speech streams are identical to the ladder (zero
+switches); steady clips switch exactly once, at the class decision
+(~0.8–1.5 s in); alternating 3 s speech/music segments track every
+boundary. Black-box `opusdec` and `ffmpeg` decode every adaptive
+capture (mono, stereo, alternating, silence) without diagnostics,
+`opusdec` agreeing with our decode at 52–62 dB. The same batteries
+found and fixed three rate-control defects on the way: the SILK rate
+knob's ~4× size cliff at the default pulse target (no operating point
+between ~10 and ~70 kb/s), the Hybrid arms coding their SILK layer at
+a fixed ~190 B (every Hybrid target below ~80 kb/s emitted 70–80 kb/s;
+now elected to a 0.8 payload share, the measured optimum), and the
+missing §5.2.3.3 compensation gain on the noise-shaping quantizer
+(+3.5–6 dB SNR at every SILK packet size). By these waveform/spectral
+metrics the CELT-only arm still leads the SILK-only and Hybrid arms on
+speech at 12–48 kb/s; the speech ladder follows the RFC's mode
+semantics (the LP layer for speech at WB and below, with its FEC / DTX
+/ PLC behaviour) rather than that measure.
 
 Underneath sit the per-mode arms, each usable directly:
 
@@ -410,7 +448,8 @@ registry-resolution integration suites). Per-stage progress lives in
   pre-skip / output gain, `sample_rate` → any §4.2.9 output rate) or
   an `OpusStreamEncoder` on the unified `OpusEncoder` (mode / bandwidth / application / cbr / fec / packet-loss / redundancy options included) (channels,
   `bit_rate`, and the typed `OpusEncoderOptions` schema: bandwidth,
-  frame-ms, constrained-vbr, dtx, tapset-election, complexity).
+  frame-ms, constrained-vbr, dtx, tapset-election, complexity,
+  signal-adaptive).
   Registry-resolved decodes of the SILK fixtures are bit-exact
   against their reference decodes.
 
