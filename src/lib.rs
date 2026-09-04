@@ -815,6 +815,7 @@ pub mod range_encoder;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod redundancy_decode_params;
 pub mod registry;
+pub mod signal_analysis;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_decode;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
@@ -1050,6 +1051,7 @@ pub use registry::{
     make_decoder, make_encoder, OpusEncoderOptions, OpusStreamDecoder, OpusStreamEncoder,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub use signal_analysis::{SignalAnalyser, SignalClass, SignalFeatures, SignalVerdict};
 pub use silk_decode::{
     decode_silk_frame, encode_silk_frame, SilkFrameConfig, SilkFrameDecoded, SilkFrameSymbols,
 };

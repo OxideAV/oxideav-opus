@@ -4,6 +4,15 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- `signal_analysis`: per-frame speech-vs-music analyser for the §2.1 / §5
+  election — tonality, spectral flux, harmonicity + pitch stability,
+  voiced/unvoiced alternation, transient density, envelope modulation,
+  content bandwidth, stereo width on a 10 ms block grid; logistic music
+  probability with smoothing, dwell and two-threshold hysteresis
+  (`tests/signal_adaptive_election.rs` corpus batteries).
+
 ## [0.0.14](https://github.com/OxideAV/oxideav-opus/compare/v0.0.13...v0.0.14) - 2026-08-30
 
 ### Fixed
