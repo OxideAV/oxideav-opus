@@ -4,6 +4,20 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.15](https://github.com/OxideAV/oxideav-opus/compare/v0.0.14...v0.0.15) - 2026-09-04
+
+### Other
+
+- content-bandwidth cap waits for a full hold-down window; README numbers from the final matrix
+- CELT-only DTX gates on the analyser's activity floor
+- 40 / 60 ms packets on the CELT-only and Hybrid arms (§3.2 code-3 multi-frame)
+- signal-adaptive option (default on) + README/CHANGELOG for the election
+- signal-adaptive mode / bandwidth election through the §4.5 machinery
+- §5.2.3.3 compensation gain G on the noise-shaping quantizer path
+- silk/hybrid rate control: continuous pulse-RMS knob + Hybrid SILK-layer share election
+- speech-vs-music analyser with hysteresis for the §2.1 election
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Fixed
 
 - SILK noise-shaping quantizer: the §5.2.3.3 compensation gain G (ratio of
