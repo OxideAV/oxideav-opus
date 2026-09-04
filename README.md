@@ -225,13 +225,14 @@ Measured on the crate's corpus (`tests/signal_adaptive_election.rs`:
 synthetic speech, four-voice music mono/stereo, speech over a music
 bed, tones, silence, an optional real speech sample; own decode; bark
 log-spectral distance, lower is better) at equal target rate, the
-adaptive election against the bitrate-only ladder: music 16 kb/s
-9.56 → 9.06 dB, 24 kb/s 7.86 → 5.80, stereo music 36 kb/s 8.64 → 5.90,
-tones 24 kb/s 16.6 → 9.7 (steady state 5.5), speech over music
-24 kb/s 5.94 → 5.43; speech streams are identical to the ladder (zero
-switches); steady clips switch exactly once, at the class decision
-(~0.8–1.5 s in); alternating 3 s speech/music segments track every
-boundary. Black-box `opusdec` and `ffmpeg` decode every adaptive
+adaptive election against the bitrate-only ladder: music 12 kb/s
+11.4 → 9.0 dB, 16 kb/s 9.6 → 8.9, 24 kb/s 7.6 → 5.7 (steady state
+6.9 → 4.4); stereo music 24 kb/s 10.3 → 7.8, 36 kb/s 8.3 → 5.8; tones
+16 kb/s 15.6 → 9.8 (steady 6.7), 24 kb/s 14.9 → 9.0 (steady 5.7);
+speech over music 24 kb/s 5.7 → 5.3; speech streams are identical to
+the ladder (zero switches); steady clips switch exactly once, at the
+class decision (~0.8–1.5 s in); alternating 3 s speech/music segments
+track every boundary. Black-box `opusdec` and `ffmpeg` decode every adaptive
 capture (mono, stereo, alternating, silence) without diagnostics,
 `opusdec` agreeing with our decode at 52–62 dB. The same batteries
 found and fixed three rate-control defects on the way: the SILK rate

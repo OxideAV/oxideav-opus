@@ -520,12 +520,17 @@ impl OpusEncoder {
         };
         let class = verdict.map_or(SignalClass::Unknown, |v| v.class);
         // The content-bandwidth cap applies once the analyser has
-        // decided a class (its hold-down memory has then heard ≥ 0.8 s
-        // of active input); before that a stream opening on a
-        // narrowband onset would otherwise start capped and pay a §4.5
-        // bandwidth transition a few packets in.
+        // decided a class AND its hold-down memory has heard a full
+        // window of active input (sparse content — a fricative every
+        // few syllables — must have had its chance to register);
+        // before that a stream opening on a narrowband onset would
+        // start capped and pay a §4.5 bandwidth transition (plus the
+        // immediate raise) a few packets in.
         let cap = verdict
-            .filter(|v| v.class != SignalClass::Unknown)
+            .filter(|v| {
+                v.class != SignalClass::Unknown
+                    && v.active_blocks >= crate::signal_analysis::BANDWIDTH_HOLD_BLOCKS
+            })
             .map_or(Bandwidth::Fb, |v| v.bandwidth);
         let celt_only_duration = matches!(self.frame_tenths_ms, 25 | 50);
         let mut mode = self.forced_mode.unwrap_or_else(|| {

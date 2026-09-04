@@ -80,7 +80,7 @@ const TRANSIENT_HIST: usize = 100;
 /// Content-bandwidth memory: a band stays "present" for this many
 /// blocks after it was last heard (1.5 s), so brief dips never
 /// trigger a §4.5 bandwidth transition.
-const BANDWIDTH_HOLD_BLOCKS: u32 = 150;
+pub const BANDWIDTH_HOLD_BLOCKS: u32 = 150;
 
 /// Absolute activity floor (block RMS, dBFS re 32768).
 const ACTIVITY_FLOOR_DB: f32 = -60.0;
