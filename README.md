@@ -181,7 +181,9 @@ fronted by one streaming encoder. `OpusEncoder` (`opus_encoder`)
 takes 48 kHz interleaved S16 and emits one packet per frame, with
 every §2.1 control parameter live: bitrate (6–510 kb/s), operating
 mode (auto / SILK / Hybrid / CELT), audio bandwidth (auto / NB / MB /
-WB / SWB / FB), frame duration (2.5–60 ms), VBR / constrained VBR /
+WB / SWB / FB), packet duration (2.5–60 ms; 40 / 60 ms packets are
+native SILK frames or §3.2 code-3 packets of 20 ms CELT / Hybrid
+frames), VBR / constrained VBR /
 hard CBR (§3.2.5 exact-size padding), DTX, in-band FEC with the
 §2.1.7 packet-loss knob, the 0–10 complexity ladder, tapset election,
 and the §4.5.1 transition redundancy switch. In `auto`, the mode and

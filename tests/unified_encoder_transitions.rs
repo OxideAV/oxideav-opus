@@ -293,8 +293,14 @@ fn knob_validation() {
         .expect("silk ok at 20 ms");
     assert!(enc.set_frame_tenths_ms(50).is_err());
     enc.set_mode(None).expect("auto");
-    enc.set_frame_tenths_ms(400).expect("40 ms auto = SILK");
-    assert!(enc.set_mode(Some(Mode::Hybrid)).is_err());
+    enc.set_frame_tenths_ms(400).expect("40 ms auto");
+    // 40 / 60 ms packets exist on every arm (code-3 multi-frame
+    // packets of 20 ms frames on CELT / Hybrid — tests/long_packets.rs).
+    enc.set_mode(Some(Mode::Hybrid))
+        .expect("hybrid 40 ms = 2 x 20 ms");
+    enc.set_mode(Some(Mode::CeltOnly))
+        .expect("celt 60 ms = 3 x 20 ms");
+    enc.set_frame_tenths_ms(600).expect("60 ms");
     assert!(OpusEncoder::new(3, Application::Voip, 16_000).is_err());
 }
 

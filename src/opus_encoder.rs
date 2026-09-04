@@ -42,6 +42,13 @@
 //! and go through exactly the same §4.5 transition machinery as
 //! knob-driven ones, so every switch stays conformant.
 //!
+//! §2.1.4 / §3.2: 40 and 60 ms packets are native single frames on
+//! the SILK-only arm and **code-3 multi-frame packets** of 20 ms frames
+//! on the CELT-only and Hybrid arms (two or three frames sharing one
+//! TOC; a transition's §4.5.1 redundancy rides in the first or last
+//! frame of the packet exactly as it would in a 20 ms packet; hard CBR
+//! pads the code-3 framing itself).
+//!
 //! The SILK-only arms consume internal-rate PCM, so this module owns
 //! the 48 kHz → 8/12/16 kHz decimators; their tap counts put each
 //! SILK-only chain (decimator group delay + the decoder's §4.2.9
@@ -65,10 +72,10 @@ use crate::hybrid_packet_encode::{
     Decimator48, HybridEncoderMono, HybridEncoderStereo, RedundancyPlan,
 };
 use crate::mode_transition_reset::{decide_state_resets, CeltResetPlacement};
-use crate::packet_compose::pad_packet_to;
+use crate::packet_compose::{compose_packet, compose_packet_code3, pad_packet_to};
 use crate::signal_analysis::{SignalAnalyser, SignalClass, SignalVerdict};
 use crate::silk_encoder::{DtxState, SilkEncoderMono, SilkEncoderStereo};
-use crate::toc::{Bandwidth, Mode};
+use crate::toc::{Bandwidth, FrameCountCode, Mode, OpusTocByte};
 use crate::vbr::VbrRateControl;
 use crate::Error;
 
@@ -366,21 +373,17 @@ impl OpusEncoder {
         Ok(())
     }
 
-    /// §2.1.4 frame duration in tenths of a millisecond (25 / 50 /
-    /// 100 / 200; 400 / 600 additionally when the resolved mode is
-    /// SILK-only). 2.5 / 5 ms frames exist only in CELT-only mode, so
-    /// they force it.
+    /// §2.1.4 packet duration in tenths of a millisecond (25 / 50 /
+    /// 100 / 200 / 400 / 600). 2.5 / 5 ms frames exist only in
+    /// CELT-only mode, so they force it; 40 / 60 ms packets are single
+    /// SILK frames on the SILK-only arm and §3.2 code-3 packets of two
+    /// / three 20 ms frames on the CELT-only and Hybrid arms.
     pub fn set_frame_tenths_ms(&mut self, tenths: u16) -> Result<(), Error> {
         if !matches!(tenths, 25 | 50 | 100 | 200 | 400 | 600) {
             return Err(Error::MalformedPacket);
         }
         if matches!(tenths, 25 | 50)
             && matches!(self.forced_mode, Some(Mode::SilkOnly | Mode::Hybrid))
-        {
-            return Err(Error::MalformedPacket);
-        }
-        if matches!(tenths, 400 | 600)
-            && matches!(self.forced_mode, Some(Mode::CeltOnly | Mode::Hybrid))
         {
             return Err(Error::MalformedPacket);
         }
@@ -393,14 +396,10 @@ impl OpusEncoder {
     /// selection). Must be compatible with the frame duration (see
     /// [`Self::set_frame_tenths_ms`]).
     pub fn set_mode(&mut self, mode: Option<Mode>) -> Result<(), Error> {
-        match mode {
-            Some(Mode::SilkOnly | Mode::Hybrid) if matches!(self.frame_tenths_ms, 25 | 50) => {
-                return Err(Error::MalformedPacket)
-            }
-            Some(Mode::CeltOnly | Mode::Hybrid) if matches!(self.frame_tenths_ms, 400 | 600) => {
-                return Err(Error::MalformedPacket)
-            }
-            _ => {}
+        if matches!(mode, Some(Mode::SilkOnly | Mode::Hybrid))
+            && matches!(self.frame_tenths_ms, 25 | 50)
+        {
+            return Err(Error::MalformedPacket);
         }
         self.forced_mode = mode;
         Ok(())
@@ -526,12 +525,9 @@ impl OpusEncoder {
             .filter(|v| v.class != SignalClass::Unknown)
             .map_or(Bandwidth::Fb, |v| v.bandwidth);
         let celt_only_duration = matches!(self.frame_tenths_ms, 25 | 50);
-        let silk_only_duration = matches!(self.frame_tenths_ms, 400 | 600);
         let mut mode = self.forced_mode.unwrap_or_else(|| {
             if celt_only_duration || self.application == Application::RestrictedLowDelay {
                 Mode::CeltOnly
-            } else if silk_only_duration {
-                Mode::SilkOnly
             } else {
                 let (hybrid_at, celt_at) = Self::rate_ladder(self.application, class);
                 if eff < hybrid_at {
@@ -685,6 +681,21 @@ impl OpusEncoder {
         }
     }
 
+    /// The Opus-frame duration the arm for `mode` codes: the packet
+    /// duration, except that the CELT-only and Hybrid arms code 20 ms
+    /// frames and a 40 / 60 ms packet holds two / three of them.
+    fn arm_tenths(&self, mode: Mode) -> u16 {
+        match mode {
+            Mode::SilkOnly => self.frame_tenths_ms,
+            Mode::Hybrid | Mode::CeltOnly => self.frame_tenths_ms.min(200),
+        }
+    }
+
+    /// Opus frames per packet for `mode` (1, 2 or 3).
+    fn sub_frames(&self, mode: Mode) -> usize {
+        usize::from(self.frame_tenths_ms / self.arm_tenths(mode))
+    }
+
     /// The elected total packet size (TOC included) for this frame.
     fn elect_packet_bytes(&self) -> usize {
         if self.vbr {
@@ -742,7 +753,7 @@ impl OpusEncoder {
         let plan_end = switching && self.redundancy && Self::end_r_applies(cur, target);
 
         let elected = self.elect_packet_bytes();
-        let (packet, end_r_carried, red_extra) =
+        let (packet, end_r_carried, red_extra, marker) =
             self.encode_in_current(pcm, cur, elected, plan_end)?;
         // §4.5.3: the transition side information is "the extra
         // bitrate required for redundancy" — charged on top of the
@@ -778,12 +789,38 @@ impl OpusEncoder {
         self.prev_bitrate_bps = self.bitrate_bps;
 
         // Hard CBR: §3.2.5 code-3 padding to the exact target (§2.1.9
-        // DTX markers stay 1 byte — suppressing the payload is DTX's
-        // point). A floor-raised packet larger than the target stands.
-        if !self.vbr && packet.len() > 1 && packet.len() < self.cbr_packet_bytes() {
-            return pad_packet_to(&packet, self.cbr_packet_bytes());
+        // DTX markers stay at their framing minimum — suppressing the
+        // payload is DTX's point). A floor-raised packet larger than
+        // the target stands.
+        if !self.vbr && !marker && packet.len() < self.cbr_packet_bytes() {
+            let target = self.cbr_packet_bytes();
+            if self.sub_frames(cur.mode) == 1 {
+                return pad_packet_to(&packet, target);
+            }
+            return Self::pad_code3_to(&packet, target);
         }
         Ok(packet)
+    }
+
+    /// Pad an already code-3 multi-frame packet to exactly
+    /// `target_len` bytes (re-composed with the §3.2.5 padding chain;
+    /// the frame bytes are unchanged).
+    fn pad_code3_to(packet: &[u8], target_len: usize) -> Result<Vec<u8>, Error> {
+        let parsed = crate::frames::OpusPacket::parse(packet)?;
+        let frames: Vec<&[u8]> = parsed.frames().to_vec();
+        let vbr = frames.iter().any(|f| f.len() != frames[0].len());
+        let toc = packet[0];
+        // The chain header grows by one byte per 254 bytes of padding:
+        // search the few candidate counts around the shortfall.
+        let base = compose_packet_code3(toc, &frames, vbr, 0)?.len();
+        let need = target_len.saturating_sub(base);
+        for padding in (need.saturating_sub(8)..=need).rev() {
+            let out = compose_packet_code3(toc, &frames, vbr, padding)?;
+            if out.len() == target_len {
+                return Ok(out);
+            }
+        }
+        compose_packet_code3(toc, &frames, vbr, need)
     }
 
     /// Build a cold-start arm for `config` (fresh states everywhere).
@@ -804,7 +841,8 @@ impl OpusEncoder {
         let stereo = self.channels == 2;
         let arm = match config.mode {
             Mode::CeltOnly => {
-                let mut enc = CeltEncoder::new(config.bandwidth, self.frame_tenths_ms, stereo)?;
+                let mut enc =
+                    CeltEncoder::new(config.bandwidth, self.arm_tenths(config.mode), stereo)?;
                 enc.set_complexity(self.complexity);
                 if self.tapset_election {
                     enc.set_tapset_election(true);
@@ -816,7 +854,8 @@ impl OpusEncoder {
             }
             Mode::Hybrid => {
                 if stereo {
-                    let mut h = HybridEncoderStereo::new(config.bandwidth, self.frame_tenths_ms)?;
+                    let mut h =
+                        HybridEncoderStereo::new(config.bandwidth, self.arm_tenths(config.mode))?;
                     h.set_silk_share(self.hybrid_silk_share);
                     h.set_dtx(self.dtx);
                     h.set_fec(self.fec);
@@ -837,7 +876,8 @@ impl OpusEncoder {
                     }
                     Arm::HybridStereo(Box::new(h))
                 } else {
-                    let mut h = HybridEncoderMono::new(config.bandwidth, self.frame_tenths_ms)?;
+                    let mut h =
+                        HybridEncoderMono::new(config.bandwidth, self.arm_tenths(config.mode))?;
                     h.set_silk_share(self.hybrid_silk_share);
                     h.set_dtx(self.dtx);
                     h.set_fec(self.fec);
@@ -914,22 +954,85 @@ impl OpusEncoder {
     /// Encode one packet through the current arm, embedding the
     /// planned §4.5.1 side information. Returns the packet, whether
     /// an END-position redundant frame was actually carried (a
-    /// §2.1.9 DTX marker carries none), and the redundant bytes
-    /// appended (kept out of the rate-control ledger).
+    /// §2.1.9 DTX marker carries none), the redundant bytes appended
+    /// (kept out of the rate-control ledger), and whether the packet
+    /// is a DTX marker (every frame zero-length).
+    ///
+    /// A 40 / 60 ms packet on the CELT-only or Hybrid arm is two /
+    /// three 20 ms Opus frames in one §3.2 code-3 packet: the
+    /// beginning-position redundancy belongs to the first frame, the
+    /// end-position one to the last, and the election is split evenly
+    /// after the framing bytes.
     fn encode_in_current(
         &mut self,
         pcm: &[i16],
         cur: StreamConfig,
         elected: usize,
         plan_end: bool,
+    ) -> Result<(Vec<u8>, bool, usize, bool), Error> {
+        let m = self.sub_frames(cur.mode);
+        if m == 1 {
+            let (packet, end_carried, red) = self.encode_one(pcm, cur, elected, plan_end, true)?;
+            let marker = packet.len() == 1;
+            return Ok((packet, end_carried, red, marker));
+        }
+        let ch = self.channels;
+        let sub = usize::from(self.arm_tenths(cur.mode)) * 48 / 10 * ch;
+        // Framing: TOC + count byte + up to two length bytes per
+        // non-final frame; each frame's own election keeps a TOC byte
+        // of headroom that the composer strips.
+        let framing = 2 + (m - 1) * 2;
+        let per_frame = elected
+            .saturating_sub(framing)
+            .div_ceil(m)
+            .max(MIN_PACKET_BYTES);
+        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(m);
+        let mut end_carried = false;
+        let mut red_total = 0usize;
+        for k in 0..m {
+            let last = k + 1 == m;
+            let (pkt, end_c, red) = self.encode_one(
+                &pcm[k * sub..(k + 1) * sub],
+                cur,
+                per_frame,
+                plan_end && last,
+                k == 0,
+            )?;
+            end_carried |= end_c;
+            red_total += red;
+            frames.push(pkt[1..].to_vec());
+        }
+        let marker = frames.iter().all(Vec::is_empty);
+        let toc = OpusTocByte::compose_byte(
+            cur.mode,
+            cur.bandwidth,
+            self.arm_tenths(cur.mode),
+            ch == 2,
+            FrameCountCode::Arbitrary,
+        )?;
+        let refs: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
+        let packet = compose_packet(toc, &refs)?;
+        Ok((packet, end_carried, red_total, marker))
+    }
+
+    /// One Opus frame through the current arm (see
+    /// [`Self::encode_in_current`]); `first` frames of a packet take
+    /// the pending beginning-position redundancy.
+    fn encode_one(
+        &mut self,
+        pcm: &[i16],
+        cur: StreamConfig,
+        elected: usize,
+        plan_end: bool,
+        first: bool,
     ) -> Result<(Vec<u8>, bool, usize), Error> {
-        let begin_r = std::mem::take(&mut self.begin_r_pending);
+        let begin_r = first && std::mem::take(&mut self.begin_r_pending);
         let red_bytes = if begin_r {
             self.begin_r_bytes
         } else {
             self.redundant_frame_bytes()
         };
-        let reset_after_begin = std::mem::take(&mut self.reset_celt_after_begin_r);
+        let reset_after_begin = first && std::mem::take(&mut self.reset_celt_after_begin_r);
         let ch = self.channels;
         let mut arm = self.arm.take().expect("arm installed");
         let result = (|| -> Result<(Vec<u8>, bool, usize), Error> {
@@ -940,10 +1043,11 @@ impl OpusEncoder {
                         "CELT frames carry no §4.5.1 side info"
                     );
                     let digital_silence = pcm.iter().all(|&v| v == 0);
-                    if self
-                        .celt_dtx
-                        .step(digital_silence, false, u32::from(self.frame_tenths_ms))
-                    {
+                    if self.celt_dtx.step(
+                        digital_silence,
+                        false,
+                        u32::from(self.arm_tenths(cur.mode)),
+                    ) {
                         return Ok((enc.dtx_marker()?, false, 0));
                     }
                     if self.celt_dtx.take_resume() {

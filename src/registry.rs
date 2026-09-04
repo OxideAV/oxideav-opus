@@ -327,8 +327,9 @@ pub struct OpusEncoderOptions {
     /// §2.1.3 audio bandwidth: `"auto"` (default — bitrate-driven),
     /// `"nb"`, `"mb"`, `"wb"`, `"swb"`, or `"fb"`.
     pub bandwidth: String,
-    /// Frame duration in milliseconds: 2.5, 5, 10, 20 (default), 40,
-    /// or 60 (the long durations are SILK-only).
+    /// Packet duration in milliseconds: 2.5, 5, 10, 20 (default), 40,
+    /// or 60 (40 / 60 ms are single SILK frames on the SILK-only mode
+    /// and §3.2 code-3 packets of 20 ms frames on CELT / Hybrid).
     pub frame_ms: f32,
     /// §2.1.8 hard CBR (§3.2.5 code-3 padding to the exact
     /// per-packet byte target) instead of VBR.
@@ -402,7 +403,7 @@ impl oxideav_core::CodecOptionsStruct for OpusEncoderOptions {
             name: "frame-ms",
             kind: OptionKind::F32,
             default: OptionValue::F32(20.0),
-            help: "frame duration in ms: 2.5, 5, 10, 20, 40, or 60",
+            help: "packet duration in ms: 2.5, 5, 10, 20, 40, or 60 (40/60 pack 20 ms CELT/Hybrid frames)",
         },
         OptionField {
             name: "cbr",

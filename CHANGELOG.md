@@ -32,6 +32,11 @@ All notable changes to `oxideav-opus` are recorded here.
   1.5 s dwell; `signal_verdict` / `signal_switches` expose the decision.
   Measured wins at equal rate on music, tones and mixed content; speech
   streams unchanged (`tests/signal_adaptive_election.rs`).
+- 40 / 60 ms packets on the CELT-only and Hybrid arms: §3.2 code-3
+  multi-frame packets of two / three 20 ms frames (VBR lengths or exact
+  CBR padding, all-zero-length DTX markers, §4.5.1 redundancy in the first
+  / last frame of the packet); `frame-ms=40|60` no longer forces SILK
+  (`tests/long_packets.rs`).
 - Hybrid SILK-layer share knob (`set_silk_share` / `set_hybrid_silk_share`).
 - `signal_analysis`: per-frame speech-vs-music analyser for the §2.1 / §5
   election — tonality, spectral flux, harmonicity + pitch stability,
