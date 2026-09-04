@@ -6,6 +6,11 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Fixed
 
+- SILK noise-shaping quantizer: the §5.2.3.3 compensation gain G (ratio of
+  the analysis / synthesis shaping filters' prediction gains) was missing,
+  so every rate-controlled SILK frame carried a level error that capped its
+  SNR regardless of rate; measured +3.5–6 dB at every packet size
+  (WB speech-like, 190 B: 11.7 → 18.0 dB).
 - SILK rate knob made continuous: a rate-controlled encode now runs the
   §5.2.3.8 noise-shaping quantizer at every pulse target (λ only below the
   default), closing the ~4× packet-size cliff at the default target that

@@ -788,15 +788,24 @@ impl ChannelAnalyzer {
             };
             let a_ana = chirped(g_ana);
             let a_syn = chirped(g_syn);
+            // §5.2.3.3 compensation gain G: "the ratio of the
+            // prediction gain of the short-term analysis and synthesis
+            // filter coefficients" — the signal path through the
+            // analysis prefilter and the synthesis-shaping feedback is
+            // Wana/Wsyn, whose level differs from unity by exactly
+            // this ratio; without it the reconstruction carries a
+            // level error that caps the SNR regardless of rate.
+            let comp_gain = (prediction_gain(&a_ana) / prediction_gain(&a_syn)).clamp(0.25, 4.0);
             // §5.2.3.7 prefilter: Wana applied to the input (FIR over
-            // the frame with the real input history in `buf`).
+            // the frame with the real input history in `buf`), then
+            // the §5.2.3.8 compensation gain.
             let mut xpre = Vec::with_capacity(frame_len);
             for i in 0..frame_len {
                 let mut v = buf[hist_len + i];
                 for (k, &af) in a_ana.iter().enumerate() {
                     v -= af as f64 * buf[hist_len + i - k - 1];
                 }
-                xpre.push(v as f32);
+                xpre.push((v * comp_gain) as f32);
             }
             (
                 PulseRateControl {
@@ -2000,6 +2009,29 @@ where
         .or(smallest)
         .map(|(s, t, _)| (s, t))
         .ok_or(last_err)
+}
+
+/// §5.2.3.3 prediction gain of the LPC synthesis filter `1/A(z)` for
+/// predictor-form coefficients `a` (`x[i] ≈ Σ a[k]·x[i-k-1]`):
+/// `(Π (1 - r_k²))^-0.5` over the reflection coefficients obtained by
+/// the step-down recursion (an unstable set saturates at the clamp
+/// the caller applies).
+fn prediction_gain(a: &[f32]) -> f64 {
+    let mut c: Vec<f64> = a.iter().map(|&v| f64::from(v)).collect();
+    let mut energy = 1.0f64;
+    for m in (1..=c.len()).rev() {
+        let k = c[m - 1];
+        let denom = 1.0 - k * k;
+        if denom <= 1e-6 {
+            return f64::INFINITY;
+        }
+        energy /= denom;
+        let prev = c.clone();
+        for j in 0..m - 1 {
+            c[j] = (prev[j] + k * prev[m - 2 - j]) / denom;
+        }
+    }
+    energy.sqrt()
 }
 
 /// Map a desired linear Q16 gain to the §4.2.7.4 `log_gain` index
