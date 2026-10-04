@@ -215,6 +215,11 @@ pub struct OpusEncoder {
     bitrate_bps: u32,
     forced_mode: Option<Mode>,
     forced_bandwidth: Option<Bandwidth>,
+    /// Ceiling on the automatically decided audio bandwidth: the
+    /// signal's own band limit when the 48 kHz input was upsampled
+    /// from a lower rate (§2.1.3 — there is nothing to code above the
+    /// source's Nyquist frequency). `Fb` = no ceiling.
+    max_bandwidth: Bandwidth,
     vbr: bool,
     constrained_vbr: bool,
     dtx: bool,
@@ -283,6 +288,7 @@ impl OpusEncoder {
             bitrate_bps,
             forced_mode: None,
             forced_bandwidth: None,
+            max_bandwidth: Bandwidth::Fb,
             vbr: true,
             constrained_vbr: false,
             dtx: false,
@@ -415,6 +421,22 @@ impl OpusEncoder {
         self.forced_bandwidth = bandwidth;
     }
 
+    /// Cap the automatically decided audio bandwidth at `bandwidth`
+    /// (default `Fb`, no cap). Used when the source signal is band
+    /// limited by its sample rate — 8 / 12 / 16 / 24 kHz input carries
+    /// nothing above NB / MB / WB / SWB (RFC 6716 §2.1.3 Table 1), so
+    /// the encoder spends no bits on empty bands and elects the mode
+    /// that suits the narrower signal. A forced bandwidth
+    /// ([`Self::set_bandwidth`]) is not capped.
+    pub fn set_max_bandwidth(&mut self, bandwidth: Bandwidth) {
+        self.max_bandwidth = bandwidth;
+    }
+
+    /// The bandwidth ceiling set by [`Self::set_max_bandwidth`].
+    pub fn max_bandwidth(&self) -> Bandwidth {
+        self.max_bandwidth
+    }
+
     /// §2.1.8 VBR (the default) vs. hard CBR (§3.2.5 code-3 padding
     /// to the exact per-packet byte target).
     pub fn set_vbr(&mut self, vbr: bool) {
@@ -532,6 +554,12 @@ impl OpusEncoder {
                     && v.active_blocks >= crate::signal_analysis::BANDWIDTH_HOLD_BLOCKS
             })
             .map_or(Bandwidth::Fb, |v| v.bandwidth);
+        // The input-rate ceiling applies from the first packet on.
+        let cap = if Self::bw_rank(self.max_bandwidth) < Self::bw_rank(cap) {
+            self.max_bandwidth
+        } else {
+            cap
+        };
         let celt_only_duration = matches!(self.frame_tenths_ms, 25 | 50);
         let mut mode = self.forced_mode.unwrap_or_else(|| {
             if celt_only_duration || self.application == Application::RestrictedLowDelay {

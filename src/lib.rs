@@ -800,6 +800,7 @@ pub mod framing;
 pub mod framing_self_delim;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod hybrid_packet_encode;
+pub mod input_upsampler;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod mode_transition_reset;
 pub mod multistream;
@@ -1159,11 +1160,26 @@ pub fn register(ctx: &mut RuntimeContext) {
     caps.max_channels = Some(255);
     ctx.codecs.register(
         oxideav_core::CodecInfo::new(oxideav_core::CodecId::new("opus"))
-            .capabilities(caps)
+            .capabilities(caps.with_decode())
             .decoder(registry::make_decoder)
-            .encoder(registry::make_encoder)
-            .encoder_options::<registry::OpusEncoderOptions>()
             .payload_magic(opus_head::OPUS_HEAD_MAGIC.as_slice()),
+    );
+    // The encoder is a separate implementation entry because its input
+    // shape is narrower than the decoder's output: RFC 6716 §2 input
+    // rates (8 / 12 / 16 / 24 / 48 kHz), interleaved S16, mono or
+    // stereo. Pipelines resample / convert / downmix other shapes.
+    let enc_caps = oxideav_core::CodecCapabilities::audio("opus_sw")
+        .with_encode()
+        .with_lossy(true)
+        .with_max_sample_rate(48_000)
+        .with_max_channels(2)
+        .with_sample_rates(registry::ENCODER_INPUT_RATES_HZ.to_vec())
+        .with_sample_formats(vec![oxideav_core::SampleFormat::S16]);
+    ctx.codecs.register(
+        oxideav_core::CodecInfo::new(oxideav_core::CodecId::new("opus"))
+            .capabilities(enc_caps)
+            .encoder(registry::make_encoder)
+            .encoder_options::<registry::OpusEncoderOptions>(),
     );
 }
 

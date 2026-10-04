@@ -20,8 +20,11 @@
 //!   output-rate timeline). A zero-length packet payload is treated
 //!   as a lost packet and concealed per RFC 6716 §4.4
 //!   ([`crate::decoder::OpusDecoder::conceal_loss`]).
-//! * **Encode** ([`OpusStreamEncoder`]): 48 kHz interleaved S16 input
-//!   frames are re-blocked into 20 ms Opus frames and encoded through
+//! * **Encode** ([`OpusStreamEncoder`]): interleaved S16 input at any
+//!   RFC 6716 §2 rate (8 / 12 / 16 / 24 / 48 kHz; reduced rates are
+//!   interpolated to 48 kHz, the bandwidth decision capped at the
+//!   source's band limit, and the rate recorded as the `OpusHead`
+//!   input sample rate) is re-blocked into 20 ms Opus frames and encoded through
 //!   the unified [`crate::opus_encoder::OpusEncoder`] (bitrate-driven
 //!   mode/bandwidth ladder, §4.5 transitions, every §2.1 knob)
 //!   at the requested `bit_rate` (RFC 6716 §2.1.8), one packet per
@@ -482,14 +485,33 @@ impl oxideav_core::CodecOptionsStruct for OpusEncoderOptions {
     }
 }
 
+/// Encoder input sample rates (RFC 6716 §2: 8, 12, 16, 24 and 48 kHz).
+/// Reduced-rate input is interpolated to the 48 kHz coding timeline by
+/// [`crate::input_upsampler::InputUpsampler`] and the automatic
+/// bandwidth decision is capped at the source's band limit.
+pub const ENCODER_INPUT_RATES_HZ: &[u32] = &[8_000, 12_000, 16_000, 24_000, 48_000];
+
+/// Audio bandwidth an input at `rate` Hz can carry (RFC 6716 §2.1.3
+/// Table 1: NB 4 kHz, MB 6 kHz, WB 8 kHz, SWB 12 kHz, FB 20 kHz).
+fn bandwidth_for_input_rate(rate: u32) -> crate::toc::Bandwidth {
+    use crate::toc::Bandwidth;
+    match rate {
+        8_000 => Bandwidth::Nb,
+        12_000 => Bandwidth::Mb,
+        16_000 => Bandwidth::Wb,
+        24_000 => Bandwidth::Swb,
+        _ => Bandwidth::Fb,
+    }
+}
+
 /// Decoder-side start-up samples the encoder's processing chain
 /// introduces (the CELT MDCT overlap latency), declared as the RFC
 /// 7845 §5.1 pre-skip in the composed `OpusHead`.
 const ENCODE_PRE_SKIP: u16 = 120;
 
 /// [`oxideav_core::Encoder`] adapter over the unified
-/// [`crate::opus_encoder::OpusEncoder`]: 48 kHz interleaved S16
-/// frames in, one Opus packet per frame out, with the §2.1.1
+/// [`crate::opus_encoder::OpusEncoder`]: interleaved S16 frames at
+/// 8 / 12 / 16 / 24 / 48 kHz in, one Opus packet per frame out, with the §2.1.1
 /// bitrate-driven mode/bandwidth ladder and the §4.5 transition
 /// machinery behind the `mode`/`bandwidth`/`application` options.
 /// Build via [`make_encoder`].
@@ -502,7 +524,11 @@ pub struct OpusStreamEncoder {
     /// Samples per channel in one Opus frame (options-selected
     /// duration at 48 kHz).
     frame_samples: usize,
-    /// Interleaved samples awaiting a full 20 ms frame.
+    /// Reduced-rate input → 48 kHz interpolator (`None` at 48 kHz).
+    upsampler: Option<crate::input_upsampler::InputUpsampler>,
+    /// Input sample rate in Hz.
+    input_rate: u32,
+    /// Interleaved 48 kHz samples awaiting a full frame.
     pending: Vec<i16>,
     /// Encoded packets not yet pulled by `receive_packet`.
     queue: VecDeque<Packet>,
@@ -513,12 +539,12 @@ pub struct OpusStreamEncoder {
 
 impl OpusStreamEncoder {
     fn from_params(params: &CodecParameters) -> oxideav_core::Result<Self> {
-        if let Some(rate) = params.sample_rate {
-            if rate != OUTPUT_SAMPLE_RATE_HZ {
-                return Err(oxideav_core::Error::unsupported(format!(
-                    "opus encode: unsupported input sample rate {rate} Hz (48000 required)"
-                )));
-            }
+        let input_rate = params.sample_rate.unwrap_or(OUTPUT_SAMPLE_RATE_HZ);
+        if !ENCODER_INPUT_RATES_HZ.contains(&input_rate) {
+            return Err(oxideav_core::Error::unsupported(format!(
+                "opus encode: unsupported input sample rate {input_rate} Hz \
+                 (8000 / 12000 / 16000 / 24000 / 48000; resample other rates first)"
+            )));
         }
         match params.sample_format {
             None | Some(SampleFormat::S16) => {}
@@ -611,13 +637,21 @@ impl OpusStreamEncoder {
             enc.set_complexity(c.min(10) as u8);
         }
         enc.set_signal_adaptive(opts.signal_adaptive);
+        enc.set_max_bandwidth(bandwidth_for_input_rate(input_rate));
         let frame_samples = enc.frame_samples();
+        let upsampler = crate::input_upsampler::InputUpsampler::new(input_rate, channels as usize);
+        // The interpolation filter delays the signal on the 48 kHz
+        // timeline; the decoder discards that start-up too (RFC 7845
+        // §5.1 pre-skip counts 48 kHz samples).
+        let pre_skip = ENCODE_PRE_SKIP + upsampler.as_ref().map_or(0, |u| u.delay_samples() as u16);
 
         let head = OpusHead {
             version: 1,
             channel_count: channels as u8,
-            pre_skip: ENCODE_PRE_SKIP,
-            input_sample_rate: OUTPUT_SAMPLE_RATE_HZ,
+            pre_skip,
+            // RFC 7845 §5.1: the original input rate, informational
+            // for players that want to restore it on output.
+            input_sample_rate: input_rate,
             output_gain_q7_8: 0,
             mapping_family: 0,
             mapping: crate::opus_head::ChannelMappingTable {
@@ -644,11 +678,18 @@ impl OpusStreamEncoder {
             out_params,
             channels: channels as usize,
             frame_samples,
+            upsampler,
+            input_rate,
             pending: Vec::new(),
             queue: VecDeque::new(),
             next_pts: 0,
             flushed: false,
         })
+    }
+
+    /// The input sample rate this encoder was built for (Hz).
+    pub fn input_sample_rate(&self) -> u32 {
+        self.input_rate
     }
 
     fn encode_ready_frames(&mut self) -> oxideav_core::Result<()> {
@@ -713,11 +754,16 @@ impl oxideav_core::Encoder for OpusStreamEncoder {
                 self.channels
             )));
         }
-        self.pending.extend(
-            plane
-                .chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]])),
-        );
+        let pcm = plane
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]));
+        match self.upsampler.as_mut() {
+            Some(up) => {
+                let input: Vec<i16> = pcm.collect();
+                up.process(&input, &mut self.pending);
+            }
+            None => self.pending.extend(pcm),
+        }
         self.encode_ready_frames()
     }
 
@@ -732,6 +778,12 @@ impl oxideav_core::Encoder for OpusStreamEncoder {
     fn flush(&mut self) -> oxideav_core::Result<()> {
         if !self.flushed {
             self.flushed = true;
+            if let Some(up) = self.upsampler.as_mut() {
+                // Push the interpolator's tail (the last real input
+                // still inside the filter) out with silence.
+                let tail = vec![0i16; up.tail_input_samples() * self.channels];
+                up.process(&tail, &mut self.pending);
+            }
             if !self.pending.is_empty() {
                 // Zero-pad the final partial frame to a whole 20 ms
                 // packet; the container's end-trimming (RFC 7845 §4.4
@@ -843,5 +895,87 @@ mod tests {
         // composed OpusHead declares.
         assert_eq!(decoded, 5 * 960 - usize::from(ENCODE_PRE_SKIP));
         assert!(energy > 0.0, "decoded audio must carry signal");
+    }
+
+    /// Encode `secs` of a `freq` Hz mono tone at `rate` and decode it
+    /// at 48 kHz: returns (encoder, decoded 48 kHz samples).
+    fn reduced_rate_roundtrip(rate: u32, freq: f64, secs: f64) -> (OpusStreamEncoder, Vec<i16>) {
+        let mut params = audio_params(1);
+        params.sample_rate = Some(rate);
+        let mut enc = OpusStreamEncoder::from_params(&params).expect("encoder");
+        let n = (rate as f64 * secs) as usize;
+        let mut bytes = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let v =
+                (10_000.0 * (std::f64::consts::TAU * freq * i as f64 / rate as f64).sin()) as i16;
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![bytes],
+        }))
+        .expect("send");
+        enc.flush().expect("flush");
+        let mut dec_params = audio_params(1);
+        dec_params.extradata = enc.output_params().extradata.clone();
+        let mut dec = OpusStreamDecoder::from_params(&dec_params).expect("decoder");
+        let mut out = Vec::new();
+        while let Ok(packet) = enc.receive_packet() {
+            dec.send_packet(&packet).expect("decode");
+            while let Ok(Frame::Audio(f)) = dec.receive_frame() {
+                out.extend(
+                    f.data[0]
+                        .chunks_exact(2)
+                        .map(|b| i16::from_le_bytes([b[0], b[1]])),
+                );
+            }
+        }
+        (enc, out)
+    }
+
+    #[test]
+    fn encoder_accepts_every_rfc6716_input_rate() {
+        for rate in [8_000u32, 12_000, 16_000, 24_000, 48_000] {
+            let (enc, out) = reduced_rate_roundtrip(rate, 440.0, 0.5);
+            assert_eq!(enc.input_sample_rate(), rate);
+            let head = OpusHead::parse(&enc.output_params().extradata).expect("OpusHead");
+            assert_eq!(head.input_sample_rate, rate, "OpusHead input rate");
+            assert_eq!(enc.output_params().sample_rate, Some(OUTPUT_SAMPLE_RATE_HZ));
+            // Whole duration survives (padding to the last 20 ms
+            // packet may add up to one frame).
+            assert!(
+                out.len() >= 24_000 - 960,
+                "{rate} Hz: {} samples",
+                out.len()
+            );
+        }
+        let mut p = audio_params(1);
+        p.sample_rate = Some(44_100);
+        assert!(OpusStreamEncoder::from_params(&p).is_err());
+    }
+
+    /// A reduced-rate tone decodes at 48 kHz as the same tone, aligned
+    /// to the input by the declared pre-skip (the interpolator's delay
+    /// is folded into it).
+    #[test]
+    fn reduced_rate_tone_is_aligned_and_at_the_right_pitch() {
+        let freq = 1_000.0;
+        for rate in [8_000u32, 16_000, 24_000] {
+            let (_, out) = reduced_rate_roundtrip(rate, freq, 0.5);
+            // Correlate against the ideal 48 kHz tone over a stable
+            // window: a correct pitch and alignment give a high
+            // normalised correlation at lag 0.
+            let (mut xy, mut xx, mut yy) = (0f64, 0f64, 0f64);
+            for (i, &v) in out.iter().enumerate().take(20_000).skip(4_000) {
+                let want = (std::f64::consts::TAU * freq * i as f64 / 48_000.0).sin();
+                let got = f64::from(v);
+                xy += want * got;
+                xx += want * want;
+                yy += got * got;
+            }
+            let corr = xy / (xx * yy).sqrt();
+            assert!(corr > 0.95, "{rate} Hz: correlation {corr:.3}");
+        }
     }
 }
