@@ -329,21 +329,27 @@ mod tests {
         };
         assert!(r.is_noop());
 
-        assert!(!StateReset {
-            silk: true,
-            celt: CeltResetPlacement::None
-        }
-        .is_noop());
-        assert!(!StateReset {
-            silk: false,
-            celt: CeltResetPlacement::BeforeFrame
-        }
-        .is_noop());
-        assert!(!StateReset {
-            silk: false,
-            celt: CeltResetPlacement::BeforeRedundantOnly
-        }
-        .is_noop());
+        assert!(
+            !StateReset {
+                silk: true,
+                celt: CeltResetPlacement::None
+            }
+            .is_noop()
+        );
+        assert!(
+            !StateReset {
+                silk: false,
+                celt: CeltResetPlacement::BeforeFrame
+            }
+            .is_noop()
+        );
+        assert!(
+            !StateReset {
+                silk: false,
+                celt: CeltResetPlacement::BeforeRedundantOnly
+            }
+            .is_noop()
+        );
     }
 
     // ----- Rule 1 (SILK) -----

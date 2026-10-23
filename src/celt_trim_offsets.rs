@@ -129,7 +129,7 @@
 //! lookup).
 
 use crate::celt_alloc_trim::{ALLOC_TRIM_MAX, ALLOC_TRIM_MIN};
-use crate::celt_band_layout::{celt_band_bins_per_channel, CeltFrameSize, CELT_NUM_BANDS};
+use crate::celt_band_layout::{CELT_NUM_BANDS, CeltFrameSize, celt_band_bins_per_channel};
 
 /// §4.3.3 constant subtracted from `alloc_trim` in the trim-offsets
 /// formula (RFC 6716 §4.3.3 p. 115: "take the alloc_trim and subtract

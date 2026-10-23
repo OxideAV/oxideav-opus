@@ -113,11 +113,7 @@ pub fn lpc_residual(x: &[f64], hist: &[f64], a: &[f64]) -> Vec<f64> {
                 x[idx as usize]
             } else {
                 let h = hist.len() as isize + idx;
-                if h >= 0 {
-                    hist[h as usize]
-                } else {
-                    0.0
-                }
+                if h >= 0 { hist[h as usize] } else { 0.0 }
             };
             pred += ak * s;
         }

@@ -57,10 +57,10 @@
 //! (pp. 116–120), reproduced from `docs/audio/opus/rfc6716-opus.txt`.
 //! No external library source was consulted.
 
-use crate::celt_pvq_decode::{decode_pvq_shape_into, PvqShapeError};
-use crate::celt_spreading::{apply_spreading, SpreadingError};
+use crate::celt_pvq_decode::{PvqShapeError, decode_pvq_shape_into};
+use crate::celt_spreading::{SpreadingError, apply_spreading};
 use crate::celt_tf_adjust::{TfAdjustment, TfDirection};
-use crate::celt_tf_hadamard::{apply_tf_hadamard, TfHadamardError};
+use crate::celt_tf_hadamard::{TfHadamardError, apply_tf_hadamard};
 
 /// Maximum PVQ codebook size, in bits, that the non-split §4.3.4.2 path
 /// can decode (RFC 6716 §4.3.4.4: "the maximum size allowed for

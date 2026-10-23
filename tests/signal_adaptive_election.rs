@@ -226,7 +226,7 @@ fn music_like(seconds: f64, seed: u64, channels: usize) -> Vec<i16> {
                 right[t + b + i] += 0.35 * env * (hp + 0.3 * rng.next());
             }
             // Kick on every other beat: decaying 60 Hz sine.
-            if (t + b) / beat % 2 == 0 {
+            if ((t + b) / beat).is_multiple_of(2) {
                 for i in 0..((0.12 * FS) as usize).min(len - b) {
                     let env = (-(i as f64) / (0.03 * FS)).exp();
                     let s = 1.5 * env * (TAU * 60.0 * i as f64 / FS).sin();
@@ -326,7 +326,9 @@ fn external_speech(channels: usize) -> Option<Vec<i16>> {
     let path = std::env::var_os("OPUS_SPEECH_S16")?;
     let bytes = std::fs::read(path).ok()?;
     let mono: Vec<i16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| i16::from_le_bytes([b[0], b[1]]))
         .collect();
     Some(if channels == 2 {
@@ -360,11 +362,7 @@ fn seg_snr_db(input: &[i16], out: &[i16], channels: usize, lag: usize) -> f64 {
         acc += (10.0 * (sig / err.max(1e-9)).log10()).clamp(-10.0, 60.0);
         cnt += 1;
     }
-    if cnt == 0 {
-        0.0
-    } else {
-        acc / cnt as f64
-    }
+    if cnt == 0 { 0.0 } else { acc / cnt as f64 }
 }
 
 /// Bark-spaced log-spectral distance (dB): RMS over 20 ms frames of

@@ -66,7 +66,7 @@ fn run_arm(pcm: &[i16], payload: usize, arm: &str) -> (f64, usize, [usize; 3], V
     let mut pf_frames = 0usize;
     let mut tapsets = [0usize; 3];
     let mut packets = Vec::new();
-    for chunk in pcm.chunks_exact(960) {
+    for chunk in pcm.as_chunks::<960>().0 {
         let (packet, info) = enc.encode_packet(chunk, payload).unwrap();
         if info.postfilter_on {
             pf_frames += 1;
@@ -132,7 +132,7 @@ fn tapset_election_tracks_best_fixed_arm_and_default_is_unchanged() {
     let (_, _, _, p_default) = {
         let mut enc = CeltEncoder::new(Bandwidth::Fb, 200, false).unwrap();
         let mut packets = Vec::new();
-        for chunk in pcm.chunks_exact(960) {
+        for chunk in pcm.as_chunks::<960>().0 {
             packets.push(enc.encode_packet(chunk, 40).unwrap().0);
         }
         (0.0, 0, [0usize; 3], packets)
@@ -152,7 +152,7 @@ fn silence_gapped_periodic() -> Vec<i16> {
     let head_frames = 25usize;
     let a = head_frames * 960;
     let b = a + gap_frames * 960;
-    pcm.splice(a..a, std::iter::repeat(0i16).take(b - a));
+    pcm.splice(a..a, std::iter::repeat_n(0i16, b - a));
     pcm
 }
 
@@ -174,7 +174,7 @@ fn run_vbr_arm(
     let mut tapsets_pre = [0usize; 3];
     let mut tapsets_post = [0usize; 3];
     // Frames 25..40 are the digital-silence gap.
-    for (k, chunk) in pcm.chunks_exact(960).enumerate() {
+    for (k, chunk) in pcm.as_chunks::<960>().0.iter().enumerate() {
         let (packet, info) = enc.encode_frame(chunk).unwrap();
         if info.postfilter_on {
             if k < 40 {
@@ -279,7 +279,7 @@ fn tapset_election_survives_mid_stream_silence_cbr() {
         let mut hist = vec![0i16; 120];
         let (mut sig, mut err) = (0.0f64, 0.0f64);
         let mut tapsets = [0usize; 3];
-        for (k, chunk) in pcm.chunks_exact(960).enumerate() {
+        for (k, chunk) in pcm.as_chunks::<960>().0.iter().enumerate() {
             let (packet, info) = enc.encode_packet(chunk, 40).unwrap();
             assert_eq!(packet.len(), 41);
             if info.postfilter_on {

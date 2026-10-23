@@ -76,7 +76,7 @@
 //! is the textbook synthesis step for a lapped transform with a
 //! power-complementary window; no external library source was consulted.
 
-use crate::celt_mdct_window::{mdct_window, MdctWindowError};
+use crate::celt_mdct_window::{MdctWindowError, mdct_window};
 
 /// Errors returnable by the §4.3.7 weighted overlap-add helpers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,7 +170,7 @@ pub fn apply_synthesis_window(
         return Err(OverlapAddError::ZeroLength);
     }
     if block.len() != 2 * n {
-        if block.len() % 2 != 0 {
+        if !block.len().is_multiple_of(2) {
             return Err(OverlapAddError::BlockLenNotEven { got: block.len() });
         }
         return Err(OverlapAddError::BlockLenMismatch {
@@ -179,7 +179,7 @@ pub fn apply_synthesis_window(
         });
     }
     let overlap = ramp.len();
-    if overlap == 0 || overlap > n || overlap % 2 != 0 {
+    if overlap == 0 || overlap > n || !overlap.is_multiple_of(2) {
         return Err(OverlapAddError::BadOverlap { overlap, n });
     }
     let two_n = 2 * n;
@@ -244,7 +244,7 @@ impl WeightedOverlapAdd {
         if n == 0 {
             return Err(OverlapAddError::ZeroLength);
         }
-        if overlap == 0 || overlap > n || overlap % 2 != 0 {
+        if overlap == 0 || overlap > n || !overlap.is_multiple_of(2) {
             return Err(OverlapAddError::BadOverlap { overlap, n });
         }
         let ramp = mdct_window(overlap).map_err(|e| match e {
@@ -318,7 +318,7 @@ impl WeightedOverlapAdd {
     pub fn process_into(&mut self, block: &[f64], out: &mut [f64]) -> Result<(), OverlapAddError> {
         let two_n = 2 * self.n;
         if block.len() != two_n {
-            if block.len() % 2 != 0 {
+            if !block.len().is_multiple_of(2) {
                 return Err(OverlapAddError::BlockLenNotEven { got: block.len() });
             }
             return Err(OverlapAddError::BlockLenMismatch {
@@ -623,17 +623,25 @@ mod tests {
     #[test]
     fn error_display_messages() {
         assert!(OverlapAddError::ZeroLength.to_string().contains("N >= 1"));
-        assert!(OverlapAddError::BlockLenNotEven { got: 7 }
-            .to_string()
-            .contains("not 2*N"));
-        assert!(OverlapAddError::BlockLenMismatch { got: 6, want: 8 }
-            .to_string()
-            .contains("!= required 2*N"));
-        assert!(OverlapAddError::BadOverlap { overlap: 6, n: 4 }
-            .to_string()
-            .contains("invalid"));
-        assert!(OverlapAddError::OutputTooSmall { want: 4, got: 3 }
-            .to_string()
-            .contains("< required N"));
+        assert!(
+            OverlapAddError::BlockLenNotEven { got: 7 }
+                .to_string()
+                .contains("not 2*N")
+        );
+        assert!(
+            OverlapAddError::BlockLenMismatch { got: 6, want: 8 }
+                .to_string()
+                .contains("!= required 2*N")
+        );
+        assert!(
+            OverlapAddError::BadOverlap { overlap: 6, n: 4 }
+                .to_string()
+                .contains("invalid")
+        );
+        assert!(
+            OverlapAddError::OutputTooSmall { want: 4, got: 3 }
+                .to_string()
+                .contains("< required N")
+        );
     }
 }

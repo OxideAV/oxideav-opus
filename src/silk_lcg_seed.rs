@@ -8,8 +8,8 @@
 //! This module is intentionally tiny — the LCG seed is one symbol per
 //! SILK frame and is consumed by the [`crate::silk_excitation`] module.
 
-use crate::range_decoder::RangeDecoder;
 use crate::Error;
+use crate::range_decoder::RangeDecoder;
 
 /// Table 43 — uniform 4-entry PDF for the LCG seed.
 ///

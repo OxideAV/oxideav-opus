@@ -64,7 +64,7 @@
 //! cross-check against any reference implementation.
 
 use crate::celt_band_layout::CeltFrameSize;
-use crate::celt_tf_adjust::{celt_tf_adjustment, celt_tf_select_can_affect, TfAdjustment};
+use crate::celt_tf_adjust::{TfAdjustment, celt_tf_adjustment, celt_tf_select_can_affect};
 use crate::range_decoder::RangeDecoder;
 
 /// `dec_bit_logp` argument for the `{3, 1}/4` PDF (first band,
@@ -485,10 +485,11 @@ mod tests {
             "5ms transient all-choice0 agrees → no tf_select"
         );
         // Table 62 [1][0] = 1 for every band.
-        assert!(res
-            .adjustments
-            .iter()
-            .all(|&a| a == TF_ADJ_TRANSIENT_SELECT0[1][0]));
+        assert!(
+            res.adjustments
+                .iter()
+                .all(|&a| a == TF_ADJ_TRANSIENT_SELECT0[1][0])
+        );
     }
 
     /// tf_select=1 path on a transient frame routes to Table 63.

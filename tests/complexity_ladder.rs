@@ -93,7 +93,7 @@ fn celt_arm(pcm: &[i16], complexity: Option<u8>) -> (f64, usize, Vec<Vec<u8>>) {
     let (mut sig, mut err) = (0.0f64, 0.0f64);
     let mut pf = 0usize;
     let mut packets = Vec::new();
-    for chunk in pcm.chunks_exact(960) {
+    for chunk in pcm.as_chunks::<960>().0 {
         let (packet, info) = enc.encode_packet(chunk, 40).unwrap();
         if info.postfilter_on {
             pf += 1;
@@ -157,7 +157,7 @@ fn silk_ladder_is_monotone_and_default_rung_is_bit_identical() {
         let mut packets = Vec::new();
         let mut recon: Vec<f32> = Vec::new();
         let mut bytes = 0usize;
-        for chunk in pcm.chunks_exact(320) {
+        for chunk in pcm.as_chunks::<320>().0 {
             let out = enc.encode_packet_elected(chunk, 40).unwrap();
             bytes += out.packet.len();
             recon.extend_from_slice(&out.reconstructed);
@@ -217,7 +217,7 @@ fn hybrid_and_vbr_arms_take_the_complexity_knob() {
         enc.set_complexity(c);
         let mut dec = OpusDecoder::new();
         let mut packets = Vec::new();
-        for chunk in pcm48.chunks_exact(960) {
+        for chunk in pcm48.as_chunks::<960>().0 {
             let packet = enc.encode_frame(chunk).unwrap();
             assert_eq!(
                 dec.decode_packet(&packet).unwrap().samples_per_channel(),
@@ -237,7 +237,7 @@ fn hybrid_and_vbr_arms_take_the_complexity_knob() {
         enc.set_complexity(c);
         let mut dec = OpusDecoder::new();
         let mut packets = Vec::new();
-        for chunk in pcm48.chunks_exact(960) {
+        for chunk in pcm48.as_chunks::<960>().0 {
             let (packet, _) = enc.encode_frame(chunk).unwrap();
             assert_eq!(
                 dec.decode_packet(&packet).unwrap().samples_per_channel(),

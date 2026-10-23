@@ -25,7 +25,7 @@
 use crate::celt_band_layout::CELT_NUM_BANDS;
 use crate::celt_pvq_encode::alg_quant;
 use crate::celt_rate_alloc::{
-    band_edge, band_width, bits2pulses, cache_run, get_pulses, pulses2bits, BITRES, LOG_N_400,
+    BITRES, LOG_N_400, band_edge, band_width, bits2pulses, cache_run, get_pulses, pulses2bits,
 };
 use crate::range_encoder::RangeEncoder;
 

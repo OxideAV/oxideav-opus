@@ -32,11 +32,11 @@
 //! the project treats as staged spec material. No external source is
 //! consulted.
 
+use crate::Error;
 use crate::silk_decode::SilkFrameDecoded;
 use crate::silk_excitation::SilkFrameSize;
 use crate::silk_frame::SignalType;
 use crate::toc::Bandwidth;
-use crate::Error;
 
 /// §4.2.7.6 LTP filter order (5 taps).
 const LTP_ORDER: usize = 5;
@@ -164,7 +164,7 @@ pub(crate) fn div32_varq(a32: i32, b32: i32, qres: i32) -> i32 {
 fn lpc_analysis_filter(out: &mut [i16], input: &[i16], a_q12: &[i16], order: usize) {
     let len = out.len();
     debug_assert_eq!(input.len(), len);
-    debug_assert!(order >= 6 && order % 2 == 0 && order <= len);
+    debug_assert!(order >= 6 && order.is_multiple_of(2) && order <= len);
     for ix in order..len {
         // in_ptr points one behind the predicted sample.
         let base = ix - 1;

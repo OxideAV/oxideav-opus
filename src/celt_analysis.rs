@@ -28,7 +28,7 @@
 
 use crate::celt_band_layout::CELT_NUM_BANDS;
 use crate::celt_coarse_energy::e_mean;
-use crate::celt_mdct_window::{celt_overlap_window, CELT_OVERLAP_48K};
+use crate::celt_mdct_window::{CELT_OVERLAP_48K, celt_overlap_window};
 use crate::celt_rate_alloc::{band_edge, band_width};
 
 /// §5.3 / §4.3.7.2 emphasis coefficient (`27853/32768`).

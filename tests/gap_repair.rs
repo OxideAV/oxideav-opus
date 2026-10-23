@@ -8,7 +8,7 @@
 
 use oxideav_opus::decoder::{FrameDecodeStatus, OpusDecoder};
 use oxideav_opus::toc::{Bandwidth, ChannelMapping, Mode, OpusTocByte};
-use oxideav_opus::{compose_plc_gap_packets, OpusPacket};
+use oxideav_opus::{OpusPacket, compose_plc_gap_packets};
 
 /// Sum of zero-length-frame durations (tenths) across the packets,
 /// asserting every frame is in fact zero-length.

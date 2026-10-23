@@ -95,8 +95,8 @@
 //! values reproduced in [`crate::celt_static_alloc::STATIC_ALLOC`]).
 
 use crate::celt_band_layout::{
-    celt_band_bins_per_channel, celt_end_coded_band, celt_first_coded_band, CeltFrameSize,
-    CELT_NUM_BANDS,
+    CELT_NUM_BANDS, CeltFrameSize, celt_band_bins_per_channel, celt_end_coded_band,
+    celt_first_coded_band,
 };
 use crate::celt_static_alloc::{
     STATIC_ALLOC, STATIC_ALLOC_INTERP_STEPS, STATIC_ALLOC_Q_MAX, STATIC_ALLOC_RIGHT_SHIFT,
@@ -626,7 +626,12 @@ mod tests {
                         assert!(
                             cur >= prev,
                             "total non-monotone at fs {:?} channels {} is_hybrid {} q_fp {}: {} < {}",
-                            fs, channels, is_hybrid, q_fp, cur, prev,
+                            fs,
+                            channels,
+                            is_hybrid,
+                            q_fp,
+                            cur,
+                            prev,
                         );
                         prev = cur;
                     }
@@ -825,7 +830,10 @@ mod tests {
                             assert!(
                                 next > budget,
                                 "search undercut at fs {:?} budget {}: next q_fp = {} total {} <= budget",
-                                fs, budget, out.q_fp + 1, next,
+                                fs,
+                                budget,
+                                out.q_fp + 1,
+                                next,
                             );
                         }
                     }

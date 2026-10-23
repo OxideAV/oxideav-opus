@@ -70,9 +70,9 @@
 //! `sc_Q16[0]` is `0`, zeroing every coefficient and guaranteeing a stable
 //! all-zero filter.
 
+use crate::Error;
 use crate::silk_lsf_stage2::{D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB};
 use crate::toc::Bandwidth;
-use crate::Error;
 
 // =====================================================================
 // Table 27 — LSF Ordering for Polynomial Evaluation.

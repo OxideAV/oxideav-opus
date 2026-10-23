@@ -46,7 +46,7 @@ use crate::celt_band_layout::CELT_NUM_BANDS;
 use crate::celt_pvq_decode::decode_pvq_vector_into;
 use crate::celt_pvq_v::pvq_codebook_size;
 use crate::celt_rate_alloc::{
-    band_edge, band_width, bits2pulses, cache_run, get_pulses, pulses2bits, BITRES, LOG_N_400,
+    BITRES, LOG_N_400, band_edge, band_width, bits2pulses, cache_run, get_pulses, pulses2bits,
 };
 use crate::range_decoder::RangeDecoder;
 
@@ -694,10 +694,10 @@ fn quant_band(
         let n_b0 = n_b;
 
         // Reorganize samples in time order.
-        if b0 > 1 {
-            if let Some(lb) = lowband_local.as_deref_mut() {
-                deinterleave_hadamard(lb, n_b >> recombine, b0 << recombine, long_blocks);
-            }
+        if b0 > 1
+            && let Some(lb) = lowband_local.as_deref_mut()
+        {
+            deinterleave_hadamard(lb, n_b >> recombine, b0 << recombine, long_blocks);
         }
         let _ = n_b0;
     }

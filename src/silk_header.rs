@@ -42,8 +42,8 @@
 //! All PDF transcriptions and the bit-packing convention are taken
 //! verbatim from RFC 6716. No external library source consulted.
 
-use crate::range_decoder::RangeDecoder;
 use crate::Error;
+use crate::range_decoder::RangeDecoder;
 
 /// Maximum number of SILK frames in a single channel of one Opus
 /// frame, per §4.2.2 (three 20 ms SILK frames in a 60 ms Opus frame).

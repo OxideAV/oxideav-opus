@@ -212,7 +212,7 @@ pub fn mdct_forward(time: &[f64]) -> Result<Vec<f64>, ImdctError> {
     if time.is_empty() {
         return Err(ImdctError::ZeroLength);
     }
-    if time.len() % 2 != 0 {
+    if !time.len().is_multiple_of(2) {
         return Err(ImdctError::OutputLenMismatch {
             got: time.len(),
             want: time.len() + 1,
@@ -468,9 +468,11 @@ mod tests {
     #[test]
     fn error_display_messages() {
         assert!(ImdctError::ZeroLength.to_string().contains("N >= 1"));
-        assert!(ImdctError::OutputLenMismatch { got: 3, want: 4 }
-            .to_string()
-            .contains("!= required 2*N"));
+        assert!(
+            ImdctError::OutputLenMismatch { got: 3, want: 4 }
+                .to_string()
+                .contains("!= required 2*N")
+        );
     }
 
     #[test]

@@ -239,8 +239,11 @@ mod tests {
         u.process(&input, &mut out);
         assert_eq!(out.len(), 800);
         let tail = &out[400..];
-        assert!(tail
-            .chunks_exact(2)
-            .all(|f| (f[0] - 1_000).abs() <= 1 && (f[1] + 2_000).abs() <= 1));
+        assert!(
+            tail.as_chunks::<2>()
+                .0
+                .iter()
+                .all(|f| (f[0] - 1_000).abs() <= 1 && (f[1] + 2_000).abs() <= 1)
+        );
     }
 }

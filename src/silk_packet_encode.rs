@@ -28,18 +28,18 @@
 //! with two independent per-channel carried states threaded exactly
 //! the way [`crate::decoder::OpusDecoder`]'s stereo walk threads them.
 
+use crate::Error;
 use crate::celt_redundancy::{
-    RedundancyPosition, REDUNDANCY_POSITION_ICDF, REDUNDANCY_POSITION_ICDF_FTB,
+    REDUNDANCY_POSITION_ICDF, REDUNDANCY_POSITION_ICDF_FTB, RedundancyPosition,
 };
 use crate::decoder::ChannelDecodeState;
 use crate::range_encoder::RangeEncoder;
 use crate::silk_decode::{
-    encode_silk_frame, SilkFrameConfig, SilkFrameDecoded, SilkFrameSymbols, StereoHeaderContext,
+    SilkFrameConfig, SilkFrameDecoded, SilkFrameSymbols, StereoHeaderContext, encode_silk_frame,
 };
 use crate::silk_excitation::SilkFrameSize;
-use crate::silk_header::{silk_frame_count, PerFrameLbrr, SilkChannelHeader, SilkHeaderBits};
+use crate::silk_header::{PerFrameLbrr, SilkChannelHeader, SilkHeaderBits, silk_frame_count};
 use crate::toc::{Bandwidth, FrameCountCode, Mode, OpusTocByte};
-use crate::Error;
 
 /// Encode one **mono, SILK-only, code-0** Opus packet from per-frame
 /// symbol scripts.
@@ -443,10 +443,10 @@ pub fn encode_silk_only_packet_stereo_red(
         if iv.mid.header.frame_type >= 2 {
             mid_vad_flags |= 1 << idx;
         }
-        if let Some(side) = &iv.side {
-            if side.header.frame_type >= 2 {
-                side_vad_flags |= 1 << idx;
-            }
+        if let Some(side) = &iv.side
+            && side.header.frame_type >= 2
+        {
+            side_vad_flags |= 1 << idx;
         }
     }
     let mut mid_lbrr_bits = 0u8;
@@ -647,10 +647,10 @@ mod tests {
     use crate::decoder::{FrameDecodeStatus, OpusDecoder};
     use crate::range_decoder::RangeDecoder;
     use crate::silk_decode::decode_silk_frame;
-    use crate::silk_excitation::{shell_block_count, ExcitationSymbols, SHELL_BLOCK_SAMPLES};
+    use crate::silk_excitation::{ExcitationSymbols, SHELL_BLOCK_SAMPLES, shell_block_count};
     use crate::silk_frame::SilkHeaderSymbols;
     use crate::silk_gains::GainSymbol;
-    use crate::silk_ltp::{LagSymbols, LtpSymbols, LTP_MAX_SUBFRAMES};
+    use crate::silk_ltp::{LTP_MAX_SUBFRAMES, LagSymbols, LtpSymbols};
 
     /// A tiny deterministic LCG for the packet-level sweeps.
     struct Lcg(u64);

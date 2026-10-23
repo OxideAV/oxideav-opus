@@ -74,7 +74,7 @@ fn run_arm(pcm: &[f32], loss_perc: u8) -> (f64, f64, usize, f64, Vec<Vec<u8>>) {
     let mut packets = Vec::new();
     let mut recon: Vec<f32> = Vec::new();
     let mut bytes = 0usize;
-    for chunk in pcm.chunks_exact(320) {
+    for chunk in pcm.as_chunks::<320>().0 {
         let out = enc.encode_packet_elected(chunk, 40).unwrap();
         bytes += out.packet.len();
         recon.extend_from_slice(&out.reconstructed);
@@ -85,7 +85,7 @@ fn run_arm(pcm: &[f32], loss_perc: u8) -> (f64, f64, usize, f64, Vec<Vec<u8>>) {
     // misprediction dominates whole-stream error regardless of the
     // redundancy budget under test).
     let (mut csig, mut cerr) = (0.0f64, 0.0f64);
-    for (k, chunk) in pcm.chunks_exact(320).enumerate() {
+    for (k, chunk) in pcm.as_chunks::<320>().0.iter().enumerate() {
         let ph = ((k * 320) as f64 / 16000.0 / 0.9).fract();
         if !(0.06..0.74).contains(&ph) {
             continue;
@@ -159,7 +159,9 @@ fn loss_knob_at_zero_is_bit_identical_to_legacy_fec() {
         if touch {
             enc.set_packet_loss_perc(0);
         }
-        pcm.chunks_exact(320)
+        pcm.as_chunks::<320>()
+            .0
+            .iter()
             .map(|c| enc.encode_packet_elected(c, 40).unwrap().packet)
             .collect::<Vec<_>>()
     };
@@ -275,7 +277,7 @@ fn stereo_and_vbr_arms_ride_the_loss_knob() {
         let mut dec = OpusDecoder::new();
         let mut carriers = 0usize;
         let mut n = 0usize;
-        let chunks: Vec<_> = pcm.chunks_exact(320).collect();
+        let chunks: Vec<_> = pcm.as_chunks::<320>().0.iter().collect();
         for (k, _) in chunks.iter().enumerate() {
             let l = &left[k * 320..(k + 1) * 320];
             let r = &right[k * 320..(k + 1) * 320];
@@ -315,7 +317,7 @@ fn stereo_and_vbr_arms_ride_the_loss_knob() {
     let mut dec = OpusDecoder::new();
     let mut total = 0usize;
     let mut count = 0usize;
-    for chunk in pcm.chunks_exact(320) {
+    for chunk in pcm.as_chunks::<320>().0 {
         let packet = enc.encode_frame(chunk).unwrap();
         total += packet.len();
         count += 1;
@@ -359,7 +361,7 @@ fn hybrid_fec_emits_recovers_and_takes_the_loss_knob() {
         let mut dec = OpusDecoder::new();
         let mut carriers = 0usize;
         let mut packets = Vec::new();
-        for (ki, chunk) in pcm.chunks_exact(960).enumerate() {
+        for (ki, chunk) in pcm.as_chunks::<960>().0.iter().enumerate() {
             let packet = enc
                 .encode_packet_elected(chunk, 120)
                 .unwrap_or_else(|e| panic!("packet {ki} (fec {fec} loss {loss}): {e:?}"));
@@ -436,7 +438,7 @@ fn stereo_hybrid_fec_emits_and_recovers() {
     let mut dec = OpusDecoder::new();
     let mut carriers = 0usize;
     let mut packets = Vec::new();
-    for chunk in pcm.chunks_exact(2 * 960) {
+    for chunk in pcm.as_chunks::<{ 2 * 960 }>().0 {
         let packet = enc.encode_packet_elected(chunk, 200).unwrap();
         if OpusDecoder::new()
             .decode_packet_fec(&packet)
@@ -466,7 +468,7 @@ fn stereo_hybrid_fec_emits_and_recovers() {
     // Both channels carry real audio with the panned imbalance
     // preserved (L was encoded twice as loud as R).
     let (mut el, mut er) = (0.0f64, 0.0f64);
-    for pair in fec.pcm.chunks_exact(2) {
+    for pair in fec.pcm.as_chunks::<2>().0 {
         el += f64::from(pair[0]) * f64::from(pair[0]);
         er += f64::from(pair[1]) * f64::from(pair[1]);
     }

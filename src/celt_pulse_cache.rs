@@ -354,7 +354,7 @@ mod tests {
         // every distinct run offset corresponds to exactly one
         // effective size N = (width << lm_row) >> 1, and the sentinel
         // appears exactly when N = 0.
-        use crate::celt_band_layout::{celt_band_bins_per_channel, CeltFrameSize};
+        use crate::celt_band_layout::{CeltFrameSize, celt_band_bins_per_channel};
         use std::collections::HashMap;
         let mut n_for_offset: HashMap<usize, usize> = HashMap::new();
         for lm_row in 0..CACHE_LM_COUNT {

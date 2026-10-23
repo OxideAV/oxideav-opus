@@ -221,7 +221,7 @@ mod tests {
         // Every (LM, intra, band) Laplace parameter pair from the
         // §4.3.2.1 tables, over the full useful qi range: the encoder's
         // (possibly clamped) value must decode back exactly.
-        use crate::celt_e_prob_model::{e_prob_pair, EnergyPredictionMode};
+        use crate::celt_e_prob_model::{EnergyPredictionMode, e_prob_pair};
         use crate::range_encoder::RangeEncoder;
         for lm in 0..4u32 {
             for mode in [EnergyPredictionMode::Inter, EnergyPredictionMode::Intra] {

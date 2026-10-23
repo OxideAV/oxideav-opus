@@ -615,7 +615,7 @@ impl SignalAnalyser {
         let out_n = BLOCK_SAMPLES / PITCH_RATE_RATIO;
         self.pitch_hist.copy_within(out_n.., 0);
         let base = PITCH_HIST - out_n;
-        for (k, chunk) in mono.chunks_exact(PITCH_RATE_RATIO).enumerate() {
+        for (k, chunk) in mono.as_chunks::<PITCH_RATE_RATIO>().0.iter().enumerate() {
             let mut acc = 0.0f32;
             for &x in chunk {
                 self.lp_box1[self.lp_pos] = x;

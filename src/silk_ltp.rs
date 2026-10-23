@@ -28,11 +28,11 @@
 //! All truth is taken from RFC 6716 §4.2.7.6 (Tables 29–42); no external
 //! library source is consulted.
 
+use crate::Error;
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
 use crate::silk_frame::SignalType;
 use crate::toc::Bandwidth;
-use crate::Error;
 
 /// Maximum subframes in a SILK frame (4 for 20 ms / Hybrid; 2 for 10 ms).
 pub const LTP_MAX_SUBFRAMES: usize = 4;

@@ -54,9 +54,9 @@
 //! §3.2 source, the §3 narrative on pp. 13–18, and Appendix B itself
 //! are the only inputs.
 
-use crate::frames::{decode_length, OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
-use crate::toc::{FrameCountCode, OpusTocByte};
 use crate::Error;
+use crate::frames::{MAX_FRAME_BYTES, MAX_FRAMES_PER_PACKET, OpusPacket, decode_length};
+use crate::toc::{FrameCountCode, OpusTocByte};
 
 /// Result of parsing one self-delimited Opus packet from a buffer.
 ///
@@ -294,7 +294,7 @@ mod tests {
     fn code0_two_byte_length() {
         // first=252 second=0 → length 252; build a 252-byte frame.
         let mut bytes = vec![toc_byte(0, false, 0), 252, 0];
-        bytes.extend(std::iter::repeat(0x7Fu8).take(252));
+        bytes.extend(std::iter::repeat_n(0x7Fu8, 252));
         let r = parse_self_delimited(&bytes).unwrap();
         assert_eq!(r.consumed, 1 + 2 + 252);
         assert_eq!(r.packet.frames()[0].len(), 252);
@@ -512,7 +512,7 @@ mod tests {
         // bytes but only supplying 10.
         bytes[1] = 255;
         bytes[2] = 255;
-        bytes.extend(std::iter::repeat(0u8).take(10));
+        bytes.extend(std::iter::repeat_n(0u8, 10));
         assert_eq!(parse_self_delimited(&bytes), Err(Error::MalformedPacket));
     }
 

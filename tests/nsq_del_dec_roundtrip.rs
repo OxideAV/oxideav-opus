@@ -144,7 +144,7 @@ fn default_quality_with_trellis_never_regresses() {
         enc.set_nsq_delayed_decision(states);
         let mut packets = Vec::new();
         let mut recon: Vec<f32> = Vec::new();
-        for chunk in pcm.chunks_exact(320) {
+        for chunk in pcm.as_chunks::<320>().0 {
             let out = enc.encode_packet(chunk).unwrap();
             recon.extend_from_slice(&out.reconstructed);
             packets.push(out.packet);
@@ -192,7 +192,7 @@ fn vbr_arm_with_delayed_decision_stays_on_target() {
     let mut dec = OpusDecoder::new();
     let mut total = 0usize;
     let mut packets = 0usize;
-    for chunk in pcm.chunks_exact(320) {
+    for chunk in pcm.as_chunks::<320>().0 {
         let packet = enc.encode_frame(chunk).unwrap();
         total += packet.len();
         packets += 1;
@@ -224,7 +224,12 @@ fn lbrr_rearmed_analyzer_still_elects_the_trellis() {
     // Build identical carried history on one analyzer, then snapshot
     // it the way the FEC path snapshots the pre-packet analyzer.
     let mut base = ChannelAnalyzer::new(Bandwidth::Wb).unwrap();
-    let chunks: Vec<&[f32]> = pcm.chunks_exact(320).collect();
+    let chunks: Vec<&[f32]> = pcm
+        .as_chunks::<320>()
+        .0
+        .iter()
+        .map(|c| c.as_slice())
+        .collect();
     for chunk in &chunks[..chunks.len() - 10] {
         base.analyze_frame_sized(chunk, true, SilkFrameSize::TwentyMs)
             .unwrap();
@@ -296,7 +301,7 @@ fn fec_recovery_composes_with_delayed_decision() {
         enc.set_nsq_delayed_decision(states);
         let mut packets = Vec::new();
         let mut bytes = 0usize;
-        for chunk in pcm.chunks_exact(320) {
+        for chunk in pcm.as_chunks::<320>().0 {
             let out = enc.encode_packet_elected(chunk, 40).unwrap();
             bytes += out.packet.len();
             packets.push(out.packet);
@@ -403,7 +408,7 @@ fn hybrid_delayed_decision_measured_end_to_end() {
         let (mut sig, mut err) = (0.0f64, 0.0f64);
         let mut bytes = 0usize;
         let mut packets = Vec::new();
-        for chunk in pcm.chunks_exact(960) {
+        for chunk in pcm.as_chunks::<960>().0 {
             let packet = enc.encode_packet_elected(chunk, 250).unwrap();
             bytes += packet.len();
             let out = dec.decode_packet(&packet).unwrap();

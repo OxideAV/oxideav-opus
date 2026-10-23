@@ -19,8 +19,8 @@
 //! round. Length zero is a legal §3.2.1 result (DTX / lost frame); such
 //! frames appear as empty slices in the returned list.
 
-use crate::toc::{FrameCountCode, OpusTocByte};
 use crate::Error;
+use crate::toc::{FrameCountCode, OpusTocByte};
 
 /// Maximum compressed frame length permitted by the §3.2.1 two-byte
 /// length encoding. RFC 6716 §3.2.1: "The maximum representable length
@@ -141,7 +141,7 @@ fn parse_code0(body: &[u8]) -> Result<(Vec<&[u8]>, usize), Error> {
 /// R3: `(N - 1)` (= `body.len()`) MUST be even. Each frame is
 /// `body.len() / 2` bytes. R2 bounds each frame to ≤ 1275 bytes.
 fn parse_code1(body: &[u8]) -> Result<(Vec<&[u8]>, usize), Error> {
-    if body.len() % 2 != 0 {
+    if !body.len().is_multiple_of(2) {
         return Err(Error::MalformedPacket);
     }
     let half = body.len() / 2;
@@ -272,7 +272,7 @@ fn parse_code3(body: &[u8]) -> Result<(Vec<&[u8]>, usize), Error> {
         // any padding-header bytes (consumed during the chain) and
         // padding_bytes (trailing), the remaining body slice is R.
         let r = body.len() - cursor - padding_bytes;
-        if r % m != 0 {
+        if !r.is_multiple_of(m) {
             return Err(Error::MalformedPacket);
         }
         let per = r / m;
@@ -415,7 +415,7 @@ mod tests {
         // N1 = 4*4 + 252 = 268.
         let n1 = 268usize;
         let mut packet = vec![toc(1, false, 2), 252, 4];
-        packet.extend(std::iter::repeat(0xAA).take(n1));
+        packet.extend(std::iter::repeat_n(0xAA, n1));
         packet.extend_from_slice(&[0xBB; 5]); // frame 2 = 5 bytes
         let parsed = OpusPacket::parse(&packet).unwrap();
         assert_eq!(parsed.frame_count(), 2);
@@ -573,7 +573,7 @@ mod tests {
         // M-1 = 3 declared lengths.
         packet.extend_from_slice(&sizes[..3]);
         for &n in sizes.iter() {
-            packet.extend(std::iter::repeat(0xAA).take(n as usize));
+            packet.extend(std::iter::repeat_n(0xAA, n as usize));
         }
         packet.extend_from_slice(&[0u8; 7]);
         let parsed = OpusPacket::parse(&packet).unwrap();
@@ -599,7 +599,7 @@ mod tests {
         let mut packet = vec![toc(15, false, 3), fc, 255, 3];
         // Frame body: any non-padding payload. 4 bytes is fine.
         packet.extend_from_slice(&[0xF1, 0xF2, 0xF3, 0xF4]);
-        packet.extend(std::iter::repeat(0u8).take(257));
+        packet.extend(std::iter::repeat_n(0u8, 257));
         let parsed = OpusPacket::parse(&packet).unwrap();
         assert_eq!(parsed.frame_count(), 1);
         assert_eq!(parsed.frames()[0], &[0xF1, 0xF2, 0xF3, 0xF4]);
@@ -654,8 +654,8 @@ mod tests {
         let m: u8 = MAX_FRAMES_PER_PACKET;
         let fc = 0x80 | m;
         let mut packet = vec![toc(16, false, 3), fc];
-        packet.extend(std::iter::repeat(1u8).take(47)); // 47 declared lengths of 1
-        packet.extend(std::iter::repeat(0xCC).take(48));
+        packet.extend(std::iter::repeat_n(1u8, 47)); // 47 declared lengths of 1
+        packet.extend(std::iter::repeat_n(0xCC, 48));
         let parsed = OpusPacket::parse(&packet).unwrap();
         assert_eq!(parsed.frame_count(), 48);
         for f in parsed.frames() {

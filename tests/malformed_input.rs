@@ -50,8 +50,8 @@
 //!   of the §4.1.3.3 leading-zero offset.
 
 use oxideav_opus::{
-    FrameDecodeStatus, OpusDecoder, OpusPacket, OpusTocByte, RangeDecoder, SilkHeaderBits,
-    MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES,
+    FrameDecodeStatus, MAX_FRAME_BYTES, MAX_FRAMES_PER_PACKET, OpusDecoder, OpusPacket,
+    OpusTocByte, RangeDecoder, SilkHeaderBits,
 };
 
 /// RFC 6716 §3.4 [R1]: a well-formed Opus packet has at least one

@@ -27,10 +27,10 @@
 //! this module only produces the interpolated first-half `n1_Q15[]` and
 //! the decoded factor.
 
+use crate::Error;
 use crate::range_decoder::RangeDecoder;
 use crate::silk_lsf_stabilize::NlsfStabilized;
 use crate::silk_lsf_stage2::D_LPC_MAX;
-use crate::Error;
 
 // =====================================================================
 // Table 26 — PDF for the Normalized LSF Interpolation Index.
@@ -113,10 +113,10 @@ impl LsfInterpolated {
     ) -> Result<Self, Error> {
         let d_lpc = n2.len();
 
-        if let Some(n0) = n0_q15 {
-            if n0.len() != d_lpc {
-                return Err(Error::MalformedPacket);
-            }
+        if let Some(n0) = n0_q15
+            && n0.len() != d_lpc
+        {
+            return Err(Error::MalformedPacket);
         }
 
         // 10 ms frames: the factor is not stored at all, and there is no
@@ -446,13 +446,10 @@ mod tests {
         let n0_wb = stabilized(Bandwidth::Wb, 0, &wb_buf); // d_LPC = 16
         let n0_vec: Vec<i16> = n0_wb.nlsf_q15().to_vec();
         let mut rd = RangeDecoder::new(&buf);
-        assert!(LsfInterpolated::decode(
-            &mut rd,
-            &n2_nb,
-            Some(&n0_vec),
-            LsfInterpContext::TwentyMs
-        )
-        .is_err());
+        assert!(
+            LsfInterpolated::decode(&mut rd, &n2_nb, Some(&n0_vec), LsfInterpContext::TwentyMs)
+                .is_err()
+        );
     }
 
     // --- n1 stays in range; intermediate values bounded --------------

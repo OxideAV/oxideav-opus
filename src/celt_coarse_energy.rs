@@ -95,9 +95,9 @@
 //! `docs/audio/celt/tables/e_means.csv` (numeric facts), reproduced
 //! inline below.
 
-use crate::celt_band_layout::{CeltFrameSize, CELT_NUM_BANDS};
+use crate::celt_band_layout::{CELT_NUM_BANDS, CeltFrameSize};
 use crate::celt_e_prob_model::{
-    e_prob_pair, energy_pred_coef, EProbModelError, EnergyPredictionMode,
+    EProbModelError, EnergyPredictionMode, e_prob_pair, energy_pred_coef,
 };
 use crate::celt_laplace::{decay_byte_to_q14, ec_laplace_decode, prob_to_fs};
 use crate::range_decoder::RangeDecoder;

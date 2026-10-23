@@ -77,13 +77,13 @@
 //! All truth is taken from RFC 6716 §4.2.7.9.1. No external library source
 //! is consulted.
 
+use crate::Error;
 use crate::silk_excitation::SilkFrameSize;
 use crate::silk_frame::SignalType;
-use crate::silk_lpc_synth::{subframe_samples, LPC_SYNTH_MAX_ORDER};
+use crate::silk_lpc_synth::{LPC_SYNTH_MAX_ORDER, subframe_samples};
 use crate::silk_lsf_stage2::{D_LPC_NB_MB, D_LPC_WB};
 use crate::silk_ltp::LTP_FILTER_TAPS;
 use crate::toc::Bandwidth;
-use crate::Error;
 
 /// Maximum pitch lag across SILK bandwidths (WB `lag_max`, §4.2.7.6.1).
 pub const LTP_MAX_PITCH_LAG: usize = 288;

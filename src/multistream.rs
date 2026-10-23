@@ -29,9 +29,9 @@
 //! already implemented in [`crate::framing_self_delim`]. No external
 //! library source is consulted.
 
+use crate::Error;
 use crate::framing_self_delim::parse_self_delimited;
 use crate::opus_head::{ChannelMappingTable, OpusHead};
-use crate::Error;
 
 /// One stream's raw Opus packet bytes within a multistream packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

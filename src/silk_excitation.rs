@@ -31,11 +31,11 @@
 //! All truth is RFC 6716 §4.2.7.8 + Tables 44–53. No external library
 //! source is consulted.
 
+use crate::Error;
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
 use crate::silk_frame::{QuantizationOffsetType, SignalType};
 use crate::toc::Bandwidth;
-use crate::Error;
 
 /// Samples per SILK shell block (RFC 6716 §4.2.7.8 fixes `N = 16`).
 pub const SHELL_BLOCK_SAMPLES: usize = 16;
@@ -1717,54 +1717,62 @@ mod tests {
         let mut e = vec![0i32; total];
         e[0] = 17;
         let mut re = RangeEncoder::new();
-        assert!(Excitation::encode(
-            &mut re,
-            cfg,
-            &ExcitationSymbols {
-                rate_level: 0,
-                lsb_counts: &lsb0,
-                e_raw: &e,
-            }
-        )
-        .is_err());
+        assert!(
+            Excitation::encode(
+                &mut re,
+                cfg,
+                &ExcitationSymbols {
+                    rate_level: 0,
+                    lsb_counts: &lsb0,
+                    e_raw: &e,
+                }
+            )
+            .is_err()
+        );
         // Rate level out of range.
         let z = vec![0i32; total];
         let mut re = RangeEncoder::new();
-        assert!(Excitation::encode(
-            &mut re,
-            cfg,
-            &ExcitationSymbols {
-                rate_level: 9,
-                lsb_counts: &lsb0,
-                e_raw: &z,
-            }
-        )
-        .is_err());
+        assert!(
+            Excitation::encode(
+                &mut re,
+                cfg,
+                &ExcitationSymbols {
+                    rate_level: 9,
+                    lsb_counts: &lsb0,
+                    e_raw: &z,
+                }
+            )
+            .is_err()
+        );
         // Wrong lsb_counts length.
         let mut re = RangeEncoder::new();
-        assert!(Excitation::encode(
-            &mut re,
-            cfg,
-            &ExcitationSymbols {
-                rate_level: 0,
-                lsb_counts: &lsb0[..4],
-                e_raw: &z,
-            }
-        )
-        .is_err());
+        assert!(
+            Excitation::encode(
+                &mut re,
+                cfg,
+                &ExcitationSymbols {
+                    rate_level: 0,
+                    lsb_counts: &lsb0[..4],
+                    e_raw: &z,
+                }
+            )
+            .is_err()
+        );
         // LSB count > 10.
         let bad_lsb = vec![11u8; blocks];
         let mut re = RangeEncoder::new();
-        assert!(Excitation::encode(
-            &mut re,
-            cfg,
-            &ExcitationSymbols {
-                rate_level: 0,
-                lsb_counts: &bad_lsb,
-                e_raw: &z,
-            }
-        )
-        .is_err());
+        assert!(
+            Excitation::encode(
+                &mut re,
+                cfg,
+                &ExcitationSymbols {
+                    rate_level: 0,
+                    lsb_counts: &bad_lsb,
+                    e_raw: &z,
+                }
+            )
+            .is_err()
+        );
         // All 16 pulses concentrated on the left 2-sample half of a
         // 4-sample partition: Table 49's `left = 16` cell has
         // probability 1/256 (the round-382 table sweep fixed this
@@ -1794,15 +1802,17 @@ mod tests {
         let mut e = vec![0i32; total];
         e[0] = 17;
         let mut re = RangeEncoder::new();
-        assert!(Excitation::encode(
-            &mut re,
-            cfg,
-            &ExcitationSymbols {
-                rate_level: 0,
-                lsb_counts: &lsb1,
-                e_raw: &e,
-            }
-        )
-        .is_ok());
+        assert!(
+            Excitation::encode(
+                &mut re,
+                cfg,
+                &ExcitationSymbols {
+                    rate_level: 0,
+                    lsb_counts: &lsb1,
+                    e_raw: &e,
+                }
+            )
+            .is_ok()
+        );
     }
 }

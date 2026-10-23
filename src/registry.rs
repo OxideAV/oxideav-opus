@@ -45,9 +45,9 @@ use oxideav_core::{
     Rational, SampleFormat, TimeBase,
 };
 
-use crate::decoder::{DecodedAudio, OpusDecoder, OUTPUT_SAMPLE_RATE_HZ};
+use crate::decoder::{DecodedAudio, OUTPUT_SAMPLE_RATE_HZ, OpusDecoder};
 use crate::multistream::MultistreamDecoder;
-use crate::opus_head::{apply_output_gain, OpusHead, PreSkip};
+use crate::opus_head::{OpusHead, PreSkip, apply_output_gain};
 
 /// The registry codec id this crate claims.
 pub(crate) const CODEC_ID: &str = "opus";
@@ -115,14 +115,14 @@ impl OpusStreamDecoder {
             // channel geometry, pre-skip, and output gain.
             let head = OpusHead::parse(&params.extradata)
                 .map_err(|e| oxideav_core::Error::invalid(format!("opus extradata: {e}")))?;
-            if let Some(c) = params.channels {
-                if c != u16::from(head.channel_count) {
-                    return Err(oxideav_core::Error::invalid(format!(
-                        "opus: parameter channel count {c} contradicts the OpusHead \
+            if let Some(c) = params.channels
+                && c != u16::from(head.channel_count)
+            {
+                return Err(oxideav_core::Error::invalid(format!(
+                    "opus: parameter channel count {c} contradicts the OpusHead \
                          channel count {}",
-                        head.channel_count
-                    )));
-                }
+                    head.channel_count
+                )));
             }
             channels = head.channel_count;
             // RFC 7845 §5.1 pre-skip counts 48 kHz samples; at a
@@ -192,7 +192,7 @@ impl OpusStreamDecoder {
                 }
             }
             (2, 1) => {
-                for pair in pcm.chunks_exact(2) {
+                for pair in pcm.as_chunks::<2>().0 {
                     out.push(((i32::from(pair[0]) + i32::from(pair[1])) / 2) as i16);
                 }
             }
@@ -569,7 +569,7 @@ impl OpusStreamEncoder {
             other => {
                 return Err(oxideav_core::Error::invalid(format!(
                     "opus encode: application '{other}' (voip / audio / lowdelay)"
-                )))
+                )));
             }
         };
         let forced_mode = match opts.mode.as_str() {
@@ -580,7 +580,7 @@ impl OpusStreamEncoder {
             other => {
                 return Err(oxideav_core::Error::invalid(format!(
                     "opus encode: mode '{other}' (auto / silk / hybrid / celt)"
-                )))
+                )));
             }
         };
         let forced_bandwidth = match opts.bandwidth.as_str() {
@@ -593,7 +593,7 @@ impl OpusStreamEncoder {
             other => {
                 return Err(oxideav_core::Error::invalid(format!(
                     "opus encode: bandwidth '{other}' (auto / nb / mb / wb / swb / fb)"
-                )))
+                )));
             }
         };
         let frame_tenths = (opts.frame_ms * 10.0).round() as u16;
@@ -732,7 +732,7 @@ impl oxideav_core::Encoder for OpusStreamEncoder {
             _ => {
                 return Err(oxideav_core::Error::invalid(
                     "opus encode: expected an audio frame",
-                ))
+                ));
             }
         };
         let plane = audio
@@ -755,7 +755,9 @@ impl oxideav_core::Encoder for OpusStreamEncoder {
             )));
         }
         let pcm = plane
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i16::from_le_bytes([b[0], b[1]]));
         match self.upsampler.as_mut() {
             Some(up) => {
@@ -885,7 +887,7 @@ mod tests {
             dec.send_packet(&packet).expect("decode");
             while let Ok(Frame::Audio(f)) = dec.receive_frame() {
                 decoded += f.samples as usize;
-                for b in f.data[0].chunks_exact(2) {
+                for b in f.data[0].as_chunks::<2>().0 {
                     let v = f64::from(i16::from_le_bytes([b[0], b[1]]));
                     energy += v * v;
                 }
@@ -926,7 +928,9 @@ mod tests {
             while let Ok(Frame::Audio(f)) = dec.receive_frame() {
                 out.extend(
                     f.data[0]
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|b| i16::from_le_bytes([b[0], b[1]])),
                 );
             }

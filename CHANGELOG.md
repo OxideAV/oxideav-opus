@@ -4,6 +4,10 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
 ### Fixed
 
 - SILK noise-shaping quantizer: the §5.2.3.3 compensation gain G (ratio of
@@ -1641,7 +1645,6 @@ All notable changes to `oxideav-opus` are recorded here.
   covering all bandwidths / frame sizes / signal types) plus
   bad-input rejection tests; the range encoder itself gained a
   zero-probability-cell debug assertion.
-
 
 - *Cargo-fuzz harness suite restored (`fuzz/`).* The scheduled Fuzz
   workflow had been failing since the orphan rebuild dropped the old

@@ -349,7 +349,7 @@ pub fn apply_spreading(
         return Err(SpreadingError::ZeroBlocks);
     }
     let len = x.len();
-    if len % nb_blocks != 0 {
+    if !len.is_multiple_of(nb_blocks) {
         return Err(SpreadingError::BlocksDoNotDivideLength { len, nb_blocks });
     }
     let Some(f_r) = f_r else {
@@ -689,7 +689,7 @@ mod tests {
         let mut x = pseudo_vector(8, 41);
         let mut expected = x.clone();
         let theta = spread_theta(4, k, 2).unwrap().unwrap();
-        for block in expected.chunks_exact_mut(4) {
+        for block in expected.as_chunks_mut::<4>().0 {
             rotate_in_place(block, theta);
         }
         apply_spreading(&mut x, k, 2, 2).unwrap();
@@ -706,7 +706,7 @@ mod tests {
         let before = l2(&x);
         let mut no_pre = x.clone();
         let theta = spread_theta(8, k, 3).unwrap().unwrap();
-        for block in no_pre.chunks_exact_mut(8) {
+        for block in no_pre.as_chunks_mut::<8>().0 {
             rotate_in_place(block, theta);
         }
         apply_spreading(&mut x, k, 3, 2).unwrap();
@@ -721,7 +721,7 @@ mod tests {
         let mut expected = pseudo_vector(16, 8);
         let stride = spreading_stride(16, 2).unwrap();
         rotate_strided(&mut expected, stride, core::f64::consts::FRAC_PI_2 - theta).unwrap();
-        for block in expected.chunks_exact_mut(8) {
+        for block in expected.as_chunks_mut::<8>().0 {
             rotate_in_place(block, theta);
         }
         assert_eq!(x, expected);

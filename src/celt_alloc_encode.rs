@@ -18,7 +18,7 @@
 
 use crate::celt_band_layout::CELT_NUM_BANDS;
 use crate::celt_log2_frac_table::LOG2_FRAC_TABLE;
-use crate::celt_rate_alloc::{band_edge, band_width, Allocation, BITRES, MAX_FINE_BITS};
+use crate::celt_rate_alloc::{Allocation, BITRES, MAX_FINE_BITS, band_edge, band_width};
 use crate::celt_static_alloc::STATIC_ALLOC;
 use crate::range_encoder::RangeEncoder;
 
@@ -381,7 +381,7 @@ fn interp_bits2pulses_encode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::celt_cache_caps50::{cap_for_band_bits, CacheCapsStereo};
+    use crate::celt_cache_caps50::{CacheCapsStereo, cap_for_band_bits};
     use crate::celt_rate_alloc::compute_allocation_decode;
     use crate::range_decoder::RangeDecoder;
 

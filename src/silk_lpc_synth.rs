@@ -37,10 +37,10 @@
 //! All truth is taken from RFC 6716 §4.2.7.9.2. No external library
 //! source is consulted.
 
+use crate::Error;
 use crate::silk_excitation::SilkFrameSize;
 use crate::silk_lsf_stage2::{D_LPC_NB_MB, D_LPC_WB};
 use crate::toc::Bandwidth;
-use crate::Error;
 
 /// Largest LPC order across SILK bandwidths (WB → 16).
 pub const LPC_SYNTH_MAX_ORDER: usize = D_LPC_WB;
@@ -615,28 +615,32 @@ mod tests {
         let res = vec![0.0f32; 79]; // 40*2 = 80 expected
         let gains = vec![65536u32, 65536];
         let a: Vec<Vec<i16>> = vec![vec![0i16; 10]; 2];
-        assert!(lpc_synthesis_frame(
-            Bandwidth::Nb,
-            SilkFrameSize::TenMs,
-            &mut s,
-            &res,
-            &gains,
-            &a
-        )
-        .is_err());
+        assert!(
+            lpc_synthesis_frame(
+                Bandwidth::Nb,
+                SilkFrameSize::TenMs,
+                &mut s,
+                &res,
+                &gains,
+                &a
+            )
+            .is_err()
+        );
 
         // gain length wrong.
         let res = vec![0.0f32; 80];
         let gains = vec![65536u32];
-        assert!(lpc_synthesis_frame(
-            Bandwidth::Nb,
-            SilkFrameSize::TenMs,
-            &mut s,
-            &res,
-            &gains,
-            &a
-        )
-        .is_err());
+        assert!(
+            lpc_synthesis_frame(
+                Bandwidth::Nb,
+                SilkFrameSize::TenMs,
+                &mut s,
+                &res,
+                &gains,
+                &a
+            )
+            .is_err()
+        );
     }
 
     // --- a sweep that exercises every bandwidth × frame size -----------

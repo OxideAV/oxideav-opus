@@ -272,7 +272,7 @@ pub fn apply_tf_hadamard(
         return Err(TfHadamardError::BlocksNotPowerOfTwo { nb_blocks });
     }
     let len = x.len();
-    if len % nb_blocks != 0 {
+    if !len.is_multiple_of(nb_blocks) {
         return Err(TfHadamardError::BlocksDoNotDivideLength { len, nb_blocks });
     }
 

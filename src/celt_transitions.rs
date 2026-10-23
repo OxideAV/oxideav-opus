@@ -1234,7 +1234,7 @@ mod tests {
         // `figure18_celt_to_hybrid_with_redundancy_marks_silk_reset_only`
         // test. The cases below pin the four-row agreement that
         // is unconditional.
-        use crate::mode_transition_reset::{decide_state_resets, CeltResetPlacement};
+        use crate::mode_transition_reset::{CeltResetPlacement, decide_state_resets};
         use OperatingMode::*;
 
         // Row 1: SILK → SILK with R. §4.5.2 sees same-mode → no

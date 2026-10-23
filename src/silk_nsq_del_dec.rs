@@ -33,20 +33,20 @@
 //! `docs/audio/opus/rfc6716-opus.txt`, hash-verified per §A.1). No
 //! external library source is consulted.
 
+use crate::Error;
 use crate::silk_excitation::shell_block_count;
-use crate::silk_excitation::{quantization_offset_q23, SilkFrameSize, SHELL_BLOCK_SAMPLES};
+use crate::silk_excitation::{SHELL_BLOCK_SAMPLES, SilkFrameSize, quantization_offset_q23};
 use crate::silk_excitation_quantize::{
-    choose_pulse_pair, finish_excitation_symbols, ExcitationQuantized, LtpFrameParams,
-    PulseRateControl,
+    ExcitationQuantized, LtpFrameParams, PulseRateControl, choose_pulse_pair,
+    finish_excitation_symbols,
 };
 use crate::silk_frame::{QuantizationOffsetType, SignalType};
-use crate::silk_lpc_synth::{lpc_synthesis_subframe, subframe_samples, LpcSynthState};
+use crate::silk_lpc_synth::{LpcSynthState, lpc_synthesis_subframe, subframe_samples};
 use crate::silk_ltp::LTP_FILTER_TAPS;
 use crate::silk_ltp_synth::{
-    ltp_synth_commit_subframe, ltp_synthesis_subframe, LtpSynthState, LtpSynthSubframe,
+    LtpSynthState, LtpSynthSubframe, ltp_synth_commit_subframe, ltp_synthesis_subframe,
 };
 use crate::toc::Bandwidth;
-use crate::Error;
 
 /// Maximum number of delayed-decision states (the listing's bound;
 /// also the §4.2.7.7 seed alphabet size, so more states would only
@@ -384,10 +384,10 @@ mod tests {
     use crate::range_decoder::RangeDecoder;
     use crate::range_encoder::RangeEncoder;
     use crate::silk_excitation::{Excitation, ExcitationConfig, ExcitationSymbols};
-    use crate::silk_excitation_quantize::{quantize_excitation_frame, MAX_PULSE_MAGNITUDE};
+    use crate::silk_excitation_quantize::{MAX_PULSE_MAGNITUDE, quantize_excitation_frame};
     use crate::silk_lsf_recon::cb1_q8;
     use crate::silk_lsf_to_lpc::LpcQ17;
-    use crate::silk_ltp::{ltp_filter_taps_q7, LTP_MAX_SUBFRAMES};
+    use crate::silk_ltp::{LTP_MAX_SUBFRAMES, ltp_filter_taps_q7};
 
     fn wb_codebook_lpc(i1: u8) -> Vec<i32> {
         let cb = cb1_q8(Bandwidth::Wb, i1).unwrap();
@@ -488,11 +488,12 @@ mod tests {
                     single.rd_q23
                 );
                 assert!(dd.lcg_seed <= 3);
-                assert!(dd
-                    .quantized
-                    .e_raw
-                    .iter()
-                    .all(|&v| v.abs() <= MAX_PULSE_MAGNITUDE));
+                assert!(
+                    dd.quantized
+                        .e_raw
+                        .iter()
+                        .all(|&v| v.abs() <= MAX_PULSE_MAGNITUDE)
+                );
             }
         }
     }
@@ -675,55 +676,61 @@ mod tests {
         let mut ltp_state = LtpSynthState::new(bw).unwrap();
         let mut lpc_state = LpcSynthState::new(bw).unwrap();
         // Too many states.
-        assert!(quantize_excitation_frame_del_dec(
-            bw,
-            SilkFrameSize::TwentyMs,
-            SignalType::Unvoiced,
-            QuantizationOffsetType::Low,
-            0,
-            5,
-            &[100_000; 4],
-            &a_q12,
-            None,
-            &target,
-            &PulseRateControl::default(),
-            &mut ltp_state,
-            &mut lpc_state,
-        )
-        .is_err());
+        assert!(
+            quantize_excitation_frame_del_dec(
+                bw,
+                SilkFrameSize::TwentyMs,
+                SignalType::Unvoiced,
+                QuantizationOffsetType::Low,
+                0,
+                5,
+                &[100_000; 4],
+                &a_q12,
+                None,
+                &target,
+                &PulseRateControl::default(),
+                &mut ltp_state,
+                &mut lpc_state,
+            )
+            .is_err()
+        );
         // Zero states.
-        assert!(quantize_excitation_frame_del_dec(
-            bw,
-            SilkFrameSize::TwentyMs,
-            SignalType::Unvoiced,
-            QuantizationOffsetType::Low,
-            0,
-            0,
-            &[100_000; 4],
-            &a_q12,
-            None,
-            &target,
-            &PulseRateControl::default(),
-            &mut ltp_state,
-            &mut lpc_state,
-        )
-        .is_err());
+        assert!(
+            quantize_excitation_frame_del_dec(
+                bw,
+                SilkFrameSize::TwentyMs,
+                SignalType::Unvoiced,
+                QuantizationOffsetType::Low,
+                0,
+                0,
+                &[100_000; 4],
+                &a_q12,
+                None,
+                &target,
+                &PulseRateControl::default(),
+                &mut ltp_state,
+                &mut lpc_state,
+            )
+            .is_err()
+        );
         // Bad base seed.
-        assert!(quantize_excitation_frame_del_dec(
-            bw,
-            SilkFrameSize::TwentyMs,
-            SignalType::Unvoiced,
-            QuantizationOffsetType::Low,
-            4,
-            2,
-            &[100_000; 4],
-            &a_q12,
-            None,
-            &target,
-            &PulseRateControl::default(),
-            &mut ltp_state,
-            &mut lpc_state,
-        )
-        .is_err());
+        assert!(
+            quantize_excitation_frame_del_dec(
+                bw,
+                SilkFrameSize::TwentyMs,
+                SignalType::Unvoiced,
+                QuantizationOffsetType::Low,
+                4,
+                2,
+                &[100_000; 4],
+                &a_q12,
+                None,
+                &target,
+                &PulseRateControl::default(),
+                &mut ltp_state,
+                &mut lpc_state,
+            )
+            .is_err()
+        );
     }
 }

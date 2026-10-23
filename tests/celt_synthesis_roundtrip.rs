@@ -19,7 +19,7 @@
 //! backend's documented input boundary.
 
 use oxideav_opus::celt_band_layout::{
-    celt_band_bins_per_channel, celt_end_coded_band, celt_first_coded_band, CeltFrameSize,
+    CeltFrameSize, celt_band_bins_per_channel, celt_end_coded_band, celt_first_coded_band,
 };
 use oxideav_opus::celt_deemphasis::DeemphasisFilter;
 use oxideav_opus::celt_denormalise::denormalise_bands;

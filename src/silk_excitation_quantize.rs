@@ -44,19 +44,19 @@
 //! All truth is taken from RFC 6716 §4.2.7.8 / §4.2.7.9 / §5.2.3.8.
 //! No external library source is consulted.
 
+use crate::Error;
 use crate::range_encoder::RangeEncoder;
 use crate::silk_excitation::{
-    quantization_offset_q23, shell_block_count, Excitation, ExcitationConfig, ExcitationSymbols,
-    SilkFrameSize, SHELL_BLOCK_SAMPLES,
+    Excitation, ExcitationConfig, ExcitationSymbols, SHELL_BLOCK_SAMPLES, SilkFrameSize,
+    quantization_offset_q23, shell_block_count,
 };
 use crate::silk_frame::{QuantizationOffsetType, SignalType};
-use crate::silk_lpc_synth::{lpc_synthesis_subframe, subframe_samples, LpcSynthState};
+use crate::silk_lpc_synth::{LpcSynthState, lpc_synthesis_subframe, subframe_samples};
 use crate::silk_ltp::{LTP_FILTER_TAPS, LTP_MAX_SUBFRAMES};
 use crate::silk_ltp_synth::{
-    ltp_synth_commit_subframe, ltp_synthesis_subframe, LtpSynthState, LtpSynthSubframe,
+    LtpSynthState, LtpSynthSubframe, ltp_synth_commit_subframe, ltp_synthesis_subframe,
 };
 use crate::toc::Bandwidth;
-use crate::Error;
 
 /// Per-sample excitation magnitude cap: keeps every shell block
 /// encodable (`16 * 1024 >> 10 = 16` pre-LSB pulses max).
@@ -473,7 +473,7 @@ pub(crate) fn choose_pulse_pair(want: f32, offset_q23: i32, lambda_pulses: f32) 
         if cost < best.1 {
             second = Some(best);
             best = (c, cost);
-        } else if second.map_or(true, |(_, sc)| cost < sc) {
+        } else if second.is_none_or(|(_, sc)| cost < sc) {
             second = Some((c, cost));
         }
     }
@@ -753,36 +753,40 @@ mod tests {
         let mut lpc_state = LpcSynthState::new(bw).unwrap();
         let target = vec![0.0f32; 4 * n];
         // Voiced without LTP params.
-        assert!(quantize_excitation_frame(
-            bw,
-            SilkFrameSize::TwentyMs,
-            SignalType::Voiced,
-            QuantizationOffsetType::Low,
-            0,
-            &[100_000; 4],
-            &a_q12,
-            None,
-            &target,
-            &PulseRateControl::default(),
-            &mut ltp_state,
-            &mut lpc_state,
-        )
-        .is_err());
+        assert!(
+            quantize_excitation_frame(
+                bw,
+                SilkFrameSize::TwentyMs,
+                SignalType::Voiced,
+                QuantizationOffsetType::Low,
+                0,
+                &[100_000; 4],
+                &a_q12,
+                None,
+                &target,
+                &PulseRateControl::default(),
+                &mut ltp_state,
+                &mut lpc_state,
+            )
+            .is_err()
+        );
         // Bad seed.
-        assert!(quantize_excitation_frame(
-            bw,
-            SilkFrameSize::TwentyMs,
-            SignalType::Unvoiced,
-            QuantizationOffsetType::Low,
-            4,
-            &[100_000; 4],
-            &a_q12,
-            None,
-            &target,
-            &PulseRateControl::default(),
-            &mut ltp_state,
-            &mut lpc_state,
-        )
-        .is_err());
+        assert!(
+            quantize_excitation_frame(
+                bw,
+                SilkFrameSize::TwentyMs,
+                SignalType::Unvoiced,
+                QuantizationOffsetType::Low,
+                4,
+                &[100_000; 4],
+                &a_q12,
+                None,
+                &target,
+                &PulseRateControl::default(),
+                &mut ltp_state,
+                &mut lpc_state,
+            )
+            .is_err()
+        );
     }
 }

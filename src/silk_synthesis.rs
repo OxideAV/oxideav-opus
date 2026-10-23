@@ -45,12 +45,12 @@
 //! All truth is taken from RFC 6716 §4.2.7.9 and the §A reference
 //! listing. No external library source is consulted.
 
+use crate::Error;
 use crate::silk_decode::SilkFrameDecoded;
-use crate::silk_decode_core::{decode_core, SilkCoreState};
+use crate::silk_decode_core::{SilkCoreState, decode_core};
 use crate::silk_excitation::SilkFrameSize;
 use crate::silk_gains::SILK_MAX_SUBFRAMES;
 use crate::toc::Bandwidth;
-use crate::Error;
 
 /// Cross-frame SILK synthesis state for one channel: the §4.2.7.9
 /// fixed-point reconstruction histories
@@ -195,7 +195,7 @@ pub fn silk_frame_internal_samples(
 mod tests {
     use super::*;
     use crate::range_decoder::RangeDecoder;
-    use crate::silk_decode::{decode_silk_frame, SilkFrameConfig};
+    use crate::silk_decode::{SilkFrameConfig, decode_silk_frame};
 
     fn fresh_cfg(bandwidth: Bandwidth, frame_size: SilkFrameSize, voiced: bool) -> SilkFrameConfig {
         SilkFrameConfig {

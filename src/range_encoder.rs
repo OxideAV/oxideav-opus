@@ -493,11 +493,7 @@ mod tests {
             (self.0 >> 32) as u32
         }
         fn below(&mut self, n: u32) -> u32 {
-            if n == 0 {
-                0
-            } else {
-                self.next_u32() % n
-            }
+            if n == 0 { 0 } else { self.next_u32() % n }
         }
     }
 

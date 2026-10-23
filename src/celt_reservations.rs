@@ -123,7 +123,7 @@
 //! [`crate::celt_log2_frac_table`] module.
 
 use crate::celt_band_layout::CeltFrameSize;
-use crate::celt_log2_frac_table::{log2_frac, Log2FracError};
+use crate::celt_log2_frac_table::{Log2FracError, log2_frac};
 
 /// §4.3.3 anti-collapse / skip / dual-stereo reservation cost in 1/8
 /// bits (RFC 6716 §4.3.3 p. 114). Each of these flags costs exactly

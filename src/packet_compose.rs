@@ -29,9 +29,9 @@
 //! length uniformity. Composed packets therefore always reparse to
 //! the same frames, padding, and TOC byte.
 
-use crate::frames::{MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
-use crate::toc::{FrameCountCode, OpusTocByte};
 use crate::Error;
+use crate::frames::{MAX_FRAME_BYTES, MAX_FRAMES_PER_PACKET};
+use crate::toc::{FrameCountCode, OpusTocByte};
 
 /// Encode one §3.2.1 length sequence (0..=1275) into `out`.
 ///
@@ -367,7 +367,7 @@ pub fn compose_plc_gap_packets(
     use crate::toc::{Bandwidth, ChannelMapping, Mode};
 
     let prev = OpusTocByte::parse(&[prev_toc_byte])?;
-    if gap_tenths_ms == 0 || gap_tenths_ms % 25 != 0 {
+    if gap_tenths_ms == 0 || !gap_tenths_ms.is_multiple_of(25) {
         return Err(Error::MalformedPacket);
     }
     let stereo = prev.channels == ChannelMapping::Stereo;
@@ -457,7 +457,7 @@ pub fn compose_plc_gap_packets(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::{decode_length, OpusPacket};
+    use crate::frames::{OpusPacket, decode_length};
     use crate::framing_self_delim::parse_self_delimited;
     use crate::toc::{Bandwidth, Mode};
 
@@ -715,7 +715,7 @@ mod tests {
         /// stage-2 residual, no LTP (unvoiced/inactive types only),
         /// `pulses` unit pulses at each shell block's first sample.
         fn new(frame_type: u8, pulses: i32) -> Self {
-            use crate::silk_excitation::{shell_block_count, SilkFrameSize, SHELL_BLOCK_SAMPLES};
+            use crate::silk_excitation::{SHELL_BLOCK_SAMPLES, SilkFrameSize, shell_block_count};
             use crate::silk_gains::GainSymbol;
             assert!(frame_type < 4, "voiced scripts would need LTP symbols");
             let blocks = shell_block_count(Bandwidth::Nb, SilkFrameSize::TwentyMs).unwrap();

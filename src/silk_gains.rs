@@ -30,10 +30,10 @@
 //! pipeline only needs the integer `log_gain` index until the LPC /
 //! LTP stages come online in a later round.
 
+use crate::Error;
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
 use crate::silk_frame::SignalType;
-use crate::Error;
 
 /// Maximum number of subframes per SILK frame.
 ///
@@ -1000,28 +1000,34 @@ mod tests {
         );
         // Independent where delta expected.
         let mut re = RangeEncoder::new();
-        assert!(SubframeGains::encode(
-            &mut re,
-            cfg,
-            &[GainSymbol::Independent(10), GainSymbol::Independent(10)]
-        )
-        .is_err());
+        assert!(
+            SubframeGains::encode(
+                &mut re,
+                cfg,
+                &[GainSymbol::Independent(10), GainSymbol::Independent(10)]
+            )
+            .is_err()
+        );
         // Out-of-range independent index.
         let mut re = RangeEncoder::new();
-        assert!(SubframeGains::encode(
-            &mut re,
-            cfg,
-            &[GainSymbol::Independent(64), GainSymbol::Delta(3)]
-        )
-        .is_err());
+        assert!(
+            SubframeGains::encode(
+                &mut re,
+                cfg,
+                &[GainSymbol::Independent(64), GainSymbol::Delta(3)]
+            )
+            .is_err()
+        );
         // Out-of-range delta index.
         let mut re = RangeEncoder::new();
-        assert!(SubframeGains::encode(
-            &mut re,
-            cfg,
-            &[GainSymbol::Independent(10), GainSymbol::Delta(41)]
-        )
-        .is_err());
+        assert!(
+            SubframeGains::encode(
+                &mut re,
+                cfg,
+                &[GainSymbol::Independent(10), GainSymbol::Delta(41)]
+            )
+            .is_err()
+        );
         // Wrong symbol count.
         let mut re = RangeEncoder::new();
         assert!(SubframeGains::encode(&mut re, cfg, &[GainSymbol::Independent(10)]).is_err());

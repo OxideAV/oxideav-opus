@@ -18,16 +18,16 @@
 
 use crate::celt_alloc_encode::compute_allocation_encode;
 use crate::celt_analysis::{
-    amp_to_log2, compute_band_energies, forward_mdct, normalise_bands, transient_analysis,
-    CeltAnalysis,
+    CeltAnalysis, amp_to_log2, compute_band_energies, forward_mdct, normalise_bands,
+    transient_analysis,
 };
 use crate::celt_band_encode::quant_all_bands_encode;
 use crate::celt_band_layout::CELT_NUM_BANDS;
-use crate::celt_cache_caps50::{cap_for_band_bits, CacheCapsStereo};
+use crate::celt_cache_caps50::{CacheCapsStereo, cap_for_band_bits};
 use crate::celt_energy_encode::{
-    quant_coarse_energy, quant_energy_finalise, quant_fine_energy, EnergyGrid,
+    EnergyGrid, quant_coarse_energy, quant_energy_finalise, quant_fine_energy,
 };
-use crate::celt_rate_alloc::{band_edge, band_width, BITRES};
+use crate::celt_rate_alloc::{BITRES, band_edge, band_width};
 use crate::celt_spreading::SPREAD_ICDF;
 use crate::celt_tf_adjust::{
     TF_ADJ_NONTRANSIENT_SELECT0, TF_ADJ_NONTRANSIENT_SELECT1, TF_ADJ_TRANSIENT_SELECT0,

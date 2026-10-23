@@ -112,7 +112,7 @@
 //! lookup).
 
 use crate::celt_band_layout::{
-    celt_band_bins_per_channel, celt_end_coded_band, celt_first_coded_band, CeltFrameSize,
+    CeltFrameSize, celt_band_bins_per_channel, celt_end_coded_band, celt_first_coded_band,
 };
 
 /// §4.3.3 numerator of the band-size dependent term in 1/8 bits per
@@ -647,10 +647,10 @@ mod tests {
         // And 24 1/8 bits / 16 bins = 1.5 1/8 bits per bin = 48/128
         // whole bits per bin, matching the §4.3.3 narrative.
         let per_bin_128ths = (bin_term * 16) / n; // (24*16)/16 = 24
-                                                  // 24 in 1/8 bits = 24 * 16 = 384 in 1/128 bits across 16
-                                                  // bins ⇒ 24 1/128 bits per bin × 2 (since 1/8 = 16/128) =
-                                                  // 48 1/128 bits per bin. Cross-check the §4.3.3 "48 128th
-                                                  // bits per MDCT bin" wording.
+        // 24 in 1/8 bits = 24 * 16 = 384 in 1/128 bits across 16
+        // bins ⇒ 24 1/128 bits per bin × 2 (since 1/8 = 16/128) =
+        // 48 1/128 bits per bin. Cross-check the §4.3.3 "48 128th
+        // bits per MDCT bin" wording.
         assert_eq!(per_bin_128ths * 2, 48);
     }
 

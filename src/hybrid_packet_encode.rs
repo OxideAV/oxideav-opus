@@ -22,10 +22,11 @@
 //! listing (staged `docs/audio/opus/rfc6716-opus.txt`, hash-verified
 //! per §A.1). No external library source was consulted.
 
-use crate::celt_frame_encode::{encode_celt_frame, CeltEncoderState};
+use crate::Error;
+use crate::celt_frame_encode::{CeltEncoderState, encode_celt_frame};
 use crate::celt_packet_encode::{
-    encode_redundant_celt_frame, REDUNDANT_FRAME_MAX_BYTES, REDUNDANT_FRAME_MIN_BYTES,
-    REDUNDANT_FRAME_SAMPLES,
+    REDUNDANT_FRAME_MAX_BYTES, REDUNDANT_FRAME_MIN_BYTES, REDUNDANT_FRAME_SAMPLES,
+    encode_redundant_celt_frame,
 };
 use crate::celt_redundancy::{
     HYBRID_REDUNDANCY_MIN_REMAINING_BITS, HYBRID_REDUNDANCY_SIZE_BASELINE_BYTES,
@@ -33,19 +34,18 @@ use crate::celt_redundancy::{
     REDUNDANCY_POSITION_ICDF_FTB,
 };
 use crate::range_encoder::RangeEncoder;
-use crate::silk_decode::{encode_silk_frame, SilkFrameConfig, StereoHeaderContext};
+use crate::silk_decode::{SilkFrameConfig, StereoHeaderContext, encode_silk_frame};
 use crate::silk_encoder::{
-    elect_by_size, interval_rms, lbrr_interval_is_onset, lbrr_ratio_for_loss, AnalyzedFrame,
-    ChannelAnalyzer, DtxState, ACTIVITY_RMS, LBRR_ONSET_ONLY_MAX_LOSS_PERC, MID_ONLY_SIDE_RMS,
+    ACTIVITY_RMS, AnalyzedFrame, ChannelAnalyzer, DtxState, LBRR_ONSET_ONLY_MAX_LOSS_PERC,
+    MID_ONLY_SIDE_RMS, elect_by_size, interval_rms, lbrr_interval_is_onset, lbrr_ratio_for_loss,
 };
 use crate::silk_excitation::SilkFrameSize;
 use crate::silk_frame::{StereoPredictionWeights, StereoWeightSymbols};
 use crate::silk_header::{PerFrameLbrr, SilkChannelHeader, SilkHeaderBits};
 use crate::silk_stereo::{
-    estimate_stereo_weights, stereo_lr_to_ms, StereoDownmixState, StereoWeightsQ13,
+    StereoDownmixState, StereoWeightsQ13, estimate_stereo_weights, stereo_lr_to_ms,
 };
 use crate::toc::{Bandwidth, FrameCountCode, Mode, OpusTocByte};
-use crate::Error;
 
 /// §3.2 maximum Opus frame payload.
 const MAX_FRAME_BYTES: usize = 1275;
@@ -1043,7 +1043,7 @@ impl HybridEncoderStereo {
     fn decimate(&mut self, pcm: &[i16]) -> (Vec<f32>, Vec<f32>) {
         let mut l48 = Vec::with_capacity(self.n);
         let mut r48 = Vec::with_capacity(self.n);
-        for pair in pcm.chunks_exact(2) {
+        for pair in pcm.as_chunks::<2>().0 {
             l48.push(f64::from(pair[0]));
             r48.push(f64::from(pair[1]));
         }

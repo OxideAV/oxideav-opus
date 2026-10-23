@@ -201,7 +201,7 @@ pub fn mdct_window(overlap: usize) -> Result<Vec<f64>, MdctWindowError> {
     if overlap == 0 {
         return Err(MdctWindowError::ZeroLength);
     }
-    if overlap % 2 != 0 {
+    if !overlap.is_multiple_of(2) {
         return Err(MdctWindowError::OddOverlap { overlap });
     }
     let mut w = Vec::with_capacity(overlap);
@@ -401,12 +401,16 @@ mod tests {
 
     #[test]
     fn error_display_messages() {
-        assert!(MdctWindowError::PositionOutOfRange { n: 7, len: 4 }
-            .to_string()
-            .contains("position 7"));
+        assert!(
+            MdctWindowError::PositionOutOfRange { n: 7, len: 4 }
+                .to_string()
+                .contains("position 7")
+        );
         assert!(MdctWindowError::ZeroLength.to_string().contains("L >= 1"));
-        assert!(MdctWindowError::OddOverlap { overlap: 3 }
-            .to_string()
-            .contains("even"));
+        assert!(
+            MdctWindowError::OddOverlap { overlap: 3 }
+                .to_string()
+                .contains("even")
+        );
     }
 }

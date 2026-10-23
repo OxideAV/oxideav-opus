@@ -62,8 +62,8 @@
 //! All truth is taken from RFC 6716 §4.2.8 (and §4.2.7.1 for the weight
 //! decode).
 
-use crate::toc::Bandwidth;
 use crate::Error;
+use crate::toc::Bandwidth;
 
 /// Number of samples in the §4.2.8 interpolation phase (`n1`): 64 for
 /// NB, 96 for MB, 128 for WB. Roughly 8 ms at each SILK internal rate.
@@ -180,10 +180,10 @@ pub fn stereo_ms_to_lr(
     if n2 == 0 {
         return Err(Error::MalformedPacket);
     }
-    if let Some(s) = side {
-        if s.len() != n2 {
-            return Err(Error::MalformedPacket);
-        }
+    if let Some(s) = side
+        && s.len() != n2
+    {
+        return Err(Error::MalformedPacket);
     }
     // n1 is the interpolation-phase length; it must not exceed n2 (the
     // §4.2.8 `min(i - j, n1)` term clamps the ramp regardless, but a
@@ -579,10 +579,10 @@ pub fn stereo_ms_to_lr_i16(
     if n < interp_len || n < 2 {
         return Err(Error::MalformedPacket);
     }
-    if let Some(s) = side {
-        if s.len() != n {
-            return Err(Error::MalformedPacket);
-        }
+    if let Some(s) = side
+        && s.len() != n
+    {
+        return Err(Error::MalformedPacket);
     }
 
     // x1/x2 with the two-sample carried history at the front.
@@ -681,24 +681,28 @@ mod tests {
     #[test]
     fn rejects_empty_and_mismatched() {
         let mut s = StereoUnmixState::new();
-        assert!(stereo_ms_to_lr(
-            Bandwidth::Wb,
-            &[],
-            None,
-            StereoWeightsQ13::default(),
-            &mut s
-        )
-        .is_err());
+        assert!(
+            stereo_ms_to_lr(
+                Bandwidth::Wb,
+                &[],
+                None,
+                StereoWeightsQ13::default(),
+                &mut s
+            )
+            .is_err()
+        );
         let mid = vec![0.0f32; 80];
         let side = vec![0.0f32; 79];
-        assert!(stereo_ms_to_lr(
-            Bandwidth::Wb,
-            &mid,
-            Some(&side),
-            StereoWeightsQ13::default(),
-            &mut s
-        )
-        .is_err());
+        assert!(
+            stereo_ms_to_lr(
+                Bandwidth::Wb,
+                &mid,
+                Some(&side),
+                StereoWeightsQ13::default(),
+                &mut s
+            )
+            .is_err()
+        );
     }
 
     /// With zero weights and no side channel, the unmixer collapses to
@@ -1099,33 +1103,39 @@ mod tests {
     #[test]
     fn lr_to_ms_rejects_bad_input_and_resets() {
         let mut s = StereoDownmixState::new();
-        assert!(stereo_lr_to_ms(
-            Bandwidth::Wb,
-            &[],
-            &[],
-            StereoWeightsQ13::default(),
-            None,
-            &mut s
-        )
-        .is_err());
-        assert!(stereo_lr_to_ms(
-            Bandwidth::Wb,
-            &[0.0; 4],
-            &[0.0; 3],
-            StereoWeightsQ13::default(),
-            None,
-            &mut s
-        )
-        .is_err());
-        assert!(stereo_lr_to_ms(
-            Bandwidth::Swb,
-            &[0.0; 4],
-            &[0.0; 4],
-            StereoWeightsQ13::default(),
-            None,
-            &mut s
-        )
-        .is_err());
+        assert!(
+            stereo_lr_to_ms(
+                Bandwidth::Wb,
+                &[],
+                &[],
+                StereoWeightsQ13::default(),
+                None,
+                &mut s
+            )
+            .is_err()
+        );
+        assert!(
+            stereo_lr_to_ms(
+                Bandwidth::Wb,
+                &[0.0; 4],
+                &[0.0; 3],
+                StereoWeightsQ13::default(),
+                None,
+                &mut s
+            )
+            .is_err()
+        );
+        assert!(
+            stereo_lr_to_ms(
+                Bandwidth::Swb,
+                &[0.0; 4],
+                &[0.0; 4],
+                StereoWeightsQ13::default(),
+                None,
+                &mut s
+            )
+            .is_err()
+        );
         let _ = stereo_lr_to_ms(
             Bandwidth::Wb,
             &[0.1; 320],

@@ -31,9 +31,9 @@
 //! The §4.2.7.5.4 stabilization and §4.2.7.5.5 interpolation steps that
 //! run after this reconstruction are deferred to a later round.
 
-use crate::silk_lsf_stage2::{LsfStage2, D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB};
-use crate::toc::Bandwidth;
 use crate::Error;
+use crate::silk_lsf_stage2::{D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB, LsfStage2};
+use crate::toc::Bandwidth;
 
 // =====================================================================
 // Table 23 — NB/MB Normalized LSF Stage-1 Codebook Vectors.
@@ -399,7 +399,9 @@ mod tests {
     fn table24_row0_spot_check() {
         assert_eq!(
             WB_STAGE1_CB1_Q8[0],
-            [7, 23, 38, 54, 69, 85, 100, 116, 131, 147, 162, 178, 193, 208, 223, 239]
+            [
+                7, 23, 38, 54, 69, 85, 100, 116, 131, 147, 162, 178, 193, 208, 223, 239
+            ]
         );
     }
 
@@ -408,7 +410,9 @@ mod tests {
     fn table24_row31_spot_check() {
         assert_eq!(
             WB_STAGE1_CB1_Q8[31],
-            [15, 21, 35, 50, 61, 73, 86, 97, 110, 119, 129, 141, 175, 198, 218, 237]
+            [
+                15, 21, 35, 50, 61, 73, 86, 97, 110, 119, 129, 141, 175, 198, 218, 237
+            ]
         );
     }
 

@@ -46,7 +46,7 @@
 //! No external library source was consulted.
 
 use crate::celt_frame_decode::CeltPostFilterOut;
-use crate::celt_mdct_window::{celt_overlap_window, CELT_OVERLAP_48K};
+use crate::celt_mdct_window::{CELT_OVERLAP_48K, celt_overlap_window};
 use crate::celt_post_filter::POST_FILTER_TAPS;
 
 /// The §4.3.7.1 minimum comb-filter period.

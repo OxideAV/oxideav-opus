@@ -39,7 +39,7 @@
 //! §6, takes precedence over the prose). No external library source was
 //! consulted.
 
-use crate::celt_band_layout::{celt_band_bins_per_channel, CeltFrameSize, CELT_NUM_BANDS};
+use crate::celt_band_layout::{CELT_NUM_BANDS, CeltFrameSize, celt_band_bins_per_channel};
 use crate::celt_log2_frac_table::LOG2_FRAC_TABLE;
 use crate::celt_pulse_cache::{CACHE_BITS50, CACHE_INDEX50};
 use crate::celt_static_alloc::STATIC_ALLOC;
@@ -579,7 +579,7 @@ fn interp_bits2pulses(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::celt_cache_caps50::{cap_for_band_bits, CacheCapsStereo};
+    use crate::celt_cache_caps50::{CacheCapsStereo, cap_for_band_bits};
 
     fn caps_for(lm: u32, channels: u32) -> [i32; CELT_NUM_BANDS] {
         let stereo = if channels == 2 {

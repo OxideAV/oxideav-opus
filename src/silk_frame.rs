@@ -26,10 +26,10 @@
 //! the four structural decisions that everything downstream branches
 //! on.
 
+use crate::Error;
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
 use crate::toc::Bandwidth;
-use crate::Error;
 
 /// Decoded stereo prediction weights for one mid-channel SILK frame
 /// (RFC 6716 §4.2.7.1).
@@ -657,7 +657,7 @@ fn frame_type_to_signal_qoff(frame_type: u8) -> (SignalType, QuantizationOffsetT
         4 | 5 => SignalType::Voiced,
         _ => SignalType::Inactive, // unreachable in practice; defensive
     };
-    let qoff = if frame_type % 2 == 0 {
+    let qoff = if frame_type.is_multiple_of(2) {
         QuantizationOffsetType::Low
     } else {
         QuantizationOffsetType::High

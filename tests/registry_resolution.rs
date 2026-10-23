@@ -161,7 +161,9 @@ fn wav_pcm_payload(wav: &[u8]) -> Vec<i16> {
         if id == b"data" {
             let body = &wav[off + 8..off + 8 + len];
             return body
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
         }
@@ -219,7 +221,9 @@ fn registry_decode_fixture(stream: &[u8]) -> (Vec<i16>, usize) {
                     channels = ch;
                     pcm.extend(
                         f.data[0]
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|b| i16::from_le_bytes([b[0], b[1]])),
                     );
                 }
@@ -333,7 +337,7 @@ fn registry_resolved_encoder_roundtrips_through_resolved_decoder() {
         dec.send_packet(&packet).expect("decode");
         while let Ok(Frame::Audio(f)) = dec.receive_frame() {
             decoded += f.samples as usize;
-            for b in f.data[0].chunks_exact(2) {
+            for b in f.data[0].as_chunks::<2>().0 {
                 let v = f64::from(i16::from_le_bytes([b[0], b[1]]));
                 energy += v * v;
             }
@@ -355,7 +359,9 @@ fn registry_resolved_decoder_honours_a_reduced_sample_rate() {
     let stream = include_bytes!("fixtures/silk-nb-mono-16kbps.opus");
     let expected_full = {
         let raw = include_bytes!("fixtures/silk-nb-mono-16kbps.expected8000.pcm");
-        raw.chunks_exact(2)
+        raw.as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect::<Vec<i16>>()
     };
@@ -376,7 +382,9 @@ fn registry_resolved_decoder_honours_a_reduced_sample_rate() {
         while let Ok(Frame::Audio(f)) = dec.receive_frame() {
             pcm.extend(
                 f.data[0]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|b| i16::from_le_bytes([b[0], b[1]])),
             );
         }

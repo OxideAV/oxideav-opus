@@ -879,156 +879,157 @@ pub mod vbr;
 
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_alloc_search::{
+    AllocSearchError, AllocSearchOutcome, Q_FP_MAX, QFpComponents, STATIC_ALLOC_INTERP_RIGHT_SHIFT,
     per_band_eighth_bits_at_q_fp, q_fp_from_components, q_fp_to_components, search_q_fp,
-    total_eighth_bits_at_q_fp, AllocSearchError, AllocSearchOutcome, QFpComponents, Q_FP_MAX,
-    STATIC_ALLOC_INTERP_RIGHT_SHIFT,
+    total_eighth_bits_at_q_fp,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_alloc_trim::{
-    alloc_trim_icdf, alloc_trim_is_signalled, alloc_trim_pdf, decode_alloc_trim, frame_eighth_bits,
-    AllocTrimError, ALLOC_TRIM_DEFAULT, ALLOC_TRIM_FTB, ALLOC_TRIM_ICDF, ALLOC_TRIM_MAX,
-    ALLOC_TRIM_MIN, ALLOC_TRIM_PDF, ALLOC_TRIM_PDF_DENOMINATOR, ALLOC_TRIM_PDF_LEN,
-    ALLOC_TRIM_SIGNAL_COST_EIGHTH_BITS, EIGHTH_BITS_PER_BYTE,
+    ALLOC_TRIM_DEFAULT, ALLOC_TRIM_FTB, ALLOC_TRIM_ICDF, ALLOC_TRIM_MAX, ALLOC_TRIM_MIN,
+    ALLOC_TRIM_PDF, ALLOC_TRIM_PDF_DENOMINATOR, ALLOC_TRIM_PDF_LEN,
+    ALLOC_TRIM_SIGNAL_COST_EIGHTH_BITS, AllocTrimError, EIGHTH_BITS_PER_BYTE, alloc_trim_icdf,
+    alloc_trim_is_signalled, alloc_trim_pdf, decode_alloc_trim, frame_eighth_bits,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_band_boost::{
-    band_boost_quanta, decode_band_boosts, BandBoost, BandBoostError, BandBoostOutcome,
-    BAND_BOOST_QUANTA_CEIL_MULT, BAND_BOOST_QUANTA_FLOOR_EIGHTH_BITS, DYNALLOC_LOGP_INIT,
-    DYNALLOC_LOGP_MIN, DYNALLOC_LOOP_LOGP_AFTER_FIRST,
+    BAND_BOOST_QUANTA_CEIL_MULT, BAND_BOOST_QUANTA_FLOOR_EIGHTH_BITS, BandBoost, BandBoostError,
+    BandBoostOutcome, DYNALLOC_LOGP_INIT, DYNALLOC_LOGP_MIN, DYNALLOC_LOOP_LOGP_AFTER_FIRST,
+    band_boost_quanta, decode_band_boosts,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_band_layout::{
+    CELT_MAX_BINS_PER_BAND, CELT_NUM_BANDS, CeltFrameSize, HYBRID_FIRST_CODED_BAND,
     celt_band_at_hz, celt_band_bins_per_channel, celt_band_start_hz, celt_band_stop_hz,
-    celt_end_coded_band, celt_first_coded_band, celt_total_bins_per_channel, CeltFrameSize,
-    CELT_MAX_BINS_PER_BAND, CELT_NUM_BANDS, HYBRID_FIRST_CODED_BAND,
+    celt_end_coded_band, celt_first_coded_band, celt_total_bins_per_channel,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_band_thresh::{
+    BAND_THRESH_BINS_DIVISOR, BAND_THRESH_BINS_MULTIPLIER, BAND_THRESH_MONO_CHANNELS,
+    BAND_THRESH_PER_CHANNEL_EIGHTH_BITS, BAND_THRESH_STEREO_CHANNELS, BandThreshError,
     band_min_thresh, band_min_thresh_vec, compute_band_min_thresh, standard_band_window,
-    BandThreshError, BAND_THRESH_BINS_DIVISOR, BAND_THRESH_BINS_MULTIPLIER,
-    BAND_THRESH_MONO_CHANNELS, BAND_THRESH_PER_CHANNEL_EIGHTH_BITS, BAND_THRESH_STEREO_CHANNELS,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_cache_caps50::{
-    cache_caps_offset, cache_caps_row, cache_caps_value, cap_for_band_bits, init_caps,
-    CacheCaps50Error, CacheCapsStereo, CACHE_CAPS50, CACHE_CAPS50_LM_COUNT,
-    CACHE_CAPS50_STEREO_COUNT, CACHE_CAPS50_STEREO_MONO, CACHE_CAPS50_STEREO_STEREO,
-    CACHE_CAPS50_TOTAL_BYTES, INIT_CAPS_BIAS, INIT_CAPS_DIVISOR, INIT_CAPS_MAX_CHANNELS,
+    CACHE_CAPS50, CACHE_CAPS50_LM_COUNT, CACHE_CAPS50_STEREO_COUNT, CACHE_CAPS50_STEREO_MONO,
+    CACHE_CAPS50_STEREO_STEREO, CACHE_CAPS50_TOTAL_BYTES, CacheCaps50Error, CacheCapsStereo,
+    INIT_CAPS_BIAS, INIT_CAPS_DIVISOR, INIT_CAPS_MAX_CHANNELS, cache_caps_offset, cache_caps_row,
+    cache_caps_value, cap_for_band_bits, init_caps,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
-pub use celt_deemphasis::{DeemphasisError, DeemphasisFilter, DEEMPHASIS_ALPHA_P};
+pub use celt_deemphasis::{DEEMPHASIS_ALPHA_P, DeemphasisError, DeemphasisFilter};
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_denormalise::{
-    denormalise_band, denormalise_bands, denormalise_gain, DenormaliseError,
+    DenormaliseError, denormalise_band, denormalise_bands, denormalise_gain,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_e_prob_model::{
-    e_prob_pair, e_prob_row, energy_pred_coef, EProbModelError, EProbPair, EnergyPredCoef,
-    EnergyPredictionMode, E_PROB_MODEL, E_PROB_MODEL_BYTES_PER_BAND, E_PROB_MODEL_BYTES_PER_ROW,
-    E_PROB_MODEL_LM_COUNT, E_PROB_MODEL_MODE_COUNT, E_PROB_MODEL_MODE_INTER,
-    E_PROB_MODEL_MODE_INTRA, E_PROB_MODEL_TOTAL_BYTES, INTER_PRED_ALPHA_Q15, INTER_PRED_BETA_Q15,
-    INTRA_PRED_ALPHA_Q15, INTRA_PRED_BETA_Q15, Q15_ONE,
+    E_PROB_MODEL, E_PROB_MODEL_BYTES_PER_BAND, E_PROB_MODEL_BYTES_PER_ROW, E_PROB_MODEL_LM_COUNT,
+    E_PROB_MODEL_MODE_COUNT, E_PROB_MODEL_MODE_INTER, E_PROB_MODEL_MODE_INTRA,
+    E_PROB_MODEL_TOTAL_BYTES, EProbModelError, EProbPair, EnergyPredCoef, EnergyPredictionMode,
+    INTER_PRED_ALPHA_Q15, INTER_PRED_BETA_Q15, INTRA_PRED_ALPHA_Q15, INTRA_PRED_BETA_Q15, Q15_ONE,
+    e_prob_pair, e_prob_row, energy_pred_coef,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
-pub use celt_frame_prefix::{decode_celt_frame_prefix, CeltFramePrefix, CeltPostFilterParams};
+pub use celt_frame_prefix::{CeltFramePrefix, CeltPostFilterParams, decode_celt_frame_prefix};
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_header::{CeltHeaderPrefix, CeltPostFilter};
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_laplace::{
-    ec_laplace_decode, LAPLACE_DECAY_UNIT, LAPLACE_LOG_MINP, LAPLACE_MINP, LAPLACE_NMIN,
-    LAPLACE_TOTAL,
+    LAPLACE_DECAY_UNIT, LAPLACE_LOG_MINP, LAPLACE_MINP, LAPLACE_NMIN, LAPLACE_TOTAL,
+    ec_laplace_decode,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_log2_frac_table::{
-    log2_frac, log2_frac_row, Log2FracError, LOG2_FRAC_TABLE, LOG2_FRAC_TABLE_LEN,
-    Q3_BITS_PER_WHOLE_BIT,
+    LOG2_FRAC_TABLE, LOG2_FRAC_TABLE_LEN, Log2FracError, Q3_BITS_PER_WHOLE_BIT, log2_frac,
+    log2_frac_row,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_mdct_window::{
-    basic_window, celt_overlap_window, mdct_window, window_tap, MdctWindowError, BASIC_WINDOW_LEN,
-    CELT_OVERLAP_48K,
+    BASIC_WINDOW_LEN, CELT_OVERLAP_48K, MdctWindowError, basic_window, celt_overlap_window,
+    mdct_window, window_tap,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
-pub use celt_overlap_add::{apply_synthesis_window, OverlapAddError, WeightedOverlapAdd};
+pub use celt_overlap_add::{OverlapAddError, WeightedOverlapAdd, apply_synthesis_window};
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_pulse_cache::{
-    bits_to_pulses, cache_flat_index, cache_max_pulses, cache_pulse_cost, cache_run_offset,
-    PulseCacheError, CACHE_BITS50, CACHE_BITS_LEN, CACHE_INDEX50, CACHE_INDEX_LEN,
-    CACHE_INDEX_SENTINEL, CACHE_LM_COUNT, CACHE_MAX_PULSES,
+    CACHE_BITS_LEN, CACHE_BITS50, CACHE_INDEX_LEN, CACHE_INDEX_SENTINEL, CACHE_INDEX50,
+    CACHE_LM_COUNT, CACHE_MAX_PULSES, PulseCacheError, bits_to_pulses, cache_flat_index,
+    cache_max_pulses, cache_pulse_cost, cache_run_offset,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_pvq_decode::{
-    decode_pvq_shape, decode_pvq_shape_into, decode_pvq_vector, decode_pvq_vector_into,
-    pvq_l1_norm, pvq_l2_norm_squared, pvq_unit_normalize, PvqDecodeError, PvqShapeError,
-    PVQ_DECODE_K_MAX, PVQ_DECODE_N_MAX,
+    PVQ_DECODE_K_MAX, PVQ_DECODE_N_MAX, PvqDecodeError, PvqShapeError, decode_pvq_shape,
+    decode_pvq_shape_into, decode_pvq_vector, decode_pvq_vector_into, pvq_l1_norm,
+    pvq_l2_norm_squared, pvq_unit_normalize,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
-pub use celt_pvq_v::{pvq_codebook_size, PvqVError, PVQ_V_K_MAX, PVQ_V_MAX, PVQ_V_N_MAX};
+pub use celt_pvq_v::{PVQ_V_K_MAX, PVQ_V_MAX, PVQ_V_N_MAX, PvqVError, pvq_codebook_size};
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_redundancy::{
-    decode_redundancy, remaining_bits, whole_bytes_remaining, RedundancyDecision,
-    RedundancyPosition, HYBRID_REDUNDANCY_MIN_REMAINING_BITS,
-    HYBRID_REDUNDANCY_SIZE_BASELINE_BYTES, HYBRID_REDUNDANCY_SIZE_DEC_UINT_FT,
-    REDUNDANCY_FLAG_ICDF, REDUNDANCY_FLAG_ICDF_FTB, REDUNDANCY_MIN_SIZE_BYTES,
-    REDUNDANCY_POSITION_ICDF, REDUNDANCY_POSITION_ICDF_FTB,
-    SILK_ONLY_REDUNDANCY_MIN_REMAINING_BITS,
+    HYBRID_REDUNDANCY_MIN_REMAINING_BITS, HYBRID_REDUNDANCY_SIZE_BASELINE_BYTES,
+    HYBRID_REDUNDANCY_SIZE_DEC_UINT_FT, REDUNDANCY_FLAG_ICDF, REDUNDANCY_FLAG_ICDF_FTB,
+    REDUNDANCY_MIN_SIZE_BYTES, REDUNDANCY_POSITION_ICDF, REDUNDANCY_POSITION_ICDF_FTB,
+    RedundancyDecision, RedundancyPosition, SILK_ONLY_REDUNDANCY_MIN_REMAINING_BITS,
+    decode_redundancy, remaining_bits, whole_bytes_remaining,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_reservations::{
-    reserve_block, ReservationError, ReservationOutcome, ANTI_COLLAPSE_HEADROOM_LM_OFFSET,
-    ANTI_COLLAPSE_HEADROOM_MULT_EIGHTH_BITS, ANTI_COLLAPSE_LM_MIN_EXCLUSIVE,
-    CONSERVATIVE_DEDUCTION_EIGHTH_BITS, ONE_BIT_EIGHTH_BITS,
+    ANTI_COLLAPSE_HEADROOM_LM_OFFSET, ANTI_COLLAPSE_HEADROOM_MULT_EIGHTH_BITS,
+    ANTI_COLLAPSE_LM_MIN_EXCLUSIVE, CONSERVATIVE_DEDUCTION_EIGHTH_BITS, ONE_BIT_EIGHTH_BITS,
+    ReservationError, ReservationOutcome, reserve_block,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_spreading::{
-    apply_spreading, decode_spread, rotate_in_place, rotate_strided, rotation_angle, rotation_gain,
-    spread_f_r, spread_theta, spreading_stride, SpreadingError, SPREAD_FTB, SPREAD_F_R,
-    SPREAD_ICDF, SPREAD_MAX, SPREAD_PDF, SPREAD_PDF_DENOMINATOR, SPREAD_PRE_ROTATION_MIN_BLOCK_LEN,
-    SPREAD_VALUE_COUNT,
+    SPREAD_F_R, SPREAD_FTB, SPREAD_ICDF, SPREAD_MAX, SPREAD_PDF, SPREAD_PDF_DENOMINATOR,
+    SPREAD_PRE_ROTATION_MIN_BLOCK_LEN, SPREAD_VALUE_COUNT, SpreadingError, apply_spreading,
+    decode_spread, rotate_in_place, rotate_strided, rotation_angle, rotation_gain, spread_f_r,
+    spread_theta, spreading_stride,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_static_alloc::{
-    static_alloc_cell, static_alloc_eighth_bits, static_alloc_row, StaticAllocError, STATIC_ALLOC,
-    STATIC_ALLOC_INTERP_STEPS, STATIC_ALLOC_Q_COUNT, STATIC_ALLOC_Q_MAX, STATIC_ALLOC_Q_MIN,
-    STATIC_ALLOC_RIGHT_SHIFT, STATIC_ALLOC_TOTAL_CELLS,
+    STATIC_ALLOC, STATIC_ALLOC_INTERP_STEPS, STATIC_ALLOC_Q_COUNT, STATIC_ALLOC_Q_MAX,
+    STATIC_ALLOC_Q_MIN, STATIC_ALLOC_RIGHT_SHIFT, STATIC_ALLOC_TOTAL_CELLS, StaticAllocError,
+    static_alloc_cell, static_alloc_eighth_bits, static_alloc_row,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_tf_adjust::{
-    celt_tf_adjustment, celt_tf_select_can_affect, TfAdjustment, TfDirection,
-    TF_ADJUSTMENT_ABS_MAX, TF_ADJUSTMENT_MAX, TF_ADJ_NONTRANSIENT_SELECT0,
-    TF_ADJ_NONTRANSIENT_SELECT1, TF_ADJ_TRANSIENT_SELECT0, TF_ADJ_TRANSIENT_SELECT1,
+    TF_ADJ_NONTRANSIENT_SELECT0, TF_ADJ_NONTRANSIENT_SELECT1, TF_ADJ_TRANSIENT_SELECT0,
+    TF_ADJ_TRANSIENT_SELECT1, TF_ADJUSTMENT_ABS_MAX, TF_ADJUSTMENT_MAX, TfAdjustment, TfDirection,
+    celt_tf_adjustment, celt_tf_select_can_affect,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
-pub use celt_tf_decode::{decode_tf, TfDecode};
+pub use celt_tf_decode::{TfDecode, decode_tf};
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_transitions::{
-    classify_normative_transition, recommended_non_normative, BoundaryOp, NormativeTransition,
-    RecommendedNonNormativeTransition,
+    BoundaryOp, NormativeTransition, RecommendedNonNormativeTransition,
+    classify_normative_transition, recommended_non_normative,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use celt_trim_offsets::{
-    band_n_shortest, band_trim_offset, band_trim_offset_for_band, shortest_frame_size,
-    TrimOffsetError, TRIM_OFFSETS_BIAS, TRIM_OFFSETS_DIVISOR, TRIM_OFFSETS_MONO_CHANNELS,
+    TRIM_OFFSETS_BIAS, TRIM_OFFSETS_DIVISOR, TRIM_OFFSETS_MONO_CHANNELS,
     TRIM_OFFSETS_NUMERATOR_SCALE, TRIM_OFFSETS_STEREO_CHANNELS,
     TRIM_OFFSETS_WIDTH_ONE_BINS_PER_CHANNEL, TRIM_OFFSETS_WIDTH_ONE_PER_CHANNEL_EIGHTH_BITS,
+    TrimOffsetError, band_n_shortest, band_trim_offset, band_trim_offset_for_band,
+    shortest_frame_size,
 };
 pub use decoder::{
-    channel_count, output_samples_per_channel, DecodedAudio, FecDecodeStatus, FecRecovered,
-    FrameDecodeStatus, FrameOutcome, OpusDecoder, OUTPUT_SAMPLES_PER_MS, OUTPUT_SAMPLE_RATE_HZ,
+    DecodedAudio, FecDecodeStatus, FecRecovered, FrameDecodeStatus, FrameOutcome,
+    OUTPUT_SAMPLE_RATE_HZ, OUTPUT_SAMPLES_PER_MS, OpusDecoder, channel_count,
+    output_samples_per_channel,
 };
-pub use frames::{OpusPacket, MAX_FRAMES_PER_PACKET, MAX_FRAME_BYTES};
+pub use frames::{MAX_FRAME_BYTES, MAX_FRAMES_PER_PACKET, OpusPacket};
 pub use framing::{OperatingMode, OpusFrameRouting, SilkBandwidth};
-pub use framing_self_delim::{parse_self_delimited, SelfDelimitedParse};
+pub use framing_self_delim::{SelfDelimitedParse, parse_self_delimited};
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
-pub use mode_transition_reset::{decide_state_resets, CeltResetPlacement, StateReset};
+pub use mode_transition_reset::{CeltResetPlacement, StateReset, decide_state_resets};
 pub use multistream::{
-    assemble_multistream_packet, split_multistream_packet, MultistreamAudio, MultistreamDecoder,
-    StreamPacket,
+    MultistreamAudio, MultistreamDecoder, StreamPacket, assemble_multistream_packet,
+    split_multistream_packet,
 };
 pub use opus_encoder::{Application, OpusEncoder};
 pub use opus_head::{
-    apply_output_gain, ChannelMappingTable, OpusHead, OpusHeadError, PreSkip, OPUS_HEAD_MAGIC,
-    OPUS_HEAD_MAX_VERSION, OPUS_HEAD_MIN_LEN,
+    ChannelMappingTable, OPUS_HEAD_MAGIC, OPUS_HEAD_MAX_VERSION, OPUS_HEAD_MIN_LEN, OpusHead,
+    OpusHeadError, PreSkip, apply_output_gain,
 };
 pub use packet_compose::{
     compose_packet, compose_packet_code3, compose_plc_gap_packets, compose_self_delimited,
@@ -1036,8 +1037,8 @@ pub use packet_compose::{
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use plc::{
-    conceal_celt, conceal_silk, cross_lap, find_pitch, loss_gain, PlcFlavor, PlcState,
-    PITCH_MAX_LAG, PITCH_MIN_LAG, PLC_CROSS_LAP_SAMPLES, PLC_HISTORY_SAMPLES,
+    PITCH_MAX_LAG, PITCH_MIN_LAG, PLC_CROSS_LAP_SAMPLES, PLC_HISTORY_SAMPLES, PlcFlavor, PlcState,
+    conceal_celt, conceal_silk, cross_lap, find_pitch, loss_gain,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use range_decoder::RangeDecoder;
@@ -1045,21 +1046,21 @@ pub use range_decoder::RangeDecoder;
 pub use range_encoder::RangeEncoder;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use redundancy_decode_params::{
-    apply_mb_to_wb_override, redundant_frame_params, CrossLapPlacement, RedundantFrameParams,
-    REDUNDANT_CROSS_LAP_TENTHS_MS, REDUNDANT_FRAME_TENTHS_MS,
+    CrossLapPlacement, REDUNDANT_CROSS_LAP_TENTHS_MS, REDUNDANT_FRAME_TENTHS_MS,
+    RedundantFrameParams, apply_mb_to_wb_override, redundant_frame_params,
 };
 pub use registry::{
-    make_decoder, make_encoder, OpusEncoderOptions, OpusStreamDecoder, OpusStreamEncoder,
+    OpusEncoderOptions, OpusStreamDecoder, OpusStreamEncoder, make_decoder, make_encoder,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use signal_analysis::{SignalAnalyser, SignalClass, SignalFeatures, SignalVerdict};
 pub use silk_decode::{
-    decode_silk_frame, encode_silk_frame, SilkFrameConfig, SilkFrameDecoded, SilkFrameSymbols,
+    SilkFrameConfig, SilkFrameDecoded, SilkFrameSymbols, decode_silk_frame, encode_silk_frame,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_excitation::{
-    quantization_offset_q23, shell_block_count, Excitation, ExcitationConfig, ExcitationSymbols,
-    SilkFrameSize, MAX_EXCITATION_SAMPLES, MAX_SHELL_BLOCKS, SHELL_BLOCK_SAMPLES,
+    Excitation, ExcitationConfig, ExcitationSymbols, MAX_EXCITATION_SAMPLES, MAX_SHELL_BLOCKS,
+    SHELL_BLOCK_SAMPLES, SilkFrameSize, quantization_offset_q23, shell_block_count,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_frame::{
@@ -1068,64 +1069,64 @@ pub use silk_frame::{
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_gains::{
-    GainSymbol, SubframeGain, SubframeGains, SubframeGainsConfig, SILK_MAX_SUBFRAMES,
+    GainSymbol, SILK_MAX_SUBFRAMES, SubframeGain, SubframeGains, SubframeGainsConfig,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_header::{
-    per_frame_lbrr_pdf, silk_frame_count, PerFrameLbrr, SilkChannelHeader, SilkHeaderBits,
-    SILK_MAX_FRAMES_PER_CHANNEL,
+    PerFrameLbrr, SILK_MAX_FRAMES_PER_CHANNEL, SilkChannelHeader, SilkHeaderBits,
+    per_frame_lbrr_pdf, silk_frame_count,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_lcg_seed::{decode_lcg_seed, encode_lcg_seed};
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_log2lin::{
-    silk_gains_dequant, silk_log2lin, SILK_GAIN_Q16_MAX, SILK_GAIN_Q16_MIN, SILK_LOG_GAIN_BIAS,
-    SILK_LOG_GAIN_MULTIPLIER,
+    SILK_GAIN_Q16_MAX, SILK_GAIN_Q16_MIN, SILK_LOG_GAIN_BIAS, SILK_LOG_GAIN_MULTIPLIER,
+    silk_gains_dequant, silk_log2lin,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_lpc_synth::{
-    lpc_synthesis_frame, lpc_synthesis_subframe, subframe_samples, LpcSynthState,
-    LPC_SYNTH_MAX_ORDER, LPC_SYNTH_MAX_SUBFRAME_SAMPLES,
+    LPC_SYNTH_MAX_ORDER, LPC_SYNTH_MAX_SUBFRAME_SAMPLES, LpcSynthState, lpc_synthesis_frame,
+    lpc_synthesis_subframe, subframe_samples,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_lsf_interp::{LsfInterpContext, LsfInterpolated};
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
-pub use silk_lsf_recon::{cb1_q8, NlsfReconstructed};
+pub use silk_lsf_recon::{NlsfReconstructed, cb1_q8};
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_lsf_stabilize::NlsfStabilized;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_lsf_stage2::{
-    LsfStage2, D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB, QSTEP_NB_MB_Q16, QSTEP_WB_Q16,
+    D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB, LsfStage2, QSTEP_NB_MB_Q16, QSTEP_WB_Q16,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
-pub use silk_lsf_to_lpc::{nlsf_to_c_q17, ordering, LpcQ12, LpcQ17};
+pub use silk_lsf_to_lpc::{LpcQ12, LpcQ17, nlsf_to_c_q17, ordering};
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_ltp::{
-    LagCoding, LagSymbols, LtpConfig, LtpParameters, LtpSymbols, LTP_FILTER_TAPS,
-    LTP_MAX_SUBFRAMES, LTP_SCALING_DEFAULT_Q14,
+    LTP_FILTER_TAPS, LTP_MAX_SUBFRAMES, LTP_SCALING_DEFAULT_Q14, LagCoding, LagSymbols, LtpConfig,
+    LtpParameters, LtpSymbols,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_ltp_synth::{
-    ltp_synth_commit_subframe, ltp_synthesis_subframe, LtpSynthState, LtpSynthSubframe,
     LTP_LPC_HISTORY_MAX, LTP_MAX_PITCH_LAG, LTP_OUT_HISTORY_MAX, LTP_SCALE_FRESH_Q14,
+    LtpSynthState, LtpSynthSubframe, ltp_synth_commit_subframe, ltp_synthesis_subframe,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_packet_encode::{
+    StereoIntervalLbrr, StereoIntervalScripts, StereoLbrrPredictions, StereoPacketPredictions,
     encode_silk_only_packet_mono, encode_silk_only_packet_mono_with_lbrr,
-    encode_silk_only_packet_stereo, encode_silk_only_packet_stereo_with_lbrr, StereoIntervalLbrr,
-    StereoIntervalScripts, StereoLbrrPredictions, StereoPacketPredictions,
+    encode_silk_only_packet_stereo, encode_silk_only_packet_stereo_with_lbrr,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_resampler::{
+    REFERENCE_RATE_HZ, SILK_RESAMPLER_DELAY_MS_MB, SILK_RESAMPLER_DELAY_MS_NB,
+    SILK_RESAMPLER_DELAY_MS_WB, SUPPORTED_OUTPUT_RATES_HZ, SilkChannelPath, SilkUpsampler,
     is_supported_output_rate, silk_frame_samples_at_output, silk_frame_samples_internal,
     silk_internal_rate_hz, silk_resampler_delay_ms, silk_resampler_delay_samples_at,
-    SilkChannelPath, SilkUpsampler, REFERENCE_RATE_HZ, SILK_RESAMPLER_DELAY_MS_MB,
-    SILK_RESAMPLER_DELAY_MS_NB, SILK_RESAMPLER_DELAY_MS_WB, SUPPORTED_OUTPUT_RATES_HZ,
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_stereo::{
-    estimate_stereo_weights, interp_phase_samples, stereo_lr_to_ms, stereo_ms_to_lr, MidSideFrame,
-    StereoDownmixState, StereoFrame, StereoUnmixState, StereoWeightsQ13,
+    MidSideFrame, StereoDownmixState, StereoFrame, StereoUnmixState, StereoWeightsQ13,
+    estimate_stereo_weights, interp_phase_samples, stereo_lr_to_ms, stereo_ms_to_lr,
 };
 pub use toc::{Bandwidth, ChannelMapping, FrameCountCode, Mode, OpusTocByte};
 

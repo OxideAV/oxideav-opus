@@ -317,7 +317,7 @@ pub fn cap_for_band_bits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::celt_band_layout::{celt_band_bins_per_channel, CeltFrameSize};
+    use crate::celt_band_layout::{CeltFrameSize, celt_band_bins_per_channel};
 
     // ---- Table-shape invariants ----
 

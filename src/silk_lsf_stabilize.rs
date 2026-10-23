@@ -30,10 +30,10 @@
 //! entries — one per coefficient plus a trailing entry for the spacing
 //! against the implicit `32768` upper edge.
 
+use crate::Error;
 use crate::silk_lsf_recon::NlsfReconstructed;
 use crate::silk_lsf_stage2::{D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB};
 use crate::toc::Bandwidth;
-use crate::Error;
 
 /// The implicit upper edge `NLSF_Q15[d_LPC]` from §4.2.7.5.4.
 const NLSF_UPPER_Q15: i32 = 32768;

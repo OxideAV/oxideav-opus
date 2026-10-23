@@ -20,7 +20,7 @@
 //! `docs/audio/opus/rfc6716-opus.txt`, extracted and hash-verified per
 //! §A.1). No external library source was consulted.
 
-use crate::celt_pvq_v::{pvq_codebook_size, PvqVError};
+use crate::celt_pvq_v::{PvqVError, pvq_codebook_size};
 use crate::range_encoder::RangeEncoder;
 
 /// Errors returnable by [`encode_pvq_vector`].

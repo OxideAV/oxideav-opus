@@ -905,27 +905,37 @@ mod tests {
     /// Every error variant renders an informative `Display`.
     #[test]
     fn error_display() {
-        assert!(PostFilterError::TapsetOutOfRange { tapset: 9 }
+        assert!(
+            PostFilterError::TapsetOutOfRange { tapset: 9 }
+                .to_string()
+                .contains("tapset")
+        );
+        assert!(
+            PostFilterError::PeriodOutOfRange { period: 5 }
+                .to_string()
+                .contains("period")
+        );
+        assert!(
+            PostFilterError::GainIndexOutOfRange { gain_index: 9 }
+                .to_string()
+                .contains("gain")
+        );
+        assert!(
+            PostFilterError::OutputBufferTooSmall {
+                input_len: 4,
+                output_len: 1
+            }
             .to_string()
-            .contains("tapset"));
-        assert!(PostFilterError::PeriodOutOfRange { period: 5 }
+            .contains("need 4")
+        );
+        assert!(
+            PostFilterError::TransitionLengthMismatch {
+                expected: 16,
+                provided: 8
+            }
             .to_string()
-            .contains("period"));
-        assert!(PostFilterError::GainIndexOutOfRange { gain_index: 9 }
-            .to_string()
-            .contains("gain"));
-        assert!(PostFilterError::OutputBufferTooSmall {
-            input_len: 4,
-            output_len: 1
-        }
-        .to_string()
-        .contains("need 4"));
-        assert!(PostFilterError::TransitionLengthMismatch {
-            expected: 16,
-            provided: 8
-        }
-        .to_string()
-        .contains("expected 16"));
+            .contains("expected 16")
+        );
         let w = PostFilterError::Window(MdctWindowError::ZeroLength);
         assert!(w.to_string().contains("window"));
     }

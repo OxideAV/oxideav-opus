@@ -55,12 +55,12 @@
 //! `docs/audio/opus/rfc6716-opus.txt`). No external library source
 //! was consulted.
 
+use crate::Error;
 use crate::celt_frame_encode::CeltFrameEncodeInfo;
 use crate::celt_packet_encode::CeltEncoder;
 use crate::hybrid_packet_encode::{HybridEncoderMono, HybridEncoderStereo};
 use crate::silk_encoder::{SilkEncoderMono, SilkEncoderStereo};
 use crate::toc::Bandwidth;
-use crate::Error;
 
 /// §3.2.1 maximum Opus frame payload (\[R2\]).
 const MAX_FRAME_BYTES: usize = 1275;

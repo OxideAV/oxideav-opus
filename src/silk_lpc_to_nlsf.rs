@@ -40,8 +40,8 @@
 //! standard line-spectral-pair theory. No external library source is
 //! consulted.
 
-use crate::silk_lsf_stage2::{D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB};
 use crate::Error;
+use crate::silk_lsf_stage2::{D_LPC_MAX, D_LPC_NB_MB, D_LPC_WB};
 use core::f64::consts::PI;
 
 /// Number of initial grid cells used to bracket the roots of each

@@ -51,6 +51,7 @@
 //! (§4.2.6) reuses the same per-frame decode with the §4.2.7.1 / §4.2.7.2
 //! symbols enabled and is wired once the stereo unmixing back half lands.
 
+use crate::Error;
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
 use crate::silk_excitation::{Excitation, ExcitationConfig, ExcitationSymbols, SilkFrameSize};
@@ -67,7 +68,6 @@ use crate::silk_lsf_stage2::LsfStage2;
 use crate::silk_lsf_to_lpc::LpcQ12;
 use crate::silk_ltp::{LagCoding, LtpConfig, LtpParameters, LtpSymbols};
 use crate::toc::Bandwidth;
-use crate::Error;
 
 /// Configuration for one regular SILK frame decode, supplying the
 /// per-frame conditions that the §4.2 packet organisation determines
@@ -709,10 +709,10 @@ mod tests {
     #[test]
     fn whole_frame_encode_decode_roundtrip_random() {
         use crate::range_encoder::RangeEncoder;
-        use crate::silk_excitation::{shell_block_count, SHELL_BLOCK_SAMPLES};
+        use crate::silk_excitation::{SHELL_BLOCK_SAMPLES, shell_block_count};
         use crate::silk_frame::StereoWeightSymbols;
         use crate::silk_gains::GainSymbol;
-        use crate::silk_ltp::{LagSymbols, LtpSymbols, LTP_MAX_SUBFRAMES};
+        use crate::silk_ltp::{LTP_MAX_SUBFRAMES, LagSymbols, LtpSymbols};
 
         let mut rng = Lcg(0xF8A3_0382);
         let mut done = 0u32;

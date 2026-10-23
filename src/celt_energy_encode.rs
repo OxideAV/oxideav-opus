@@ -15,7 +15,7 @@
 //! was consulted.
 
 use crate::celt_band_layout::CELT_NUM_BANDS;
-use crate::celt_e_prob_model::{e_prob_pair, EnergyPredictionMode};
+use crate::celt_e_prob_model::{EnergyPredictionMode, e_prob_pair};
 use crate::celt_laplace::ec_laplace_encode;
 use crate::celt_rate_alloc::MAX_FINE_BITS;
 use crate::range_encoder::RangeEncoder;

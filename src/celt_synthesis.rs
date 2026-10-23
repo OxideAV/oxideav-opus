@@ -84,10 +84,10 @@
 //! external library source was consulted — the composition is exactly the
 //! pipeline the standards-track text lays out.
 
-use crate::celt_band_layout::{celt_first_coded_band, celt_total_bins_per_channel, CeltFrameSize};
+use crate::celt_band_layout::{CeltFrameSize, celt_first_coded_band, celt_total_bins_per_channel};
 use crate::celt_deemphasis::DeemphasisFilter;
-use crate::celt_denormalise::{denormalise_bands, DenormaliseError};
-use crate::celt_imdct::{imdct_into, ImdctError};
+use crate::celt_denormalise::{DenormaliseError, denormalise_bands};
+use crate::celt_imdct::{ImdctError, imdct_into};
 use crate::celt_mdct_window::CELT_OVERLAP_48K;
 use crate::celt_overlap_add::{OverlapAddError, WeightedOverlapAdd};
 

@@ -78,10 +78,10 @@
 //! Either way the multi-frame packet loop and the RFC 7845 §5.1 48 kHz
 //! sample-count accounting are exercised end-to-end.
 
+use crate::Error;
 use crate::frames::OpusPacket;
 use crate::framing::{OperatingMode, OpusFrameRouting};
 use crate::toc::ChannelMapping;
-use crate::Error;
 
 /// Default output sample rate of the Opus decoder, in Hz (RFC 7845
 /// §5.1's canonical rate; also the CELT layer's MDCT grid). A decoder
@@ -899,12 +899,11 @@ impl OpusDecoder {
                 if beginning {
                     red_pcm = self.decode_redundant_celt(red_bytes, &params, false);
                 }
-                if let Some(prev_end_redundancy) = self.hybrid_to_silk_flush.take() {
-                    if !(beginning && prev_end_redundancy) {
-                        if let Some(flush) = self.celt_overlap_flush(channels as usize) {
-                            add_into_head(&mut pcm[pcm_start..], &flush);
-                        }
-                    }
+                if let Some(prev_end_redundancy) = self.hybrid_to_silk_flush.take()
+                    && !(beginning && prev_end_redundancy)
+                    && let Some(flush) = self.celt_overlap_flush(channels as usize)
+                {
+                    add_into_head(&mut pcm[pcm_start..], &flush);
                 }
                 if !beginning {
                     red_pcm = self.decode_redundant_celt(red_bytes, &params, true);
@@ -922,10 +921,10 @@ impl OpusDecoder {
         }
         // No redundant frame in this SILK frame: the Hybrid→SILK seam
         // still flushes the CELT overlap (Figure 18 `H -> c + S`).
-        if self.hybrid_to_silk_flush.take().is_some() {
-            if let Some(flush) = self.celt_overlap_flush(channels as usize) {
-                add_into_head(&mut pcm[pcm_start..], &flush);
-            }
+        if self.hybrid_to_silk_flush.take().is_some()
+            && let Some(flush) = self.celt_overlap_flush(channels as usize)
+        {
+            add_into_head(&mut pcm[pcm_start..], &flush);
         }
         self.last_redundancy = redundancy;
 
@@ -944,11 +943,11 @@ impl OpusDecoder {
         rd: &mut crate::range_decoder::RangeDecoder<'_>,
         routing: &OpusFrameRouting,
     ) -> Result<(Vec<i16>, crate::toc::Bandwidth), Error> {
-        use crate::silk_decode::{decode_silk_frame, SilkFrameConfig, SilkFrameDecoded};
+        use crate::silk_decode::{SilkFrameConfig, SilkFrameDecoded, decode_silk_frame};
         use crate::silk_excitation::SilkFrameSize;
         use crate::silk_frame::FrameKind;
         use crate::silk_header::SilkHeaderBits;
-        use crate::silk_synthesis::{synthesize_silk_frame_i16, SilkSynthState};
+        use crate::silk_synthesis::{SilkSynthState, synthesize_silk_frame_i16};
 
         let bandwidth = routing
             .silk_bandwidth
@@ -1177,11 +1176,11 @@ impl OpusDecoder {
         rd: &mut crate::range_decoder::RangeDecoder<'_>,
         routing: &OpusFrameRouting,
     ) -> Result<(Vec<i16>, Vec<i16>, crate::toc::Bandwidth), Error> {
-        use crate::silk_decode::{decode_silk_frame, SilkFrameDecoded, StereoHeaderContext};
+        use crate::silk_decode::{SilkFrameDecoded, StereoHeaderContext, decode_silk_frame};
         use crate::silk_excitation::SilkFrameSize;
         use crate::silk_header::SilkHeaderBits;
-        use crate::silk_stereo::{stereo_ms_to_lr_i16, StereoUnmixStateI16, StereoWeightsQ13};
-        use crate::silk_synthesis::{synthesize_silk_frame_i16, SilkSynthState};
+        use crate::silk_stereo::{StereoUnmixStateI16, StereoWeightsQ13, stereo_ms_to_lr_i16};
+        use crate::silk_synthesis::{SilkSynthState, synthesize_silk_frame_i16};
 
         let bandwidth = routing
             .silk_bandwidth
@@ -1647,10 +1646,10 @@ impl OpusDecoder {
         routing: &OpusFrameRouting,
     ) -> Result<Option<(Vec<i16>, crate::toc::Bandwidth)>, Error> {
         use crate::range_decoder::RangeDecoder;
-        use crate::silk_decode::{decode_silk_frame, SilkFrameDecoded};
+        use crate::silk_decode::{SilkFrameDecoded, decode_silk_frame};
         use crate::silk_excitation::SilkFrameSize;
         use crate::silk_header::SilkHeaderBits;
-        use crate::silk_synthesis::{synthesize_silk_frame_i16, SilkSynthState};
+        use crate::silk_synthesis::{SilkSynthState, synthesize_silk_frame_i16};
 
         let bandwidth = routing
             .silk_bandwidth
@@ -1755,11 +1754,11 @@ impl OpusDecoder {
         routing: &OpusFrameRouting,
     ) -> Result<Option<(Vec<i16>, Vec<i16>, crate::toc::Bandwidth)>, Error> {
         use crate::range_decoder::RangeDecoder;
-        use crate::silk_decode::{decode_silk_frame, SilkFrameDecoded, StereoHeaderContext};
+        use crate::silk_decode::{SilkFrameDecoded, StereoHeaderContext, decode_silk_frame};
         use crate::silk_excitation::SilkFrameSize;
         use crate::silk_header::SilkHeaderBits;
-        use crate::silk_stereo::{stereo_ms_to_lr_i16, StereoUnmixStateI16, StereoWeightsQ13};
-        use crate::silk_synthesis::{synthesize_silk_frame_i16, SilkSynthState};
+        use crate::silk_stereo::{StereoUnmixStateI16, StereoWeightsQ13, stereo_ms_to_lr_i16};
+        use crate::silk_synthesis::{SilkSynthState, synthesize_silk_frame_i16};
 
         let bandwidth = routing
             .silk_bandwidth
@@ -2023,14 +2022,14 @@ impl OpusDecoder {
         // frame (CELT→Hybrid transition) decodes on the carried CELT
         // state, BEFORE the deferred main-layer reset.
         let mut red_pcm: Option<Vec<i16>> = None;
-        if let Some(params) = &red_params {
-            if matches!(
+        if let Some(params) = &red_params
+            && matches!(
                 params.position,
                 crate::celt_redundancy::RedundancyPosition::Beginning
-            ) {
-                let red_bytes = &frame[frame.len() - params.size_bytes..];
-                red_pcm = self.decode_redundant_celt(red_bytes, params, false);
-            }
+            )
+        {
+            let red_bytes = &frame[frame.len() - params.size_bytes..];
+            red_pcm = self.decode_redundant_celt(red_bytes, params, false);
         }
 
         // Deferred §4.5.2 reset for the main CELT layer (rule 2 /
@@ -2132,14 +2131,14 @@ impl OpusDecoder {
         // the main layer; its warmed state carries into the next
         // CELT-only frame (whose packet-boundary reset rule 3
         // suppresses).
-        if let Some(params) = &red_params {
-            if matches!(
+        if let Some(params) = &red_params
+            && matches!(
                 params.position,
                 crate::celt_redundancy::RedundancyPosition::End
-            ) {
-                let red_bytes = &frame[frame.len() - params.size_bytes..];
-                red_pcm = self.decode_redundant_celt(red_bytes, params, true);
-            }
+            )
+        {
+            let red_bytes = &frame[frame.len() - params.size_bytes..];
+            red_pcm = self.decode_redundant_celt(red_bytes, params, true);
         }
         if let (Some(params), Some(red)) = (&red_params, &red_pcm) {
             apply_redundancy_cross_lap(
@@ -2271,7 +2270,7 @@ fn apply_redundancy_cross_lap(
     position: crate::celt_redundancy::RedundancyPosition,
     downsample: usize,
 ) {
-    use crate::celt_mdct_window::{celt_overlap_window, CELT_OVERLAP_48K};
+    use crate::celt_mdct_window::{CELT_OVERLAP_48K, celt_overlap_window};
 
     // 2.5 ms at the output rate; the power-complementary window is
     // sampled on the 48 kHz grid at stride `downsample` (the
@@ -2334,7 +2333,7 @@ fn add_into_head(region: &mut [i16], add: &[i16]) {
 /// window (the Figure 19 `P & …` join); a 2.5 ms frame crossfades
 /// over its whole length instead.
 fn apply_transition_fill(region: &mut [i16], fill: &[i16], channels: usize, downsample: usize) {
-    use crate::celt_mdct_window::{celt_overlap_window, CELT_OVERLAP_48K};
+    use crate::celt_mdct_window::{CELT_OVERLAP_48K, celt_overlap_window};
     if channels == 0 {
         return;
     }
@@ -3236,7 +3235,7 @@ mod tests {
         // Direct exercise of the §4.3 frame decode: on a non-silent
         // body it must consume real bits and never report a tell past
         // the frame budget unless the coder latched an error.
-        use crate::celt_frame_decode::{decode_celt_frame, CeltEnergyState};
+        use crate::celt_frame_decode::{CeltEnergyState, decode_celt_frame};
         use crate::range_decoder::RangeDecoder;
 
         let body: [u8; 14] = [
@@ -3263,7 +3262,7 @@ mod tests {
     use crate::silk_frame::{SilkHeaderSymbols, StereoPredictionWeights, StereoWeightSymbols};
     use crate::silk_gains::GainSymbol;
     use crate::silk_packet_encode::{
-        encode_silk_only_packet_mono, encode_silk_only_packet_stereo, StereoIntervalScripts,
+        StereoIntervalScripts, encode_silk_only_packet_mono, encode_silk_only_packet_stereo,
     };
 
     /// Owned buffers for one scripted NB 20 ms unvoiced SILK frame (4
@@ -3469,7 +3468,9 @@ mod tests {
         let side_rms = |audio: &DecodedAudio| {
             let d: Vec<i16> = audio
                 .pcm
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|lr| ((lr[0] as i32 - lr[1] as i32) / 2) as i16)
                 .collect();
             rms(&d)

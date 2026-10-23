@@ -61,23 +61,23 @@
 //! transcribed from RFC 6716 §2.1, §4.5.1–§4.5.3 and §5
 //! (`docs/audio/opus/rfc6716-opus.txt`).
 
+use crate::Error;
 use crate::celt_frame_encode::CeltEncoderState;
 use crate::celt_packet_encode::{
-    encode_redundant_celt_frame, CeltEncoder, REDUNDANT_FRAME_MAX_BYTES, REDUNDANT_FRAME_MIN_BYTES,
-    REDUNDANT_FRAME_SAMPLES,
+    CeltEncoder, REDUNDANT_FRAME_MAX_BYTES, REDUNDANT_FRAME_MIN_BYTES, REDUNDANT_FRAME_SAMPLES,
+    encode_redundant_celt_frame,
 };
 use crate::celt_redundancy::{RedundancyDecision, RedundancyPosition};
 use crate::framing::OperatingMode;
 use crate::hybrid_packet_encode::{
     Decimator48, HybridEncoderMono, HybridEncoderStereo, RedundancyPlan,
 };
-use crate::mode_transition_reset::{decide_state_resets, CeltResetPlacement};
+use crate::mode_transition_reset::{CeltResetPlacement, decide_state_resets};
 use crate::packet_compose::{compose_packet, compose_packet_code3, pad_packet_to};
 use crate::signal_analysis::{SignalAnalyser, SignalClass, SignalVerdict};
 use crate::silk_encoder::{DtxState, SilkEncoderMono, SilkEncoderStereo};
 use crate::toc::{Bandwidth, FrameCountCode, Mode, OpusTocByte};
 use crate::vbr::VbrRateControl;
-use crate::Error;
 
 /// §3.2.1 maximum Opus frame payload.
 const MAX_FRAME_BYTES: usize = 1275;

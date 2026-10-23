@@ -38,12 +38,12 @@
 //! §4.2.7.6.2 (codebooks), §5.2.3.6 (search outline). No external
 //! library source is consulted.
 
+use crate::Error;
 use crate::silk_lpc_synth::subframe_samples;
 use crate::silk_ltp::{
-    lag_range, ltp_filter_codebook_len, ltp_filter_taps_q7, LTP_FILTER_TAPS, LTP_MAX_SUBFRAMES,
+    LTP_FILTER_TAPS, LTP_MAX_SUBFRAMES, lag_range, ltp_filter_codebook_len, ltp_filter_taps_q7,
 };
 use crate::toc::Bandwidth;
-use crate::Error;
 
 /// Result of the §5.2.3.6 LTP quantisation for one voiced SILK frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

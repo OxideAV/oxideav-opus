@@ -50,7 +50,7 @@ fn voice_silence_voice(voice_ms: usize, silence_ms: usize) -> (Vec<f32>, std::op
     let v = voice_ms * 16;
     let s = silence_ms * 16;
     let mut sig = voice(16_000, v);
-    sig.extend(std::iter::repeat(0.0f32).take(s));
+    sig.extend(std::iter::repeat_n(0.0f32, s));
     sig.extend(voice(16_000, v));
     let first_silent_packet = v.div_ceil(WB_20MS);
     let first_voice_again = (v + s) / WB_20MS;
@@ -61,7 +61,9 @@ fn encode_stream(sig: &[f32], dtx: bool, fec: bool) -> Vec<Vec<u8>> {
     let mut enc = SilkEncoderMono::new(Bandwidth::Wb).unwrap();
     enc.set_dtx(dtx);
     enc.set_fec(fec);
-    sig.chunks_exact(WB_20MS)
+    sig.as_chunks::<WB_20MS>()
+        .0
+        .iter()
         .map(|c| enc.encode_packet(c).unwrap().packet)
         .collect()
 }
@@ -310,7 +312,7 @@ fn voice_silence_voice_48k(
     let s = silence_ms * 48;
     let f: Vec<f32> = voice(48_000, v);
     let mut sig: Vec<i16> = f.iter().map(|&x| (x * 6000.0) as i16).collect();
-    sig.extend(std::iter::repeat(0i16).take(s));
+    sig.extend(std::iter::repeat_n(0i16, s));
     sig.extend(f.iter().map(|&x| (x * 6000.0) as i16));
     (sig, v.div_ceil(960)..(v + s) / 960)
 }
@@ -323,7 +325,9 @@ fn hybrid_mono_dtx_markers_cadence_and_roundtrip() {
     let mut enc = HybridEncoderMono::new(Bandwidth::Fb, 200).unwrap();
     enc.set_dtx(true);
     let packets: Vec<Vec<u8>> = sig
-        .chunks_exact(960)
+        .as_chunks::<960>()
+        .0
+        .iter()
         .map(|c| enc.encode_packet_elected(c, 80).unwrap())
         .collect();
 
@@ -373,7 +377,9 @@ fn hybrid_stereo_dtx_markers_and_roundtrip() {
     let mut enc = HybridEncoderStereo::new(Bandwidth::Fb, 200).unwrap();
     enc.set_dtx(true);
     let packets: Vec<Vec<u8>> = inter
-        .chunks_exact(1920)
+        .as_chunks::<1920>()
+        .0
+        .iter()
         .map(|c| enc.encode_packet_elected(c, 120).unwrap())
         .collect();
     let markers: Vec<usize> = (0..packets.len())
@@ -403,11 +409,15 @@ fn silk_vbr_dtx_collapses_the_silent_run() {
     on.set_dtx(true);
     let mut off = SilkVbrEncoderMono::new(Bandwidth::Wb, 200, 24_000, false).unwrap();
     let pk_on: Vec<Vec<u8>> = sig
-        .chunks_exact(WB_20MS)
+        .as_chunks::<WB_20MS>()
+        .0
+        .iter()
         .map(|c| on.encode_frame(c).unwrap())
         .collect();
     let pk_off: Vec<Vec<u8>> = sig
-        .chunks_exact(WB_20MS)
+        .as_chunks::<WB_20MS>()
+        .0
+        .iter()
         .map(|c| off.encode_frame(c).unwrap())
         .collect();
 
@@ -448,14 +458,16 @@ fn celt_vbr_dtx_suppresses_digital_silence() {
     let v = 24_000; // 0.5 s
     let s = 96_000; // 2 s digital silence
     let mut sig = tone(v);
-    sig.extend(std::iter::repeat(0i16).take(s));
+    sig.extend(std::iter::repeat_n(0i16, s));
     sig.extend(tone(v));
     let silent = v / 960..(v + s) / 960;
 
     let run = |dtx: bool| -> Vec<Vec<u8>> {
         let mut enc = CeltVbrEncoder::new(Bandwidth::Fb, 200, false, 64_000, false).unwrap();
         enc.set_dtx(dtx);
-        sig.chunks_exact(960)
+        sig.as_chunks::<960>()
+            .0
+            .iter()
             .map(|c| enc.encode_frame(c).unwrap().0)
             .collect()
     };
@@ -554,7 +566,7 @@ fn celt_dtx_gates_on_the_analyser_activity_floor() {
         let mut dec = OpusDecoder::new();
         let mut markers = 0usize;
         let mut sizes = Vec::new();
-        for frame in pcm.chunks_exact(960) {
+        for frame in pcm.as_chunks::<960>().0 {
             let p = enc.encode_frame(frame).unwrap();
             let out = dec.decode_packet(&p).unwrap();
             assert_eq!(out.samples_per_channel(), 960);

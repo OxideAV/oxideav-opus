@@ -31,11 +31,11 @@
 //! All truth is taken from RFC 6716 §4.2.7.5 / §5.2.3.5. No external
 //! library source is consulted.
 
-use crate::silk_lsf_recon::{cb1_q8, ihmw_w_q9_for, NlsfReconstructed};
-use crate::silk_lsf_stabilize::NlsfStabilized;
-use crate::silk_lsf_stage2::{LsfStage2, D_LPC_MAX};
-use crate::toc::Bandwidth;
 use crate::Error;
+use crate::silk_lsf_recon::{NlsfReconstructed, cb1_q8, ihmw_w_q9_for};
+use crate::silk_lsf_stabilize::NlsfStabilized;
+use crate::silk_lsf_stage2::{D_LPC_MAX, LsfStage2};
+use crate::toc::Bandwidth;
 
 /// Result of the §5.2.3.5 NLSF quantisation: the wire indices plus
 /// the exact decoder-side reconstruction they produce.

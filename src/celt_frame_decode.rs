@@ -47,11 +47,11 @@
 
 use crate::celt_band_decode::{anti_collapse, quant_all_bands_decode};
 use crate::celt_band_layout::CELT_NUM_BANDS;
-use crate::celt_cache_caps50::{cap_for_band_bits, CacheCapsStereo};
+use crate::celt_cache_caps50::{CacheCapsStereo, cap_for_band_bits};
 use crate::celt_coarse_energy::e_mean;
-use crate::celt_e_prob_model::{e_prob_pair, EnergyPredictionMode};
+use crate::celt_e_prob_model::{EnergyPredictionMode, e_prob_pair};
 use crate::celt_laplace::ec_laplace_decode;
-use crate::celt_rate_alloc::{band_width, compute_allocation_decode, BITRES, MAX_FINE_BITS};
+use crate::celt_rate_alloc::{BITRES, MAX_FINE_BITS, band_width, compute_allocation_decode};
 use crate::celt_tf_adjust::{
     TF_ADJ_NONTRANSIENT_SELECT0, TF_ADJ_NONTRANSIENT_SELECT1, TF_ADJ_TRANSIENT_SELECT0,
     TF_ADJ_TRANSIENT_SELECT1,

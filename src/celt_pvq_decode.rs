@@ -58,7 +58,7 @@
 //! was consulted; the five-step index-to-vector procedure is stated
 //! verbatim in the standards-track text.
 
-use crate::celt_pvq_v::{pvq_codebook_size, PvqVError, PVQ_V_K_MAX, PVQ_V_N_MAX};
+use crate::celt_pvq_v::{PVQ_V_K_MAX, PVQ_V_N_MAX, PvqVError, pvq_codebook_size};
 
 /// Errors returnable by [`decode_pvq_vector`] and [`decode_pvq_vector_into`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

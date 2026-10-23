@@ -207,11 +207,7 @@ pub const fn band_boost_quanta(n_bins: u32) -> u32 {
         BAND_BOOST_QUANTA_FLOOR_EIGHTH_BITS
     };
     let ceiling = BAND_BOOST_QUANTA_CEIL_MULT * n_bins;
-    if ceiling < floored {
-        ceiling
-    } else {
-        floored
-    }
+    if ceiling < floored { ceiling } else { floored }
 }
 
 /// §4.3.3 per-band boost-loop outcome (RFC 6716 §4.3.3, pp. 113–114).

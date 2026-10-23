@@ -253,11 +253,7 @@ pub fn remove_doubling(
             break;
         }
         let t1b = if k == 2 {
-            if t1 + t0 > maxperiod {
-                t0
-            } else {
-                t0 + t1
-            }
+            if t1 + t0 > maxperiod { t0 } else { t0 + t1 }
         } else {
             (2 * check * t0 + k) / (2 * k)
         };

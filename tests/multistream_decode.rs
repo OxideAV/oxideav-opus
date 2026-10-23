@@ -397,7 +397,9 @@ fn multistream_51_fixture_decodes_at_the_float_noise_floor() {
     // 44-byte canonical WAV header; s16le payload in Vorbis order.
     let payload = &FIXTURE_MS51_EXPECTED[44..];
     let want: Vec<i16> = payload
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
     assert_eq!(trimmed.len(), want.len());

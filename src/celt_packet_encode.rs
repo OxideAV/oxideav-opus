@@ -13,11 +13,11 @@
 //! (staged `docs/audio/opus/rfc6716-opus.txt`, hash-verified per
 //! §A.1). No external library source was consulted.
 
-use crate::celt_frame_encode::{encode_celt_frame, CeltEncoderState, CeltFrameEncodeInfo};
+use crate::Error;
+use crate::celt_frame_encode::{CeltEncoderState, CeltFrameEncodeInfo, encode_celt_frame};
 use crate::decoder::OpusDecoder;
 use crate::range_encoder::RangeEncoder;
 use crate::toc::{Bandwidth, FrameCountCode, Mode, OpusTocByte};
-use crate::Error;
 
 /// The §3.2 maximum Opus frame payload.
 const MAX_FRAME_BYTES: usize = 1275;

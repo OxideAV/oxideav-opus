@@ -56,11 +56,12 @@
 //! All truth is taken from RFC 6716 §4.2.7 / §4.2.8 / §5.2. No
 //! external library source is consulted.
 
+use crate::Error;
 use crate::celt_redundancy::RedundancyPosition;
 use crate::silk_decode::SilkFrameSymbols;
 use crate::silk_excitation::{ExcitationSymbols, SilkFrameSize};
 use crate::silk_excitation_quantize::{
-    quantize_excitation_frame, ExcitationQuantized, LtpFrameParams, PulseRateControl,
+    ExcitationQuantized, LtpFrameParams, PulseRateControl, quantize_excitation_frame,
 };
 use crate::silk_frame::{
     QuantizationOffsetType, SignalType, SilkHeaderSymbols, StereoPredictionWeights,
@@ -69,23 +70,22 @@ use crate::silk_frame::{
 use crate::silk_gains::{GainSymbol, SubframeGains, SubframeGainsConfig};
 use crate::silk_log2lin::silk_gains_dequant;
 use crate::silk_lpc_analysis::{bandwidth_expand, burg_lpc, lpc_residual};
-use crate::silk_lpc_synth::{subframe_samples, LpcSynthState};
+use crate::silk_lpc_synth::{LpcSynthState, subframe_samples};
 use crate::silk_lpc_to_nlsf::lpc_to_nlsf_q15;
 use crate::silk_lsf_stage2::{D_LPC_NB_MB, D_LPC_WB};
 use crate::silk_lsf_to_lpc::LpcQ17;
-use crate::silk_ltp::{contour_offsets, lag_range, LtpSymbols, LTP_MAX_SUBFRAMES};
+use crate::silk_ltp::{LTP_MAX_SUBFRAMES, LtpSymbols, contour_offsets, lag_range};
 use crate::silk_ltp_analysis::ltp_analysis;
 use crate::silk_ltp_synth::LtpSynthState;
 use crate::silk_nlsf_quantize::quantize_nlsf;
-use crate::silk_nsq_del_dec::{quantize_excitation_frame_del_dec, MAX_DEL_DEC_STATES};
+use crate::silk_nsq_del_dec::{MAX_DEL_DEC_STATES, quantize_excitation_frame_del_dec};
 use crate::silk_packet_encode::{
-    encode_silk_only_packet_mono_red, encode_silk_only_packet_stereo_red, StereoIntervalLbrr,
-    StereoIntervalScripts,
+    StereoIntervalLbrr, StereoIntervalScripts, encode_silk_only_packet_mono_red,
+    encode_silk_only_packet_stereo_red,
 };
 use crate::silk_pitch::{pitch_analysis, quantize_lag};
-use crate::silk_stereo::{stereo_lr_to_ms, StereoDownmixState, StereoWeightsQ13};
+use crate::silk_stereo::{StereoDownmixState, StereoWeightsQ13, stereo_lr_to_ms};
 use crate::toc::{Bandwidth, FrameCountCode, Mode, OpusTocByte};
-use crate::Error;
 
 /// Default target RMS of the excitation pulses (`e_raw`) the gain
 /// selection aims for — the bitrate/precision knob of this encoder
@@ -727,10 +727,8 @@ impl ChannelAnalyzer {
         // packet: delta-coded against the previous frame's last
         // subframe gain, exactly as the decoder's regular walk does.
         let first_subframe_is_independent = first_in_packet || self.prev_log_gain.is_none();
-        if first_subframe_is_independent {
-            if let Some(prev) = self.prev_log_gain {
-                desired[0] = desired[0].max(prev.saturating_sub(16));
-            }
+        if first_subframe_is_independent && let Some(prev) = self.prev_log_gain {
+            desired[0] = desired[0].max(prev.saturating_sub(16));
         }
         let gains_cfg = SubframeGainsConfig {
             signal_type,
@@ -1957,14 +1955,10 @@ where
             return Ok((cand, product));
         }
         let size = size_bytes as f64;
-        if size <= target
-            && best_under
-                .as_ref()
-                .map_or(true, |(_, _, b)| size_bytes > *b)
-        {
+        if size <= target && best_under.as_ref().is_none_or(|(_, _, b)| size_bytes > *b) {
             best_under = Some((cand.clone(), product.clone(), size_bytes));
         }
-        if smallest.as_ref().map_or(true, |(_, _, b)| size_bytes < *b) {
+        if smallest.as_ref().is_none_or(|(_, _, b)| size_bytes < *b) {
             smallest = Some((cand, product, size_bytes));
         }
         if size <= target && size >= ELECT_ACCEPT_FRACTION * target {
@@ -1987,11 +1981,7 @@ where
                 if pinned {
                     break;
                 }
-                if size > target {
-                    q2 * 0.5
-                } else {
-                    q2 * 2.0
-                }
+                if size > target { q2 * 0.5 } else { q2 * 2.0 }
             } else {
                 q2 + (target - s2) * (q2 - q1) / (s2 - s1)
             }
@@ -2199,7 +2189,11 @@ mod tests {
         for _pkt in 0..8 {
             let pcm: Vec<f32> = (0..flen)
                 .map(|_| {
-                    let pulse = if sample_idx % period == 0 { 1.0 } else { 0.0 };
+                    let pulse = if sample_idx.is_multiple_of(period) {
+                        1.0
+                    } else {
+                        0.0
+                    };
                     lp = 0.75 * lp + 0.25 * pulse;
                     sample_idx += 1;
                     (0.5 * lp) as f32
@@ -2260,7 +2254,7 @@ mod tests {
         assert_eq!(flen, 160); // 10 ms at 16 kHz, per channel
         let fs = 16_000.0f64;
 
-        let gen = |i: usize| -> (f32, f32) {
+        let r#gen = |i: usize| -> (f32, f32) {
             let t = i as f64 / fs;
             let s = (core::f64::consts::TAU * 500.0 * t).sin();
             ((0.35 * s) as f32, (0.15 * s) as f32)
@@ -2270,11 +2264,11 @@ mod tests {
             let mut left = Vec::with_capacity(flen);
             let mut right = Vec::with_capacity(flen);
             for i in 0..flen {
-                let (l, r) = gen(pkt_idx * flen + i);
+                let (l, r) = r#gen(pkt_idx * flen + i);
                 left.push(l);
                 right.push(r);
             }
-            let next = gen((pkt_idx + 1) * flen);
+            let next = r#gen((pkt_idx + 1) * flen);
             let out = enc.encode_packet(&left, &right, Some(next)).unwrap();
             let audio = dec.decode_packet(&out.packet).unwrap();
             assert_eq!(audio.channels, 2);
@@ -2335,7 +2329,11 @@ mod tests {
         for _pkt in 0..4 {
             let pcm: Vec<f32> = (0..flen)
                 .map(|_| {
-                    let pulse = if sample_idx % period == 0 { 1.0 } else { 0.0 };
+                    let pulse = if sample_idx.is_multiple_of(period) {
+                        1.0
+                    } else {
+                        0.0
+                    };
                     lp = 0.75 * lp + 0.25 * pulse;
                     sample_idx += 1;
                     (0.5 * lp) as f32
@@ -2453,7 +2451,7 @@ mod tests {
         let target = 80usize;
         let mut enc = SilkEncoderStereo::new(bw).unwrap();
         let flen = enc.frame_samples();
-        let gen = |i: usize| -> (f32, f32) {
+        let r#gen = |i: usize| -> (f32, f32) {
             let s = mixed_sig(i, 16_000.0);
             (s, 0.4 * s)
         };
@@ -2465,11 +2463,11 @@ mod tests {
             let mut left = Vec::with_capacity(flen);
             let mut right = Vec::with_capacity(flen);
             for i in 0..flen {
-                let (l, r) = gen(pkt_idx * flen + i);
+                let (l, r) = r#gen(pkt_idx * flen + i);
                 left.push(l);
                 right.push(r);
             }
-            let next = gen((pkt_idx + 1) * flen);
+            let next = r#gen((pkt_idx + 1) * flen);
             let out = enc
                 .encode_packet_elected(&left, &right, Some(next), target)
                 .unwrap();
@@ -2481,7 +2479,7 @@ mod tests {
             sizes.push(out.packet.len());
             let audio = dec.decode_packet(&out.packet).unwrap();
             assert_eq!(audio.channels, 2);
-            for pair in audio.pcm.chunks_exact(2) {
+            for pair in audio.pcm.as_chunks::<2>().0 {
                 l48.push(pair[0] as f64 / 32768.0);
                 r48.push(pair[1] as f64 / 32768.0);
             }
@@ -2588,7 +2586,7 @@ mod tests {
         let fs = 16_000.0f64;
         let f = 350.0f64;
 
-        let gen = |i: usize| -> (f32, f32) {
+        let r#gen = |i: usize| -> (f32, f32) {
             let t = i as f64 / fs;
             let s = (core::f64::consts::TAU * f * t).sin();
             ((0.4 * s) as f32, (0.2 * s) as f32)
@@ -2601,15 +2599,15 @@ mod tests {
             let mut left = Vec::with_capacity(flen);
             let mut right = Vec::with_capacity(flen);
             for i in 0..flen {
-                let (l, r) = gen(pkt_idx * flen + i);
+                let (l, r) = r#gen(pkt_idx * flen + i);
                 left.push(l);
                 right.push(r);
             }
-            let next = gen((pkt_idx + 1) * flen);
+            let next = r#gen((pkt_idx + 1) * flen);
             let out = enc.encode_packet(&left, &right, Some(next)).unwrap();
             let audio = dec.decode_packet(&out.packet).unwrap();
             assert_eq!(audio.channels, 2);
-            for ch in audio.pcm.chunks_exact(2) {
+            for ch in audio.pcm.as_chunks::<2>().0 {
                 l48.push(ch[0] as f64 / 32768.0);
                 r48.push(ch[1] as f64 / 32768.0);
             }
@@ -2707,7 +2705,7 @@ mod tests {
         let fs = 8_000.0f64;
         let f = 300.0f64;
 
-        let gen = |i: usize| -> (f32, f32) {
+        let r#gen = |i: usize| -> (f32, f32) {
             let t = i as f64 / fs;
             let s = (core::f64::consts::TAU * f * t).sin();
             ((0.4 * s) as f32, (0.2 * s) as f32)
@@ -2717,11 +2715,11 @@ mod tests {
             let mut left = Vec::with_capacity(flen);
             let mut right = Vec::with_capacity(flen);
             for i in 0..flen {
-                let (l, r) = gen(pkt_idx * flen + i);
+                let (l, r) = r#gen(pkt_idx * flen + i);
                 left.push(l);
                 right.push(r);
             }
-            let next = gen((pkt_idx + 1) * flen);
+            let next = r#gen((pkt_idx + 1) * flen);
             packets.push(enc.encode_packet(&left, &right, Some(next)).unwrap().packet);
         }
 
@@ -2813,7 +2811,7 @@ mod tests {
         let fs = 16_000.0f64;
         let f = 350.0f64;
 
-        let gen = |i: usize| -> (f32, f32) {
+        let r#gen = |i: usize| -> (f32, f32) {
             let t = i as f64 / fs;
             let s = (core::f64::consts::TAU * f * t).sin();
             ((0.4 * s) as f32, (0.2 * s) as f32)
@@ -2826,17 +2824,17 @@ mod tests {
             let mut left = Vec::with_capacity(flen);
             let mut right = Vec::with_capacity(flen);
             for i in 0..flen {
-                let (l, r) = gen(pkt_idx * flen + i);
+                let (l, r) = r#gen(pkt_idx * flen + i);
                 left.push(l);
                 right.push(r);
             }
-            let next = gen((pkt_idx + 1) * flen);
+            let next = r#gen((pkt_idx + 1) * flen);
             let out = enc.encode_packet(&left, &right, Some(next)).unwrap();
             let audio = dec.decode_packet(&out.packet).unwrap();
             assert_eq!(audio.channels, 2);
             // §3.1: 40 ms stereo = 1920 samples per channel at 48 kHz.
             assert_eq!(audio.pcm.len(), 2 * 1920);
-            for ch in audio.pcm.chunks_exact(2) {
+            for ch in audio.pcm.as_chunks::<2>().0 {
                 l48.push(ch[0] as f64 / 32768.0);
                 r48.push(ch[1] as f64 / 32768.0);
             }

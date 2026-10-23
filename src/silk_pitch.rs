@@ -30,10 +30,10 @@
 //! §5.2.3.2 (analysis outline). No external library source is
 //! consulted.
 
-use crate::silk_lpc_synth::subframe_samples;
-use crate::silk_ltp::{contour_codebook_len, contour_offsets, lag_range, LagSymbols};
-use crate::toc::Bandwidth;
 use crate::Error;
+use crate::silk_lpc_synth::subframe_samples;
+use crate::silk_ltp::{LagSymbols, contour_codebook_len, contour_offsets, lag_range};
+use crate::toc::Bandwidth;
 
 /// Voicing decision threshold on the biased normalized correlation
 /// (encoder freedom; §5.2.3.2's reference threshold adapts to speech
@@ -430,7 +430,7 @@ mod tests {
         while next < total {
             x[next] = 1.0;
             next += period;
-            if next % 3 == 0 && period < 84 {
+            if next.is_multiple_of(3) && period < 84 {
                 period += 1;
             }
         }

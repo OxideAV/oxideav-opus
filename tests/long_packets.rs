@@ -212,9 +212,11 @@ fn long_packet_transitions_place_redundancy() {
         }
     }
     // Leg 1 (12k): SILK NB 40 ms native single frames.
-    assert!(log[..15]
-        .iter()
-        .all(|l| l.0 == Mode::SilkOnly && l.1 == 400 && l.2 == 1));
+    assert!(
+        log[..15]
+            .iter()
+            .all(|l| l.0 == Mode::SilkOnly && l.1 == 400 && l.2 == 1)
+    );
     // The transition carrier (first packet of leg 2 is coded in the
     // old configuration) carries END redundancy; the rest of leg 2 is
     // CELT 2 × 20 ms.
@@ -230,17 +232,21 @@ fn long_packet_transitions_place_redundancy() {
         "SILK→CELT end redundancy: {:?}",
         log[15].3
     );
-    assert!(log[16..30]
-        .iter()
-        .all(|l| l.0 == Mode::CeltOnly && l.1 == 200 && l.2 == 2));
+    assert!(
+        log[16..30]
+            .iter()
+            .all(|l| l.0 == Mode::CeltOnly && l.1 == 200 && l.2 == 2)
+    );
     // CELT → Hybrid: the first Hybrid packet's first frame carries the
     // BEGINNING redundancy (the decoder reports the last frame it
     // decoded, so check the packet whose first frame carried it by
     // decoding it alone).
     assert_eq!(log[30].0, Mode::CeltOnly);
-    assert!(log[31..45]
-        .iter()
-        .all(|l| l.0 == Mode::Hybrid && l.1 == 200 && l.2 == 2));
+    assert!(
+        log[31..45]
+            .iter()
+            .all(|l| l.0 == Mode::Hybrid && l.1 == 200 && l.2 == 2)
+    );
     // Hybrid → SILK NB: end redundancy in the LAST Hybrid frame of the
     // carrier packet.
     assert_eq!(log[45].0, Mode::Hybrid);
@@ -255,9 +261,11 @@ fn long_packet_transitions_place_redundancy() {
         "Hybrid→SILK end redundancy: {:?}",
         log[45].3
     );
-    assert!(log[46..]
-        .iter()
-        .all(|l| l.0 == Mode::SilkOnly && l.1 == 400));
+    assert!(
+        log[46..]
+            .iter()
+            .all(|l| l.0 == Mode::SilkOnly && l.1 == 400)
+    );
 }
 
 /// The beginning-position redundancy of a CELT → Hybrid switch sits
@@ -269,7 +277,7 @@ fn long_packet_begin_redundancy_is_in_the_first_frame() {
     enc.set_signal_adaptive(false);
     enc.set_frame_tenths_ms(400).expect("40 ms");
     let mut packets = Vec::new();
-    for (i, frame) in input.chunks_exact(1920).enumerate() {
+    for (i, frame) in input.as_chunks::<1920>().0.iter().enumerate() {
         if i == 20 {
             enc.set_bitrate(28_000).expect("rate");
         }

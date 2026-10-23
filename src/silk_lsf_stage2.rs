@@ -34,10 +34,10 @@
 //! the IHMW weights, the §4.2.7.5.4 stabilization, and §4.2.7.5.5
 //! interpolation are deferred to round 7+.
 
+use crate::Error;
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
 use crate::toc::Bandwidth;
-use crate::Error;
 
 /// Order of the SILK LPC for NB and MB (Table 15 / 17 / 21 width).
 pub const D_LPC_NB_MB: usize = 10;

@@ -339,7 +339,7 @@ mod tests {
         let max_idx = ALLOC_TRIM_PDF
             .iter()
             .enumerate()
-            .max_by_key(|(_, &v)| v)
+            .max_by_key(|&(_, &v)| v)
             .map(|(k, _)| k)
             .expect("non-empty PDF");
         assert_eq!(max_idx, ALLOC_TRIM_DEFAULT as usize);

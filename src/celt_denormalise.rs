@@ -75,8 +75,8 @@
 //! operation is stated directly in the standards-track text.
 
 use crate::celt_band_layout::{
-    celt_band_bins_per_channel, celt_end_coded_band, celt_first_coded_band, CeltFrameSize,
-    CELT_NUM_BANDS,
+    CELT_NUM_BANDS, CeltFrameSize, celt_band_bins_per_channel, celt_end_coded_band,
+    celt_first_coded_band,
 };
 
 /// Errors returnable by the §4.3.6 denormalisation helpers.
@@ -273,7 +273,7 @@ pub fn denormalise_bands(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::celt_band_layout::{celt_total_bins_per_channel, CeltFrameSize};
+    use crate::celt_band_layout::{CeltFrameSize, celt_total_bins_per_channel};
 
     #[test]
     fn gain_is_sqrt_of_linear_energy() {
