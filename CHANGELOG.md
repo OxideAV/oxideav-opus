@@ -4,6 +4,12 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/OxideAV/oxideav-opus/compare/v0.0.15...v0.0.16) - 2026-11-07
+
+### Other
+
+- API hygiene: #[non_exhaustive] on growable enums + outcome / option records, constructors, hide encoder-internal modules
+
 ### Added
 
 - `new(..)` (every field, in declaration order) on `FrameOutcome`, `DecodedAudio`, `FecRecovered`, `OpusFrameRouting`, `SelfDelimitedParse`, `StreamPacket`, `MultistreamAudio`, `OpusHead` and `ChannelMappingTable`; `with_<field>` setters on `OpusEncoderOptions`.
