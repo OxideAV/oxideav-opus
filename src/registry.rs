@@ -318,6 +318,7 @@ pub fn make_decoder(
 /// [`CodecParameters::options`] and declared to the registry via
 /// [`oxideav_core::registry::CodecInfo::encoder_options`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct OpusEncoderOptions {
     /// §2.1 application profile steering the automatic mode /
     /// bandwidth decision: `"voip"`, `"audio"` (default), or
@@ -360,6 +361,99 @@ pub struct OpusEncoderOptions {
     /// music, tones and mixed content at equal rate and to leave
     /// speech streams identical; see `tests/signal_adaptive_election.rs`).
     pub signal_adaptive: bool,
+}
+
+impl OpusEncoderOptions {
+    /// Set `application`.
+    #[must_use]
+    pub fn with_application(mut self, application: String) -> Self {
+        self.application = application;
+        self
+    }
+
+    /// Set `mode`.
+    #[must_use]
+    pub fn with_mode(mut self, mode: String) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Set `bandwidth`.
+    #[must_use]
+    pub fn with_bandwidth(mut self, bandwidth: String) -> Self {
+        self.bandwidth = bandwidth;
+        self
+    }
+
+    /// Set `frame_ms`.
+    #[must_use]
+    pub fn with_frame_ms(mut self, frame_ms: f32) -> Self {
+        self.frame_ms = frame_ms;
+        self
+    }
+
+    /// Set `cbr`.
+    #[must_use]
+    pub fn with_cbr(mut self, cbr: bool) -> Self {
+        self.cbr = cbr;
+        self
+    }
+
+    /// Set `constrained_vbr`.
+    #[must_use]
+    pub fn with_constrained_vbr(mut self, constrained_vbr: bool) -> Self {
+        self.constrained_vbr = constrained_vbr;
+        self
+    }
+
+    /// Set `dtx`.
+    #[must_use]
+    pub fn with_dtx(mut self, dtx: bool) -> Self {
+        self.dtx = dtx;
+        self
+    }
+
+    /// Set `fec`.
+    #[must_use]
+    pub fn with_fec(mut self, fec: bool) -> Self {
+        self.fec = fec;
+        self
+    }
+
+    /// Set `packet_loss`.
+    #[must_use]
+    pub fn with_packet_loss(mut self, packet_loss: u32) -> Self {
+        self.packet_loss = packet_loss;
+        self
+    }
+
+    /// Set `redundancy`.
+    #[must_use]
+    pub fn with_redundancy(mut self, redundancy: bool) -> Self {
+        self.redundancy = redundancy;
+        self
+    }
+
+    /// Set `tapset_election`.
+    #[must_use]
+    pub fn with_tapset_election(mut self, tapset_election: bool) -> Self {
+        self.tapset_election = tapset_election;
+        self
+    }
+
+    /// Set `complexity`.
+    #[must_use]
+    pub fn with_complexity(mut self, complexity: Option<u32>) -> Self {
+        self.complexity = complexity;
+        self
+    }
+
+    /// Set `signal_adaptive`.
+    #[must_use]
+    pub fn with_signal_adaptive(mut self, signal_adaptive: bool) -> Self {
+        self.signal_adaptive = signal_adaptive;
+        self
+    }
 }
 
 impl Default for OpusEncoderOptions {

@@ -112,6 +112,7 @@ pub fn output_samples_per_channel(frame_size_tenths_ms: u16) -> usize {
 /// silence because the layer's range-coded decode is not wired yet" or
 /// "emitted silence for a DTX / lost frame".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameDecodeStatus {
     /// A §3.2.1 zero-length frame: DTX or a lost/packet-loss marker.
     /// Per RFC 7845 §4.1 such a frame explicitly requests packet-loss
@@ -180,6 +181,7 @@ pub enum FrameDecodeStatus {
 /// The result of decoding one Opus frame: how many per-channel samples
 /// it contributed and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FrameOutcome {
     /// Per-channel 48 kHz sample count this frame contributed.
     pub samples_per_channel: usize,
@@ -187,9 +189,20 @@ pub struct FrameOutcome {
     pub status: FrameDecodeStatus,
 }
 
+impl FrameOutcome {
+    /// Build `FrameOutcome` from every field, in declaration order.
+    pub fn new(samples_per_channel: usize, status: FrameDecodeStatus) -> Self {
+        Self {
+            samples_per_channel,
+            status,
+        }
+    }
+}
+
 /// Decoded audio for one Opus packet: interleaved 48 kHz PCM plus the
 /// per-frame outcomes.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DecodedAudio {
     /// Interleaved signed 16-bit PCM at [`Self::sample_rate_hz`]. For
     /// stereo the layout is `[L0, R0, L1, R1, …]`; for mono it is
@@ -203,6 +216,23 @@ pub struct DecodedAudio {
     /// Per-Opus-frame outcomes, in packet order. `outcomes.len()` equals
     /// the packet's §3.2 frame count.
     pub frame_outcomes: Vec<FrameOutcome>,
+}
+
+impl DecodedAudio {
+    /// Build `DecodedAudio` from every field, in declaration order.
+    pub fn new(
+        pcm: Vec<i16>,
+        channels: u8,
+        sample_rate_hz: u32,
+        frame_outcomes: Vec<FrameOutcome>,
+    ) -> Self {
+        Self {
+            pcm,
+            channels,
+            sample_rate_hz,
+            frame_outcomes,
+        }
+    }
 }
 
 impl DecodedAudio {
@@ -223,6 +253,7 @@ impl DecodedAudio {
 /// successfully received packet (`decode_packet_fec`), rather than
 /// emitting pure silence / running pitch-based concealment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FecDecodeStatus {
     /// The packet carried §4.2.5 LBRR frame(s) for the lost prior frame,
     /// and they were decoded in Table-5 order and synthesized through the
@@ -246,6 +277,7 @@ pub enum FecDecodeStatus {
 /// The result of an in-band FEC recovery for one lost packet
 /// ([`OpusDecoder::decode_packet_fec`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct FecRecovered {
     /// Interleaved signed 16-bit PCM at [`Self::sample_rate_hz`], same
     /// layout as [`DecodedAudio::pcm`]. Length is
@@ -258,6 +290,18 @@ pub struct FecRecovered {
     pub sample_rate_hz: u32,
     /// Why the samples were produced (real recovery vs silence and why).
     pub status: FecDecodeStatus,
+}
+
+impl FecRecovered {
+    /// Build `FecRecovered` from every field, in declaration order.
+    pub fn new(pcm: Vec<i16>, channels: u8, sample_rate_hz: u32, status: FecDecodeStatus) -> Self {
+        Self {
+            pcm,
+            channels,
+            sample_rate_hz,
+            status,
+        }
+    }
 }
 
 /// Stateful Opus packet → PCM decoder.

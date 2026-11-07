@@ -111,6 +111,7 @@ impl SilkBandwidth {
 /// in one place (and one set of tests) instead of duplicated across
 /// every caller that constructs a SILK or CELT context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OpusFrameRouting {
     /// §3.1 Table 2 mode (SILK / Hybrid / CELT-only).
     pub operating_mode: OperatingMode,
@@ -140,6 +141,32 @@ pub struct OpusFrameRouting {
     ///
     /// [`silk_layer`]: Self::silk_layer
     pub silk_frames_per_channel: Option<u8>,
+}
+
+impl OpusFrameRouting {
+    /// Build `OpusFrameRouting` from every field, in declaration order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        operating_mode: OperatingMode,
+        toc_bandwidth: Bandwidth,
+        frame_size_tenths_ms: u16,
+        channels: ChannelMapping,
+        silk_layer: bool,
+        celt_layer: bool,
+        silk_bandwidth: Option<SilkBandwidth>,
+        silk_frames_per_channel: Option<u8>,
+    ) -> Self {
+        Self {
+            operating_mode,
+            toc_bandwidth,
+            frame_size_tenths_ms,
+            channels,
+            silk_layer,
+            celt_layer,
+            silk_bandwidth,
+            silk_frames_per_channel,
+        }
+    }
 }
 
 impl OpusFrameRouting {

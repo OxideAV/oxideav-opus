@@ -35,6 +35,7 @@ use crate::opus_head::{ChannelMappingTable, OpusHead};
 
 /// One stream's raw Opus packet bytes within a multistream packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StreamPacket<'a> {
     /// The complete Opus packet bytes for this stream. For the first
     /// `N − 1` streams these are the bytes the self-delimited parser
@@ -49,6 +50,16 @@ pub struct StreamPacket<'a> {
     /// self-delimited framing (the first `N − 1` streams); `false` for
     /// the final stream, which uses the regular §3 framing.
     pub self_delimited: bool,
+}
+
+impl<'a> StreamPacket<'a> {
+    /// Build `StreamPacket` from every field, in declaration order.
+    pub fn new(bytes: &'a [u8], self_delimited: bool) -> Self {
+        Self {
+            bytes,
+            self_delimited,
+        }
+    }
 }
 
 /// Split a multistream Opus packet into its `N` per-stream packets.
@@ -350,6 +361,7 @@ impl MultistreamDecoder {
 /// Decoded audio for one multistream Ogg packet: `C`-channel interleaved
 /// 48 kHz PCM.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MultistreamAudio {
     /// Interleaved signed 16-bit PCM at 48 kHz, `C` channels. Length is
     /// `samples_per_channel * channels`.
@@ -361,6 +373,23 @@ pub struct MultistreamAudio {
     pub sample_rate_hz: u32,
     /// Per-channel 48 kHz sample count.
     pub samples_per_channel: usize,
+}
+
+impl MultistreamAudio {
+    /// Build `MultistreamAudio` from every field, in declaration order.
+    pub fn new(
+        pcm: Vec<i16>,
+        channels: u8,
+        sample_rate_hz: u32,
+        samples_per_channel: usize,
+    ) -> Self {
+        Self {
+            pcm,
+            channels,
+            sample_rate_hz,
+            samples_per_channel,
+        }
+    }
 }
 
 #[cfg(test)]

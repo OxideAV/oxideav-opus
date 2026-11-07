@@ -4,6 +4,15 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- `new(..)` (every field, in declaration order) on `FrameOutcome`, `DecodedAudio`, `FecRecovered`, `OpusFrameRouting`, `SelfDelimitedParse`, `StreamPacket`, `MultistreamAudio`, `OpusHead` and `ChannelMappingTable`; `with_<field>` setters on `OpusEncoderOptions`.
+
+### Changed
+
+- `#[non_exhaustive]` on the growable enums `Error`, `FrameDecodeStatus`, `FecDecodeStatus`, `Application` and `OpusHeadError`, and on the records `FrameOutcome`, `DecodedAudio`, `FecRecovered`, `OpusFrameRouting`, `SelfDelimitedParse`, `StreamPacket`, `MultistreamAudio`, `OpusEncoderOptions`. The RFC 6716 TOC enums `Mode`, `Bandwidth`, `ChannelMapping`, `FrameCountCode`, `OperatingMode`, `SilkBandwidth` and the `OpusTocByte` record stay exhaustive: the one-byte TOC fixes them. `OpusHead` / `ChannelMappingTable` stay exhaustive for now because a sibling test builds them with struct literals; they gain `new(..)` to migrate to.
+- `#[doc(hidden)]` on the `input_upsampler` and `signal_analysis` modules and on the root re-export of the SILK frame codec (`SilkFrameConfig`, `SilkFrameDecoded`, `SilkFrameSymbols`, `decode_silk_frame`, `encode_silk_frame`) — encoder / decoder plumbing, like the other already-hidden SILK / CELT stage modules.
+
 ## [0.0.15](https://github.com/OxideAV/oxideav-opus/compare/v0.0.14...v0.0.15) - 2026-10-23
 
 ### Other

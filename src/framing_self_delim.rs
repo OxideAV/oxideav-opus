@@ -67,12 +67,20 @@ use crate::toc::{FrameCountCode, OpusTocByte};
 /// demuxer advances by exactly that count to reach the next stream's
 /// TOC byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SelfDelimitedParse<'a> {
     /// Parsed Opus packet — `packet.frames()` are slices into the
     /// original input buffer.
     pub packet: OpusPacket<'a>,
     /// Number of bytes consumed from the start of the input buffer.
     pub consumed: usize,
+}
+
+impl<'a> SelfDelimitedParse<'a> {
+    /// Build `SelfDelimitedParse` from every field, in declaration order.
+    pub fn new(packet: OpusPacket<'a>, consumed: usize) -> Self {
+        Self { packet, consumed }
+    }
 }
 
 /// Parse one self-delimited Opus packet (RFC 6716 Appendix B) from

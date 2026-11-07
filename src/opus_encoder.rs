@@ -122,6 +122,7 @@ const fn stereo_decim_taps(ratio: usize) -> usize {
 /// documented freedom — RFC 6716 §2.1 leaves the policy to the
 /// implementation and §2.1.1 pins the sweet spots).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Application {
     /// Speech-leaning: SILK-only up to wideband speech rates, Hybrid
     /// through the §2.1.1 "28-40 kbit/s FB speech" band, CELT above.

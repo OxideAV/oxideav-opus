@@ -56,6 +56,7 @@ pub const OPUS_HEAD_MAX_VERSION: u8 = 15;
 
 /// Errors that can arise parsing an `OpusHead` identification header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OpusHeadError {
     /// The packet is shorter than the smallest valid header.
     TooShort {
@@ -192,6 +193,17 @@ pub struct ChannelMappingTable {
 }
 
 impl ChannelMappingTable {
+    /// Build `ChannelMappingTable` from every field, in declaration order.
+    pub fn new(stream_count: u8, coupled_count: u8, mapping: Vec<u8>) -> Self {
+        Self {
+            stream_count,
+            coupled_count,
+            mapping,
+        }
+    }
+}
+
+impl ChannelMappingTable {
     /// Total decoded channel count `M + N` (RFC 7845 §5.1.1 item 2).
     /// This is the number of distinct decoder channels the streams
     /// produce before the [`Self::mapping`] selects output channels.
@@ -226,6 +238,29 @@ pub struct OpusHead {
     /// The resolved §5.1.1 channel-mapping table (synthesized for
     /// family 0, parsed for families ≥ 1).
     pub mapping: ChannelMappingTable,
+}
+
+impl OpusHead {
+    /// Build `OpusHead` from every field, in declaration order.
+    pub fn new(
+        version: u8,
+        channel_count: u8,
+        pre_skip: u16,
+        input_sample_rate: u32,
+        output_gain_q7_8: i16,
+        mapping_family: u8,
+        mapping: ChannelMappingTable,
+    ) -> Self {
+        Self {
+            version,
+            channel_count,
+            pre_skip,
+            input_sample_rate,
+            output_gain_q7_8,
+            mapping_family,
+            mapping,
+        }
+    }
 }
 
 impl OpusHead {

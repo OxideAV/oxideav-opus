@@ -656,6 +656,7 @@ use oxideav_core::RuntimeContext;
 
 /// Crate-local error type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The caller passed a zero-length packet. RFC 6716 §3.1 requires
     /// every well-formed Opus packet to contain at least one byte (R1).
@@ -800,6 +801,7 @@ pub mod framing;
 pub mod framing_self_delim;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod hybrid_packet_encode;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod input_upsampler;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod mode_transition_reset;
@@ -816,6 +818,7 @@ pub mod range_encoder;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod redundancy_decode_params;
 pub mod registry;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod signal_analysis;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod silk_decode;
@@ -1054,6 +1057,7 @@ pub use registry::{
 };
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use signal_analysis::{SignalAnalyser, SignalClass, SignalFeatures, SignalVerdict};
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub use silk_decode::{
     SilkFrameConfig, SilkFrameDecoded, SilkFrameSymbols, decode_silk_frame, encode_silk_frame,
 };
