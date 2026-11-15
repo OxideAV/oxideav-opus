@@ -1,11 +1,9 @@
 //! # oxideav-opus
 //!
-//! **Status:** orphan-rebuild scaffold (post 2026-05-20 audit).
-//!
-//! The prior implementation was retired under the workspace clean-room
-//! policy. The crate is being re-implemented from scratch against
-//! RFC 6716 + RFC 8251 + RFC 7587 + RFC 7845 using only material under
-//! `docs/` and black-box validator binaries (`opusdec` / `opusenc`).
+//! Opus decoder and encoder (SILK, CELT and Hybrid modes), written
+//! from RFC 6716 + RFC 8251 + RFC 7587 + RFC 7845 using only material
+//! under `docs/` and black-box validator binaries (`opusdec` /
+//! `opusenc`).
 //!
 //! ## Current surface
 //!
@@ -684,10 +682,7 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-opus: packet violates an RFC 6716 §3.2 frame-packing requirement"
             ),
-            Error::NotImplemented => write!(
-                f,
-                "oxideav-opus: orphan-rebuild scaffold — SILK/CELT pipeline not wired up yet"
-            ),
+            Error::NotImplemented => write!(f, "oxideav-opus: this operation is not implemented"),
         }
     }
 }

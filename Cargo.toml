@@ -6,7 +6,7 @@ rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-opus"
 authors = ["Mark Karpeles"]
-description = "Opus audio codec — orphan-rebuild scaffold pending clean-room re-implementation."
+description = "Pure-Rust Opus audio codec (SILK + CELT + Hybrid) decoder and encoder for the oxideav framework."
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-opus"

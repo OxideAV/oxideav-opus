@@ -7,10 +7,13 @@ Pure-Rust Opus audio codec (SILK + CELT) for the
 
 ## Status
 
-**Clean-room rebuild in progress (orphan scaffold).** The prior
-implementation was retired under the workspace clean-room policy; the
-crate is being re-implemented from scratch against the published RFCs
-using only material under `docs/` and black-box validator binaries.
+**Working decoder and encoder.** SILK, CELT and Hybrid packets decode
+to PCM and the encoder writes all three modes; the crate is written
+from the published RFCs using only material under `docs/` and
+black-box validator binaries. The conformance and quality tables
+further down give the measured state; the official RFC 6716 test
+vectors are not staged yet, so the conformance table runs on a
+self-built corpus.
 
 A top-level `OpusDecoder::decode_packet` packet → PCM orchestration is
 now in place: it parses the §3.1 TOC, splits the §3.2 frame packing
