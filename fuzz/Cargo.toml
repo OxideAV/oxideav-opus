@@ -89,3 +89,10 @@ path = "fuzz_targets/silk_elected_roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "unified_encode_roundtrip"
+path = "fuzz_targets/unified_encode_roundtrip.rs"
+test = false
+doc = false
+bench = false

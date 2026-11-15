@@ -39,8 +39,27 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let chunk = body.len().div_ceil(n);
-    for part in body.chunks(chunk.max(1)) {
-        let _ = dec.decode_packet(part);
+    for (i, part) in body.chunks(chunk.max(1)).enumerate() {
+        match dec.decode_packet(part) {
+            Ok(audio) => {
+                // The fixed-channel re-layout and the §6 final range
+                // must hold for whatever was decoded.
+                let per_channel = audio.samples_per_channel();
+                let target = 1 + ((data[0] >> 6) & 1);
+                let laid = audio.into_channels(target);
+                assert_eq!(laid.channels, target);
+                assert_eq!(laid.pcm.len(), per_channel * target as usize);
+                let _ = dec.final_range();
+            }
+            // A rejected packet is treated as lost every other time,
+            // so §4.4 concealment interleaves with hostile decodes.
+            Err(_) if i % 2 == 1 => {
+                let concealed = dec.conceal_loss();
+                assert_eq!(dec.final_range(), 0);
+                assert!(concealed.pcm.len() <= 2 * 5760);
+            }
+            Err(_) => {}
+        }
     }
     // Also exercise the Appendix-B self-delimited entry on the whole
     // body with the same (already warmed-up) state.
