@@ -688,8 +688,8 @@ mod tests {
         let cap = caps_for(0, 1);
         let offsets = [0i32; CELT_NUM_BANDS];
         let alloc = compute_allocation_decode(&mut rd, 0, 21, &offsets, &cap, 5, 8, 1, 0);
-        for j in 0..21 {
-            assert!(alloc.pulses[j] <= 8, "band {j} got {}", alloc.pulses[j]);
+        for (j, &pulses) in alloc.pulses.iter().enumerate().take(21) {
+            assert!(pulses <= 8, "band {j} got {pulses}");
         }
     }
 

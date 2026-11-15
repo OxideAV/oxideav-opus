@@ -294,12 +294,8 @@ mod tests {
         let pa = pitch_analysis(bw, &x, lag_max as usize, 4).unwrap();
         assert!(pa.voiced, "corr = {}", pa.correlation);
         assert!(pa.correlation > 0.9);
-        for s in 0..4 {
-            assert!(
-                (pa.subframe_lags[s] - 80).abs() <= 2,
-                "subframe {s}: {}",
-                pa.subframe_lags[s]
-            );
+        for (s, &lag) in pa.subframe_lags.iter().enumerate().take(4) {
+            assert!((lag - 80).abs() <= 2, "subframe {s}: {lag}");
         }
     }
 

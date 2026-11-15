@@ -202,12 +202,12 @@ mod tests {
         // chosen taps vs no LTP at all.
         let mut e_none = 0.0f64;
         let mut e_ltp = 0.0f64;
-        for s in 0..4 {
+        for (s, taps) in q.taps_q7.iter().enumerate().take(4) {
             let base = frame_start + s * n;
             for i in 0..n {
                 let mut pred = 0.0f64;
-                for k in 0..LTP_FILTER_TAPS {
-                    pred += q.taps_q7[s][k] as f64 / 128.0 * r[base + i + 2 - 80 - k];
+                for (k, &tap) in taps.iter().enumerate().take(LTP_FILTER_TAPS) {
+                    pred += tap as f64 / 128.0 * r[base + i + 2 - 80 - k];
                 }
                 e_none += r[base + i] * r[base + i];
                 e_ltp += (r[base + i] - pred) * (r[base + i] - pred);
@@ -302,9 +302,11 @@ mod tests {
         let q = ltp_analysis(bw, &r, frame_start, 4, &lags).unwrap();
         assert!(q.periodicity_index <= 2);
         let cb_len = ltp_filter_codebook_len(q.periodicity_index).unwrap();
-        for s in 0..4 {
-            assert!((q.filter_indices[s] as usize) < cb_len);
-        }
+        assert!(
+            q.filter_indices[..4]
+                .iter()
+                .all(|&index| (index as usize) < cb_len)
+        );
     }
 
     #[test]

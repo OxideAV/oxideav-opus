@@ -367,10 +367,10 @@ pub fn decode_celt_frame(
         if alloc.fine_bits[i] <= 0 {
             continue;
         }
-        for ch in 0..c {
+        for row in state.old_band_e.iter_mut().take(c) {
             let q2 = rd.dec_bits(alloc.fine_bits[i] as u32) as f64;
             let offset = (q2 + 0.5) / f64::from(1u32 << alloc.fine_bits[i]) - 0.5;
-            state.old_band_e[ch][i] += offset;
+            row[i] += offset;
         }
     }
 
@@ -411,10 +411,10 @@ pub fn decode_celt_frame(
             let mut i = start;
             while i < end && bits_left >= c as i32 {
                 if alloc.fine_bits[i] < MAX_FINE_BITS && alloc.fine_priority[i] == prio {
-                    for ch in 0..c {
+                    for row in state.old_band_e.iter_mut().take(c) {
                         let q2 = rd.dec_bits(1) as f64;
                         let offset = (q2 - 0.5) / f64::from(1u32 << (alloc.fine_bits[i] + 1));
-                        state.old_band_e[ch][i] += offset;
+                        row[i] += offset;
                         bits_left -= 1;
                     }
                 }
@@ -488,7 +488,12 @@ fn unquant_coarse_energy(
     let mut prev = [0.0f64; 2];
 
     for i in start..end {
-        for (ch, prev_c) in prev.iter_mut().enumerate().take(channels) {
+        for (row, prev_c) in state
+            .old_band_e
+            .iter_mut()
+            .zip(prev.iter_mut())
+            .take(channels)
+        {
             let tell = rd.tell();
             let qi: i32 = if budget.saturating_sub(tell) >= 15 {
                 let pair = e_prob_pair(lm as u32, mode, i.min(20) as u32)
@@ -503,8 +508,8 @@ fn unquant_coarse_energy(
                 -1
             };
             let q = f64::from(qi);
-            let old = state.old_band_e[ch][i].max(-9.0);
-            state.old_band_e[ch][i] = coef * old + *prev_c + q;
+            let old = row[i].max(-9.0);
+            row[i] = coef * old + *prev_c + q;
             *prev_c += q - beta * q;
         }
     }
@@ -569,10 +574,8 @@ fn finish_energy_state(
     transient: bool,
 ) {
     if silence {
-        for ch in 0..channels {
-            for i in 0..CELT_NUM_BANDS {
-                state.old_band_e[ch][i] = ENERGY_FLOOR;
-            }
+        for row in state.old_band_e.iter_mut().take(channels) {
+            row.fill(ENERGY_FLOOR);
         }
     }
     if channels == 1 {
@@ -644,8 +647,8 @@ mod tests {
         let mut st = CeltEnergyState::new();
         let out = decode_celt_frame(&mut rd, buf.len(), 0, 21, 3, 1, &mut st);
         if !out.silence {
-            for i in 0..21 {
-                assert!(out.band_gain[0][i] > 0.0, "band {i} gain");
+            for (i, gain) in out.band_gain[0].iter().enumerate().take(21) {
+                assert!(*gain > 0.0, "band {i} gain");
             }
             // The rng carries the final range state.
             assert_ne!(st.rng, 0);
@@ -667,9 +670,7 @@ mod tests {
         if !out2.silence {
             let edge17 = 2 * crate::celt_rate_alloc::band_edge(17) as usize;
             assert!(out2.x[..edge17].iter().all(|&v| v == 0.0));
-            for i in 0..17 {
-                assert_eq!(out2.band_gain[0][i], 0.0);
-            }
+            assert!(out2.band_gain[0][..17].iter().all(|&g| g == 0.0));
         }
     }
 

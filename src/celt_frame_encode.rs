@@ -227,10 +227,8 @@ pub fn encode_celt_frame(
         );
         state.prefilter_gain = 0.0;
         state.prefilter_tapset = 0;
-        for ch in 0..2 {
-            for i in 0..CELT_NUM_BANDS {
-                state.old_band_e[ch][i] = ENERGY_FLOOR;
-            }
+        for row in state.old_band_e.iter_mut() {
+            row.fill(ENERGY_FLOOR);
         }
         state.consec_transient = 0;
         state.force_intra = false;
@@ -614,10 +612,9 @@ pub fn encode_celt_frame(
     if channels == 1 {
         state.old_band_e[1] = state.old_band_e[0];
     }
-    for ch in 0..2 {
-        for i in (0..start).chain(end..CELT_NUM_BANDS) {
-            state.old_band_e[ch][i] = 0.0;
-        }
+    for row in state.old_band_e.iter_mut() {
+        row[..start].fill(0.0);
+        row[end..].fill(0.0);
     }
     state.consec_transient = if transient {
         state.consec_transient + 1
