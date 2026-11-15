@@ -79,10 +79,7 @@ use crate::silk_ltp_analysis::ltp_analysis;
 use crate::silk_ltp_synth::LtpSynthState;
 use crate::silk_nlsf_quantize::quantize_nlsf;
 use crate::silk_nsq_del_dec::{MAX_DEL_DEC_STATES, quantize_excitation_frame_del_dec};
-use crate::silk_packet_encode::{
-    StereoIntervalLbrr, StereoIntervalScripts, encode_silk_only_packet_mono_red,
-    encode_silk_only_packet_stereo_red,
-};
+use crate::silk_packet_encode::{StereoIntervalLbrr, StereoIntervalScripts};
 use crate::silk_pitch::{pitch_analysis, quantize_lag};
 use crate::silk_stereo::{StereoDownmixState, StereoWeightsQ13, stereo_lr_to_ms};
 use crate::toc::{Bandwidth, FrameCountCode, Mode, OpusTocByte};
@@ -1015,6 +1012,10 @@ pub struct SilkEncoderMono {
     /// §4.5.1.2 transition side-information arming for the NEXT
     /// packet (see [`Self::set_redundancy_position`]).
     pending_red_pos: Option<RedundancyPosition>,
+    /// Range-coder `rng` at the end of the most recent packet (zero
+    /// for a DTX marker) — the encoder half of the §6 final-range
+    /// check.
+    last_final_rng: u32,
 }
 
 impl SilkEncoderMono {
@@ -1044,6 +1045,7 @@ impl SilkEncoderMono {
             lbrr_prev_rms: 0.0,
             dtx: DtxState::default(),
             pending_red_pos: None,
+            last_final_rng: 0,
         })
     }
 
@@ -1067,6 +1069,12 @@ impl SilkEncoderMono {
     }
 
     /// Drop any pending §4.2.5 LBRR material (configuration switch).
+    /// Range-coder `rng` at the end of the most recent packet
+    /// (RFC 6716 §6 "final range"; zero before any packet).
+    pub(crate) fn last_final_rng(&self) -> u32 {
+        self.last_final_rng
+    }
+
     pub(crate) fn drop_pending_fec(&mut self) {
         self.pending_fec = None;
     }
@@ -1271,13 +1279,15 @@ impl SilkEncoderMono {
             .iter()
             .map(|o| o.as_ref().map(AnalyzedFrame::symbols))
             .collect();
-        let (packet, _, _) = encode_silk_only_packet_mono_red(
-            bandwidth,
-            self.packet_tenths_ms,
-            &symbols,
-            &lbrr_symbols,
-            red_pos,
-        )?;
+        let (packet, _, _, final_rng) =
+            crate::silk_packet_encode::encode_silk_only_packet_mono_red_rng(
+                bandwidth,
+                self.packet_tenths_ms,
+                &symbols,
+                &lbrr_symbols,
+                red_pos,
+            )?;
+        self.last_final_rng = final_rng;
         let mut reconstructed = Vec::with_capacity(pcm.len());
         let mut voiced = false;
         for f in &frames {
@@ -1391,6 +1401,9 @@ pub struct SilkEncoderStereo {
     /// §4.5.1.2 transition side-information arming (see
     /// [`SilkEncoderMono::set_redundancy_position`]).
     pending_red_pos: Option<RedundancyPosition>,
+    /// Range-coder `rng` at the end of the most recent packet (zero
+    /// for a DTX marker).
+    last_final_rng: u32,
 }
 
 impl SilkEncoderStereo {
@@ -1425,6 +1438,7 @@ impl SilkEncoderStereo {
             lbrr_prev_rms: 0.0,
             dtx: DtxState::default(),
             pending_red_pos: None,
+            last_final_rng: 0,
         })
     }
 
@@ -1453,6 +1467,12 @@ impl SilkEncoderStereo {
     }
 
     /// Drop any pending §4.2.5 LBRR material (configuration switch).
+    /// Range-coder `rng` at the end of the most recent packet
+    /// (RFC 6716 §6 "final range"; zero before any packet).
+    pub(crate) fn last_final_rng(&self) -> u32 {
+        self.last_final_rng
+    }
+
     pub(crate) fn drop_pending_fec(&mut self) {
         self.pending_fec = None;
     }
@@ -1806,13 +1826,15 @@ impl SilkEncoderStereo {
                 side: s.as_ref().map(AnalyzedFrame::symbols),
             })
             .collect();
-        let (packet, _, _) = encode_silk_only_packet_stereo_red(
-            self.bandwidth,
-            self.packet_tenths_ms,
-            &intervals,
-            &lbrr,
-            red_pos,
-        )?;
+        let (packet, _, _, final_rng) =
+            crate::silk_packet_encode::encode_silk_only_packet_stereo_red_rng(
+                self.bandwidth,
+                self.packet_tenths_ms,
+                &intervals,
+                &lbrr,
+                red_pos,
+            )?;
+        self.last_final_rng = final_rng;
 
         let mut reconstructed = Vec::with_capacity(total_len);
         let mut voiced = false;

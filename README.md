@@ -229,6 +229,17 @@ starts the side channel fresh. The first stereo packets after such a
 switch decoded 4–50 dB off the reference; they are now bit-exact (SILK)
 / at the float floor (Hybrid), as is the reverse switch.
 
+The encoder side of the same check: `OpusEncoder::final_range()`
+reports the value for each packet written, and
+`tests/encoder_final_range.rs` holds the decoder to it on every packet
+of 88 forced configurations (SILK NB/MB/WB × 10–60 ms, Hybrid SWB/FB ×
+10–60 ms, CELT NB/WB/SWB/FB × 2.5–60 ms, mono and stereo), of the VBR /
+constrained VBR / CBR / FEC / DTX variants of each mode, and of mode /
+bandwidth ladders with and without §4.5.1 redundancy plus an automatic
+bitrate sweep (4118 packets). The same captures decode through the
+reference listing's demo decoder — which performs the comparison itself
+— without a single range mismatch (124 captures).
+
 The official `testvector01..12` set named in §6.1 is not part of the
 staged documents, so its pass table cannot be reported here.
 

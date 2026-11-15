@@ -415,9 +415,11 @@ pub fn encode_redundant_celt_frame(
     }
     let end_band = celt_end_band(carrier_bandwidth);
     let n_before = state.frame_len();
+    let main_rng = state.frame_rng();
     state.set_geometry(channels, REDUNDANT_FRAME_SAMPLES);
     let mut enc = RangeEncoder::new();
     let _info = encode_celt_frame(state, &mut enc, pcm, bytes, 0, end_band, 1);
+    state.file_redundant_rng(main_rng);
     state.set_geometry(channels, n_before);
     enc.finish_fixed(bytes).ok_or(Error::MalformedPacket)
 }

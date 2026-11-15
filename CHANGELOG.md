@@ -7,6 +7,7 @@ All notable changes to `oxideav-opus` are recorded here.
 ### Added
 
 - `OpusDecoder::final_range()` — the RFC 6716 §6 final range decoder state of the last decoded Opus frame (redundant CELT frame XORed in; zero for DTX / lost / one-byte frames).
+- `OpusEncoder::final_range()` — the encoder-side §6 final range coder state of the last packet written, verified packet-by-packet against the decoder in `tests/encoder_final_range.rs` (every mode × bandwidth × duration × channel count, VBR / constrained VBR / CBR, FEC, DTX, and the §4.5 switches with their redundant frames).
 - `DecodedAudio::into_channels(1 | 2)` — re-lay a decoded packet onto a fixed output channel count whatever the packet's stereo flag.
 - `tests/conformance_vectors.rs`: the §6 decoder conformance gates (final range on every packet, the Appendix A.4 quality measure at 8 / 12 / 16 / 24 / 48 kHz × mono / stereo) over a 12-vector reference-encoder corpus.
 

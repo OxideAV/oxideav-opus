@@ -271,6 +271,8 @@ pub struct OpusEncoder {
     hybrid_silk_share: f64,
     /// The analyser found the current packet inactive (CELT DTX gate).
     celt_inactive: bool,
+    /// §6 final range of the most recently encoded packet.
+    final_range: u32,
 }
 
 impl OpusEncoder {
@@ -314,6 +316,7 @@ impl OpusEncoder {
             signal_switches: 0,
             hybrid_silk_share: crate::hybrid_packet_encode::HYBRID_SILK_SHARE,
             celt_inactive: false,
+            final_range: 0,
         })
     }
 
@@ -748,6 +751,18 @@ impl OpusEncoder {
         bytes.clamp(MIN_PACKET_BYTES, 1 + MAX_FRAME_BYTES)
     }
 
+    /// The **final range coder state** of the most recently encoded
+    /// packet (RFC 6716 §6): the range coder's `rng` after the last
+    /// symbol of the packet's last Opus frame, XORed with the same
+    /// value of that frame's §4.5.1 redundant CELT frame when it
+    /// carries one. A decoder that decoded the packet correctly ends on
+    /// the identical value ([`crate::decoder::OpusDecoder::final_range`]).
+    /// Zero for a §2.1.9 DTX marker, a frame of at most one byte, or
+    /// before any packet was encoded.
+    pub fn final_range(&self) -> u32 {
+        self.final_range
+    }
+
     /// Encode one frame of interleaved 48 kHz S16 PCM
     /// (`channels() * frame_samples()` values) into one Opus packet.
     pub fn encode_frame(&mut self, pcm: &[i16]) -> Result<Vec<u8>, Error> {
@@ -804,7 +819,7 @@ impl OpusEncoder {
         // §4.5.3: the transition side information is "the extra
         // bitrate required for redundancy" — charged on top of the
         // election, not to the drift ledger (repaying ~5 ms of CELT
-        // out of a low-rate SILK leg's следующие packets would starve
+        // out of a low-rate SILK leg's following packets would starve
         // the primary encoding right where the seam needs it most).
         self.rc.commit(packet.len().saturating_sub(red_extra));
 
@@ -1274,6 +1289,35 @@ impl OpusEncoder {
                 }
             }
         })();
+        // §6 final range of this Opus frame: the main coder's `rng`,
+        // XORed with the redundant frame's when one rides along.
+        if let Ok((packet, _, red_extra)) = &result {
+            let main = match &mut arm {
+                Arm::Celt(enc) => enc.celt_state_mut().frame_rng(),
+                Arm::HybridMono(h) => h.celt_state_mut().frame_rng(),
+                Arm::HybridStereo(h) => h.celt_state_mut().frame_rng(),
+                Arm::SilkMono(a) => a.enc.last_final_rng(),
+                Arm::SilkStereo(a) => a.enc.last_final_rng(),
+            };
+            let redundant = if *red_extra == 0 {
+                0
+            } else {
+                match &mut arm {
+                    Arm::Celt(_) => 0,
+                    Arm::HybridMono(h) => h.celt_state_mut().redundant_rng(),
+                    Arm::HybridStereo(h) => h.celt_state_mut().redundant_rng(),
+                    Arm::SilkMono(_) | Arm::SilkStereo(_) => self
+                        .celt_carry
+                        .as_ref()
+                        .map_or(0, CeltEncoderState::redundant_rng),
+                }
+            };
+            self.final_range = if packet.len() <= 2 {
+                0
+            } else {
+                main ^ redundant
+            };
+        }
         self.arm = Some(arm);
         result
     }

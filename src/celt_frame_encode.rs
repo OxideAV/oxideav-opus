@@ -82,6 +82,11 @@ pub struct CeltEncoderState {
     pub prefilter_enabled: bool,
     channels: usize,
     n: usize,
+    /// Range-coder `rng` at the end of the most recent frame coded on
+    /// this state (the encoder half of the §6 final-range check).
+    frame_rng: u32,
+    /// The same for the most recent §4.5.1 redundant frame.
+    redundant_rng: u32,
 }
 
 /// Reported outcome of one frame encode (diagnostics for tests).
@@ -127,7 +132,30 @@ impl CeltEncoderState {
             prefilter_enabled: true,
             channels,
             n,
+            frame_rng: 0,
+            redundant_rng: 0,
         }
+    }
+
+    /// Range-coder `rng` after the last symbol of the most recent
+    /// main frame coded on this state (RFC 6716 §6 "final range").
+    #[must_use]
+    pub(crate) fn frame_rng(&self) -> u32 {
+        self.frame_rng
+    }
+
+    /// Range-coder `rng` after the most recent §4.5.1 redundant frame.
+    #[must_use]
+    pub(crate) fn redundant_rng(&self) -> u32 {
+        self.redundant_rng
+    }
+
+    /// Re-file the frame just coded as a redundant frame, restoring
+    /// the main frame's value `main_rng` (a redundant frame shares the
+    /// stream's one CELT state).
+    pub(crate) fn file_redundant_rng(&mut self, main_rng: u32) {
+        self.redundant_rng = self.frame_rng;
+        self.frame_rng = main_rng;
     }
 
     /// Frame length per channel.
@@ -232,6 +260,7 @@ pub fn encode_celt_frame(
         }
         state.consec_transient = 0;
         state.force_intra = false;
+        state.frame_rng = enc.range_size();
         return CeltFrameEncodeInfo {
             silence: true,
             transient: false,
@@ -622,6 +651,7 @@ pub fn encode_celt_frame(
         0
     };
     state.force_intra = false;
+    state.frame_rng = enc.range_size();
 
     CeltFrameEncodeInfo {
         silence: false,

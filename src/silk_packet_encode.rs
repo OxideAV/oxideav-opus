@@ -122,6 +122,34 @@ pub fn encode_silk_only_packet_mono_red(
     ),
     Error,
 > {
+    let (packet, regular, lbrr_pred, _rng) = encode_silk_only_packet_mono_red_rng(
+        bandwidth,
+        frame_size_tenths_ms,
+        frames,
+        lbrr,
+        redundancy_position,
+    )?;
+    Ok((packet, regular, lbrr_pred))
+}
+
+/// [`encode_silk_only_packet_mono_red`] also returning the range
+/// coder's final `rng` (RFC 6716 §6).
+#[allow(clippy::type_complexity)]
+pub(crate) fn encode_silk_only_packet_mono_red_rng(
+    bandwidth: Bandwidth,
+    frame_size_tenths_ms: u16,
+    frames: &[SilkFrameSymbols<'_>],
+    lbrr: &[Option<SilkFrameSymbols<'_>>],
+    redundancy_position: Option<RedundancyPosition>,
+) -> Result<
+    (
+        Vec<u8>,
+        Vec<SilkFrameDecoded>,
+        Vec<Option<SilkFrameDecoded>>,
+        u32,
+    ),
+    Error,
+> {
     let num_silk_frames = silk_frame_count(frame_size_tenths_ms).ok_or(Error::MalformedPacket)?;
     if frames.len() != num_silk_frames as usize || lbrr.len() != num_silk_frames as usize {
         return Err(Error::MalformedPacket);
@@ -270,6 +298,7 @@ pub fn encode_silk_only_packet_mono_red(
     // §5.1.5 finalize; §3.2 code-0 framing = TOC byte + the single
     // compressed frame. R2: a frame may not exceed 1275 bytes.
     let tell = re.tell() as usize;
+    let final_rng = re.range_size();
     let mut body = re.finish();
     if redundancy_position.is_some() {
         // §4.5.1.3: the redundant frame is "the number of whole bytes
@@ -290,7 +319,7 @@ pub fn encode_silk_only_packet_mono_red(
     let mut packet = Vec::with_capacity(1 + body.len());
     packet.push(toc);
     packet.extend_from_slice(&body);
-    Ok((packet, predictions, lbrr_predictions))
+    Ok((packet, predictions, lbrr_predictions, final_rng))
 }
 
 /// One 20 ms time interval's symbol scripts for a **stereo** SILK-only
@@ -412,6 +441,26 @@ pub fn encode_silk_only_packet_stereo_red(
     lbrr: &[StereoIntervalLbrr<'_>],
     redundancy_position: Option<RedundancyPosition>,
 ) -> Result<(Vec<u8>, StereoPacketPredictions, StereoLbrrPredictions), Error> {
+    let (packet, regular, lbrr_pred, _rng) = encode_silk_only_packet_stereo_red_rng(
+        bandwidth,
+        frame_size_tenths_ms,
+        intervals,
+        lbrr,
+        redundancy_position,
+    )?;
+    Ok((packet, regular, lbrr_pred))
+}
+
+/// [`encode_silk_only_packet_stereo_red`] also returning the range
+/// coder's final `rng` (RFC 6716 §6).
+#[allow(clippy::type_complexity)]
+pub(crate) fn encode_silk_only_packet_stereo_red_rng(
+    bandwidth: Bandwidth,
+    frame_size_tenths_ms: u16,
+    intervals: &[StereoIntervalScripts<'_>],
+    lbrr: &[StereoIntervalLbrr<'_>],
+    redundancy_position: Option<RedundancyPosition>,
+) -> Result<(Vec<u8>, StereoPacketPredictions, StereoLbrrPredictions, u32), Error> {
     let num_silk_frames = silk_frame_count(frame_size_tenths_ms).ok_or(Error::MalformedPacket)?;
     if intervals.len() != num_silk_frames as usize || lbrr.len() != num_silk_frames as usize {
         return Err(Error::MalformedPacket);
@@ -605,6 +654,7 @@ pub fn encode_silk_only_packet_stereo_red(
     // omitted trailing zero bytes up to ceil(tell / 8) (see the mono
     // writer — the decoder's §4.5.1.3 whole-bytes count starts there).
     let tell = re.tell() as usize;
+    let final_rng = re.range_size();
     let mut body = re.finish();
     if redundancy_position.is_some() {
         let full = tell.div_ceil(8);
@@ -628,6 +678,7 @@ pub fn encode_silk_only_packet_stereo_red(
             mid: lbrr_mid_pred,
             side: lbrr_side_pred,
         },
+        final_rng,
     ))
 }
 
