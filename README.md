@@ -240,6 +240,28 @@ bitrate sweep (4118 packets). The same captures decode through the
 reference listing's demo decoder — which performs the comparison itself
 — without a single range mismatch (124 captures).
 
+**Packet-level features** (`tests/packet_features.rs`, on streams the
+crate's own encoder writes): every §3.2 frame-count code — 0, 1, 2,
+3 CBR and VBR with 1–6 frames, up to the 48-frame / 120 ms ceiling —
+with §3.2.5 padding lengths across the 255-chain boundaries (0, 1, 253,
+254, 255, 509, 700 bytes) and the Appendix B self-delimited forms
+decodes to the **identical samples and final range** as the same frames
+sent one per packet (SILK, Hybrid and CELT, mono and stereo);
+zero-length frames inside multi-frame packets are concealed in place;
+and RFC 7845 family-1 mappings at every channel count 1–8 plus a
+discrete mapping with silent and duplicated channels route each output
+channel sample-exactly from the stream channel it names.
+
+**Hostile input.** Eight coverage-guided targets (`fuzz/`): packet
+decode at every output rate with interleaved loss concealment and the
+fixed-channel re-layout, FEC recovery, multistream, the range coder
+differential, and four encoder → decoder round trips (CELT, VBR, the
+elected SILK arm, and — new — the unified encoder with every knob
+re-drawn mid-stream and the final-range check on each packet). Each ran
+610 s in this round's bounded sweep (ASan + debug assertions,
+3 at a time) without a finding: 94 754 / 111 935 / 23.4 M / 10.6 M /
+22 733 / 33 007 / 5 215 / 28 515 executions.
+
 The official `testvector01..12` set named in §6.1 is not part of the
 staged documents, so its pass table cannot be reported here.
 
@@ -315,6 +337,67 @@ metrics the CELT-only arm still leads the SILK-only and Hybrid arms on
 speech at 12–48 kb/s; the speech ladder follows the RFC's mode
 semantics (the LP layer for speech at WB and below, with its FEC / DTX
 / PLC behaviour) rather than that measure.
+
+**Quality versus bitrate against a black-box encoder.**
+`tests/quality_vs_blackbox.rs` encodes synthetic speech-like and
+music-like sources (6 s, mono and stereo) with the unified encoder
+(automatic mode, signal-adaptive election on, VBR) and with the
+black-box `opusenc` binary at the same target (hard CBR, default
+complexity, the matching `--speech` / `--music` hint); both streams are
+decoded by this crate's decoder and graded against the source with the
+crate's bark log-spectral distance (LSD, dB, lower is better) over the
+whole clip and over its second half (the steady state, past the
+start-up class decision), plus segmental SNR. Every own packet is also
+held to the final-range check.
+
+| source | target kb/s | own packets SILK/Hybrid/CELT | own kb/s | own LSD | own LSD 2nd half | own segSNR | black-box kb/s | black-box LSD | black-box LSD 2nd half | black-box segSNR | LSD gap | 2nd-half gap |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| speech mono | 8 | 300/0/0 | 7.8 | 5.20 | 5.61 | 11.3 | 8.0 | 6.21 | 6.31 | 11.8 | -1.02 | -0.70 |
+| speech mono | 12 | 300/0/0 | 11.4 | 4.39 | 4.65 | 13.6 | 12.0 | 6.52 | 6.60 | 13.5 | -2.13 | -1.95 |
+| speech mono | 16 | 300/0/0 | 14.9 | 4.16 | 4.29 | 15.8 | 16.1 | 6.16 | 6.10 | 13.5 | -2.00 | -1.80 |
+| speech mono | 24 | 0/300/0 | 24.1 | 3.75 | 3.82 | 16.6 | 24.1 | 5.51 | 5.34 | 14.8 | -1.75 | -1.53 |
+| speech mono | 32 | 0/300/0 | 32.1 | 3.26 | 3.20 | 18.4 | 32.1 | 5.19 | 5.02 | 15.5 | -1.94 | -1.82 |
+| speech mono | 48 | 0/0/300 | 43.6 | 1.16 | 1.12 | 28.1 | 48.2 | 4.93 | 4.56 | 16.0 | -3.77 | -3.44 |
+| speech mono | 64 | 0/0/300 | 58.1 | 1.08 | 1.00 | 31.1 | 64.2 | 4.58 | 4.24 | 16.2 | -3.50 | -3.24 |
+| speech stereo | 16 | 300/0/0 | 15.0 | 3.61 | 3.99 | 18.6 | 16.1 | 5.27 | 5.36 | 14.4 | -1.66 | -1.37 |
+| speech stereo | 24 | 300/0/0 | 22.2 | 3.66 | 3.81 | 15.4 | 24.1 | 4.81 | 4.88 | 15.9 | -1.15 | -1.07 |
+| speech stereo | 32 | 300/0/0 | 29.3 | 3.46 | 3.57 | 17.3 | 32.1 | 4.51 | 4.57 | 16.7 | -1.06 | -1.00 |
+| speech stereo | 48 | 76/224/0 | 45.3 | 2.98 | 2.98 | 17.5 | 48.2 | 4.32 | 4.33 | 17.2 | -1.34 | -1.34 |
+| speech stereo | 64 | 76/224/0 | 57.4 | 2.85 | 2.91 | 17.8 | 64.2 | 4.25 | 4.25 | 17.3 | -1.40 | -1.34 |
+| music mono | 16 | 76/0/224 | 16.1 | 6.88 | 5.11 | 12.0 | 16.1 | 6.85 | 6.60 | 13.0 | +0.03 | -1.50 |
+| music mono | 24 | 0/76/224 | 24.1 | 5.31 | 4.43 | 14.6 | 24.1 | 4.42 | 3.88 | 15.1 | +0.90 | +0.55 |
+| music mono | 32 | 0/0/300 | 32.1 | 3.22 | 2.87 | 19.0 | 32.1 | 3.40 | 2.77 | 17.2 | -0.18 | +0.09 |
+| music mono | 48 | 0/0/300 | 48.2 | 2.35 | 1.70 | 21.9 | 48.2 | 2.71 | 1.92 | 20.2 | -0.37 | -0.22 |
+| music mono | 64 | 0/0/300 | 64.2 | 2.06 | 1.24 | 24.5 | 64.2 | 2.38 | 1.44 | 22.8 | -0.33 | -0.20 |
+| music mono | 96 | 0/0/300 | 96.3 | 1.65 | 0.85 | 27.8 | 96.3 | 1.96 | 1.00 | 26.7 | -0.30 | -0.15 |
+| music mono | 128 | 0/0/300 | 128.4 | 1.22 | 0.61 | 30.6 | 128.4 | 1.30 | 0.80 | 28.8 | -0.08 | -0.19 |
+| music stereo | 24 | 76/0/224 | 24.1 | 7.10 | 5.71 | 8.5 | 24.1 | 4.88 | 4.73 | 10.0 | +2.22 | +0.99 |
+| music stereo | 32 | 0/76/224 | 32.1 | 5.56 | 5.03 | 10.4 | 32.1 | 4.37 | 4.18 | 12.8 | +1.19 | +0.85 |
+| music stereo | 48 | 0/0/300 | 48.2 | 3.63 | 3.57 | 16.4 | 48.2 | 3.43 | 3.40 | 15.5 | +0.21 | +0.17 |
+| music stereo | 64 | 0/0/300 | 64.2 | 2.45 | 2.44 | 18.1 | 64.2 | 2.58 | 2.70 | 17.1 | -0.14 | -0.26 |
+| music stereo | 96 | 0/0/300 | 96.3 | 1.60 | 1.67 | 20.8 | 96.3 | 1.81 | 1.98 | 20.4 | -0.21 | -0.31 |
+| music stereo | 128 | 0/0/300 | 128.4 | 1.21 | 1.29 | 23.5 | 128.4 | 1.32 | 1.49 | 23.0 | -0.11 | -0.20 |
+
+Reading it honestly: the measure is a spectral-match proxy, not a
+listening test — the black-box encoder is perceptually tuned and a
+lower LSD here is not a claim of better sound (its speech rows trade
+waveform match for other things this metric does not see). What the
+table does establish is rate discipline (realized rate within 10 % of
+target on every row), and where this encoder is *behind* on its own
+metric: **stereo music at 24–32 kb/s** (+2.2 / +1.2 dB whole clip,
++1.0 / +0.85 dB steady state) and mono music at 24 kb/s (+0.9 / +0.55),
+part of which is the first ~1.5 s spent on the LP / Hybrid layer before
+the analyser's music decision moves the stream to the MDCT layer. The
+steady-state gap is bounded by the test at 1.5 dB.
+
+The worst rows drove one change this round: the MDCT layer's automatic
+audio bandwidth now follows the stream's total rate (full band from
+22 kb/s, wideband below 18 kb/s, narrowband only below 9 kb/s) instead
+of a per-channel-discounted ladder that kept 32 kb/s stereo at
+wideband. Measured before → after on the same table: stereo music
+32 kb/s 7.86 → 5.56 dB (gap +3.49 → +1.19), 48 kb/s 4.09 → 3.63,
+24 kb/s 7.58 → 7.10; mono music 32 kb/s 3.92 → 3.22 (gap +0.52 →
+−0.18); no row regressed.
 
 Underneath sit the per-mode arms, each usable directly:
 

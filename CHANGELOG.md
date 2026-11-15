@@ -8,6 +8,7 @@ All notable changes to `oxideav-opus` are recorded here.
 
 - `OpusDecoder::final_range()` — the RFC 6716 §6 final range decoder state of the last decoded Opus frame (redundant CELT frame XORed in; zero for DTX / lost / one-byte frames).
 - `OpusEncoder::final_range()` — the encoder-side §6 final range coder state of the last packet written, verified packet-by-packet against the decoder in `tests/encoder_final_range.rs` (every mode × bandwidth × duration × channel count, VBR / constrained VBR / CBR, FEC, DTX, and the §4.5 switches with their redundant frames).
+- `tests/quality_vs_blackbox.rs` (objective quality versus bitrate against the black-box `opusenc` encoder at equal rate, speech-like / music-like × mono / stereo, with a steady-state gap bound), `tests/packet_features.rs` (every frame-count code, padding length and self-delimited form decodes sample- and range-identically; zero-length frames; family-1 mappings at 1–8 channels), and the `unified_encode_roundtrip` fuzz target (every encoder knob re-drawn mid-stream, final-range check per packet).
 - `DecodedAudio::into_channels(1 | 2)` — re-lay a decoded packet onto a fixed output channel count whatever the packet's stereo flag.
 - `tests/conformance_vectors.rs`: the §6 decoder conformance gates (final range on every packet, the Appendix A.4 quality measure at 8 / 12 / 16 / 24 / 48 kHz × mono / stereo) over a 12-vector reference-encoder corpus.
 
@@ -19,6 +20,7 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Changed
 
+- The unified encoder's automatic CELT-only audio bandwidth follows the stream's total bitrate (narrowband below 9 kb/s, wideband below 18 kb/s, super-wideband below 22 kb/s, full band above) instead of a per-channel-discounted ladder; stereo music at 32 kb/s moves from wideband to full band (bark LSD 7.86 → 5.56 dB on the round's quality table), mono music at 32 kb/s 3.92 → 3.22 dB.
 - `#[non_exhaustive]` on the growable enums `Error`, `FrameDecodeStatus`, `FecDecodeStatus`, `Application` and `OpusHeadError`, and on the records `FrameOutcome`, `DecodedAudio`, `FecRecovered`, `OpusFrameRouting`, `SelfDelimitedParse`, `StreamPacket`, `MultistreamAudio`, `OpusEncoderOptions`. The RFC 6716 TOC enums `Mode`, `Bandwidth`, `ChannelMapping`, `FrameCountCode`, `OperatingMode`, `SilkBandwidth` and the `OpusTocByte` record stay exhaustive: the one-byte TOC fixes them. `OpusHead` / `ChannelMappingTable` stay exhaustive for now because a sibling test builds them with struct literals; they gain `new(..)` to migrate to.
 - `#[doc(hidden)]` on the `input_upsampler` and `signal_analysis` modules and on the root re-export of the SILK frame codec (`SilkFrameConfig`, `SilkFrameDecoded`, `SilkFrameSymbols`, `decode_silk_frame`, `encode_silk_frame`) — encoder / decoder plumbing, like the other already-hidden SILK / CELT stage modules.
 

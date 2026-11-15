@@ -628,11 +628,20 @@ impl OpusEncoder {
                 Some(Bandwidth::Mb) | Some(Bandwidth::Wb) => Bandwidth::Wb,
                 Some(bw) => bw,
                 None => {
-                    let ladder = if eff < 12_000 {
+                    // The MDCT layer's bandwidth follows the stream's
+                    // total rate, mono or stereo alike: measured on
+                    // the corpus of `tests/quality_vs_blackbox.rs`
+                    // (its forced-configuration probe), every source
+                    // gains from full band from about 22 kb/s (stereo
+                    // music at 32 kb/s: LSD 8.5 dB at WB → 5.2 dB at
+                    // FB for 0.3 dB of segmental SNR), narrowband only
+                    // pays below 9 kb/s, and the wideband / full-band
+                    // crossover of music sits at 18–20 kb/s.
+                    let ladder = if self.bitrate_bps < 9_000 {
                         Bandwidth::Nb
-                    } else if eff < 24_000 {
+                    } else if self.bitrate_bps < 18_000 {
                         Bandwidth::Wb
-                    } else if eff < 40_000 {
+                    } else if self.bitrate_bps < 22_000 {
                         Bandwidth::Swb
                     } else {
                         Bandwidth::Fb
