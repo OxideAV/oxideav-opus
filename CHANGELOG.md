@@ -16,6 +16,7 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Fixed
 
+- `OpusEncoder::set_frame_tenths_ms` after the first packet: the running arm stayed framed for the old packet duration and every later `encode_frame` returned `MalformedPacket`. The arm is now re-framed around its carried CELT / SILK state on a duration change, and a change to 2.5 / 5 ms from a SILK-only or Hybrid configuration switches to CELT-only at once (found by the `unified_encode_roundtrip` fuzz target; `tests/unified_encoder_knob_regressions.rs`).
 - A mono → stereo (or stereo → mono) switch between SILK-only / Hybrid packets now hands the SILK state over the way the normative decoder does — the mono channel continues as the mid channel (synthesis histories, gain / NLSF carries, the §4.2.8 delay line, the resampler), the side channel starts fresh with the §4.2.7.1 weights zeroed — instead of restarting the mid channel from cleared state (4–50 dB off the reference decode for the first packets after the switch; now bit-exact).
 
 ### Changed

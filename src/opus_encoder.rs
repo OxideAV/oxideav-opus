@@ -273,6 +273,10 @@ pub struct OpusEncoder {
     celt_inactive: bool,
     /// §6 final range of the most recently encoded packet.
     final_range: u32,
+    /// The packet duration the current arm was built for; a
+    /// [`Self::set_frame_tenths_ms`] since then re-frames the arm
+    /// before the next packet.
+    arm_packet_tenths: u16,
 }
 
 impl OpusEncoder {
@@ -317,6 +321,7 @@ impl OpusEncoder {
             hybrid_silk_share: crate::hybrid_packet_encode::HYBRID_SILK_SHARE,
             celt_inactive: false,
             final_range: 0,
+            arm_packet_tenths: frame_tenths_ms,
         })
     }
 
@@ -794,7 +799,27 @@ impl OpusEncoder {
             self.install_fresh(target)?;
             self.cur = Some(target);
         }
-        let cur = self.cur.expect("installed above");
+        let mut cur = self.cur.expect("installed above");
+        // The packet duration changed since the arm was built.
+        if self.arm_packet_tenths != self.frame_tenths_ms {
+            if matches!(self.frame_tenths_ms, 25 | 50) && cur.mode != Mode::CeltOnly {
+                // 2.5 / 5 ms frames exist only in CELT-only mode: the
+                // old configuration cannot code a transition-carrier
+                // packet of this duration, so the switch is immediate
+                // (§4.5.3 Figure 19: no redundancy; the decoder's
+                // concealment covers the seam).
+                self.switch_to(cur, target, false)?;
+                self.cur = Some(target);
+                cur = target;
+                self.packets_since_switch = 0;
+            } else {
+                // Same configuration, new frame size: the decoder
+                // needs no special treatment (§4.5) and keeps its
+                // state, so the arm is rebuilt around the carried
+                // states.
+                self.reframe_arm(cur)?;
+            }
+        }
         // A purely signal-driven change (the knob decision did not
         // move since the previous packet) waits out the dwell in both
         // directions; a knob move always goes through (to the
@@ -893,6 +918,22 @@ impl OpusEncoder {
         compose_packet_code3(toc, &frames, vbr, need)
     }
 
+    /// Rebuild the current arm for the current packet duration without
+    /// changing the configuration: the CELT state and the SILK front
+    /// end carry over, exactly as the decoder's do across a frame-size
+    /// change; pending §4.5.1 plans are untouched.
+    fn reframe_arm(&mut self, cur: StreamConfig) -> Result<(), Error> {
+        let mut old_arm = self.arm.take().expect("arm installed");
+        let celt_state = match &mut old_arm {
+            Arm::Celt(enc) => Some(enc.celt_state_mut().clone()),
+            Arm::HybridMono(h) => Some(h.celt_state_mut().clone()),
+            Arm::HybridStereo(h) => Some(h.celt_state_mut().clone()),
+            Arm::SilkMono(_) | Arm::SilkStereo(_) => self.celt_carry.take(),
+        };
+        self.arm = Some(self.build_arm(cur, celt_state, Some(old_arm))?);
+        Ok(())
+    }
+
     /// Build a cold-start arm for `config` (fresh states everywhere).
     fn install_fresh(&mut self, config: StreamConfig) -> Result<(), Error> {
         self.arm = Some(self.build_arm(config, None, None)?);
@@ -909,6 +950,7 @@ impl OpusEncoder {
         silk_from: Option<Arm>,
     ) -> Result<Arm, Error> {
         let stereo = self.channels == 2;
+        self.arm_packet_tenths = self.frame_tenths_ms;
         let arm = match config.mode {
             Mode::CeltOnly => {
                 let mut enc =
@@ -935,14 +977,26 @@ impl OpusEncoder {
                         h.adopt_celt_state(state);
                     }
                     h.prime_decimators(&self.hist48[0], &self.hist48[1]);
-                    if let Some(Arm::SilkStereo(mut prev)) = silk_from {
-                        let (pm, ps, pd, pp) = prev.enc.stereo_parts_mut();
-                        let (m, s2, d, p) = h.silk_stereo_parts_mut();
-                        *m = pm.clone();
-                        *s2 = ps.clone();
-                        *d = *pd;
-                        *p = *pp;
-                        h.drop_pending_fec();
+                    match silk_from {
+                        Some(Arm::SilkStereo(mut prev)) => {
+                            let (pm, ps, pd, pp) = prev.enc.stereo_parts_mut();
+                            let (m, s2, d, p) = h.silk_stereo_parts_mut();
+                            *m = pm.clone();
+                            *s2 = ps.clone();
+                            *d = *pd;
+                            *p = *pp;
+                            h.drop_pending_fec();
+                        }
+                        Some(Arm::HybridStereo(mut prev)) => {
+                            let (pm, ps, pd, pp) = prev.silk_stereo_parts_mut();
+                            let (m, s2, d, p) = h.silk_stereo_parts_mut();
+                            *m = pm.clone();
+                            *s2 = ps.clone();
+                            *d = *pd;
+                            *p = *pp;
+                            h.drop_pending_fec();
+                        }
+                        _ => {}
                     }
                     Arm::HybridStereo(Box::new(h))
                 } else {
@@ -957,9 +1011,16 @@ impl OpusEncoder {
                         h.adopt_celt_state(state);
                     }
                     h.prime_decimator(&self.hist48[0]);
-                    if let Some(Arm::SilkMono(mut prev)) = silk_from {
-                        *h.silk_analyzer_mut() = prev.enc.analyzer_mut().clone();
-                        h.drop_pending_fec();
+                    match silk_from {
+                        Some(Arm::SilkMono(mut prev)) => {
+                            *h.silk_analyzer_mut() = prev.enc.analyzer_mut().clone();
+                            h.drop_pending_fec();
+                        }
+                        Some(Arm::HybridMono(mut prev)) => {
+                            *h.silk_analyzer_mut() = prev.silk_analyzer_mut().clone();
+                            h.drop_pending_fec();
+                        }
+                        _ => {}
                     }
                     Arm::HybridMono(Box::new(h))
                 }
@@ -976,14 +1037,26 @@ impl OpusEncoder {
                     enc.set_fec(self.fec);
                     enc.set_packet_loss_perc(self.loss_perc);
                     enc.set_complexity(self.complexity);
-                    if let Some(Arm::HybridStereo(mut prev)) = silk_from {
-                        let (pm, ps, pd, pp) = prev.silk_stereo_parts_mut();
-                        let (m, s2, d, p) = enc.stereo_parts_mut();
-                        *m = pm.clone();
-                        *s2 = ps.clone();
-                        *d = *pd;
-                        *p = *pp;
-                        enc.drop_pending_fec();
+                    match silk_from {
+                        Some(Arm::HybridStereo(mut prev)) => {
+                            let (pm, ps, pd, pp) = prev.silk_stereo_parts_mut();
+                            let (m, s2, d, p) = enc.stereo_parts_mut();
+                            *m = pm.clone();
+                            *s2 = ps.clone();
+                            *d = *pd;
+                            *p = *pp;
+                            enc.drop_pending_fec();
+                        }
+                        Some(Arm::SilkStereo(mut prev)) => {
+                            let (pm, ps, pd, pp) = prev.enc.stereo_parts_mut();
+                            let (m, s2, d, p) = enc.stereo_parts_mut();
+                            *m = pm.clone();
+                            *s2 = ps.clone();
+                            *d = *pd;
+                            *p = *pp;
+                            enc.drop_pending_fec();
+                        }
+                        _ => {}
                     }
                     let mut decim_l = Decimator48::with_taps(ratio, stereo_decim_taps(ratio));
                     let mut decim_r = Decimator48::with_taps(ratio, stereo_decim_taps(ratio));
@@ -1008,9 +1081,16 @@ impl OpusEncoder {
                     enc.set_fec(self.fec);
                     enc.set_packet_loss_perc(self.loss_perc);
                     enc.set_complexity(self.complexity);
-                    if let Some(Arm::HybridMono(mut prev)) = silk_from {
-                        *enc.analyzer_mut() = prev.silk_analyzer_mut().clone();
-                        enc.drop_pending_fec();
+                    match silk_from {
+                        Some(Arm::HybridMono(mut prev)) => {
+                            *enc.analyzer_mut() = prev.silk_analyzer_mut().clone();
+                            enc.drop_pending_fec();
+                        }
+                        Some(Arm::SilkMono(mut prev)) => {
+                            *enc.analyzer_mut() = prev.enc.analyzer_mut().clone();
+                            enc.drop_pending_fec();
+                        }
+                        _ => {}
                     }
                     let mut decim = Decimator48::with_taps(ratio, mono_decim_taps(ratio));
                     decim.prime(&self.hist48[0]);

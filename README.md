@@ -258,9 +258,19 @@ fixed-channel re-layout, FEC recovery, multistream, the range coder
 differential, and four encoder → decoder round trips (CELT, VBR, the
 elected SILK arm, and — new — the unified encoder with every knob
 re-drawn mid-stream and the final-range check on each packet). Each ran
-610 s in this round's bounded sweep (ASan + debug assertions,
-3 at a time) without a finding: 94 754 / 111 935 / 23.4 M / 10.6 M /
-22 733 / 33 007 / 5 215 / 28 515 executions.
+610 s twice in this round's bounded sweeps (ASan + debug assertions,
+3 at a time). The seven older targets are clean (second sweep, on the
+faster kernels: 304 212 / 627 452 / 29.1 M / 17.2 M / 499 361 /
+640 734 executions for the first six). The new unified-encoder target
+found one encoder defect in its second sweep, now fixed and pinned by
+`tests/unified_encoder_knob_regressions.rs`: **changing the packet
+duration mid-stream** (`set_frame_tenths_ms` after the first packet)
+left the running arm framed for the old duration, so every later
+`encode_frame` returned an error. The arm is now re-framed around its
+carried CELT and SILK state when the duration changes (the decoder
+needs no special treatment for a frame-size change, §4.5), and a
+change to 2.5 / 5 ms — which only the MDCT layer can code — switches to
+it immediately.
 
 The official `testvector01..12` set named in §6.1 is not part of the
 staged documents, so its pass table cannot be reported here.
