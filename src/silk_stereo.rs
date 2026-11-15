@@ -523,6 +523,21 @@ impl StereoUnmixStateI16 {
         *self = Self::default();
     }
 
+    /// A state entering stereo from a mono run: the two trailing mid
+    /// samples (oldest first) carry over, the side history and the
+    /// previous weights start at zero (§4.2.7.1).
+    pub fn with_mid_history(s_mid: [i16; 2]) -> Self {
+        Self {
+            s_mid,
+            ..Self::default()
+        }
+    }
+
+    /// The two trailing mid samples (oldest first).
+    pub fn mid_history(&self) -> [i16; 2] {
+        self.s_mid
+    }
+
     /// The previous-frame weights currently held.
     pub fn prev_weights(&self) -> StereoWeightsQ13 {
         StereoWeightsQ13 {

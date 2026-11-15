@@ -137,3 +137,33 @@ decoder's decodes of those captures (its own PLC across the holes).
 They drive `tests/plc_reconvergence.rs`: bit-exact/float-floor
 agreement before the loss and pinned re-convergence floors after it,
 identical at 48 kHz and 16 kHz.
+
+## §6 conformance corpus (round 490)
+
+`conformance/cvNN-*.bit` are captures written by the RFC 6716 §A
+reference listing's demo program (RFC 8251 patches applied) in its own
+format — per packet a big-endian u32 payload length, a big-endian u32
+final range coder state, then the payload — from short synthetic
+48 kHz stereo sources (a speech-like pulse-train / formant signal with
+pauses, a music-like chord + percussion signal, and their mix).
+`conformance/cvNN-*.dec` are that program's 48 kHz stereo decodes of
+the same captures (raw s16le interleaved); they are excluded from the
+published package and the quality gate skips a vector whose `.dec` is
+absent.
+
+| capture | encoder invocation (application, rate, channels, bit/s, options) |
+| --- | --- |
+| `cv01-celt-modes` | `audio 48000 2 64000 -celt_test` (32 CELT configurations) |
+| `cv02-celt-hq` | `audio 48000 2 256000 -celt_hq_test` |
+| `cv03-silk-nb-modes` | `voip 48000 2 20000 -silk8k_test` |
+| `cv04-silk-mb-modes` | `voip 48000 2 24000 -silk12k_test` |
+| `cv05-silk-wb-modes` | `voip 48000 2 32000 -silk16k_test` |
+| `cv06-hybrid-swb-modes` | `voip 48000 2 40000 -hybrid24k_test` |
+| `cv07-hybrid-fb-modes` | `voip 48000 2 56000 -hybrid48k_test` |
+| `cv08-voip-sweep` | `voip 48000 2 8000 -sweep 900 -sweep_max 96000 -random_framesize -random_fec` |
+| `cv09-audio-sweep` | `audio 48000 2 10000 -sweep 1500 -sweep_max 160000 -random_framesize` |
+| `cv10-voip-mono-fec-dtx` | `voip 48000 2 18000 -forcemono -inbandfec -dtx -bandwidth WB` |
+| `cv11-audio-cbr-lowrate` | `audio 48000 2 12000 -cbr -random_framesize` |
+| `cv12-lowdelay-cvbr` | `restricted-lowdelay 48000 2 96000 -cvbr -framesize 5` |
+
+They drive `tests/conformance_vectors.rs`.

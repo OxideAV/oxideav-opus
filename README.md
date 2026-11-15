@@ -174,6 +174,64 @@ hard switch, off-seam ≥ 97 dB). Loss re-convergence is gated against
 reference decodes of planted-loss captures at 48 kHz AND 16 kHz, and
 the decode fuzz target cycles output rates.
 
+### Decoder conformance (RFC 6716 §6)
+
+`tests/conformance_vectors.rs` runs the two §6 gates over a corpus
+built the way the RFC builds its own test vectors — bitstreams written
+by the Appendix A reference listing's demo program, one mode walk per
+SILK bandwidth, per Hybrid bandwidth and over every CELT bandwidth ×
+frame size × channel count, plus bitrate sweeps with random frame
+sizes and FEC toggles, a mono FEC + DTX stream, low-rate CBR and
+low-delay constrained VBR — each paired with that program's 48 kHz
+stereo decode:
+
+* **Final range.** `OpusDecoder::final_range()` reproduces the
+  encoder's recorded final range coder state on **every packet**
+  (1657 packets of the corpus + 128 of the older DTX / switch / loss
+  captures; a multi-frame packet reports its last frame, a redundant
+  CELT frame is XORed in).
+* **Quality measure.** The Appendix A.4 comparison procedure
+  (transcribed in the test from the listing embedded in the RFC text;
+  it reproduces the listing's own figures to the printed digit) scores
+  the decode at every output rate and both channel counts against the
+  48 kHz stereo reference. A vector passes at `Q ≥ 0`.
+
+| vector | 48k st | 24k st | 16k st | 12k st | 8k st | 48k mono | 24k mono | 16k mono | 12k mono | 8k mono |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `cv01-celt-modes` | 99.5 | 94.1 | 85.5 | 83.5 | 73.8 | 99.2 | 94.0 | 85.6 | 82.8 | 72.7 |
+| `cv02-celt-hq` | 99.6 | 92.5 | 88.0 | 83.6 | 74.7 | 99.2 | 94.3 | 89.0 | 84.1 | 75.4 |
+| `cv03-silk-nb-modes` | 100.0 | 96.8 | 95.0 | 90.6 | 78.3 | 96.0 | 95.3 | 94.9 | 90.6 | 78.1 |
+| `cv04-silk-mb-modes` | 100.0 | 89.8 | 94.3 | 82.4 | 79.2 | 95.1 | 89.6 | 94.0 | 82.3 | 78.7 |
+| `cv05-silk-wb-modes` | 100.0 | 96.9 | 87.2 | 85.7 | 82.9 | 95.8 | 96.0 | 87.2 | 85.6 | 82.9 |
+| `cv06-hybrid-swb-modes` | 99.8 | 95.3 | 85.9 | 90.0 | 88.4 | 99.4 | 95.0 | 86.8 | 90.0 | 88.3 |
+| `cv07-hybrid-fb-modes` | 99.9 | 93.7 | 85.3 | 89.0 | 86.7 | 99.3 | 97.3 | 85.1 | 88.4 | 85.8 |
+| `cv08-voip-sweep` | 99.5 | 51.4 | 47.2 | 58.3 | 39.0 | 99.2 | 51.6 | 46.8 | 58.1 | 38.7 |
+| `cv09-audio-sweep` | 99.5 | 94.2 | 50.4 | 85.2 | 43.9 | 99.2 | 95.2 | 50.1 | 86.5 | 43.5 |
+| `cv10-voip-mono-fec-dtx` | 100.0 | 97.2 | 87.5 | 86.4 | 83.4 | 100.0 | 97.2 | 87.4 | 86.4 | 83.3 |
+| `cv11-audio-cbr-lowrate` | 100.0 | 97.9 | 95.5 | 93.7 | 81.4 | 100.0 | 97.9 | 95.5 | 93.7 | 81.4 |
+| `cv12-lowdelay-cvbr` | 99.7 | 94.0 | 83.9 | 90.1 | 85.3 | 99.2 | 96.0 | 83.5 | 90.9 | 85.7 |
+
+**120 / 120 cells pass.** The reduced-rate figures are those of the
+measure itself, not of this decoder: the reference program's own
+reduced-rate decodes score within 0.1 of every reduced-rate stereo
+cell above against its 48 kHz decode (a 16 kHz decode of full-band
+content cannot match the reference above 8 kHz), and within 3 points
+on the mono cells. Mono output is `DecodedAudio::into_channels(1)` (the
+truncating average of the pair); stereo output of mono packets
+duplicates the channel.
+
+Building the corpus surfaced one decoder defect, now fixed: a **mono →
+stereo switch inside a SILK-only or Hybrid stream** restarted the mid
+channel from cleared state, where the normative decoder continues the
+mono channel as the mid channel (LTP / LPC histories, gain and NLSF
+carries, the §4.2.8 two-sample delay line, the resampler) and only
+starts the side channel fresh. The first stereo packets after such a
+switch decoded 4–50 dB off the reference; they are now bit-exact (SILK)
+/ at the float floor (Hybrid), as is the reverse switch.
+
+The official `testvector01..12` set named in §6.1 is not part of the
+staged documents, so its pass table cannot be reported here.
+
 ### Encoder
 
 The **encode side is complete across every RFC 6716 mode** and

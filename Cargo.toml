@@ -12,6 +12,9 @@ readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-opus"
 keywords = ["multimedia", "audio", "opus", "codec", "pure-rust"]
 categories = ["multimedia::encoding", "multimedia::audio"]
+# The conformance reference decodes are test inputs read from disk when
+# present; they stay out of the published package (10 MiB cap).
+exclude = ["tests/fixtures/conformance/*.dec"]
 
 [dependencies]
 oxideav-core = "0.1"

@@ -236,6 +236,33 @@ impl DecodedAudio {
 }
 
 impl DecodedAudio {
+    /// Re-lay this packet's audio onto a fixed output channel count
+    /// (1 or 2), whatever the packet's own §3.1 stereo flag was: an
+    /// application opens its output as mono or stereo once, while an
+    /// Opus stream may switch per packet. Mono is duplicated into both
+    /// stereo channels; a stereo pair is averaged down to mono; an equal
+    /// (or unsupported) count returns the audio unchanged.
+    pub fn into_channels(mut self, channels: u8) -> Self {
+        match (self.channels, channels) {
+            (1, 2) => {
+                self.pcm = self.pcm.iter().flat_map(|&s| [s, s]).collect();
+                self.channels = 2;
+            }
+            (2, 1) => {
+                self.pcm = self
+                    .pcm
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|p| ((i32::from(p[0]) + i32::from(p[1])) / 2) as i16)
+                    .collect();
+                self.channels = 1;
+            }
+            _ => {}
+        }
+        self
+    }
+
     /// Total per-channel sample count (at [`Self::sample_rate_hz`])
     /// across every Opus frame in the packet.
     pub fn samples_per_channel(&self) -> usize {
@@ -362,6 +389,14 @@ pub struct OpusDecoder {
     /// Holds the last internal-rate sample of the previous mono Opus
     /// frame; zero after a decoder reset ("zeros are used instead").
     silk_mono_delay: i16,
+    /// The sample before [`Self::silk_mono_delay`] — together they are
+    /// the two trailing mid samples the §4.2.8 unmixer needs when the
+    /// next SILK frame turns out to be stereo.
+    silk_mono_prev2: i16,
+    /// Channel count of the most recent SILK layer decode (SILK-only
+    /// or Hybrid); drives the mono ↔ stereo state hand-over in
+    /// [`Self::silk_adopt_channel_count`].
+    silk_internal_channels: Option<u8>,
     /// §4.2.9 mono upsampler state (SILK internal rate → 48 kHz),
     /// carried across Opus frames so consecutive frames are seamless
     /// through the resampling filter. Shared by the SILK-only and
@@ -436,6 +471,16 @@ pub struct OpusDecoder {
     /// mode's concealment flavor; consumed by the packet's first
     /// frame.
     transition_fill: Option<crate::plc::PlcFlavor>,
+    /// Range-coder state (`rng`) of the main coder at the end of the
+    /// frame being decoded — the per-frame half of the §6 "final range
+    /// decoder state".
+    frame_rng: u32,
+    /// Range-coder state at the end of the frame's §4.5.1 redundant
+    /// CELT frame (zero when the frame carries none).
+    redundant_rng: u32,
+    /// The §6 final range decoder state of the most recently decoded
+    /// Opus frame; see [`Self::final_range`].
+    final_range: u32,
 }
 
 impl OpusDecoder {
@@ -468,6 +513,21 @@ impl OpusDecoder {
             plc: crate::plc::PlcState::with_rate(output_rate_hz),
             ..Self::default()
         })
+    }
+
+    /// The **final range decoder state** of the most recently decoded
+    /// Opus frame (RFC 6716 §6): the range coder's `rng` after the last
+    /// symbol of the frame, XORed with the same value of the frame's
+    /// §4.5.1 redundant CELT frame when it carries one. A conforming
+    /// encoder ends each frame on the identical value, so comparing the
+    /// two verifies that every entropy-coded symbol of the frame was
+    /// decoded as written ("the decoder's … final range coder state
+    /// MUST match the encoder's", §6 / §6.2). Zero after a §3.2.1
+    /// zero-length (DTX / lost) frame, a one-byte frame, a concealed
+    /// loss, or before any packet was decoded. For a multi-frame packet
+    /// this is the state of the packet's last frame.
+    pub fn final_range(&self) -> u32 {
+        self.final_range
     }
 
     /// The output sample rate in Hz this decoder produces.
@@ -563,6 +623,7 @@ impl OpusDecoder {
                 // them with the rest ("for the first frame after a
                 // decoder reset, zeros are used instead").
                 self.silk_mono_delay = 0;
+                self.silk_mono_prev2 = 0;
                 if let Some(up) = self.silk_resamp_mono.as_mut() {
                     up.reset();
                 }
@@ -601,33 +662,6 @@ impl OpusDecoder {
                 crate::mode_transition_reset::CeltResetPlacement::BeforeRedundantOnly
                 | crate::mode_transition_reset::CeltResetPlacement::None => {}
             }
-        }
-
-        // §4.2.7.1: "the previous weights are reset to zeros on any
-        // transition from mono to stereo." More generally the §4.2.8
-        // unmixing history (and the mid/side synthesis state) only makes
-        // sense within a contiguous stereo run; a channel-count change
-        // clears the carried stereo state so a stale mono / prior-stereo
-        // history can never leak across the transition.
-        if self.last_channels.is_some_and(|c| c != channels) {
-            if let Some(unmix) = self.silk_stereo_unmix.as_mut() {
-                unmix.reset();
-            }
-            if let Some((mid, side)) = self.silk_synth_stereo.as_mut() {
-                mid.reset();
-                side.reset();
-            }
-            if let Some((l, r)) = self.silk_resamp_stereo.as_mut() {
-                l.reset();
-                r.reset();
-            }
-            // The mid/side §4.2.7 reconstruction carries follow the same
-            // policy as the stereo synthesis state: a channel-count
-            // change clears them (the mono carry mirrors the mono
-            // synthesis state and persists, matching the treatment of
-            // `silk_synth_mono` above).
-            self.silk_carry_mid = SilkChannelCarry::default();
-            self.silk_carry_side = SilkChannelCarry::default();
         }
 
         // §4.5 seam bookkeeping for the packet's first frame (all frames
@@ -711,6 +745,7 @@ impl OpusDecoder {
     /// received stream must not route through PLC (they either need no
     /// treatment or carry §4.5.1 redundancy).
     pub fn conceal_loss(&mut self) -> DecodedAudio {
+        self.final_range = 0;
         let tenths = self.last_frame_tenths_ms.unwrap_or(200);
         let per_channel = self.out_samples(tenths);
         let channels = self.last_channels.unwrap_or(1);
@@ -753,7 +788,10 @@ impl OpusDecoder {
         // a SILK-bearing predecessor, pitch-periodic repetition after
         // CELT-only) with the energy decay of a concealment run, which
         // after a silent tail simply holds the silence floor.
+        self.frame_rng = 0;
+        self.redundant_rng = 0;
         if frame.is_empty() {
+            self.final_range = 0;
             // A hold at the packet's head consumes the §4.5 seam
             // bookkeeping: the concealment already bridges the
             // boundary.
@@ -784,6 +822,13 @@ impl OpusDecoder {
             OperatingMode::SilkOnly => self.decode_silk_only_frame(frame, routing, pcm),
             OperatingMode::CeltOnly => self.decode_celt_only_frame(frame, routing, pcm),
             OperatingMode::Hybrid => self.decode_hybrid_frame(frame, routing, pcm),
+        };
+        // §6: a frame of at most one byte carries no entropy-coded
+        // payload worth a check and reports zero.
+        self.final_range = if frame.len() <= 1 {
+            0
+        } else {
+            self.frame_rng ^ self.redundant_rng
         };
         // The fill only applies when the frame carries no §4.5.1
         // redundancy (a redundant frame makes the transition normative
@@ -971,10 +1016,57 @@ impl OpusDecoder {
             add_into_head(&mut pcm[pcm_start..], &flush);
         }
         self.last_redundancy = redundancy;
+        self.frame_rng = rd.range_size();
 
         FrameOutcome {
             samples_per_channel: per_channel,
             status,
+        }
+    }
+
+    /// Hand the SILK state over when the coded channel count changes
+    /// between two SILK-bearing frames (§4.5: "when changing the
+    /// channel count for SILK-only or Hybrid packets" no decoder reset
+    /// happens — the encoder is expected to fade the stereo width).
+    ///
+    /// The mono channel and the stereo **mid** channel are one and the
+    /// same decoder channel in the normative decoder (Appendix A): its
+    /// LTP / LPC histories, the §4.2.7.4 / §4.2.7.5.5 carries, the
+    /// §4.2.8 two-sample output delay line and its resampler continue
+    /// across the switch. Only the side channel starts fresh on mono →
+    /// stereo, with the §4.2.7.1 previous weights and the side unmix
+    /// history zeroed ("the previous weights are reset to zeros on any
+    /// transition from mono to stereo") and the second output
+    /// channel's resampler seeded from the first one's state.
+    fn silk_adopt_channel_count(&mut self, channels: u8) {
+        let previous = self.silk_internal_channels.replace(channels);
+        match (previous, channels) {
+            (Some(1), 2) => {
+                self.silk_synth_stereo = self.silk_synth_mono.take().and_then(|mid| {
+                    let side = crate::silk_synthesis::SilkSynthState::new(mid.bandwidth()).ok()?;
+                    Some((mid, side))
+                });
+                self.silk_carry_mid = std::mem::take(&mut self.silk_carry_mono);
+                self.silk_carry_side = SilkChannelCarry::default();
+                self.silk_stereo_unmix =
+                    Some(crate::silk_stereo::StereoUnmixStateI16::with_mid_history([
+                        self.silk_mono_prev2,
+                        self.silk_mono_delay,
+                    ]));
+                self.silk_resamp_stereo = self.silk_resamp_mono.take().map(|up| (up.clone(), up));
+            }
+            (Some(2), 1) => {
+                self.silk_synth_mono = self.silk_synth_stereo.take().map(|(mid, _)| mid);
+                self.silk_carry_mono = std::mem::take(&mut self.silk_carry_mid);
+                self.silk_carry_side = SilkChannelCarry::default();
+                if let Some(unmix) = self.silk_stereo_unmix.take() {
+                    let [prev2, prev1] = unmix.mid_history();
+                    self.silk_mono_prev2 = prev2;
+                    self.silk_mono_delay = prev1;
+                }
+                self.silk_resamp_mono = self.silk_resamp_stereo.take().map(|(left, _)| left);
+            }
+            _ => {}
         }
     }
 
@@ -993,6 +1085,7 @@ impl OpusDecoder {
         use crate::silk_header::SilkHeaderBits;
         use crate::silk_synthesis::{SilkSynthState, synthesize_silk_frame_i16};
 
+        self.silk_adopt_channel_count(1);
         let bandwidth = routing
             .silk_bandwidth
             .ok_or(Error::MalformedPacket)?
@@ -1123,6 +1216,7 @@ impl OpusDecoder {
             internal.rotate_right(1);
             internal[0] = self.silk_mono_delay;
             self.silk_mono_delay = last;
+            self.silk_mono_prev2 = internal[internal.len() - 1];
         }
         Ok((internal, bandwidth))
     }
@@ -1226,6 +1320,7 @@ impl OpusDecoder {
         use crate::silk_stereo::{StereoUnmixStateI16, StereoWeightsQ13, stereo_ms_to_lr_i16};
         use crate::silk_synthesis::{SilkSynthState, synthesize_silk_frame_i16};
 
+        self.silk_adopt_channel_count(2);
         let bandwidth = routing
             .silk_bandwidth
             .ok_or(Error::MalformedPacket)?
@@ -1501,6 +1596,7 @@ impl OpusDecoder {
             channels,
             energy,
         );
+        self.frame_rng = rd.range_size();
         if rd.has_error() || u64::from(rd.tell()) > 8 * frame.len() as u64 {
             return err;
         }
@@ -1695,6 +1791,7 @@ impl OpusDecoder {
         use crate::silk_header::SilkHeaderBits;
         use crate::silk_synthesis::{SilkSynthState, synthesize_silk_frame_i16};
 
+        self.silk_adopt_channel_count(1);
         let bandwidth = routing
             .silk_bandwidth
             .ok_or(Error::MalformedPacket)?
@@ -1772,6 +1869,7 @@ impl OpusDecoder {
             internal.rotate_right(1);
             internal[0] = 0;
             self.silk_mono_delay = last;
+            self.silk_mono_prev2 = internal[internal.len() - 1];
         }
         Ok(Some((internal, bandwidth)))
     }
@@ -1804,6 +1902,7 @@ impl OpusDecoder {
         use crate::silk_stereo::{StereoUnmixStateI16, StereoWeightsQ13, stereo_ms_to_lr_i16};
         use crate::silk_synthesis::{SilkSynthState, synthesize_silk_frame_i16};
 
+        self.silk_adopt_channel_count(2);
         let bandwidth = routing
             .silk_bandwidth
             .ok_or(Error::MalformedPacket)?
@@ -2116,6 +2215,7 @@ impl OpusDecoder {
             channels,
             energy,
         );
+        self.frame_rng = rd.range_size();
         if rd.has_error() {
             // The CELT layer failed: apply the §4.6 whole-frame floor
             // (the crate-wide error convention — an error status is
@@ -2261,6 +2361,7 @@ impl OpusDecoder {
             channels,
             energy,
         );
+        self.redundant_rng = rd.range_size();
         if rd.has_error() || u64::from(rd.tell()) > 8 * red.len() as u64 {
             return None;
         }

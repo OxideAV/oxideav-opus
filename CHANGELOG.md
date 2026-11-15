@@ -6,7 +6,15 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ### Added
 
+- `OpusDecoder::final_range()` — the RFC 6716 §6 final range decoder state of the last decoded Opus frame (redundant CELT frame XORed in; zero for DTX / lost / one-byte frames).
+- `DecodedAudio::into_channels(1 | 2)` — re-lay a decoded packet onto a fixed output channel count whatever the packet's stereo flag.
+- `tests/conformance_vectors.rs`: the §6 decoder conformance gates (final range on every packet, the Appendix A.4 quality measure at 8 / 12 / 16 / 24 / 48 kHz × mono / stereo) over a 12-vector reference-encoder corpus.
+
 - `new(..)` (every field, in declaration order) on `FrameOutcome`, `DecodedAudio`, `FecRecovered`, `OpusFrameRouting`, `SelfDelimitedParse`, `StreamPacket`, `MultistreamAudio`, `OpusHead` and `ChannelMappingTable`; `with_<field>` setters on `OpusEncoderOptions`.
+
+### Fixed
+
+- A mono → stereo (or stereo → mono) switch between SILK-only / Hybrid packets now hands the SILK state over the way the normative decoder does — the mono channel continues as the mid channel (synthesis histories, gain / NLSF carries, the §4.2.8 delay line, the resampler), the side channel starts fresh with the §4.2.7.1 weights zeroed — instead of restarting the mid channel from cleared state (4–50 dB off the reference decode for the first packets after the switch; now bit-exact).
 
 ### Changed
 
