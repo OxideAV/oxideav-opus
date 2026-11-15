@@ -4,6 +4,20 @@ All notable changes to `oxideav-opus` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/OxideAV/oxideav-opus/compare/v0.0.15...v0.0.16) - 2026-11-15
+
+### Other
+
+- README / manifest / crate docs no longer describe the crate as a scaffold
+- packet-duration changes mid-stream re-frame the running arm
+- O(N log N) CELT MDCT, table-driven PVQ codebook sizes, allocation-free synthesis; throughput bench
+- CELT bandwidth follows the total rate; quality-vs-bitrate table against a black-box encoder
+- tests + fuzz: packet-level feature matrix, unified-encoder round-trip target
+- OpusEncoder::final_range() — §6 final range of every packet written
+- §6 conformance gates — final range on every packet, quality measure at every rate / channel count; SILK mono<->stereo state hand-over
+- clippy 1.100: iterate energy rows and test tables instead of indexing
+- API hygiene: #[non_exhaustive] on growable enums + outcome / option records, constructors, hide encoder-internal modules
+
 ### Added
 
 - `OpusDecoder::final_range()` — the RFC 6716 §6 final range decoder state of the last decoded Opus frame (redundant CELT frame XORed in; zero for DTX / lost / one-byte frames).
