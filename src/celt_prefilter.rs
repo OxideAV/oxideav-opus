@@ -168,8 +168,8 @@ pub fn pitch_search(x_lp: &[f64], y: &[f64], len: usize, max_pitch: usize) -> us
     let mut xcorr4 = vec![0.0f64; max_pitch >> 2];
     for (i, slot) in xcorr4.iter_mut().enumerate() {
         let mut sum = 0.0;
-        for (j, &xv) in x_lp4.iter().enumerate() {
-            sum += xv * y_lp4[i + j];
+        for (&xv, &yv) in x_lp4.iter().zip(&y_lp4[i..i + x_lp4.len()]) {
+            sum += xv * yv;
         }
         *slot = sum.max(-1.0);
     }
@@ -182,9 +182,10 @@ pub fn pitch_search(x_lp: &[f64], y: &[f64], len: usize, max_pitch: usize) -> us
         if (i_i - 2 * best4[0] as i64).abs() > 2 && (i_i - 2 * best4[1] as i64).abs() > 2 {
             continue;
         }
+        let half = len >> 1;
         let mut sum = 0.0;
-        for (j, &xv) in x_lp.iter().enumerate().take(len >> 1) {
-            sum += xv * y[i + j];
+        for (&xv, &yv) in x_lp[..half].iter().zip(&y[i..i + half]) {
+            sum += xv * yv;
         }
         *slot = sum.max(-1.0);
     }

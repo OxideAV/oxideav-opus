@@ -77,6 +77,25 @@ pub struct CeltSynthesis {
     pf_gain_old: f64,
     pf_tapset: usize,
     pf_tapset_old: usize,
+    /// Per-frame working buffers, kept between frames so steady-state
+    /// synthesis allocates nothing.
+    scratch: SynthScratch,
+}
+
+/// Working buffers of [`CeltSynthesis::synthesize_frame`] (contents
+/// are meaningless between calls).
+#[derive(Debug, Clone, Default)]
+struct SynthScratch {
+    /// Overlap-added, post-filtered signal, `channels * n`.
+    planar: Vec<f64>,
+    /// One channel's overlap-add accumulator, `n + overlap`.
+    acc: Vec<f64>,
+    /// One block's coefficients, `n / blocks`.
+    spec: Vec<f64>,
+    /// One block's inverse transform, `2 * n / blocks`.
+    time: Vec<f64>,
+    /// `[history | frame]` for the comb filter.
+    ext: Vec<f64>,
 }
 
 impl CeltSynthesis {
@@ -96,6 +115,7 @@ impl CeltSynthesis {
             pf_gain_old: 0.0,
             pf_tapset: 0,
             pf_tapset_old: 0,
+            scratch: SynthScratch::default(),
         }
     }
 
@@ -227,20 +247,35 @@ impl CeltSynthesis {
             None => (0, 0.0, 0),
         };
 
-        let mut planar = vec![0.0f64; self.channels * n];
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let n2 = n / blocks;
+        scratch.planar.clear();
+        scratch.planar.resize(self.channels * n, 0.0);
+        scratch.spec.resize(n2, 0.0);
+        scratch.time.resize(2 * n2, 0.0);
+        scratch.ext.resize(hist_len + n, 0.0);
+        let SynthScratch {
+            planar,
+            acc,
+            spec,
+            time,
+            ext,
+        } = &mut scratch;
         for c in 0..self.channels {
             // §4.3.7 inverse MDCT + windowed overlap-add.
-            let mut acc = vec![0.0f64; n + overlap];
-            let n2 = n / blocks;
+            acc.clear();
+            acc.resize(n + overlap, 0.0);
             let pad = (n2 - overlap.min(n2)) / 2;
             let block_overlap = overlap.min(n2);
-            let mut spec = vec![0.0f64; n2];
-            let mut time = vec![0.0f64; 2 * n2];
             for b in 0..blocks {
                 for (k, slot) in spec.iter_mut().enumerate() {
                     *slot = freq[c * n + b + k * blocks];
                 }
-                imdct_via_rotation(&spec, &mut time);
+                // The O(N log N) kernel covers every Opus block size;
+                // the direct evaluation remains for any other length.
+                if !crate::celt_mdct_fast::imdct_unscaled(spec, time) {
+                    imdct_via_rotation(spec, time);
+                }
                 // The low-overlap window: zero pad, rising taper, flat
                 // middle, falling taper, zero pad. Only the nonzero
                 // span [pad, 2*n2 - pad) contributes.
@@ -273,12 +308,11 @@ impl CeltSynthesis {
         let period1 = self.pf_period.max(COMB_MIN_PERIOD);
         let short_len = 120.min(n);
         for c in 0..self.channels {
-            let mut ext = vec![0.0f64; hist_len + n];
             ext[..hist_len].copy_from_slice(&self.hist[c * hist_len..(c + 1) * hist_len]);
             ext[hist_len..].copy_from_slice(&planar[c * n..(c + 1) * n]);
 
             comb_filter(
-                &mut ext,
+                ext,
                 hist_len,
                 period0,
                 period1,
@@ -292,7 +326,7 @@ impl CeltSynthesis {
             );
             if n > short_len {
                 comb_filter(
-                    &mut ext,
+                    ext,
                     hist_len + short_len,
                     period1,
                     pf_period_new.max(COMB_MIN_PERIOD),
@@ -340,6 +374,7 @@ impl CeltSynthesis {
             }
             self.deemph_mem[c] = mem;
         }
+        self.scratch = scratch;
     }
 }
 

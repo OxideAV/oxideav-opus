@@ -399,6 +399,53 @@ wideband. Measured before → after on the same table: stereo music
 24 kb/s 7.58 → 7.10; mono music 32 kb/s 3.92 → 3.22 (gap +0.52 →
 −0.18); no row regressed.
 
+### Throughput
+
+`cargo bench --bench codec_speed` (`benches/codec_speed.rs`) encodes and
+decodes a 10 s synthetic clip with the unified encoder (complexity 4,
+VBR, automatic mode: 16 kb/s speech profile → the LP layer, 32 kb/s →
+Hybrid for mono, 64 / 128 kb/s audio profile → the MDCT layer) and
+reports multiples of real time, single thread, median of 5 passes
+(Apple M-series, a machine shared with other builds — treat the
+figures as ±15 %).
+
+Profile first (macOS `sample`, 64 kb/s mono): **96 % of CELT decode**
+sat in the inverse MDCT and **93 % of CELT encode** in the forward
+MDCT, both evaluated as O(N²) rotation recurrences; once those were
+gone, the PVQ codebook-size function `V(N, K)` — recomputed from the
+§4.3.4.2 recurrence, with two allocations, for every coordinate of
+every coded vector — was 50 % of decode and 30 % of encode. Three
+changes, all with **bit-identical output** (124 encoder captures and
+30 decode dumps / 2.2 M samples compared byte for byte against the
+previous build):
+
+* `celt_mdct_fast` — both MDCT directions as a type-IV DCT folded onto
+  one N/2-point complex DFT (mixed radix 2 / 3 / 5, tables built once
+  per block size, stack scratch only);
+* `pvq_codebook_size` — a table of every representable `V(N, K)` built
+  once from the recurrence (about 12 000 cells), a lookup per call;
+* CELT synthesis reuses its working buffers (no per-frame allocation in
+  the transform path), and the SILK and CELT pitch-search correlations
+  run on slices with the lag-independent window energy hoisted.
+
+| channels | target kb/s | layer | encode before → after (× real time) | decode before → after (× real time) |
+| --- | --- | --- | --- | --- |
+| 1 | 16 | SILK | 24.9 → 30.3 | 1562 → 1558 |
+| 1 | 32 | Hybrid | 5.0 → 30.6 | 6.0 → 592 |
+| 1 | 64 | CELT | 5.6 → 213 | 5.8 → 595 |
+| 1 | 128 | CELT | 5.5 → 183 | 5.6 → 478 |
+| 2 | 16 | SILK | 34.3 → 37.1 | 1371 → 1472 |
+| 2 | 32 | SILK | 14.7 → 15.9 | 771 → 779 |
+| 2 | 64 | CELT | 3.2 → 166 | 3.4 → 388 |
+| 2 | 128 | CELT | 3.1 → 153 | 3.1 → 323 |
+
+What is left: the SILK analysis side is now the slowest path (stereo at
+32 kb/s encodes at 16× real time) — its full-rate exhaustive pitch-lag
+sweep is 27 % of SILK encode and the NLSF root search (grid bracketing
+with a `cos` per evaluation) another 15 %; the CELT encoder's pitch
+pre-filter search is 30 % of what remains there, and the encoder arms
+still allocate per frame.
+
 Underneath sit the per-mode arms, each usable directly:
 
 * **SILK-only** (`SilkEncoderMono` / `SilkEncoderStereo`): the full

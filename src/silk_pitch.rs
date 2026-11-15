@@ -104,8 +104,10 @@ pub fn pitch_analysis(
     let mut best_lag = lag_min;
     let mut best_biased = f64::MIN;
     let mut best_unbiased = 0.0f64;
+    // The window's own energy does not depend on the lag.
+    let frame_energy = energy_of(&frame[..frame_len]);
     for lag in lag_min..=lag_max {
-        let c = normalized_corr(x, frame_start, 0, frame_len, lag);
+        let c = normalized_corr(x, frame_start, 0, frame_len, lag, frame_energy);
         let bias = 1.0 - SHORT_LAG_BIAS * (lag - lag_min) as f64 / (lag_max - lag_min) as f64;
         let biased = c * bias;
         if biased > best_biased {
@@ -133,8 +135,9 @@ pub fn pitch_analysis(
         let lo = (best_lag - SUBFRAME_SEARCH_HALF_WIDTH).max(lag_min);
         let hi = (best_lag + SUBFRAME_SEARCH_HALF_WIDTH).min(lag_max);
         let mut best = (best_lag, f64::MIN);
+        let sub_energy = energy_of(&frame[s * n..(s + 1) * n]);
         for lag in lo..=hi {
-            let c = normalized_corr(x, frame_start, s * n, n, lag);
+            let c = normalized_corr(x, frame_start, s * n, n, lag, sub_energy);
             if c > best.1 {
                 best = (lag, c);
             }
@@ -181,20 +184,34 @@ pub fn pitch_analysis(
     })
 }
 
+/// Sum of squares of a window, accumulated in sample order.
+fn energy_of(window: &[f64]) -> f64 {
+    let mut acc = 0.0f64;
+    for &v in window {
+        acc += v * v;
+    }
+    acc
+}
+
 /// Normalized cross-correlation between the window
-/// `x[frame_start+off .. +len]` and the same window delayed by `lag`
-/// samples (reaching into the history prefix).
-fn normalized_corr(x: &[f64], frame_start: usize, off: usize, len: usize, lag: i32) -> f64 {
+/// `x[frame_start+off .. +len]` (whose energy is `xx`) and the same
+/// window delayed by `lag` samples (reaching into the history prefix).
+fn normalized_corr(
+    x: &[f64],
+    frame_start: usize,
+    off: usize,
+    len: usize,
+    lag: i32,
+    xx: f64,
+) -> f64 {
     let a0 = frame_start + off;
     let b0 = a0 - lag as usize;
+    let current = &x[a0..a0 + len];
+    let delayed = &x[b0..b0 + len];
     let mut xy = 0.0f64;
-    let mut xx = 0.0f64;
     let mut yy = 0.0f64;
-    for i in 0..len {
-        let xa = x[a0 + i];
-        let xb = x[b0 + i];
+    for (&xa, &xb) in current.iter().zip(delayed) {
         xy += xa * xb;
-        xx += xa * xa;
         yy += xb * xb;
     }
     if xx <= 0.0 || yy <= 0.0 {

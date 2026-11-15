@@ -344,6 +344,7 @@ pub fn forward_mdct(ibuf: &[f64], n: usize, overlap: usize, blocks: usize) -> Ve
     let pad = (n2 - block_overlap) / 2;
     let mut freq = vec![0.0f64; n];
     let mut xw = vec![0.0f64; 2 * n2];
+    let mut coeffs = [0.0f64; crate::celt_mdct_fast::MAX_N];
     for b in 0..blocks {
         // Windowed block: support t in [pad, pad + n2 + overlap).
         xw.fill(0.0);
@@ -360,6 +361,14 @@ pub fn forward_mdct(ibuf: &[f64], n: usize, overlap: usize, blocks: usize) -> Ve
         // X(k) = (2/n2) * sum_t xw(t) cos[(pi/n2)(t + 1/2 + n2/2)(k + 1/2)].
         let nf = n2 as f64;
         let scale = 2.0 / nf;
+        // The O(N log N) kernel covers every Opus block size; the
+        // direct evaluation below remains for any other length.
+        if crate::celt_mdct_fast::mdct_unscaled(&xw, &mut coeffs[..n2]) {
+            for (k, &c) in coeffs[..n2].iter().enumerate() {
+                freq[b + k * blocks] = scale * c;
+            }
+            continue;
+        }
         for k in 0..n2 {
             let base = (std::f64::consts::PI / nf) * (k as f64 + 0.5);
             // phase(t) = base * (t + 1/2 + n2/2); rotation recurrence.

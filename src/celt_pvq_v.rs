@@ -203,10 +203,10 @@ impl std::error::Error for PvqVError {}
 ///     V(0, K) = 0                       for all K ≥ 1
 /// ```
 ///
-/// The function evaluates the recurrence in `u64` over two rolling
-/// rows and short-circuits with [`PvqVError::OverflowsDecUintRange`]
-/// the moment any intermediate cell crosses [`PVQ_V_MAX`] =
-/// `2**32 − 1`.
+/// The values come from a table built once from the recurrence (a
+/// lookup per call, no allocation); a `(N, K)` whose value crosses
+/// [`PVQ_V_MAX`] = `2**32 − 1` returns
+/// [`PvqVError::OverflowsDecUintRange`].
 ///
 /// # Edge cases
 ///
@@ -247,42 +247,119 @@ pub fn pvq_codebook_size(n: u32, k: u32) -> Result<u32, PvqVError> {
         return Ok(0);
     }
 
-    // Rolling-row evaluation.
-    //
-    // row_prev holds V(N - 1, k) for k ∈ 0..=k_max.
-    // row_curr holds V(N,     k) and is rebuilt left-to-right per step.
-    //
-    // Seed: row_prev = V(0, k) = δ_{k,0}, i.e. [1, 0, 0, ..., 0].
-    let k_usize = k as usize;
-    let mut row_prev: Vec<u64> = vec![0u64; k_usize + 1];
-    row_prev[0] = 1;
-    let mut row_curr: Vec<u64> = vec![0u64; k_usize + 1];
-
-    for _ in 1..=n {
-        // V(N, 0) = 1 by definition.
-        row_curr[0] = 1;
-        for kk in 1..=k_usize {
-            // V(N, K) = V(N - 1, K) + V(N, K - 1) + V(N - 1, K - 1).
-            let v_nm1_k = row_prev[kk];
-            let v_n_km1 = row_curr[kk - 1];
-            let v_nm1_km1 = row_prev[kk - 1];
-            let v = v_nm1_k + v_n_km1 + v_nm1_km1;
-            if v > PVQ_V_MAX {
-                return Err(PvqVError::OverflowsDecUintRange { n, k });
-            }
-            row_curr[kk] = v;
-        }
-        // Slide rows: row_prev <- row_curr; row_curr becomes scratch.
-        core::mem::swap(&mut row_prev, &mut row_curr);
+    // Every representable V(N, K) sits in a table built once from the
+    // recurrence; a (N, K) past its row's end overflows `ec_dec_uint`.
+    match codebook_rows()[n as usize].get(k as usize) {
+        Some(&v) => Ok(v),
+        None => Err(PvqVError::OverflowsDecUintRange { n, k }),
     }
+}
 
-    // After the swap on the final iteration `row_prev` holds V(N, .).
-    Ok(row_prev[k_usize] as u32)
+/// `rows[n][k] = V(n, k)` for every `n ≤ PVQ_V_N_MAX` and every
+/// `k ≤ PVQ_V_K_MAX` whose value fits `ec_dec_uint` (`≤ 2**32 − 1`).
+///
+/// `V` is non-decreasing in both arguments, so the representable `k`
+/// of each row form a prefix `0..len(n)` and `len` is non-increasing in
+/// `n` from `n = 1` on: row `n` is filled left to right from row
+/// `n − 1` by the §4.3.4.2 recurrence and stops at the first value
+/// past the bound (every later cell of that row, and of every later
+/// row at that `k`, is larger still). Row 0 is `[1]` (`V(0, K) = 0`
+/// for `K ≥ 1` is answered before the lookup). About 12 000 cells in
+/// total.
+fn codebook_rows() -> &'static [Vec<u32>] {
+    static ROWS: std::sync::OnceLock<Vec<Vec<u32>>> = std::sync::OnceLock::new();
+    ROWS.get_or_init(|| {
+        let k_cap = PVQ_V_K_MAX as usize + 1;
+        let mut rows: Vec<Vec<u32>> = Vec::with_capacity(PVQ_V_N_MAX as usize + 1);
+        rows.push(vec![1]);
+        for n in 1..=PVQ_V_N_MAX as usize {
+            let mut row: Vec<u32> = Vec::new();
+            row.push(1);
+            {
+                let prev = &rows[n - 1];
+                // V(0, k) = 0 for k ≥ 1: row 0 reads as zero past its
+                // single cell; later rows end where they overflow.
+                let prev_at = |k: usize| -> Option<u64> {
+                    if n == 1 {
+                        Some(u64::from(k == 0))
+                    } else {
+                        prev.get(k).map(|&v| u64::from(v))
+                    }
+                };
+                for k in 1..k_cap {
+                    let (Some(up), Some(diag)) = (prev_at(k), prev_at(k - 1)) else {
+                        break;
+                    };
+                    let v = up + u64::from(row[k - 1]) + diag;
+                    if v > PVQ_V_MAX {
+                        break;
+                    }
+                    row.push(v as u32);
+                }
+            }
+            rows.push(row);
+        }
+        rows
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The §4.3.4.2 recurrence evaluated directly over two rolling
+    /// rows — the definition the table is checked against.
+    fn direct(n: u32, k: u32) -> Result<u32, PvqVError> {
+        if k == 0 {
+            return Ok(1);
+        }
+        if n == 0 {
+            return Ok(0);
+        }
+        let k_usize = k as usize;
+        let mut row_prev = vec![0u64; k_usize + 1];
+        row_prev[0] = 1;
+        let mut row_curr = vec![0u64; k_usize + 1];
+        for _ in 1..=n {
+            row_curr[0] = 1;
+            for kk in 1..=k_usize {
+                let v = row_prev[kk] + row_curr[kk - 1] + row_prev[kk - 1];
+                if v > PVQ_V_MAX {
+                    return Err(PvqVError::OverflowsDecUintRange { n, k });
+                }
+                row_curr[kk] = v;
+            }
+            core::mem::swap(&mut row_prev, &mut row_curr);
+        }
+        Ok(row_prev[k_usize] as u32)
+    }
+
+    #[test]
+    fn table_matches_the_direct_recurrence() {
+        // Dense over the small corner, then every row at its own
+        // boundary (last representable K and the first overflowing
+        // one) and at scattered interior points.
+        for n in 0..=40u32 {
+            for k in 0..=60u32 {
+                assert_eq!(pvq_codebook_size(n, k), direct(n, k), "V({n}, {k})");
+            }
+        }
+        for n in 1..=PVQ_V_N_MAX {
+            let len = codebook_rows()[n as usize].len() as u32;
+            for k in [len / 3, len / 2, len.saturating_sub(2), len - 1] {
+                assert_eq!(pvq_codebook_size(n, k), direct(n, k), "V({n}, {k})");
+            }
+            if len <= PVQ_V_K_MAX {
+                assert_eq!(pvq_codebook_size(n, len), direct(n, len), "V({n}, {len})");
+                assert!(pvq_codebook_size(n, len).is_err());
+            }
+        }
+        for k in [1u32, 2, 100, 1000, 4096] {
+            for n in [1u32, 2, 3, 4] {
+                assert_eq!(pvq_codebook_size(n, k), direct(n, k), "V({n}, {k})");
+            }
+        }
+    }
 
     // ---- §4.3.4.2 recurrence-defined edge cases -----------------------------
 

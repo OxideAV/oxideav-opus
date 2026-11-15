@@ -751,6 +751,7 @@ pub mod celt_imdct;
 pub mod celt_laplace;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_log2_frac_table;
+mod celt_mdct_fast;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod celt_mdct_synthesis;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
